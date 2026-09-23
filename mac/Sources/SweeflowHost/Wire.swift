@@ -4,7 +4,7 @@ import Foundation
 enum Msg: UInt8 {
     case hello = 0x01, welcome = 0x02
     case windowAdded = 0x10, windowChanged = 0x11, windowRemoved = 0x12, appIcon = 0x13, cursor = 0x14, focused = 0x15
-    case windowButtons = 0x16, moveStarted = 0x17, toggleMaximize = 0x18
+    case windowButtons = 0x16, moveStarted = 0x17, toggleMaximize = 0x18, minimize = 0x1A
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
     case clipboard = 0x40, ping = 0x41, pong = 0x42

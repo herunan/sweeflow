@@ -290,8 +290,17 @@ final class Session {
     private func startTracking() {
         tracker.onAdded = { [weak self] w in self?.placeOnVirtualDisplay(w); self?.sendAdded(w) }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
-        tracker.onRemoved = { [weak self] wid in
+        tracker.onRemoved = { [weak self] w in
             guard let self else { return }
+            let wid = w.wid
+            // Minimised on the Mac (⌘M, or an app's own button): a minimised window can't be
+            // captured, so restore it there and minimise the Linux window instead.
+            if w.kind == .toplevel, self.control_.isMinimized(wid, pid: w.pid) {
+                log("window \(wid) minimised on the Mac → minimising on Linux instead")
+                self.control_.unminimize(wid, pid: w.pid)
+                var m = MsgWriter(.minimize); m.u32(wid); self.control?.send(m)
+                return
+            }
             self.control_.forget(wid)
             self.sentButtons[wid] = nil
             var m = MsgWriter(.windowRemoved); m.u32(wid); self.control?.send(m)

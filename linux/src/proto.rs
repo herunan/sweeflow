@@ -16,6 +16,7 @@ pub mod t {
     pub const WINDOW_BUTTONS: u8 = 0x16;
     pub const MOVE_STARTED: u8 = 0x17;
     pub const TOGGLE_MAXIMIZE: u8 = 0x18;
+    pub const MINIMIZE: u8 = 0x1A;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;

@@ -46,6 +46,7 @@ pub enum UiEvent {
     WindowButtons(u32, [[f32; 4]; 3]),
     MoveStarted(u32),
     ToggleMaximize(u32),
+    Minimize(u32),
     Frame(u32, GpuFrame),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
@@ -211,6 +212,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
+        t::MINIMIZE => UiEvent::Minimize(r.u32()?),
         t::PONG => return Ok(()),
         _ => {
             log::debug!("ignoring control message {ty:#x}");

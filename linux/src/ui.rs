@@ -372,6 +372,11 @@ impl App {
                 }
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
+            UiEvent::Minimize(wid) => {
+                if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
+                    t.set_minimized();
+                }
+            }
             UiEvent::Frame(wid, frame) => self.present(wid, frame, qh),
             UiEvent::RawFrame { wid, w, h, px_per_pt, capture_us, bgra } => {
                 self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)

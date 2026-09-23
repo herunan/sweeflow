@@ -23,7 +23,7 @@ struct TrackedWindow: Equatable {
 final class WindowTracker {
     var onAdded: ((TrackedWindow) -> Void)?
     var onChanged: ((TrackedWindow) -> Void)?
-    var onRemoved: ((UInt32) -> Void)?
+    var onRemoved: ((TrackedWindow) -> Void)?
 
     private(set) var windows: [UInt32: TrackedWindow] = [:]
     /// Window ids in front-to-back order from the last poll.
@@ -103,9 +103,9 @@ final class WindowTracker {
             order.append(p.wid)
         }
 
-        for (wid, _) in windows where seen[wid] == nil {
+        for (wid, old) in windows where seen[wid] == nil {
             windows[wid] = nil
-            onRemoved?(wid)
+            onRemoved?(old)
         }
         // Parents before children so the client can attach popups.
         for wid in order {

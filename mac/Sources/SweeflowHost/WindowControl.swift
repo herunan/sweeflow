@@ -39,6 +39,19 @@ final class WindowControl {
         return AXUIElementSetAttributeValue(e, kAXPositionAttribute as CFString, v) == .success
     }
 
+    /// Whether the window is minimised to the Dock (and so off-screen, out of the stream).
+    func isMinimized(_ wid: UInt32, pid: pid_t) -> Bool {
+        guard let e = element(wid, pid: pid) else { return false }
+        var v: CFTypeRef?
+        return AXUIElementCopyAttributeValue(e, kAXMinimizedAttribute as CFString, &v) == .success
+            && (v as? Bool) == true
+    }
+
+    func unminimize(_ wid: UInt32, pid: pid_t) {
+        guard let e = element(wid, pid: pid) else { return }
+        AXUIElementSetAttributeValue(e, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+    }
+
     /// Brings the window to the front and makes its app active so it receives keystrokes.
     func focus(_ wid: UInt32, pid: pid_t) {
         if let e = element(wid, pid: pid) {

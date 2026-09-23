@@ -31,6 +31,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x15 | S→C | Focused | u32 wid (Mac-side key window changed) |
 | 0x16 | S→C | WindowButtons | u32 wid, 3 × (f32 x, y, w, h): close, minimise, zoom button frames (window-relative; zero = absent) |
 | 0x17 | S→C | MoveStarted | u32 wid — the app began dragging its window; client should start an interactive move |
+| 0x1A | S→C | Minimize | u32 wid — the window was minimised on the Mac (restored there); client minimises its window |
 | 0x18 | S→C | ToggleMaximize | u32 wid — the app zoomed its window (title-bar double-click); client toggles maximised |
 | 0x20 | C→S | Resize | u32 wid, f32 w, f32 h |
 | 0x21 | C→S | Focus | u32 wid |
