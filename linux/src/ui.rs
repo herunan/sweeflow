@@ -66,7 +66,7 @@ use wayland_protocols::{
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
     xdg::{
-        shell::client::xdg_positioner,
+        shell::client::{xdg_positioner, xdg_toplevel},
         toplevel_icon::v1::client::{
             xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1,
             xdg_toplevel_icon_v1::XdgToplevelIconV1,
@@ -100,7 +100,10 @@ struct Win {
     /// Last size we asked the Mac for, and when (to ignore stale Mac-side sizes mid-resize).
     requested: Option<((u32, u32), Instant)>,
     floating: bool,
+    maximized: bool,
     suspended: bool,
+    /// Traffic lights (close, minimise, zoom) in window points.
+    buttons: [[f32; 4]; 3],
     /// Frame waiting for the first configure.
     pending: Option<GpuFrame>,
     stale: bool,
@@ -149,6 +152,22 @@ pub struct App {
     kb_focus: Option<u32>,
     scroll_active: bool,
     wheel_accum: (f64, f64),
+    /// Serial of the last pointer enter, needed to set the cursor image.
+    enter_serial: u32,
+    /// The Mac's current cursor, drawn locally so it moves with zero latency.
+    cursor_surface: Option<wl_surface::WlSurface>,
+    cursor_buffer: Option<(wl_buffer::WlBuffer, RawPool)>,
+    cursor_hot: (i32, i32),
+    meta_down: u8,
+    shift_down: u8,
+    /// Keys we handled locally (e.g. Cmd+Tab) whose release must not reach the Mac either.
+    swallowed: Vec<u32>,
+    /// Serial of the last button press forwarded to the Mac (for handing drags to KWin).
+    press_serial: u32,
+    /// A pointer button handled locally (traffic light, resize edge): swallow its release.
+    local_press: Option<u32>,
+    /// Showing a resize cursor over a window edge instead of the Mac cursor.
+    edge_cursor: bool,
     scale: f64,
     host: String,
 }
@@ -202,6 +221,16 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         kb_focus: None,
         scroll_active: false,
         wheel_accum: (0.0, 0.0),
+        enter_serial: 0,
+        cursor_surface: None,
+        cursor_buffer: None,
+        cursor_hot: (0, 0),
+        meta_down: 0,
+        shift_down: 0,
+        swallowed: Vec::new(),
+        press_serial: 0,
+        local_press: None,
+        edge_cursor: false,
         scale,
         host,
     };
@@ -274,8 +303,21 @@ impl App {
                     self.apply_icon(wid, qh);
                 }
             }
-            UiEvent::Cursor { .. } => {}
+            UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png, qh),
             UiEvent::Focused(_) => {}
+            UiEvent::WindowButtons(wid, rects) => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.buttons = rects;
+                }
+            }
+            UiEvent::MoveStarted(wid) => {
+                if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
+                    if let Role::Toplevel(t) = &w.role {
+                        t.move_(seat, self.press_serial);
+                    }
+                }
+            }
+            UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
             UiEvent::Frame(wid, frame) => self.present(wid, frame, qh),
         }
     }
@@ -312,7 +354,8 @@ impl App {
             (Role::Popup(popup), s)
         } else {
             let surface = self.compositor.create_surface(qh);
-            let window = self.xdg.create_window(surface, WindowDecorations::RequestServer, qh);
+            // The Mac window brings its own title bar and traffic lights; no KDE frame around it.
+            let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, qh);
             window.set_title(display_title(&info.app_name, &info.title));
             window.set_app_id(format!("sweeflow-{}", info.bundle_id));
             window.set_min_size(Some((100, 60)));
@@ -357,7 +400,9 @@ impl App {
                 size,
                 requested: None,
                 floating: true,
+                maximized: false,
                 suspended: false,
+                buttons: [[0.0; 4]; 3],
                 pending: None,
                 stale: false,
             },
@@ -504,9 +549,127 @@ impl App {
         mgr.set_icon(t.xdg_toplevel(), Some(&self.icons[&bid].0));
     }
 
+    fn toggle_maximize(&self, wid: u32) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        let Role::Toplevel(t) = &w.role else { return };
+        if w.maximized {
+            t.unset_maximized();
+        } else {
+            t.set_maximized();
+        }
+    }
+
+    /// Resize edge under (x, y) for windows without a KDE frame.
+    fn edge_at(&self, wid: u32, x: f64, y: f64) -> Option<xdg_toplevel::ResizeEdge> {
+        use xdg_toplevel::ResizeEdge as E;
+        let w = self.windows.get(&wid)?;
+        if !matches!(w.role, Role::Toplevel(_)) || w.maximized {
+            return None;
+        }
+        const EDGE: f64 = 5.0;
+        const CORNER: f64 = 14.0;
+        let (bw, bh) = (w.size.0 as f64, w.size.1 as f64);
+        let (l, r, t, b) = (x < EDGE, x > bw - EDGE, y < EDGE, y > bh - EDGE);
+        let (lc, rc, tc, bc) = (x < CORNER, x > bw - CORNER, y < CORNER, y > bh - CORNER);
+        Some(match () {
+            _ if (t && lc) || (l && tc) => E::TopLeft,
+            _ if (t && rc) || (r && tc) => E::TopRight,
+            _ if (b && lc) || (l && bc) => E::BottomLeft,
+            _ if (b && rc) || (r && bc) => E::BottomRight,
+            _ if t => E::Top,
+            _ if b => E::Bottom,
+            _ if l => E::Left,
+            _ if r => E::Right,
+            _ => return None,
+        })
+    }
+
+    /// Which traffic light (0 close, 1 minimise, 2 zoom) is under (x, y), if any.
+    fn button_at(&self, wid: u32, x: f64, y: f64) -> Option<usize> {
+        let w = self.windows.get(&wid)?;
+        w.buttons.iter().position(|r| {
+            r[2] > 0.0 && x >= r[0] as f64 && x < (r[0] + r[2]) as f64 && y >= r[1] as f64 && y < (r[1] + r[3]) as f64
+        })
+    }
+
+    fn set_edge_cursor(&mut self, edge: Option<xdg_toplevel::ResizeEdge>, pointer: &wl_pointer::WlPointer, qh: &QueueHandle<Self>) {
+        use wp_cursor_shape_device_v1::Shape;
+        use xdg_toplevel::ResizeEdge as E;
+        match edge {
+            Some(e) => {
+                let Some(mgr) = &self.cursor_mgr else { return };
+                let shape = match e {
+                    E::Top => Shape::NResize,
+                    E::Bottom => Shape::SResize,
+                    E::Left => Shape::WResize,
+                    E::Right => Shape::EResize,
+                    E::TopLeft => Shape::NwResize,
+                    E::TopRight => Shape::NeResize,
+                    E::BottomLeft => Shape::SwResize,
+                    _ => Shape::SeResize,
+                };
+                let d = self.cursor_device.get_or_insert_with(|| mgr.get_pointer(pointer, qh, ()));
+                d.set_shape(self.enter_serial, shape);
+                self.edge_cursor = true;
+            }
+            None if self.edge_cursor => {
+                self.edge_cursor = false;
+                self.apply_cursor();
+            }
+            None => {}
+        }
+    }
+
+    fn set_mac_cursor(&mut self, hot_x: f32, hot_y: f32, scale: f32, png: &[u8], qh: &QueueHandle<Self>) {
+        let Ok((w, h, argb)) = decode_png_argb(png) else { return };
+        let Ok(mut pool) = RawPool::new((w * h * 4) as usize, &self.shm) else { return };
+        pool.mmap().copy_from_slice(&argb);
+        let buf = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888, (), qh);
+        let surface = self.cursor_surface.get_or_insert_with(|| self.compositor.create_surface(qh)).clone();
+        let buffer_scale = scale.round().max(1.0) as i32;
+        surface.set_buffer_scale(buffer_scale);
+        surface.attach(Some(&buf), 0, 0);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.commit();
+        if let Some((old, _)) = self.cursor_buffer.replace((buf, pool)) {
+            old.destroy();
+        }
+        // Hot spot arrives in points; cursor surface coordinates are logical pixels.
+        self.cursor_hot = ((hot_x as f64 * self.scale).round() as i32, (hot_y as f64 * self.scale).round() as i32);
+        self.apply_cursor();
+    }
+
+    fn apply_cursor(&self) {
+        if self.pointer_focus.is_none() || self.edge_cursor {
+            return;
+        }
+        let (Some(pointer), Some(surface)) = (&self.pointer, &self.cursor_surface) else { return };
+        pointer.set_cursor(self.enter_serial, Some(surface), self.cursor_hot.0, self.cursor_hot.1);
+    }
+
     fn wid_for(&self, s: &wl_surface::WlSurface) -> Option<u32> {
         self.surfaces.get(&s.id()).copied()
     }
+}
+
+const BTN_LEFT: u32 = 0x110;
+const KEY_TAB: u32 = 15;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTSHIFT: u32 = 54;
+const KEY_LEFTMETA: u32 = 125;
+const KEY_RIGHTMETA: u32 = 126;
+
+/// Opens KWin's window switcher. Our windows inhibit compositor shortcuts (so Cmd+letter reaches
+/// the Mac), which also blocks Meta+Tab; invoke it explicitly instead.
+fn switch_windows(reverse: bool) {
+    let name = if reverse { "Walk Through Windows (Reverse)" } else { "Walk Through Windows" };
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("qdbus6")
+            .args(["org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
 }
 
 fn display_title(app: &str, title: &str) -> String {
@@ -554,6 +717,7 @@ impl WindowHandler for App {
         let was_suspended = w.suspended;
         w.suspended = cfg.state.contains(WindowState::SUSPENDED);
         w.floating = !(cfg.is_maximized() || cfg.is_fullscreen() || cfg.is_tiled());
+        w.maximized = cfg.is_maximized() || cfg.is_fullscreen();
         let size = match cfg.new_size {
             (Some(cw), Some(ch)) => (cw.get(), ch.get()),
             _ => w.size,
@@ -618,13 +782,12 @@ impl PointerHandler for App {
             match e.kind {
                 PointerEventKind::Enter { serial } => {
                     self.pointer_focus = Some(wid);
-                    if let Some(mgr) = &self.cursor_mgr {
-                        if self.cursor_device.is_none() {
-                            self.cursor_device = Some(mgr.get_pointer(pointer, qh, ()));
-                        }
-                        if let Some(d) = &self.cursor_device {
-                            d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
-                        }
+                    self.enter_serial = serial;
+                    if self.cursor_surface.is_some() {
+                        self.apply_cursor();
+                    } else if let Some(mgr) = &self.cursor_mgr {
+                        let d = self.cursor_device.get_or_insert_with(|| mgr.get_pointer(pointer, qh, ()));
+                        d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
                     }
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
@@ -634,13 +797,46 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Motion { .. } => {
+                    let edge = self.edge_at(wid, e.position.0, e.position.1);
+                    self.set_edge_cursor(edge, pointer, qh);
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
-                PointerEventKind::Press { button, .. } | PointerEventKind::Release { button, .. } => {
-                    let pressed = matches!(e.kind, PointerEventKind::Press { .. });
-                    self.send(
-                        W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(pressed as u8).finish(),
-                    );
+                PointerEventKind::Press { button, serial, .. } => {
+                    if button == BTN_LEFT {
+                        if let Some(edge) = self.edge_at(wid, e.position.0, e.position.1) {
+                            if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
+                                if let Role::Toplevel(t) = &w.role {
+                                    t.resize(seat, serial, edge);
+                                }
+                            }
+                            self.local_press = Some(button);
+                            continue;
+                        }
+                        if let Some(b) = self.button_at(wid, e.position.0, e.position.1) {
+                            // Traffic lights act on the Linux window; on the Mac they would
+                            // minimise/fullscreen the window out of the stream.
+                            match b {
+                                0 => self.send(W::new(t::CLOSE).u32(wid).finish()),
+                                1 => {
+                                    if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
+                                        t.set_minimized();
+                                    }
+                                }
+                                _ => self.toggle_maximize(wid),
+                            }
+                            self.local_press = Some(button);
+                            continue;
+                        }
+                    }
+                    self.press_serial = serial;
+                    self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).finish());
+                }
+                PointerEventKind::Release { button, .. } => {
+                    if self.local_press == Some(button) {
+                        self.local_press = None;
+                        continue;
+                    }
+                    self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());
                 }
                 PointerEventKind::Axis { horizontal, vertical, source, .. } => {
                     let continuous = matches!(
@@ -707,18 +903,47 @@ impl KeyboardHandler for App {
 
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
         self.kb_focus = None;
+        self.meta_down = 0;
+        self.shift_down = 0;
+        self.swallowed.clear();
         self.send(W::new(t::RELEASE_ALL).finish());
     }
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+        match e.raw_code {
+            KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down += 1,
+            KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down += 1,
+            _ => {}
+        }
+        if e.raw_code == KEY_TAB && self.meta_down > 0 {
+            // Cmd+Tab switches between *all* desktop windows, like it does everywhere else.
+            switch_windows(self.shift_down > 0);
+            self.swallowed.push(e.raw_code);
+            return;
+        }
         self.send(W::new(t::KEY).u32(e.raw_code).u8(1).finish());
     }
 
     fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+        if self.swallowed.contains(&e.raw_code) {
+            if e.raw_code == KEY_TAB {
+                switch_windows(self.shift_down > 0);
+            }
+            return;
+        }
         self.send(W::new(t::KEY).u32(e.raw_code).u8(2).finish());
     }
 
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+        match e.raw_code {
+            KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down = self.meta_down.saturating_sub(1),
+            KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down = self.shift_down.saturating_sub(1),
+            _ => {}
+        }
+        if let Some(i) = self.swallowed.iter().position(|&k| k == e.raw_code) {
+            self.swallowed.remove(i);
+            return;
+        }
         self.send(W::new(t::KEY).u32(e.raw_code).u8(0).finish());
     }
 

@@ -56,6 +56,24 @@ final class WindowControl {
         }
     }
 
+    /// Frames of the close / minimise / zoom buttons relative to the window origin, in points
+    /// (`.zero` when a button is absent).
+    func buttonRects(_ wid: UInt32, pid: pid_t, windowOrigin: CGPoint) -> [CGRect] {
+        guard let e = element(wid, pid: pid) else { return [.zero, .zero, .zero] }
+        return [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute].map { attr in
+            var button: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(e, attr as CFString, &button) == .success, let b = button else { return .zero }
+            let el = b as! AXUIElement
+            var pos: CFTypeRef?, size: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &pos) == .success,
+                  AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &size) == .success else { return .zero }
+            var p = CGPoint.zero, sz = CGSize.zero
+            AXValueGetValue(pos as! AXValue, .cgPoint, &p)
+            AXValueGetValue(size as! AXValue, .cgSize, &sz)
+            return CGRect(x: p.x - windowOrigin.x, y: p.y - windowOrigin.y, width: sz.width, height: sz.height)
+        }
+    }
+
     /// The window the user is typing into on the Mac, if any.
     func focusedWindowID() -> UInt32? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }

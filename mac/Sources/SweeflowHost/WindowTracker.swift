@@ -112,6 +112,13 @@ final class WindowTracker {
         zOrder = order
     }
 
+    /// Current frame of one window straight from the window server (bypasses the poll interval).
+    func liveFrame(_ wid: UInt32) -> CGRect? {
+        guard let arr = CGWindowListCreateDescriptionFromArray([NSNumber(value: wid)] as CFArray) as? [[String: Any]],
+              let d = arr.first?[kCGWindowBounds as String] as? NSDictionary else { return nil }
+        return CGRect(dictionaryRepresentation: d)
+    }
+
     /// Returns true when `wid` is the topmost window covering `point` (global coords),
     /// i.e. a click there would land on it.
     func isFrontmost(_ wid: UInt32, at point: CGPoint) -> Bool {

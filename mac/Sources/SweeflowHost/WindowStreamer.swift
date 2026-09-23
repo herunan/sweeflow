@@ -30,6 +30,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var forceKeyframe = true
     private var paused = false
     private var stopped = false
+    /// Traffic-light frames (window points) to repaint over macOS's capture badge, and whether
+    /// this window currently has focus on the Linux side.
+    var buttons: [CGRect] = []
+    var active = false
 
     // Stats
     private var statFrames = 0, statBytes = 0, statLatencySum: UInt64 = 0, statLatencyN = 0
@@ -69,14 +73,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func startCapture(_ win: SCWindow) {
         let filter = SCContentFilter(desktopIndependentWindow: win)
         applySize(to: config)
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        // BGRA with alpha so the rounded window corners can be filled in (see fillCorners);
+        // the encoder converts to 4:2:0 in hardware.
+        config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
         config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
         config.queueDepth = 4
         config.showsCursor = false
         config.ignoreShadowsSingleWindow = true
-        config.shouldBeOpaque = true
+        config.shouldBeOpaque = false
         config.capturesAudio = false
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         do {
@@ -118,6 +123,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         if !p { forceKeyframe = true; if let b = lastBuffer { pendingBuffer = pendingBuffer ?? b; pump() } }
     }
 
+    /// Re-encode the last capture with fresh overlays (e.g. focus changed the traffic lights).
+    /// The capture buffer still holds the previously painted lights, so this only runs the paint.
+    func requestRepaint() {
+        guard pendingBuffer == nil, let b = lastBuffer else { return }
+        paintTrafficLights(b, buttons: buttons, scale: scale, active: active)
+        pendingBuffer = b
+        refinementsLeft = 2
+        pump()
+    }
+
     func requestKeyframe() {
         forceKeyframe = true
         if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b }
@@ -152,6 +167,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
+            fillCorners(pb, radiusPx: Int(28 * self.scale))
+            paintTrafficLights(pb, buttons: self.buttons, scale: self.scale, active: self.active)
             self.pendingBuffer = pb
             self.refinementsLeft = 2
             self.pump()
@@ -275,6 +292,92 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         VTCompressionSessionPrepareToEncodeFrames(s)
         log("encoder \(width)x\(height) @ \(Int(bitrate / 1e6)) Mbit/s")
         return s
+    }
+}
+
+/// macOS windows have rounded, transparent corners. The Linux window is a plain rectangle, so
+/// composite the transparent corner pixels over the window's own edge colour; the corners then
+/// read as part of the window rather than as black specks.
+func fillCorners(_ pb: CVPixelBuffer, radiusPx: Int) {
+    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+    let k = min(radiusPx, w / 3, h / 3)
+    guard k > 2 else { return }
+    // (corner x range, y range, sample point just inside the straight edge)
+    let corners = [
+        (0..<k, 0..<k, (k, k / 2)),
+        ((w - k)..<w, 0..<k, (w - 1 - k, k / 2)),
+        (0..<k, (h - k)..<h, (k, h - 1 - k / 2)),
+        ((w - k)..<w, (h - k)..<h, (w - 1 - k, h - 1 - k / 2)),
+    ]
+    for (xs, ys, (sx, sy)) in corners {
+        let sp = base + sy * stride + sx * 4
+        let (eb, eg, er) = (Int(sp[0]), Int(sp[1]), Int(sp[2]))
+        for y in ys {
+            let row = base + y * stride
+            for x in xs {
+                let p = row + x * 4
+                let a = Int(p[3])
+                if a == 255 { continue }
+                // Premultiplied source over the opaque edge colour.
+                p[0] = UInt8(min(255, Int(p[0]) + eb * (255 - a) / 255))
+                p[1] = UInt8(min(255, Int(p[1]) + eg * (255 - a) / 255))
+                p[2] = UInt8(min(255, Int(p[2]) + er * (255 - a) / 255))
+                p[3] = 255
+            }
+        }
+    }
+}
+
+/// While a window is captured, macOS draws a purple "being shared" badge where its traffic lights
+/// are. Paint the lights back so the streamed window looks like a normal Mac window.
+func paintTrafficLights(_ pb: CVPixelBuffer, buttons: [CGRect], scale: CGFloat, active: Bool) {
+    let rects = buttons.filter { $0.width > 0 }
+    guard rects.count == 3, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+
+    // The badge is a pill around all three buttons; clear it to the title-bar colour sampled
+    // just to its right.
+    let union = rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5)
+    let x0 = max(0, Int(union.minX * scale)), x1 = min(w, Int(union.maxX * scale))
+    let y0 = max(0, Int(union.minY * scale)), y1 = min(h, Int(union.maxY * scale))
+    let sx = min(w - 1, x1 + Int(4 * scale)), sy = min(h - 1, (y0 + y1) / 2)
+    guard x1 > x0, y1 > y0 else { return }
+    let bg = base + sy * stride + sx * 4
+    let (bb, bgc, br) = (bg[0], bg[1], bg[2])
+    for y in y0..<y1 {
+        let row = base + y * stride
+        for x in x0..<x1 { let p = row + x * 4; p[0] = bb; p[1] = bgc; p[2] = br; p[3] = 255 }
+    }
+
+    // macOS traffic-light colours (fill, rim); grey when the window is inactive.
+    let luminance = (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10
+    let inactive: (UInt8, UInt8, UInt8) = luminance < 128 ? (0x55, 0x55, 0x55) : (0xCC, 0xCC, 0xCC)
+    let colours: [(UInt8, UInt8, UInt8)] = active
+        ? [(0xFF, 0x5F, 0x57), (0xFE, 0xBC, 0x2E), (0x28, 0xC8, 0x40)]
+        : [inactive, inactive, inactive]
+    for (rect, (r, g, b)) in zip(rects, colours) {
+        let cx = rect.midX * scale, cy = rect.midY * scale
+        let radius = min(rect.width, rect.height) * scale * 0.42
+        let ix0 = max(0, Int(cx - radius - 1)), ix1 = min(w, Int(cx + radius + 2))
+        let iy0 = max(0, Int(cy - radius - 1)), iy1 = min(h, Int(cy + radius + 2))
+        for y in iy0..<iy1 {
+            let row = base + y * stride
+            for x in ix0..<ix1 {
+                let d = hypot(CGFloat(x) + 0.5 - cx, CGFloat(y) + 0.5 - cy)
+                let cover = max(0, min(1, radius + 0.5 - d))      // anti-aliased edge
+                guard cover > 0 else { continue }
+                let p = row + x * 4
+                let mix = { (dst: UInt8, src: UInt8) in UInt8((CGFloat(src) * cover + CGFloat(dst) * (1 - cover)).rounded()) }
+                p[0] = mix(p[0], b); p[1] = mix(p[1], g); p[2] = mix(p[2], r)
+            }
+        }
     }
 }
 

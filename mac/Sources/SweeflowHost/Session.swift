@@ -20,6 +20,14 @@ final class Session {
     private var raisedWid: UInt32 = 0
     private var lastFocused: UInt32 = 0
     private var focusTimer: DispatchSourceTimer?
+    private var cursor: CursorWatcher?
+    /// Watches a window right after a click in it, to catch the app starting a window drag
+    /// (title bar) or zoom (double-click), which we hand over to the Linux window manager.
+    private var gesture: (wid: UInt32, frame: CGRect, until: DispatchTime, buttonDown: Bool)?
+    private var gestureTimer: DispatchSourceTimer?
+    private var sentButtons: [UInt32: [CGRect]] = [:]
+    /// The window with keyboard focus on the Linux side (0 = none of ours).
+    private var clientFocus: UInt32 = 0
 
     init(group: NWConnectionGroup, queue: DispatchQueue, config: Config) {
         self.group = group
@@ -49,6 +57,8 @@ final class Session {
     func shutdown() {
         tracker.stop()
         focusTimer?.cancel()
+        cursor?.stop()
+        gestureTimer?.cancel()
         input.releaseAll()
         streamers.values.forEach { $0.stop() }
         streamers.removeAll()
@@ -75,6 +85,15 @@ final class Session {
             w.str(Host.current().localizedName ?? "Mac")
             s.send(w)
             startTracking()
+            let cw = CursorWatcher(scale: clientScale) { [weak self] png, hot, scale in
+                self?.queue.async {
+                    var m = MsgWriter(.cursor)
+                    m.f32(hot.x); m.f32(hot.y); m.f32(scale); m.bytes(png)
+                    self?.control?.send(m)
+                }
+            }
+            cw.start()
+            cursor = cw
         case .ping:
             var w = MsgWriter(.pong); w.u64(try m.u64()); s.send(w)
 
@@ -83,6 +102,8 @@ final class Session {
             guard let win = tracker.windows[wid] else { log("subscribe to unknown window \(wid)"); s.close(); return }
             let scale = captureScale > 0 ? captureScale : backingScale(of: win.frame)
             let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, out: s, queue: queue)
+            st.buttons = sentButtons[wid] ?? []
+            st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
         case .requestKeyframe: streamers[ObjectIdentifier(s)]?.requestKeyframe()
@@ -95,6 +116,7 @@ final class Session {
             control_.setSize(wid, pid: win.pid, CGSize(width: w, height: h))
         case .focus:
             let wid = try m.u32()
+            setClientFocus(wid)
             guard let win = tracker.windows[wid] else { return }
             raise(win)
             control_.focus(wid, pid: win.pid)
@@ -111,6 +133,7 @@ final class Session {
             if let p {
                 if pressed { ensureFront(wid, at: p) }
                 input.button(b, pressed: pressed, at: p)
+                if b == 0 { watchGesture(wid, buttonDown: pressed) }
             }
         case .scroll:
             let (_, p) = try pointerTarget(&m)
@@ -121,6 +144,7 @@ final class Session {
             input.key(evdev: code, pressed: v != 0, isRepeat: v == 2)
         case .releaseAll:
             input.releaseAll()
+            setClientFocus(0)
 
         default:
             log("unhandled message \(m.type)")
@@ -144,6 +168,67 @@ final class Session {
         raisedWid = wid
     }
 
+    private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
+        guard let win = tracker.windows[wid], win.kind == .toplevel else { return }
+        if buttonDown || gesture?.wid != wid {
+            gesture = (wid, tracker.liveFrame(wid) ?? win.frame, .now() + .milliseconds(buttonDown ? 10_000 : 400), buttonDown)
+        } else {
+            gesture?.buttonDown = false
+            gesture?.until = .now() + .milliseconds(400)   // a zoom lands shortly after the release
+        }
+        if gestureTimer == nil {
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(2))
+            t.setEventHandler { [weak self] in self?.checkGesture() }
+            t.resume()
+            gestureTimer = t
+        }
+    }
+
+    private func checkGesture() {
+        guard let g = gesture, let win = tracker.windows[g.wid], DispatchTime.now() < g.until,
+              let now = tracker.liveFrame(g.wid) else {
+            gesture = nil; gestureTimer?.cancel(); gestureTimer = nil
+            return
+        }
+        if now == g.frame { return }
+        gesture = nil; gestureTimer?.cancel(); gestureTimer = nil
+        if now.size == g.frame.size && g.buttonDown {
+            // The app started dragging its window: end the drag on the Mac, put the window back,
+            // and let KWin move the Linux window instead (the button is still held there).
+            input.button(0, pressed: false, at: input.lastPoint)
+            control_.setPosition(g.wid, pid: win.pid, g.frame.origin)
+            var m = MsgWriter(.moveStarted); m.u32(g.wid); control?.send(m)
+        } else if now.size != g.frame.size && !g.buttonDown {
+            // Double-click zoom: undo it on the Mac and maximise the Linux window instead.
+            control_.setPosition(g.wid, pid: win.pid, g.frame.origin)
+            control_.setSize(g.wid, pid: win.pid, g.frame.size)
+            var m = MsgWriter(.toggleMaximize); m.u32(g.wid); control?.send(m)
+        }
+    }
+
+    private func setClientFocus(_ wid: UInt32) {
+        guard wid != clientFocus else { return }
+        clientFocus = wid
+        for st in streamers.values {
+            let active = st.wid == wid
+            if st.active != active { st.active = active; st.requestRepaint() }
+        }
+    }
+
+    private func sendButtons(_ w: TrackedWindow) {
+        guard w.kind == .toplevel else { return }
+        let rects = control_.buttonRects(w.wid, pid: w.pid, windowOrigin: w.frame.origin)
+        guard sentButtons[w.wid] != rects else { return }
+        sentButtons[w.wid] = rects
+        for st in streamers.values where st.wid == w.wid { st.buttons = rects }
+        log("window \(w.wid) (\(w.appName)) buttons \(rects.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" })")
+        var m = MsgWriter(.windowButtons)
+        m.u32(w.wid)
+        for r in rects { m.f32(r.minX); m.f32(r.minY); m.f32(r.width); m.f32(r.height) }
+        control?.send(m)
+    }
+
     private func raise(_ win: TrackedWindow) {
         control_.focus(win.wid, pid: win.pid)
         raisedWid = win.wid
@@ -157,6 +242,7 @@ final class Session {
         tracker.onRemoved = { [weak self] wid in
             guard let self else { return }
             self.control_.forget(wid)
+            self.sentButtons[wid] = nil
             var m = MsgWriter(.windowRemoved); m.u32(wid); self.control?.send(m)
         }
         tracker.start()
@@ -183,6 +269,7 @@ final class Session {
         m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
         m.u8(w.kind.rawValue)
         control?.send(m)
+        sendButtons(w)
     }
 
     private func sendChanged(_ w: TrackedWindow) {
@@ -192,6 +279,7 @@ final class Session {
         m.f32(w.frame.width); m.f32(w.frame.height)
         m.f32(w.rel.x); m.f32(w.rel.y)
         control?.send(m)
+        sendButtons(w)
     }
 
     private func sendIcon(_ w: TrackedWindow) {

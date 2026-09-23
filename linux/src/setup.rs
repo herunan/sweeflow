@@ -11,21 +11,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::config::{self, Config};
 
-/// The Mac host's sources, embedded so the Linux binary is all you need.
-const MAC_FILES: &[(&str, &str)] = &[
-    ("Package.swift", include_str!("../../mac/Package.swift")),
-    ("install.sh", include_str!("../../mac/install.sh")),
-    ("Sources/CPrivate/include/CPrivate.h", include_str!("../../mac/Sources/CPrivate/include/CPrivate.h")),
-    ("Sources/CPrivate/shim.m", include_str!("../../mac/Sources/CPrivate/shim.m")),
-    ("Sources/SweeflowHost/main.swift", include_str!("../../mac/Sources/SweeflowHost/main.swift")),
-    ("Sources/SweeflowHost/Wire.swift", include_str!("../../mac/Sources/SweeflowHost/Wire.swift")),
-    ("Sources/SweeflowHost/Server.swift", include_str!("../../mac/Sources/SweeflowHost/Server.swift")),
-    ("Sources/SweeflowHost/Session.swift", include_str!("../../mac/Sources/SweeflowHost/Session.swift")),
-    ("Sources/SweeflowHost/WindowTracker.swift", include_str!("../../mac/Sources/SweeflowHost/WindowTracker.swift")),
-    ("Sources/SweeflowHost/WindowStreamer.swift", include_str!("../../mac/Sources/SweeflowHost/WindowStreamer.swift")),
-    ("Sources/SweeflowHost/WindowControl.swift", include_str!("../../mac/Sources/SweeflowHost/WindowControl.swift")),
-    ("Sources/SweeflowHost/Input.swift", include_str!("../../mac/Sources/SweeflowHost/Input.swift")),
-];
+// The Mac host's sources, embedded by build.rs so the Linux binary is all you need.
+include!(concat!(env!("OUT_DIR"), "/mac_files.rs"));
 
 const REMOTE_SRC: &str = "~/.sweeflow/src";
 const SUPPORT: &str = "\"$HOME/Library/Application Support/sweeflow\"";
@@ -73,7 +60,7 @@ pub fn setup(target: &str) -> Result<()> {
     // One tar stream over one SSH session.
     let mut tar = Vec::new();
     for (path, content) in MAC_FILES {
-        append_tar(&mut tar, path, content.as_bytes(), if path.ends_with(".sh") { 0o755 } else { 0o644 });
+        append_tar(&mut tar, path, content, if path.ends_with(".sh") { 0o755 } else { 0o644 });
     }
     tar.extend_from_slice(&[0u8; 1024]);
     let mut child = Command::new("ssh")

@@ -42,6 +42,10 @@ pub enum UiEvent {
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
     Focused(u32),
+    /// Close / minimise / zoom button rects (x, y, w, h) in window points.
+    WindowButtons(u32, [[f32; 4]; 3]),
+    MoveStarted(u32),
+    ToggleMaximize(u32),
     Frame(u32, GpuFrame),
 }
 
@@ -191,6 +195,18 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
         t::FOCUSED => UiEvent::Focused(r.u32()?),
+        t::WINDOW_BUTTONS => {
+            let wid = r.u32()?;
+            let mut rects = [[0f32; 4]; 3];
+            for rect in &mut rects {
+                for v in rect.iter_mut() {
+                    *v = r.f32()?;
+                }
+            }
+            UiEvent::WindowButtons(wid, rects)
+        }
+        t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
+        t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::PONG => return Ok(()),
         _ => {
             log::debug!("ignoring control message {ty:#x}");

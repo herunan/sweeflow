@@ -8,7 +8,7 @@ final class InputInjector {
     private var buttonsDown: Set<Int> = []
     private var keysDown: Set<UInt32> = []
     private var flags: CGEventFlags = []
-    private var lastPoint = CGPoint.zero
+    private(set) var lastPoint = CGPoint.zero
 
     // Click-count tracking so double/triple clicks register.
     private var lastClickAt: TimeInterval = 0

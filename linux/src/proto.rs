@@ -13,6 +13,9 @@ pub mod t {
     pub const APP_ICON: u8 = 0x13;
     pub const CURSOR: u8 = 0x14;
     pub const FOCUSED: u8 = 0x15;
+    pub const WINDOW_BUTTONS: u8 = 0x16;
+    pub const MOVE_STARTED: u8 = 0x17;
+    pub const TOGGLE_MAXIMIZE: u8 = 0x18;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;
