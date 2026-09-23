@@ -170,6 +170,7 @@ pub struct App {
     edge_cursor: bool,
     scale: f64,
     host: String,
+    connected: bool,
 }
 
 pub fn run(net_cfg: crate::config::Config) -> Result<()> {
@@ -233,6 +234,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         edge_cursor: false,
         scale,
         host,
+        connected: false,
     };
 
     // A 1x1 opaque buffer stretched behind the video; shows while a resize is catching up.
@@ -264,6 +266,8 @@ impl App {
         match ev {
             UiEvent::Connected(name) => {
                 log::info!("connected to {name}");
+                self.connected = true;
+                self.send_screen_size();
                 // Windows from before a reconnect are kept (so tiling positions survive a Wi-Fi
                 // blip) unless the Mac doesn't re-announce them shortly.
                 for w in self.windows.values_mut() {
@@ -277,7 +281,10 @@ impl App {
                     TimeoutAction::Drop
                 });
             }
-            UiEvent::Disconnected(why) => log::warn!("disconnected: {why}"),
+            UiEvent::Disconnected(why) => {
+                self.connected = false;
+                log::warn!("disconnected: {why}");
+            }
             UiEvent::WindowAdded(info) => self.add_window(info, qh),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
                 if let Some(win) = self.windows.get_mut(&wid) {
@@ -547,6 +554,23 @@ impl App {
             self.icons.insert(bid.clone(), (icon, buf));
         }
         mgr.set_icon(t.xdg_toplevel(), Some(&self.icons[&bid].0));
+    }
+
+    /// Tells the Mac how big our largest monitor is, so its virtual display can match.
+    fn send_screen_size(&self) {
+        if !self.connected {
+            return;
+        }
+        let best = self
+            .output_state
+            .outputs()
+            .filter_map(|o| self.output_state.info(&o)?.logical_size)
+            .max_by_key(|(w, h)| w * h);
+        if let Some((w, h)) = best {
+            // Mac points == our logical pixels.
+            let (w, h) = ((w as f64 / self.scale) as u16, (h as f64 / self.scale) as u16);
+            self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).finish());
+        }
     }
 
     fn toggle_maximize(&self, wid: u32) {
@@ -1032,8 +1056,12 @@ impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.send_screen_size();
+    }
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.send_screen_size();
+    }
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 

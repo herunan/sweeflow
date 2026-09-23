@@ -19,6 +19,7 @@ pub mod t {
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;
+    pub const SCREEN_SIZE: u8 = 0x23;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;

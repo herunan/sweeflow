@@ -13,6 +13,21 @@ struct Config: Codable {
         "com.example.browser",
     ]
 
+    /// Put streamed windows on an invisible display sized to the Linux monitor (lets windows be
+    /// as large as that monitor and keeps working with the lid closed). Turn off to keep windows
+    /// on the Mac's own screen while also using the Mac directly.
+    var virtualDisplay = true
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Config()
+        port = try c.decodeIfPresent(UInt16.self, forKey: .port) ?? d.port
+        apps = try c.decodeIfPresent([String].self, forKey: .apps) ?? d.apps
+        virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? d.virtualDisplay
+    }
+
     func allows(_ bundleId: String) -> Bool {
         if bundleId == Bundle.main.bundleIdentifier { return false }
         return apps.isEmpty || apps.contains(bundleId)
@@ -46,6 +61,37 @@ if !axTrusted { log("Accessibility permission not granted yet — input and wind
 let identity: Identity
 do { identity = try Identity.loadOrCreate() } catch { log("identity: \(error)"); exit(1) }
 log("host fingerprint \(identity.fingerprint)")
+
+/// Owns the virtual display and sleep prevention across sessions (main thread only). Both live
+/// while a client is connected, plus a grace period so a Wi-Fi blip doesn't reshuffle windows.
+final class HostState {
+    let display = VirtualDisplay()
+    let wake = Wakefulness()
+    private var sessions = 0
+    private var teardown: DispatchWorkItem?
+
+    func sessionStarted() {
+        sessions += 1
+        teardown?.cancel()
+        wake.hold()
+    }
+
+    func sessionEnded() {
+        sessions = max(0, sessions - 1)
+        guard sessions == 0 else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.sessions == 0 else { return }
+            log("no client for a while: removing virtual display, allowing sleep")
+            self.display.remove()
+            self.wake.release()
+        }
+        teardown = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
+    }
+}
+
+let host = HostState()
+Wakefulness.resetLidSleep()   // in case a previous run died while streaming
 
 let server = Server(identity: identity) { group, queue in Session(group: group, queue: queue, config: config) }
 do { try server.start(port: config.port) } catch { log("listen failed: \(error)"); exit(1) }

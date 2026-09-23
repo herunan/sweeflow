@@ -35,6 +35,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x20 | C→S | Resize | u32 wid, f32 w, f32 h |
 | 0x21 | C→S | Focus | u32 wid |
 | 0x22 | C→S | Close | u32 wid |
+| 0x23 | C→S | ScreenSize | u16 w, u16 h — logical size of the client's largest monitor (sizes the Mac's virtual display) |
 | 0x30 | C→S | PointerMove | u32 wid, f32 x, f32 y (window-relative points) |
 | 0x31 | C→S | PointerButton | u32 wid, f32 x, f32 y, u8 button (0 left,1 right,2 middle,3+ other), u8 pressed |
 | 0x32 | C→S | Scroll | u32 wid, f32 x, f32 y, f32 dx, f32 dy, u8 unit (0 lines, 1 pixels), u8 phase (0 none, 1 began, 2 changed, 3 ended) |

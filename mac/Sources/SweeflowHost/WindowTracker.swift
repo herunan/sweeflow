@@ -114,7 +114,7 @@ final class WindowTracker {
 
     /// Current frame of one window straight from the window server (bypasses the poll interval).
     func liveFrame(_ wid: UInt32) -> CGRect? {
-        guard let arr = CGWindowListCreateDescriptionFromArray([NSNumber(value: wid)] as CFArray) as? [[String: Any]],
+        guard let arr = CGWindowListCopyWindowInfo(.optionIncludingWindow, wid) as? [[String: Any]],
               let d = arr.first?[kCGWindowBounds as String] as? NSDictionary else { return nil }
         return CGRect(dictionaryRepresentation: d)
     }

@@ -26,6 +26,9 @@ final class Session {
     private var gesture: (wid: UInt32, frame: CGRect, until: DispatchTime, buttonDown: Bool)?
     private var gestureTimer: DispatchSourceTimer?
     private var sentButtons: [UInt32: [CGRect]] = [:]
+    /// Usable area of the virtual display (global CG coords), once it is online.
+    private var vdArea: CGRect?
+    private var started = false
     /// The window with keyboard focus on the Linux side (0 = none of ours).
     private var clientFocus: UInt32 = 0
 
@@ -55,6 +58,10 @@ final class Session {
     }
 
     func shutdown() {
+        if started {
+            started = false
+            DispatchQueue.main.async { host.sessionEnded() }
+        }
         tracker.stop()
         focusTimer?.cancel()
         cursor?.stop()
@@ -78,6 +85,10 @@ final class Session {
             captureScale = (try? m.f32()) ?? 0
             log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
             control = s
+            if !started {
+                started = true
+                DispatchQueue.main.async { host.sessionStarted() }
+            }
             let key = ObjectIdentifier(s)
             if let st = streamers.removeValue(forKey: key) { st.stop() }
             var w = MsgWriter(.welcome)
@@ -114,6 +125,12 @@ final class Session {
             let wid = try m.u32(), w = try m.f32(), h = try m.f32()
             guard let win = tracker.windows[wid] else { return }
             control_.setSize(wid, pid: win.pid, CGSize(width: w, height: h))
+        case .screenSize:
+            let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
+            guard config.virtualDisplay else { return }
+            log("client screen \(Int(w))x\(Int(h))")
+            DispatchQueue.main.async { host.display.ensure(points: CGSize(width: w, height: h)) }
+            refreshVirtualDisplayArea(attempt: 0)
         case .focus:
             let wid = try m.u32()
             setClientFocus(wid)
@@ -198,13 +215,39 @@ final class Session {
             // and let KWin move the Linux window instead (the button is still held there).
             input.button(0, pressed: false, at: input.lastPoint)
             control_.setPosition(g.wid, pid: win.pid, g.frame.origin)
+            log("window \(g.wid): title-bar drag → handing move to Linux")
             var m = MsgWriter(.moveStarted); m.u32(g.wid); control?.send(m)
         } else if now.size != g.frame.size && !g.buttonDown {
             // Double-click zoom: undo it on the Mac and maximise the Linux window instead.
             control_.setPosition(g.wid, pid: win.pid, g.frame.origin)
             control_.setSize(g.wid, pid: win.pid, g.frame.size)
+            log("window \(g.wid): zoom → toggling maximise on Linux")
             var m = MsgWriter(.toggleMaximize); m.u32(g.wid); control?.send(m)
         }
+    }
+
+    /// The new display shows up in NSScreen asynchronously; poll briefly for its usable area.
+    private func refreshVirtualDisplayArea(attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 0.3 : 0.5)) { [weak self] in
+            let area = host.display.usableBounds
+            self?.queue.async {
+                guard let self else { return }
+                if let area, area.width > 0 {
+                    self.vdArea = area
+                    log("virtual display area \(area)")
+                    for w in self.tracker.windows.values { self.placeOnVirtualDisplay(w) }
+                } else if attempt < 10 {
+                    self.refreshVirtualDisplayArea(attempt: attempt + 1)
+                }
+            }
+        }
+    }
+
+    /// Moves a streamed window onto the virtual display (top-left, below its menu bar).
+    private func placeOnVirtualDisplay(_ w: TrackedWindow) {
+        guard w.kind == .toplevel, let area = vdArea else { return }
+        if area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)) { return }
+        control_.setPosition(w.wid, pid: w.pid, area.origin)
     }
 
     private func setClientFocus(_ wid: UInt32) {
@@ -237,7 +280,7 @@ final class Session {
     // MARK: window list
 
     private func startTracking() {
-        tracker.onAdded = { [weak self] w in self?.sendAdded(w) }
+        tracker.onAdded = { [weak self] w in self?.placeOnVirtualDisplay(w); self?.sendAdded(w) }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
         tracker.onRemoved = { [weak self] wid in
             guard let self else { return }
