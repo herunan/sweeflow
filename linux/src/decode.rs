@@ -54,6 +54,8 @@ pub struct GpuFrame {
     pub format: u32,
     pub planes: Vec<Plane>,
     pub capture_us: u64,
+    /// The Mac saw a dark title bar in this frame (picks the inactive traffic-light colour).
+    pub dark_titlebar: bool,
 }
 
 // The AVFrame is exclusively owned; FFmpeg frames are safe to move between threads.
@@ -179,6 +181,7 @@ impl Decoder {
                 format,
                 planes,
                 capture_us,
+                dark_titlebar: true,
             })
         }
     }

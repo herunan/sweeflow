@@ -47,6 +47,8 @@ pub enum UiEvent {
     MoveStarted(u32),
     ToggleMaximize(u32),
     Frame(u32, GpuFrame),
+    /// Lossless premultiplied BGRA (popups/menus), already decompressed.
+    RawFrame { wid: u32, w: u16, h: u16, capture_us: u64, bgra: Vec<u8> },
 }
 
 pub enum NetCmd {
@@ -216,31 +218,59 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     ui.send(ev).map_err(|_| anyhow::anyhow!("ui gone"))
 }
 
+struct Encoded {
+    capture_us: u64,
+    w: u16,
+    h: u16,
+    key: bool,
+    lossless: bool,
+    dark: bool,
+    data: Vec<u8>,
+}
+
 /// Receives encoded frames for one window and decodes them on a dedicated thread, so a slow
 /// decode never stalls the network reader.
 async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: String) {
     // Unbounded is fine: the host never has more than a couple of frames in flight.
-    let (ftx, frx) = std::sync::mpsc::channel::<(u64, bool, Vec<u8>)>();
+    let (ftx, frx) = std::sync::mpsc::channel::<Encoded>();
     let ui2 = ui.clone();
     std::thread::Builder::new()
         .name(format!("decode-{wid}"))
         .spawn(move || {
-            let mut dec = match Decoder::new(&render_node) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("window {wid}: {e:#}");
-                    return;
-                }
-            };
+            // Created on the first HEVC frame; popups only ever send lossless frames.
+            let mut dec: Option<Decoder> = None;
             let mut waiting_for_key = true;
-            while let Ok((capture_us, key, data)) = frx.recv() {
-                if waiting_for_key && !key {
+            while let Ok(f) = frx.recv() {
+                if f.lossless {
+                    let expected = f.w as usize * f.h as usize * 4;
+                    match lz4_flex::decompress(&f.data, expected) {
+                        Ok(px) if px.len() == expected => {
+                            let ev = UiEvent::RawFrame { wid, w: f.w, h: f.h, capture_us: f.capture_us, bgra: px };
+                            if ui2.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                        other => log::warn!("window {wid}: bad lossless frame ({:?})", other.err()),
+                    }
+                    continue;
+                }
+                if waiting_for_key && !f.key {
                     continue;
                 }
                 waiting_for_key = false;
-                match dec.decode(&data, capture_us) {
-                    Ok(Some(f)) => {
-                        if ui2.send(UiEvent::Frame(wid, f)).is_err() {
+                if dec.is_none() {
+                    match Decoder::new(&render_node) {
+                        Ok(d) => dec = Some(d),
+                        Err(e) => {
+                            log::error!("window {wid}: {e:#}");
+                            return;
+                        }
+                    }
+                }
+                match dec.as_mut().unwrap().decode(&f.data, f.capture_us) {
+                    Ok(Some(mut frame)) => {
+                        frame.dark_titlebar = f.dark;
+                        if ui2.send(UiEvent::Frame(wid, frame)).is_err() {
                             return;
                         }
                     }
@@ -270,10 +300,18 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
         let parsed = (|| -> Result<_> {
             let mut r = R::new(&body);
             let capture_us = r.u64()?;
-            let _w = r.u16()?;
-            let _h = r.u16()?;
-            let key = r.u8()? & 1 != 0;
-            Ok((capture_us, key, r.bytes()?.to_vec()))
+            let w = r.u16()?;
+            let h = r.u16()?;
+            let flags = r.u8()?;
+            Ok(Encoded {
+                capture_us,
+                w,
+                h,
+                key: flags & 1 != 0,
+                lossless: flags & 2 != 0,
+                dark: flags & 4 != 0,
+                data: r.bytes()?.to_vec(),
+            })
         })();
         match parsed {
             Ok(f) => {

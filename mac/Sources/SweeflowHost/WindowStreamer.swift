@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import VideoToolbox
 import CoreMedia
+import Compression
 
 /// Captures one window with ScreenCaptureKit, encodes it with the hardware HEVC encoder and
 /// writes frames to a video stream. Flow control is end-to-end: at most `maxInFlight` frames may
@@ -34,13 +35,19 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// this window currently has focus on the Linux side.
     var buttons: [CGRect] = []
     var active = false
+    private var darkTitleBar = true
 
     // Stats
     private var statFrames = 0, statBytes = 0, statLatencySum: UInt64 = 0, statLatencyN = 0
     private var statSince = DispatchTime.now()
 
-    init(wid: UInt32, pointSize: CGSize, scale: CGFloat, out: MsgStream, queue: DispatchQueue) {
+    /// Menus, tooltips and other popups: sent as lossless BGRA with alpha (LZ4) instead of HEVC,
+    /// so their rounded corners and translucency survive. They are small and short-lived.
+    let lossless: Bool
+
+    init(wid: UInt32, pointSize: CGSize, scale: CGFloat, lossless: Bool, out: MsgStream, queue: DispatchQueue) {
         self.wid = wid
+        self.lossless = lossless
         self.pointSize = pointSize
         self.scale = scale
         self.out = out
@@ -127,7 +134,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// The capture buffer still holds the previously painted lights, so this only runs the paint.
     func requestRepaint() {
         guard pendingBuffer == nil, let b = lastBuffer else { return }
-        paintTrafficLights(b, buttons: buttons, scale: scale, active: active)
+        eraseCaptureBadge(b, buttons: buttons, scale: scale)
         pendingBuffer = b
         refinementsLeft = 2
         pump()
@@ -167,8 +174,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            fillCorners(pb, radiusPx: Int(28 * self.scale))
-            paintTrafficLights(pb, buttons: self.buttons, scale: self.scale, active: self.active)
+            if !self.lossless {
+                fillCorners(pb, radiusPx: Int(28 * self.scale))
+                if let dark = eraseCaptureBadge(pb, buttons: self.buttons, scale: self.scale) { self.darkTitleBar = dark }
+            }
             self.pendingBuffer = pb
             self.refinementsLeft = 2
             self.pump()
@@ -186,7 +195,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func pump() {
         guard !stopped, !paused, inFlight.count < maxInFlight, let pb = pendingBuffer else { return }
         pendingBuffer = nil
-        encode(pb)
+        if lossless { sendLossless(pb) } else { encode(pb) }
     }
 
     /// When the window goes idle, re-encode the last frame a couple of times: the rate controller
@@ -239,12 +248,44 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    private func sendLossless(_ pb: CVPixelBuffer) {
+        lastBuffer = pb
+        refinementsLeft = 0
+        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+        let rowBytes = w * 4
+        var packed = [UInt8](repeating: 0, count: rowBytes * h)
+        packed.withUnsafeMutableBufferPointer { dst in
+            for y in 0..<h { memcpy(dst.baseAddress! + y * rowBytes, base + y * stride, rowBytes) }
+        }
+        var out = [UInt8](repeating: 0, count: packed.count + packed.count / 255 + 64)
+        let n = compression_encode_buffer(&out, out.count, packed, packed.count, nil, COMPRESSION_LZ4_RAW)
+        guard n > 0 else { log("lz4 failed for \(wid)"); return }
+        let captureUs = hostMicros()
+        inFlight.append(captureUs)
+        lastEncodeAt = .now()
+        var m = MsgWriter(.frame)
+        m.u64(captureUs)
+        m.u16(UInt16(w)); m.u16(UInt16(h))
+        m.u8(0b11)   // keyframe | lossless BGRA (premultiplied, LZ4 block)
+        m.bytes(Data(out[0..<n]))
+        out_send(m, bytes: n)
+    }
+
+    private func out_send(_ m: MsgWriter, bytes: Int) {
+        out.send(m)
+        statFrames += 1
+        statBytes += bytes
+    }
+
     private func sendFrame(captureUs: UInt64, w: Int32, h: Int32, key: Bool, data: Data) {
         guard !stopped else { return }
         var m = MsgWriter(.frame)
         m.u64(captureUs)
         m.u16(UInt16(w)); m.u16(UInt16(h))
-        m.u8(key ? 1 : 0)
+        m.u8((key ? 1 : 0) | (darkTitleBar ? 4 : 0))
         m.bytes(data)
         out.send(m)
         statFrames += 1
@@ -333,13 +374,16 @@ func fillCorners(_ pb: CVPixelBuffer, radiusPx: Int) {
 }
 
 /// While a window is captured, macOS draws a purple "being shared" badge where its traffic lights
-/// are. Paint the lights back so the streamed window looks like a normal Mac window.
-func paintTrafficLights(_ pb: CVPixelBuffer, buttons: [CGRect], scale: CGFloat, active: Bool) {
+/// are. Erase it to the title-bar colour; the client composites the real buttons over the spot.
+/// Returns whether the title bar is dark (nil when there are no buttons), for the client's
+/// inactive traffic-light colour.
+@discardableResult
+func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], scale: CGFloat) -> Bool? {
     let rects = buttons.filter { $0.width > 0 }
     guard rects.count == 3, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
-          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
+          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
 
     // The badge is a pill around all three buttons; clear it to the title-bar colour sampled
@@ -348,37 +392,14 @@ func paintTrafficLights(_ pb: CVPixelBuffer, buttons: [CGRect], scale: CGFloat, 
     let x0 = max(0, Int(union.minX * scale)), x1 = min(w, Int(union.maxX * scale))
     let y0 = max(0, Int(union.minY * scale)), y1 = min(h, Int(union.maxY * scale))
     let sx = min(w - 1, x1 + Int(4 * scale)), sy = min(h - 1, (y0 + y1) / 2)
-    guard x1 > x0, y1 > y0 else { return }
+    guard x1 > x0, y1 > y0 else { return nil }
     let bg = base + sy * stride + sx * 4
     let (bb, bgc, br) = (bg[0], bg[1], bg[2])
     for y in y0..<y1 {
         let row = base + y * stride
         for x in x0..<x1 { let p = row + x * 4; p[0] = bb; p[1] = bgc; p[2] = br; p[3] = 255 }
     }
-
-    // macOS traffic-light colours (fill, rim); grey when the window is inactive.
-    let luminance = (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10
-    let inactive: (UInt8, UInt8, UInt8) = luminance < 128 ? (0x55, 0x55, 0x55) : (0xCC, 0xCC, 0xCC)
-    let colours: [(UInt8, UInt8, UInt8)] = active
-        ? [(0xFF, 0x5F, 0x57), (0xFE, 0xBC, 0x2E), (0x28, 0xC8, 0x40)]
-        : [inactive, inactive, inactive]
-    for (rect, (r, g, b)) in zip(rects, colours) {
-        let cx = rect.midX * scale, cy = rect.midY * scale
-        let radius = min(rect.width, rect.height) * scale * 0.42
-        let ix0 = max(0, Int(cx - radius - 1)), ix1 = min(w, Int(cx + radius + 2))
-        let iy0 = max(0, Int(cy - radius - 1)), iy1 = min(h, Int(cy + radius + 2))
-        for y in iy0..<iy1 {
-            let row = base + y * stride
-            for x in ix0..<ix1 {
-                let d = hypot(CGFloat(x) + 0.5 - cx, CGFloat(y) + 0.5 - cy)
-                let cover = max(0, min(1, radius + 0.5 - d))      // anti-aliased edge
-                guard cover > 0 else { continue }
-                let p = row + x * 4
-                let mix = { (dst: UInt8, src: UInt8) in UInt8((CGFloat(src) * cover + CGFloat(dst) * (1 - cover)).rounded()) }
-                p[0] = mix(p[0], b); p[1] = mix(p[1], g); p[2] = mix(p[2], r)
-            }
-        }
-    }
+    return (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10 < 128
 }
 
 /// Converts a length-prefixed HEVC sample to Annex B, prepending VPS/SPS/PPS on keyframes.

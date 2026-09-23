@@ -112,7 +112,8 @@ final class Session {
             let wid = try m.u32()
             guard let win = tracker.windows[wid] else { log("subscribe to unknown window \(wid)"); s.close(); return }
             let scale = captureScale > 0 ? captureScale : backingScale(of: win.frame)
-            let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, out: s, queue: queue)
+            let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, lossless: win.kind == .popup,
+                                    out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
@@ -261,7 +262,11 @@ final class Session {
 
     private func sendButtons(_ w: TrackedWindow) {
         guard w.kind == .toplevel else { return }
-        let rects = control_.buttonRects(w.wid, pid: w.pid, windowOrigin: w.frame.origin)
+        // Apps that hide the native buttons (e.g. a browser) report them outside the window.
+        let bounds = CGRect(origin: .zero, size: w.frame.size)
+        let rects = control_.buttonRects(w.wid, pid: w.pid, windowOrigin: w.frame.origin).map {
+            bounds.contains($0) ? $0 : .zero
+        }
         guard sentButtons[w.wid] != rects else { return }
         sentButtons[w.wid] = rects
         for st in streamers.values where st.wid == w.wid { st.buttons = rects }

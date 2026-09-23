@@ -45,7 +45,7 @@ use smithay_client_toolkit::{
 use tokio::sync::mpsc::UnboundedSender;
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_subsurface, wl_surface},
+    protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_subsurface, wl_surface},
     Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols::{
@@ -76,9 +76,18 @@ use wayland_protocols::{
 
 use crate::{
     decode::GpuFrame,
+    lights,
     net::{NetCmd, UiEvent, WinInfo},
     proto::{t, W},
 };
+
+struct Lights {
+    surface: wl_surface::WlSurface,
+    sub: wl_subsurface::WlSubsurface,
+    viewport: WpViewport,
+    buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
+    drawn: Option<(lights::State, [f64; 4])>,
+}
 
 enum Role {
     Toplevel(Window),
@@ -104,8 +113,19 @@ struct Win {
     suspended: bool,
     /// Traffic lights (close, minimise, zoom) in window points.
     buttons: [[f32; 4]; 3],
+    /// Our drawing of the traffic lights (a subsurface above the video).
+    lights: Option<Lights>,
+    dark_titlebar: bool,
+    /// Pointer over the traffic-light group.
+    lights_hover: bool,
+    /// Traffic light being pressed, and whether the pointer is still on it.
+    lights_pressed: Option<(usize, bool)>,
     /// Frame waiting for the first configure.
     pending: Option<GpuFrame>,
+    /// Lossless frame waiting for the first configure.
+    pending_raw: Option<(u16, u16, u64, Vec<u8>)>,
+    /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
+    raw_buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
     stale: bool,
 }
 
@@ -143,6 +163,8 @@ pub struct App {
     icons: HashMap<String, (XdgToplevelIconV1, wl_buffer::WlBuffer)>,
     icon_pngs: HashMap<String, Vec<u8>>,
     background: Option<wl_buffer::WlBuffer>,
+    /// Fully transparent 1x1 buffer: base for popups (menus have rounded, translucent edges).
+    clear: Option<wl_buffer::WlBuffer>,
 
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -214,6 +236,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         icons: HashMap::new(),
         icon_pngs: HashMap::new(),
         background: None,
+        clear: None,
         seat: None,
         keyboard: None,
         pointer: None,
@@ -240,6 +263,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     // A 1x1 opaque buffer stretched behind the video; shows while a resize is catching up.
     let bg = app.single_pixel.get()?.create_u32_rgba_buffer(0x1e1e_1e1e, 0x1e1e_1e1e, 0x1e1e_1e1e, u32::MAX, &qh, ());
     app.background = Some(bg);
+    app.clear = Some(app.single_pixel.get()?.create_u32_rgba_buffer(0, 0, 0, 0, &qh, ()));
 
     let qh2 = qh.clone();
     event_loop
@@ -316,6 +340,7 @@ impl App {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.buttons = rects;
                 }
+                self.update_lights(wid, qh);
             }
             UiEvent::MoveStarted(wid) => {
                 if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
@@ -326,6 +351,7 @@ impl App {
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
             UiEvent::Frame(wid, frame) => self.present(wid, frame, qh),
+            UiEvent::RawFrame { wid, w, h, capture_us, bgra } => self.present_raw(wid, w, h, capture_us, bgra, qh),
         }
     }
 
@@ -410,7 +436,13 @@ impl App {
                 maximized: false,
                 suspended: false,
                 buttons: [[0.0; 4]; 3],
+                lights: None,
+                dark_titlebar: true,
+                lights_hover: false,
+                lights_pressed: None,
                 pending: None,
+                pending_raw: None,
+                raw_buffers: Default::default(),
                 stale: false,
             },
         );
@@ -435,6 +467,17 @@ impl App {
         let children: Vec<u32> = self.windows.values().filter(|c| c.info.parent == wid).map(|c| c.info.wid).collect();
         for c in children {
             self.remove_window(c);
+        }
+        for (b, _) in &w.raw_buffers {
+            b.destroy();
+        }
+        if let Some(l) = w.lights {
+            for (b, _) in &l.buffers {
+                b.destroy();
+            }
+            l.viewport.destroy();
+            l.sub.destroy();
+            l.surface.destroy();
         }
         w.video_viewport.destroy();
         w.video_sub.destroy();
@@ -483,13 +526,19 @@ impl App {
             t.xdg_surface().set_window_geometry(0, 0, bw as i32, bh as i32);
         }
         let base = w.base();
-        base.attach(self.background.as_ref(), 0, 0);
+        let fill = if matches!(w.role, Role::Popup(_)) { &self.clear } else { &self.background };
+        base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
         base.commit();
     }
 
     fn present(&mut self, wid: u32, frame: GpuFrame, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.dark_titlebar != frame.dark_titlebar {
+            w.dark_titlebar = frame.dark_titlebar;
+            self.update_lights(wid, qh);
+        }
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let capture_us = frame.capture_us;
         // Always ack so the Mac keeps streaming, even if we drop this frame.
@@ -535,6 +584,38 @@ impl App {
         w.video.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
         w.video.commit();
         self.in_use.insert(buffer.id(), frame);
+    }
+
+    /// Shows a lossless frame (premultiplied BGRA == wl_shm ARGB8888 in memory) with its alpha.
+    fn present_raw(&mut self, wid: u32, pw: u16, ph: u16, capture_us: u64, bgra: Vec<u8>, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let _ = self.net.send(NetCmd::Video(wid, W::new(t::FRAME_ACK).u64(capture_us).finish()));
+        if !w.configured {
+            w.pending_raw = Some((pw, ph, capture_us, bgra));
+            return;
+        }
+        let (fw, fh) = (pw as u32, ph as u32);
+        let Ok(mut pool) = RawPool::new(bgra.len(), &self.shm) else { return };
+        pool.mmap().copy_from_slice(&bgra);
+        let buffer = pool.create_buffer(0, fw as i32, fh as i32, (fw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
+
+        let s = self.scale;
+        let (bw, bh) = w.size;
+        let px_per_pt = if w.info.w > 0.0 { (fw as f64 / w.info.w as f64).round().max(1.0) } else { s };
+        let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
+        let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);
+        w.video_viewport.set_source(0.0, 0.0, vis_w * px_per_pt, vis_h * px_per_pt);
+        w.video_viewport.set_destination((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32);
+        w.video.attach(Some(&buffer), 0, 0);
+        w.video.damage_buffer(0, 0, fw as i32, fh as i32);
+        w.video.commit();
+        // KWin uploads shm contents on commit; three generations is plenty of slack.
+        w.raw_buffers.push_back((buffer, pool));
+        while w.raw_buffers.len() > 3 {
+            if let Some((b, _)) = w.raw_buffers.pop_front() {
+                b.destroy();
+            }
+        }
     }
 
     fn apply_icon(&mut self, wid: u32, qh: &QueueHandle<Self>) {
@@ -606,6 +687,78 @@ impl App {
             _ if r => E::Right,
             _ => return None,
         })
+    }
+
+    /// Redraws a window's traffic lights if their state changed.
+    fn update_lights(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let active = self.kb_focus == Some(wid);
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if !matches!(w.role, Role::Toplevel(_)) {
+            return;
+        }
+        let Some(rect) = lights::group_rect(&w.buttons) else {
+            if let Some(l) = w.lights.take() {
+                l.viewport.destroy();
+                l.sub.destroy();
+                l.surface.destroy();
+            }
+            return;
+        };
+        let state = lights::State {
+            active,
+            hover: w.lights_hover,
+            pressed: w.lights_pressed.and_then(|(i, inside)| inside.then_some(i)),
+            dark_titlebar: w.dark_titlebar,
+        };
+        if w.lights.as_ref().and_then(|l| l.drawn) == Some((state, rect)) {
+            return;
+        }
+        if w.lights.is_none() {
+            let (sub, surface) = self.subcompositor.create_subsurface(w.base().clone(), qh);
+            sub.set_desync();
+            sub.place_above(&w.video);
+            let viewport = self.viewporter.get().expect("wp_viewporter").get_viewport(&surface, qh, ());
+            // Input goes to the video surface below; this layer is purely visual.
+            let region = self.compositor.wl_compositor().create_region(qh, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+            w.lights = Some(Lights { surface, sub, viewport, buffers: Default::default(), drawn: None });
+        }
+        // Render at 2x and let the compositor downsample, like the video.
+        let scale = 2.0 * self.scale;
+        let (pw, ph, px) = lights::render(&w.buttons, rect, scale, state);
+        let Ok(mut pool) = RawPool::new(px.len(), &self.shm) else { return };
+        pool.mmap().copy_from_slice(&px);
+        let buf = pool.create_buffer(0, pw as i32, ph as i32, (pw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
+        let l = w.lights.as_mut().unwrap();
+        let s = self.scale;
+        l.sub.set_position((rect[0] * s).round() as i32, (rect[1] * s).round() as i32);
+        l.viewport.set_destination((rect[2] * s).round() as i32, (rect[3] * s).round() as i32);
+        l.surface.attach(Some(&buf), 0, 0);
+        l.surface.damage_buffer(0, 0, pw as i32, ph as i32);
+        l.surface.commit();
+        l.drawn = Some((state, rect));
+        l.buffers.push_back((buf, pool));
+        while l.buffers.len() > 3 {
+            if let Some((b, _)) = l.buffers.pop_front() {
+                b.destroy();
+            }
+        }
+        // Subsurface position changes apply on the parent's next commit.
+        w.base().commit();
+    }
+
+    /// Tracks the pointer over the traffic lights (hover shows the glyphs).
+    fn lights_pointer(&mut self, wid: u32, x: f64, y: f64, qh: &QueueHandle<Self>) {
+        let over = self.button_at(wid, x, y);
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let in_group = lights::group_rect(&w.buttons)
+            .is_some_and(|r| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]);
+        w.lights_hover = in_group || w.lights_pressed.is_some();
+        if let Some((i, _)) = w.lights_pressed {
+            w.lights_pressed = Some((i, over == Some(i)));
+        }
+        self.update_lights(wid, qh);
     }
 
     /// Which traffic light (0 close, 1 minimise, 2 zoom) is under (x, y), if any.
@@ -761,9 +914,13 @@ impl WindowHandler for App {
             let _ = self.net.send(NetCmd::Video(wid, W::new(t::PAUSE).u8(w.suspended as u8).finish()));
         }
         let pending = w.pending.take();
+        let pending_raw = w.pending_raw.take();
         self.draw_base(wid, qh);
         if let Some(f) = pending {
             self.present(wid, f, qh);
+        }
+        if let Some((pw, ph, us, px)) = pending_raw {
+            self.present_raw(wid, pw, ph, us, px, qh);
         }
     }
 }
@@ -775,9 +932,13 @@ impl PopupHandler for App {
         w.configured = true;
         w.size = (cfg.width.max(1) as u32, cfg.height.max(1) as u32);
         let pending = w.pending.take();
+        let pending_raw = w.pending_raw.take();
         self.draw_base(wid, qh);
         if let Some(f) = pending {
             self.present(wid, f, qh);
+        }
+        if let Some((pw, ph, us, px)) = pending_raw {
+            self.present_raw(wid, pw, ph, us, px, qh);
         }
     }
 
@@ -813,16 +974,25 @@ impl PointerHandler for App {
                         let d = self.cursor_device.get_or_insert_with(|| mgr.get_pointer(pointer, qh, ()));
                         d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
                     }
+                    self.lights_pointer(wid, e.position.0, e.position.1, qh);
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
                 PointerEventKind::Leave { .. } => {
                     if self.pointer_focus == Some(wid) {
                         self.pointer_focus = None;
                     }
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.lights_hover = false;
+                    }
+                    self.update_lights(wid, qh);
                 }
                 PointerEventKind::Motion { .. } => {
                     let edge = self.edge_at(wid, e.position.0, e.position.1);
                     self.set_edge_cursor(edge, pointer, qh);
+                    self.lights_pointer(wid, e.position.0, e.position.1, qh);
+                    if self.windows.get(&wid).is_some_and(|w| w.lights_pressed.is_some()) {
+                        continue; // dragging off a traffic light: not for the Mac
+                    }
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
                 PointerEventKind::Press { button, serial, .. } => {
@@ -837,6 +1007,24 @@ impl PointerHandler for App {
                             continue;
                         }
                         if let Some(b) = self.button_at(wid, e.position.0, e.position.1) {
+                            // Like macOS, the action fires on release, and only if the pointer
+                            // is still on the button.
+                            if let Some(w) = self.windows.get_mut(&wid) {
+                                w.lights_pressed = Some((b, true));
+                            }
+                            self.update_lights(wid, qh);
+                            self.local_press = Some(button);
+                            continue;
+                        }
+                    }
+                    self.press_serial = serial;
+                    self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).finish());
+                }
+                PointerEventKind::Release { button, .. } => {
+                    if self.local_press == Some(button) {
+                        self.local_press = None;
+                        let pressed = self.windows.get_mut(&wid).and_then(|w| w.lights_pressed.take());
+                        if let Some((b, true)) = pressed {
                             // Traffic lights act on the Linux window; on the Mac they would
                             // minimise/fullscreen the window out of the stream.
                             match b {
@@ -848,16 +1036,8 @@ impl PointerHandler for App {
                                 }
                                 _ => self.toggle_maximize(wid),
                             }
-                            self.local_press = Some(button);
-                            continue;
                         }
-                    }
-                    self.press_serial = serial;
-                    self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).finish());
-                }
-                PointerEventKind::Release { button, .. } => {
-                    if self.local_press == Some(button) {
-                        self.local_press = None;
+                        self.lights_pointer(wid, e.position.0, e.position.1, qh);
                         continue;
                     }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());
@@ -912,7 +1092,7 @@ impl KeyboardHandler for App {
     fn enter(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
         _: u32,
@@ -922,11 +1102,15 @@ impl KeyboardHandler for App {
         if let Some(wid) = self.wid_for(surface) {
             self.kb_focus = Some(wid);
             self.send(W::new(t::FOCUS).u32(wid).finish());
+            self.update_lights(wid, qh);
         }
     }
 
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
-        self.kb_focus = None;
+    fn leave(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
+        let was = self.kb_focus.take();
+        if let Some(wid) = was {
+            self.update_lights(wid, qh);
+        }
         self.meta_down = 0;
         self.shift_down = 0;
         self.swallowed.clear();
@@ -1091,6 +1275,7 @@ wayland_client::delegate_noop!(App: ignore WpViewporter);
 wayland_client::delegate_noop!(App: ignore WpViewport);
 wayland_client::delegate_noop!(App: ignore WpSinglePixelBufferManagerV1);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
+wayland_client::delegate_noop!(App: ignore wl_region::WlRegion);
 wayland_client::delegate_noop!(App: ignore WpColorRepresentationManagerV1);
 wayland_client::delegate_noop!(App: ignore WpColorRepresentationSurfaceV1);
 wayland_client::delegate_noop!(App: ignore ZwpKeyboardShortcutsInhibitManagerV1);
