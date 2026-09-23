@@ -33,6 +33,7 @@ pub mod t {
     pub const REQUEST_KEYFRAME: u8 = 0x52;
     pub const PAUSE: u8 = 0x53;
     pub const FRAME_ACK: u8 = 0x54;
+    pub const CORNERS: u8 = 0x55;
 }
 
 /// Builds one framed message.

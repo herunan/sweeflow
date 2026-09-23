@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import ScreenCaptureKit
 import VideoToolbox
@@ -34,8 +35,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Traffic-light frames (window points) to repaint over macOS's capture badge, and whether
     /// this window currently has focus on the Linux side.
     var buttons: [CGRect] = []
+    /// Where macOS's capture badge overlaps this window (window points), looked up per frame.
+    var badgeRect: () -> CGRect? = { nil }
     var active = false
     private var darkTitleBar = true
+    /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
+    private var cornersHash: UInt64 = 0
+    private var pendingCorners: (Int, Data)?
 
     // Stats
     private var statFrames = 0, statBytes = 0, statLatencySum: UInt64 = 0, statLatencyN = 0
@@ -66,7 +72,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.out.close()
                     return
                 }
-                self.pointSize = win.frame.size
+                // Keep pointSize: the tracker's size (from init or windowResized) is newer than
+                // this snapshot, which can lag a resize we just requested.
                 self.startCapture(win)
             }
         }
@@ -134,7 +141,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// The capture buffer still holds the previously painted lights, so this only runs the paint.
     func requestRepaint() {
         guard pendingBuffer == nil, let b = lastBuffer else { return }
-        eraseCaptureBadge(b, buttons: buttons, scale: scale)
+        eraseCaptureBadge(b, buttons: buttons, badge: badgeRect(), scale: scale)
         pendingBuffer = b
         refinementsLeft = 2
         pump()
@@ -175,8 +182,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             if !self.lossless {
+                // Order matters: erase the capture badge first (it overlaps the top-left
+                // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
+                if let dark = eraseCaptureBadge(pb, buttons: self.buttons, badge: self.badgeRect(), scale: self.scale) { self.darkTitleBar = dark }
+                if let (t, tiles, hash) = cornerTiles(pb, scale: self.scale), hash != self.cornersHash {
+                    log("stream \(self.wid): corner tiles \(t)px (buttons known: \(self.buttons.filter { $0.width > 0 }.count))")
+                    debugDumpTile(tiles, t: t, name: "tile-\(self.wid).png")
+                    self.cornersHash = hash
+                    self.pendingCorners = (t, tiles)
+                }
                 fillCorners(pb, radiusPx: Int(28 * self.scale))
-                if let dark = eraseCaptureBadge(pb, buttons: self.buttons, scale: self.scale) { self.darkTitleBar = dark }
             }
             self.pendingBuffer = pb
             self.refinementsLeft = 2
@@ -216,7 +231,23 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Sends the window's transparent corner tiles (ahead of the frame they belong to).
+    private func flushCorners() {
+        guard let (t, tiles) = pendingCorners else { return }
+        pendingCorners = nil
+        var out = [UInt8](repeating: 0, count: tiles.count + tiles.count / 255 + 64)
+        let n = tiles.withUnsafeBytes { src in
+            compression_encode_buffer(&out, out.count, src.bindMemory(to: UInt8.self).baseAddress!, tiles.count,
+                                      nil, COMPRESSION_LZ4_RAW)
+        }
+        var m = MsgWriter(.corners)
+        m.u16(UInt16(t))
+        m.bytes(Data(out[0..<n]))
+        out_send(m, bytes: n)
+    }
+
     private func encode(_ pb: CVPixelBuffer) {
+        flushCorners()
         let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
         if encoder == nil || encoderSize != (w, h) {
             if let e = encoder { VTCompressionSessionInvalidate(e) }
@@ -269,7 +300,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         var m = MsgWriter(.frame)
         m.u64(captureUs)
         m.u16(UInt16(w)); m.u16(UInt16(h))
-        m.u8(0b11)   // keyframe | lossless BGRA (premultiplied, LZ4 block)
+        m.u8(0b11 | (UInt8(min(15, max(1, scale.rounded()))) << 4))   // keyframe | lossless | px/pt
         m.bytes(Data(out[0..<n]))
         out_send(m, bytes: n)
     }
@@ -285,7 +316,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         var m = MsgWriter(.frame)
         m.u64(captureUs)
         m.u16(UInt16(w)); m.u16(UInt16(h))
-        m.u8((key ? 1 : 0) | (darkTitleBar ? 4 : 0))
+        m.u8((key ? 1 : 0) | (darkTitleBar ? 4 : 0) | (UInt8(min(15, max(1, scale.rounded()))) << 4))
         m.bytes(data)
         out.send(m)
         statFrames += 1
@@ -323,7 +354,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             kVTCompressionPropertyKey_AverageBitRate: bitrate,
             kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: true,
             kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
-            kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_ITU_R_709_2,
+            // sRGB, not BT.709: the capture is sRGB and Linux compositors treat untagged video as
+            // sRGB, so any other curve makes VideoToolbox shift every pixel's brightness.
+            kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_sRGB,
             kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
         ]
         for (k, v) in props {
@@ -334,6 +367,51 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         log("encoder \(width)x\(height) @ \(Int(bitrate / 1e6)) Mbit/s")
         return s
     }
+}
+
+/// The window's rounded corners as four square BGRA tiles (TL, TR, BL, BR; premultiplied, with
+/// alpha), sized to the corner radius rounded up to whole points. Returns (tile px, tiles, hash);
+/// nil when the window has square corners.
+func cornerTiles(_ pb: CVPixelBuffer, scale: CGFloat) -> (Int, Data, UInt64)? {
+    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+    // Radius ≈ run of non-opaque pixels at the start of the top row.
+    let limit = min(Int(40 * scale), w / 3, h / 3)
+    var r = 0
+    while r < limit && base[r * 4 + 3] < 250 { r += 1 }
+    guard r >= 2 else { return nil }
+    let s = max(1, Int(scale.rounded()))
+    let t = ((r + s - 1) / s) * s
+    guard t <= w / 2, t <= h / 2 else { return nil }
+    var tiles = Data(count: t * t * 4 * 4)
+    tiles.withUnsafeMutableBytes { raw in
+        let dst = raw.bindMemory(to: UInt8.self).baseAddress!
+        for (i, (ox, oy)) in [(0, 0), (w - t, 0), (0, h - t), (w - t, h - t)].enumerated() {
+            for y in 0..<t {
+                memcpy(dst + (i * t * t + y * t) * 4, base + (oy + y) * stride + ox * 4, t * 4)
+            }
+        }
+    }
+    var hash: UInt64 = 0xcbf29ce484222325
+    for b in tiles { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
+    return (t, tiles, hash)
+}
+
+/// Writes the top-left corner tile as a PNG in the support directory (diagnostics).
+func debugDumpTile(_ tiles: Data, t: Int, name: String) {
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: t, pixelsHigh: t, bitsPerSample: 8,
+                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                     bytesPerRow: t * 4, bitsPerPixel: 32), let dst = rep.bitmapData else { return }
+    tiles.withUnsafeBytes { src in
+        let p = src.bindMemory(to: UInt8.self)
+        for i in 0..<(t * t) {   // BGRA premultiplied → RGBA premultiplied
+            dst[i * 4] = p[i * 4 + 2]; dst[i * 4 + 1] = p[i * 4 + 1]; dst[i * 4 + 2] = p[i * 4]; dst[i * 4 + 3] = p[i * 4 + 3]
+        }
+    }
+    try? rep.representation(using: .png, properties: [:])?.write(to: Identity.dir.appendingPathComponent(name))
 }
 
 /// macOS windows have rounded, transparent corners. The Linux window is a plain rectangle, so
@@ -378,9 +456,13 @@ func fillCorners(_ pb: CVPixelBuffer, radiusPx: Int) {
 /// Returns whether the title bar is dark (nil when there are no buttons), for the client's
 /// inactive traffic-light colour.
 @discardableResult
-func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], scale: CGFloat) -> Bool? {
+func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, scale: CGFloat) -> Bool? {
     let rects = buttons.filter { $0.width > 0 }
-    guard rects.count == 3, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+    // Erase where the badge is, plus a margin around the buttons it may cover.
+    var region: CGRect?
+    if rects.count == 3 { region = rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5) }
+    if let badge { region = region.map { $0.union(badge.insetBy(dx: -1, dy: -1)) } ?? badge.insetBy(dx: -1, dy: -1) }
+    guard let union = region, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
@@ -388,7 +470,6 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], scale: CGFloat) -
 
     // The badge is a pill around all three buttons; clear it to the title-bar colour sampled
     // just to its right.
-    let union = rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5)
     let x0 = max(0, Int(union.minX * scale)), x1 = min(w, Int(union.maxX * scale))
     let y0 = max(0, Int(union.minY * scale)), y1 = min(h, Int(union.maxY * scale))
     let sx = min(w - 1, x1 + Int(4 * scale)), sy = min(h - 1, (y0 + y1) / 2)

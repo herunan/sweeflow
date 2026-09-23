@@ -81,6 +81,24 @@ use crate::{
     proto::{t, W},
 };
 
+/// Rounded corners: the video is shown as three strips (top, middle, bottom) that leave the four
+/// corner squares uncovered; those show transparent corner tiles from the Mac. Strips and tiles
+/// are synchronised children of the middle strip, so each frame updates atomically.
+struct Corners {
+    /// Corner tile size in buffer pixels (0 = square corners).
+    t_px: u32,
+    top: (wl_subsurface::WlSubsurface, wl_surface::WlSurface, WpViewport),
+    bottom: (wl_subsurface::WlSubsurface, wl_surface::WlSurface, WpViewport),
+    tiles: Vec<(wl_subsurface::WlSubsurface, wl_surface::WlSurface, WpViewport)>,
+    tile_buffers: std::collections::VecDeque<(Vec<wl_buffer::WlBuffer>, RawPool)>,
+    /// New tile pixels to upload with the next frame.
+    pending: Option<(u32, Vec<u8>)>,
+    /// Whether the split layout was used for the last frame.
+    split: bool,
+    /// Middle strip's offset from the window's top edge (logical px).
+    middle_y: i32,
+}
+
 struct Lights {
     surface: wl_surface::WlSurface,
     sub: wl_subsurface::WlSubsurface,
@@ -115,6 +133,7 @@ struct Win {
     buttons: [[f32; 4]; 3],
     /// Our drawing of the traffic lights (a subsurface above the video).
     lights: Option<Lights>,
+    corners: Option<Corners>,
     dark_titlebar: bool,
     /// Pointer over the traffic-light group.
     lights_hover: bool,
@@ -123,7 +142,7 @@ struct Win {
     /// Frame waiting for the first configure.
     pending: Option<GpuFrame>,
     /// Lossless frame waiting for the first configure.
-    pending_raw: Option<(u16, u16, u64, Vec<u8>)>,
+    pending_raw: Option<(u16, u16, u8, u64, Vec<u8>)>,
     /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
     raw_buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
     stale: bool,
@@ -278,6 +297,9 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     log::info!("sweeflow client started, connecting to {}", app.host);
     loop {
         event_loop.dispatch(Duration::from_millis(100), &mut app)?;
+        if let Some(e) = conn.protocol_error() {
+            anyhow::bail!("Wayland protocol error: {e:?}");
+        }
     }
 }
 
@@ -351,7 +373,10 @@ impl App {
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
             UiEvent::Frame(wid, frame) => self.present(wid, frame, qh),
-            UiEvent::RawFrame { wid, w, h, capture_us, bgra } => self.present_raw(wid, w, h, capture_us, bgra, qh),
+            UiEvent::RawFrame { wid, w, h, px_per_pt, capture_us, bgra } => {
+                self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)
+            }
+            UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles, qh),
         }
     }
 
@@ -403,7 +428,14 @@ impl App {
         video_sub.set_desync();
         video_sub.set_position(0, 0);
         let video_viewport = viewporter.get_viewport(&video, qh, ());
-        let color = self.color_rep.as_ref().map(|m| {
+        // All pointer input lands on the base surface (window coordinates), however the video
+        // is split up on top of it.
+        let empty = self.compositor.wl_compositor().create_region(qh, ());
+        video.set_input_region(Some(&empty));
+        empty.destroy();
+        // Only HEVC windows carry YUV video; popups show RGB images, which must not be tagged.
+        let is_video = !matches!(role, Role::Popup(_));
+        let color = self.color_rep.as_ref().filter(|_| is_video).map(|m| {
             let c = m.get_surface(&video, qh, ());
             // VideoToolbox encodes BT.709 limited range.
             c.set_coefficients_and_range(crs::Coefficients::Bt709, crs::Range::Limited);
@@ -437,6 +469,7 @@ impl App {
                 suspended: false,
                 buttons: [[0.0; 4]; 3],
                 lights: None,
+                corners: None,
                 dark_titlebar: true,
                 lights_hover: false,
                 lights_pressed: None,
@@ -470,6 +503,16 @@ impl App {
         }
         for (b, _) in &w.raw_buffers {
             b.destroy();
+        }
+        if let Some(c) = w.corners {
+            for (bufs, _) in &c.tile_buffers {
+                bufs.iter().for_each(|b| b.destroy());
+            }
+            for (sub, surf, vp) in [c.top, c.bottom].into_iter().chain(c.tiles) {
+                vp.destroy();
+                sub.destroy();
+                surf.destroy();
+            }
         }
         if let Some(l) = w.lights {
             for (b, _) in &l.buffers {
@@ -526,7 +569,8 @@ impl App {
             t.xdg_surface().set_window_geometry(0, 0, bw as i32, bh as i32);
         }
         let base = w.base();
-        let fill = if matches!(w.role, Role::Popup(_)) { &self.clear } else { &self.background };
+        // Transparent: the window's rounded corners must show the desktop behind them.
+        let fill = &self.clear;
         base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -575,23 +619,155 @@ impl App {
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
         let s = self.scale;
         let (bw, bh) = w.size;
-        let px_per_pt = if w.info.w > 0.0 { (frame.width as f64 / w.info.w as f64).round().max(1.0) } else { s };
-        let vis_w = (frame.width as f64 / px_per_pt).min(bw as f64 / s);
-        let vis_h = (frame.height as f64 / px_per_pt).min(bh as f64 / s);
-        w.video_viewport.set_source(0.0, 0.0, vis_w * px_per_pt, vis_h * px_per_pt);
-        w.video_viewport.set_destination((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32);
+        let (fw, fh) = (frame.width, frame.height);
+        let px_per_pt = px_per_pt(frame.px_per_pt, fw, w.info.w, s);
+        let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
+        let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);
+        let (dw, dh) = ((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32);
+
+        // Apps like Terminal snap to character cells, so the Mac window can differ from ours by
+        // a point or two; the corners then go on the visible area (a sliver may be cropped).
+        let t_px = w.corners.as_ref().map_or(0, |c| c.t_px);
+        let split = t_px > 0 && (vis_w * px_per_pt) as u32 > 3 * t_px && (vis_h * px_per_pt) as u32 > 3 * t_px;
+        let l = ((t_px as f64 / px_per_pt) * s).round() as i32; // corner size, logical px
+        let (sw, sh) = ((vis_w * px_per_pt) as f64, (vis_h * px_per_pt) as f64);
+        let middle_y = if split { l } else { 0 };
+        let base = w.base().clone();
+        if let Some(c) = w.corners.as_mut() {
+            if c.middle_y != middle_y {
+                c.middle_y = middle_y;
+                w.video_sub.set_position(0, middle_y);
+                base.commit(); // subsurface positions apply with the parent's commit
+            }
+            if split {
+                let t = t_px as f64;
+                // Children of the middle strip: positions are relative to it.
+                let (tsub, tsurf, tvp) = &c.top;
+                tsub.set_position(l, -l);
+                tvp.set_source(t, 0.0, sw - 2.0 * t, t);
+                tvp.set_destination(dw - 2 * l, l);
+                tsurf.attach(Some(&buffer), 0, 0);
+                tsurf.damage_buffer(0, 0, fw as i32, fh as i32);
+                tsurf.commit();
+                let (bsub, bsurf, bvp) = &c.bottom;
+                bsub.set_position(l, dh - 2 * l);
+                bvp.set_source(t, sh - t, sw - 2.0 * t, t);
+                bvp.set_destination(dw - 2 * l, l);
+                bsurf.attach(Some(&buffer), 0, 0);
+                bsurf.damage_buffer(0, 0, fw as i32, fh as i32);
+                bsurf.commit();
+                let pos = [(0, -l), (dw - l, -l), (0, dh - 2 * l), (dw - l, dh - 2 * l)];
+                let new_tiles = c.pending.take();
+                if let Some((tp, px)) = &new_tiles {
+                    if let Ok(mut pool) = RawPool::new(px.len(), &self.shm) {
+                        pool.mmap().copy_from_slice(px);
+                        let n = (*tp * *tp * 4) as usize;
+                        let bufs: Vec<_> = (0..4)
+                            .map(|i| {
+                                pool.create_buffer((i * n) as i32, *tp as i32, *tp as i32, (*tp * 4) as i32,
+                                                   wl_shm::Format::Argb8888, (), qh)
+                            })
+                            .collect();
+                        for (i, (_, surf, _)) in c.tiles.iter().enumerate() {
+                            surf.attach(Some(&bufs[i]), 0, 0);
+                            surf.damage_buffer(0, 0, *tp as i32, *tp as i32);
+                        }
+                        c.tile_buffers.push_back((bufs, pool));
+                        while c.tile_buffers.len() > 3 {
+                            if let Some((old, _)) = c.tile_buffers.pop_front() {
+                                old.iter().for_each(|b| b.destroy());
+                            }
+                        }
+                    }
+                } else if !c.split {
+                    // Re-show the current tiles after a stretch without the split layout.
+                    if let Some((bufs, _)) = c.tile_buffers.back() {
+                        for (i, (_, surf, _)) in c.tiles.iter().enumerate() {
+                            surf.attach(Some(&bufs[i]), 0, 0);
+                        }
+                    }
+                }
+                for (i, (sub, surf, vp)) in c.tiles.iter().enumerate() {
+                    sub.set_position(pos[i].0, pos[i].1);
+                    vp.set_destination(l, l);
+                    surf.commit();
+                }
+            } else if c.split {
+                for (_, surf, _) in [&c.top, &c.bottom].into_iter().chain(c.tiles.iter()) {
+                    surf.attach(None, 0, 0);
+                    surf.commit();
+                }
+            }
+            if c.split != split {
+                log::info!("window {wid}: rounded corners {} (frame {fw}x{fh}, window {bw}x{bh}, t {t_px})",
+                           if split { "on" } else { "off" });
+            }
+            c.split = split;
+        }
+        if split {
+            let t = t_px as f64;
+            w.video_viewport.set_source(0.0, t, sw, sh - 2.0 * t);
+            w.video_viewport.set_destination(dw, dh - 2 * l);
+        } else {
+            w.video_viewport.set_source(0.0, 0.0, sw, sh);
+            w.video_viewport.set_destination(dw, dh);
+        }
         w.video.attach(Some(&buffer), 0, 0);
-        w.video.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
+        w.video.damage_buffer(0, 0, fw as i32, fh as i32);
         w.video.commit();
         self.in_use.insert(buffer.id(), frame);
     }
 
+    /// New corner tiles from the Mac; shown from the next frame on.
+    fn set_corners(&mut self, wid: u32, t_px: u32, tile_px: Vec<u8>, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        if !matches!(w.role, Role::Toplevel(_)) {
+            return;
+        }
+        if w.corners.is_none() {
+            let video = w.video.clone();
+            let viewporter = self.viewporter.get().expect("wp_viewporter").clone();
+            let make = || {
+                let (sub, surf) = self.subcompositor.create_subsurface(video.clone(), qh);
+                let vp = viewporter.get_viewport(&surf, qh, ());
+                let empty = self.compositor.wl_compositor().create_region(qh, ());
+                surf.set_input_region(Some(&empty));
+                empty.destroy();
+                (sub, surf, vp)
+            };
+            let top = make();
+            let bottom = make();
+            let tiles = (0..4).map(|_| make()).collect();
+            let corners = Corners {
+                t_px: 0,
+                top,
+                bottom,
+                tiles,
+                tile_buffers: Default::default(),
+                pending: None,
+                split: false,
+                middle_y: 0,
+            };
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.corners = Some(corners);
+            }
+        }
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let c = w.corners.as_mut().unwrap();
+        if c.t_px != t_px {
+            log::info!("window {wid}: corner radius {t_px}px");
+        }
+        c.t_px = t_px;
+        c.pending = (t_px > 0).then_some((t_px, tile_px));
+    }
+
     /// Shows a lossless frame (premultiplied BGRA == wl_shm ARGB8888 in memory) with its alpha.
-    fn present_raw(&mut self, wid: u32, pw: u16, ph: u16, capture_us: u64, bgra: Vec<u8>, qh: &QueueHandle<Self>) {
+    #[allow(clippy::too_many_arguments)]
+    fn present_raw(&mut self, wid: u32, pw: u16, ph: u16, ppp: u8, capture_us: u64, bgra: Vec<u8>, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let _ = self.net.send(NetCmd::Video(wid, W::new(t::FRAME_ACK).u64(capture_us).finish()));
         if !w.configured {
-            w.pending_raw = Some((pw, ph, capture_us, bgra));
+            w.pending_raw = Some((pw, ph, ppp, capture_us, bgra));
             return;
         }
         let (fw, fh) = (pw as u32, ph as u32);
@@ -601,7 +777,7 @@ impl App {
 
         let s = self.scale;
         let (bw, bh) = w.size;
-        let px_per_pt = if w.info.w > 0.0 { (fw as f64 / w.info.w as f64).round().max(1.0) } else { s };
+        let px_per_pt = px_per_pt(ppp, fw, w.info.w, s);
         let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
         let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);
         w.video_viewport.set_source(0.0, 0.0, vis_w * px_per_pt, vis_h * px_per_pt);
@@ -829,6 +1005,17 @@ impl App {
     }
 }
 
+/// Pixels per point of a frame: as reported by the Mac, else inferred from the window width.
+fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64 {
+    if reported > 0 {
+        reported as f64
+    } else if window_w_pt > 0.0 {
+        (frame_w as f64 / window_w_pt as f64).round().max(1.0)
+    } else {
+        fallback
+    }
+}
+
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
 const KEY_LEFTSHIFT: u32 = 42;
@@ -919,8 +1106,8 @@ impl WindowHandler for App {
         if let Some(f) = pending {
             self.present(wid, f, qh);
         }
-        if let Some((pw, ph, us, px)) = pending_raw {
-            self.present_raw(wid, pw, ph, us, px, qh);
+        if let Some((pw, ph, ppp, us, px)) = pending_raw {
+            self.present_raw(wid, pw, ph, ppp, us, px, qh);
         }
     }
 }
@@ -937,8 +1124,8 @@ impl PopupHandler for App {
         if let Some(f) = pending {
             self.present(wid, f, qh);
         }
-        if let Some((pw, ph, us, px)) = pending_raw {
-            self.present_raw(wid, pw, ph, us, px, qh);
+        if let Some((pw, ph, ppp, us, px)) = pending_raw {
+            self.present_raw(wid, pw, ph, ppp, us, px, qh);
         }
     }
 

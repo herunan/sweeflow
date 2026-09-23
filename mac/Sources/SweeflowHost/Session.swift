@@ -115,6 +115,7 @@ final class Session {
             let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, lossless: win.kind == .popup,
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
+            st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
@@ -264,8 +265,10 @@ final class Session {
         guard w.kind == .toplevel else { return }
         // Apps that hide the native buttons (e.g. a browser) report them outside the window.
         let bounds = CGRect(origin: .zero, size: w.frame.size)
-        let rects = control_.buttonRects(w.wid, pid: w.pid, windowOrigin: w.frame.origin).map {
-            bounds.contains($0) ? $0 : .zero
+        let rects = control_.buttonRects(w.wid, pid: w.pid).map { bounds.contains($0) ? $0 : .zero }
+        // A transient failure (window mid-move) must not wipe known-good positions.
+        if rects.allSatisfy({ $0 == .zero }), sentButtons[w.wid]?.contains(where: { $0 != .zero }) == true {
+            return
         }
         guard sentButtons[w.wid] != rects else { return }
         sentButtons[w.wid] = rects

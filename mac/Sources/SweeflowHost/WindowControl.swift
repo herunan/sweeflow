@@ -58,8 +58,14 @@ final class WindowControl {
 
     /// Frames of the close / minimise / zoom buttons relative to the window origin, in points
     /// (`.zero` when a button is absent).
-    func buttonRects(_ wid: UInt32, pid: pid_t, windowOrigin: CGPoint) -> [CGRect] {
+    func buttonRects(_ wid: UInt32, pid: pid_t) -> [CGRect] {
         guard let e = element(wid, pid: pid) else { return [.zero, .zero, .zero] }
+        // Measure against the window's own AX position, read now: the window-server frame we
+        // track can be stale while the window is moving (e.g. onto the virtual display).
+        var posRef: CFTypeRef?
+        var windowOrigin = CGPoint.zero
+        guard AXUIElementCopyAttributeValue(e, kAXPositionAttribute as CFString, &posRef) == .success, let pr = posRef,
+              AXValueGetValue(pr as! AXValue, .cgPoint, &windowOrigin) else { return [.zero, .zero, .zero] }
         return [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute].map { attr in
             var button: CFTypeRef?
             guard AXUIElementCopyAttributeValue(e, attr as CFString, &button) == .success, let b = button else { return .zero }

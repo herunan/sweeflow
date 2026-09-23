@@ -47,8 +47,10 @@ pub enum UiEvent {
     MoveStarted(u32),
     ToggleMaximize(u32),
     Frame(u32, GpuFrame),
+    /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
+    Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
-    RawFrame { wid: u32, w: u16, h: u16, capture_us: u64, bgra: Vec<u8> },
+    RawFrame { wid: u32, w: u16, h: u16, px_per_pt: u8, capture_us: u64, bgra: Vec<u8> },
 }
 
 pub enum NetCmd {
@@ -225,6 +227,8 @@ struct Encoded {
     key: bool,
     lossless: bool,
     dark: bool,
+    /// Pixels per point of this frame (2 for Retina captures).
+    px_per_pt: u8,
     data: Vec<u8>,
 }
 
@@ -245,7 +249,7 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                     let expected = f.w as usize * f.h as usize * 4;
                     match lz4_flex::decompress(&f.data, expected) {
                         Ok(px) if px.len() == expected => {
-                            let ev = UiEvent::RawFrame { wid, w: f.w, h: f.h, capture_us: f.capture_us, bgra: px };
+                            let ev = UiEvent::RawFrame { wid, w: f.w, h: f.h, px_per_pt: f.px_per_pt, capture_us: f.capture_us, bgra: px };
                             if ui2.send(ev).is_err() {
                                 return;
                             }
@@ -270,6 +274,7 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                 match dec.as_mut().unwrap().decode(&f.data, f.capture_us) {
                     Ok(Some(mut frame)) => {
                         frame.dark_titlebar = f.dark;
+                        frame.px_per_pt = f.px_per_pt;
                         if ui2.send(UiEvent::Frame(wid, frame)).is_err() {
                             return;
                         }
@@ -294,6 +299,26 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
             }
         };
         let (ty, body) = msg;
+        if ty == t::CORNERS {
+            let parsed = (|| -> Result<_> {
+                let mut r = R::new(&body);
+                let t_px = r.u16()? as u32;
+                let data = r.bytes()?;
+                let tiles = if t_px == 0 {
+                    Vec::new()
+                } else {
+                    lz4_flex::decompress(data, (t_px * t_px * 16) as usize)?
+                };
+                Ok((t_px, tiles))
+            })();
+            match parsed {
+                Ok((t_px, tiles)) => {
+                    let _ = ui.send(UiEvent::Corners { wid, t_px, tiles });
+                }
+                Err(e) => log::warn!("bad corners for {wid}: {e}"),
+            }
+            continue;
+        }
         if ty != t::FRAME {
             continue;
         }
@@ -310,6 +335,7 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                 key: flags & 1 != 0,
                 lossless: flags & 2 != 0,
                 dark: flags & 4 != 0,
+                px_per_pt: flags >> 4,
                 data: r.bytes()?.to_vec(),
             })
         })();

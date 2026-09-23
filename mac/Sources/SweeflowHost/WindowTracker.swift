@@ -32,6 +32,8 @@ final class WindowTracker {
     private let queue: DispatchQueue
     private let allowed: (String) -> Bool
     private var bundleCache: [pid_t: (String, String)] = [:]
+    /// macOS's "being captured" badges (small windows it attaches to captured windows), by pid.
+    private(set) var badges: [pid_t: [CGRect]] = [:]
 
     init(queue: DispatchQueue, allowed: @escaping (String) -> Bool) {
         self.queue = queue
@@ -64,6 +66,7 @@ final class WindowTracker {
         // Frontmost toplevel per pid, to parent popups/menus onto.
         var frontToplevel: [pid_t: TrackedWindow] = [:]
         var popups: [TrackedWindow] = []
+        var badges: [pid_t: [CGRect]] = [:]
 
         for info in list {
             guard let wid = info[kCGWindowNumber as String] as? UInt32,
@@ -77,7 +80,12 @@ final class WindowTracker {
             var w = TrackedWindow(wid: wid, pid: pid, bundleId: bid, appName: appName, title: title,
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
             if layer == 0 {
-                guard bounds.width >= 40, bounds.height >= 30 else { continue }
+                guard bounds.width >= 40, bounds.height >= 30 else {
+                    if (50...90).contains(bounds.width) && (14...28).contains(bounds.height) {
+                        badges[pid, default: []].append(bounds)
+                    }
+                    continue
+                }
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
                 order.append(wid)
@@ -110,6 +118,19 @@ final class WindowTracker {
             }
         }
         zOrder = order
+        self.badges = badges
+    }
+
+    /// Where macOS's capture badge overlaps `wid`, relative to the window (points).
+    func badgeRect(_ wid: UInt32) -> CGRect? {
+        guard let w = windows[wid] else { return nil }
+        for b in badges[w.pid] ?? [] {
+            let i = b.intersection(w.frame)
+            // The badge sits at the window's top-left corner.
+            guard !i.isNull, i.width > 0, i.height > 0, b.minX - w.frame.minX < 40, b.minY - w.frame.minY < 40 else { continue }
+            return i.offsetBy(dx: -w.frame.minX, dy: -w.frame.minY)
+        }
+        return nil
     }
 
     /// Current frame of one window straight from the window server (bypasses the poll interval).

@@ -8,7 +8,7 @@ enum Msg: UInt8 {
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
     case clipboard = 0x40, ping = 0x41, pong = 0x42
-    case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54
+    case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55
 }
 
 let protocolVersion: UInt16 = 1

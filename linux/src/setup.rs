@@ -104,6 +104,50 @@ pub fn setup(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Installs this binary to ~/.local/bin and a systemd user service that runs it with the
+/// desktop session (restarting it if it ever exits).
+pub fn install() -> Result<()> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
+    let bin_dir = home.join(".local/bin");
+    let unit_dir = home.join(".config/systemd/user");
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(&unit_dir)?;
+    let target = bin_dir.join("sweeflow");
+    let me = std::env::current_exe()?;
+    if me != target {
+        // Copy to a temp name then rename, so a running copy is replaced atomically.
+        let tmp = bin_dir.join(".sweeflow.new");
+        std::fs::copy(&me, &tmp)?;
+        std::fs::rename(&tmp, &target)?;
+    }
+    std::fs::write(
+        unit_dir.join("sweeflow.service"),
+        format!(
+            "[Unit]\n\
+             Description=sweeflow: Mac windows on this desktop\n\
+             PartOf=graphical-session.target\n\
+             After=graphical-session.target\n\n\
+             [Service]\n\
+             ExecStart={}\n\
+             Restart=always\n\
+             RestartSec=2\n\
+             Environment=RUST_LOG=info\n\n\
+             [Install]\n\
+             WantedBy=graphical-session.target\n",
+            target.display()
+        ),
+    )?;
+    let run = |args: &[&str]| Command::new("systemctl").arg("--user").args(args).status();
+    run(&["daemon-reload"])?;
+    if !run(&["enable", "sweeflow.service"])?.success() {
+        bail!("could not enable the sweeflow service");
+    }
+    run(&["restart", "sweeflow.service"])?;
+    println!("==> sweeflow installed to {} and running as a user service", target.display());
+    println!("    logs: journalctl --user -u sweeflow -f");
+    Ok(())
+}
+
 pub fn status() -> Result<()> {
     println!("config:       {}", Config::path().display());
     match Config::load() {

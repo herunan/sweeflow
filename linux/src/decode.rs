@@ -56,6 +56,8 @@ pub struct GpuFrame {
     pub capture_us: u64,
     /// The Mac saw a dark title bar in this frame (picks the inactive traffic-light colour).
     pub dark_titlebar: bool,
+    /// Pixels per point (from the Mac); 0 = unknown.
+    pub px_per_pt: u8,
 }
 
 // The AVFrame is exclusively owned; FFmpeg frames are safe to move between threads.
@@ -182,6 +184,7 @@ impl Decoder {
                 planes,
                 capture_us,
                 dark_titlebar: true,
+                px_per_pt: 0,
             })
         }
     }
