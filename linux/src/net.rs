@@ -106,7 +106,7 @@ async fn session(
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
-    ctl_tx.write_all(&W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).finish()).await?;
+    ctl_tx.write_all(&W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(cfg.capture_scale as f32).finish()).await?;
 
     let ui2 = ui.clone();
     let mut reader = tokio::spawn(async move {

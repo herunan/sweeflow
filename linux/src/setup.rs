@@ -104,6 +104,7 @@ pub fn setup(target: &str) -> Result<()> {
         host: format!("{host}:44120"),
         host_fingerprint: host_fp,
         scale: Config::load().map(|c| c.scale).unwrap_or(1.0),
+        capture_scale: Config::load().map(|c| c.capture_scale).unwrap_or(0.0),
         render_node: config::default_render_node(),
     };
     cfg.save()?;
@@ -123,6 +124,7 @@ pub fn status() -> Result<()> {
             println!("host:         {}", c.host);
             println!("host cert:    {}", c.host_fingerprint);
             println!("scale:        {}", c.scale);
+            println!("capture:      {}", if c.capture_scale == 0.0 { "native (Retina)".into() } else { format!("{}x", c.capture_scale) });
             println!("render node:  {}", c.render_node);
         }
         Err(e) => println!("not configured: {e}"),

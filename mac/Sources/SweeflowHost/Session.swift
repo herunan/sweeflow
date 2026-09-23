@@ -9,6 +9,8 @@ final class Session {
     private let config: Config
     private var control: MsgStream?
     private var clientScale: CGFloat = 1
+    /// Pixels per point to capture at; 0 = the window's native (Retina) backing scale.
+    private var captureScale: CGFloat = 0
     private let tracker: WindowTracker
     private let control_ = WindowControl()
     private let input = InputInjector()
@@ -63,7 +65,8 @@ final class Session {
         case .hello:
             let v = try m.u16()
             clientScale = try m.f32()
-            log("client hello v\(v) scale \(clientScale)")
+            captureScale = (try? m.f32()) ?? 0
+            log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
             control = s
             let key = ObjectIdentifier(s)
             if let st = streamers.removeValue(forKey: key) { st.stop() }
@@ -78,7 +81,8 @@ final class Session {
         case .subscribe:
             let wid = try m.u32()
             guard let win = tracker.windows[wid] else { log("subscribe to unknown window \(wid)"); s.close(); return }
-            let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: clientScale, out: s, queue: queue)
+            let scale = captureScale > 0 ? captureScale : backingScale(of: win.frame)
+            let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, out: s, queue: queue)
             streamers[ObjectIdentifier(s)] = st
             st.start()
         case .requestKeyframe: streamers[ObjectIdentifier(s)]?.requestKeyframe()
@@ -207,4 +211,19 @@ final class Session {
         m.str(w.bundleId); m.bytes(png)
         control?.send(m)
     }
+}
+
+/// Backing scale (2 on Retina) of the screen showing most of `frame` (CG, top-left origin).
+func backingScale(of frame: CGRect) -> CGFloat {
+    guard let primary = NSScreen.screens.first else { return 2 }
+    var best: (CGFloat, CGFloat) = (0, primary.backingScaleFactor)
+    for screen in NSScreen.screens {
+        // NSScreen frames are bottom-left origin; flip into CG coordinates.
+        var f = screen.frame
+        f.origin.y = primary.frame.maxY - f.maxY
+        let i = f.intersection(frame)
+        let area = i.isNull ? 0 : i.width * i.height
+        if area > best.0 { best = (area, screen.backingScaleFactor) }
+    }
+    return best.1
 }

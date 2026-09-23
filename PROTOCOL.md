@@ -21,7 +21,7 @@ The first bidirectional stream the client opens. Carries everything except video
 
 | type | dir | name | payload |
 |------|-----|------|---------|
-| 0x01 | C→S | Hello | u16 version, f32 clientScale |
+| 0x01 | C→S | Hello | u16 version, f32 clientScale, f32 captureScale (0 = window's native backing scale) |
 | 0x02 | S→C | Welcome | u16 version, str hostName |
 | 0x10 | S→C | WindowAdded | u32 wid, i32 pid, str bundleId, str appName, str title, f32 w, f32 h, u32 parent, f32 relX, f32 relY, u8 kind |
 | 0x11 | S→C | WindowChanged | u32 wid, str title, f32 w, f32 h, f32 relX, f32 relY |

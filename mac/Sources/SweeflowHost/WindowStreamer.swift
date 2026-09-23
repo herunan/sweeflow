@@ -254,7 +254,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard st == noErr, let s = session else { log("VTCompressionSessionCreate failed \(st)"); return nil }
         // Bits scale with area; desktop content compresses well so this is generous headroom.
         let pixels = Double(width) * Double(height)
-        let bitrate = min(max(pixels * 12, 8_000_000), 60_000_000)
+        let bitrate = min(max(pixels * 10, 20_000_000), 100_000_000)
         let props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,

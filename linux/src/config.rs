@@ -14,6 +14,9 @@ pub struct Config {
     pub host_fingerprint: String,
     /// Mac points → Linux pixels. 1.0 on a scale-1 monitor.
     pub scale: f64,
+    /// Pixels per point the Mac captures at; 0 = the window's native Retina resolution. Higher
+    /// than `scale` means the compositor downsamples, which gives sharper text and full-res colour.
+    pub capture_scale: f64,
     /// DRM render node of the GPU the compositor uses (decode there for zero-copy).
     pub render_node: String,
 }
@@ -33,7 +36,7 @@ impl Config {
     pub fn load() -> Result<Config> {
         let text = fs::read_to_string(Self::path())
             .with_context(|| format!("no config at {} — run `sweeflow setup user@mac` first", Self::path().display()))?;
-        let mut c = Config { host: String::new(), host_fingerprint: String::new(), scale: 1.0, render_node: String::new() };
+        let mut c = Config { host: String::new(), host_fingerprint: String::new(), scale: 1.0, capture_scale: 0.0, render_node: String::new() };
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
@@ -45,6 +48,7 @@ impl Config {
                 "host" => c.host = v,
                 "host_fingerprint" => c.host_fingerprint = v,
                 "scale" => c.scale = v.parse().context("scale")?,
+                "capture_scale" => c.capture_scale = v.parse().context("capture_scale")?,
                 "render_node" => c.render_node = v,
                 _ => {}
             }
@@ -63,8 +67,10 @@ impl Config {
         fs::write(
             Self::path(),
             format!(
-                "# sweeflow client configuration\nhost = \"{}\"\nhost_fingerprint = \"{}\"\nscale = {}\nrender_node = \"{}\"\n",
-                self.host, self.host_fingerprint, self.scale, self.render_node
+                "# sweeflow client configuration\nhost = \"{}\"\nhost_fingerprint = \"{}\"\nscale = {}\n\
+                 # 0 = capture at the Mac's native Retina resolution (sharpest); 1 = half the bandwidth\n\
+                 capture_scale = {}\nrender_node = \"{}\"\n",
+                self.host, self.host_fingerprint, self.scale, self.capture_scale, self.render_node
             ),
         )?;
         Ok(())

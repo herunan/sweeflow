@@ -470,13 +470,15 @@ impl App {
             qh,
         );
 
-        // Show the video 1:1 in logical pixels, cropped to the window.
+        // Map the frame to the window's size in points (the frame may be 2x Retina pixels; the
+        // compositor then downsamples it), cropped to the window if the Mac lags a resize.
         let s = self.scale;
         let (bw, bh) = w.size;
-        let vw = (frame.width as f64 / s).min(bw as f64);
-        let vh = (frame.height as f64 / s).min(bh as f64);
-        w.video_viewport.set_source(0.0, 0.0, vw * s, vh * s);
-        w.video_viewport.set_destination(vw.round().max(1.0) as i32, vh.round().max(1.0) as i32);
+        let px_per_pt = if w.info.w > 0.0 { (frame.width as f64 / w.info.w as f64).round().max(1.0) } else { s };
+        let vis_w = (frame.width as f64 / px_per_pt).min(bw as f64 / s);
+        let vis_h = (frame.height as f64 / px_per_pt).min(bh as f64 / s);
+        w.video_viewport.set_source(0.0, 0.0, vis_w * px_per_pt, vis_h * px_per_pt);
+        w.video_viewport.set_destination((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32);
         w.video.attach(Some(&buffer), 0, 0);
         w.video.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
         w.video.commit();
