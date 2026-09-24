@@ -70,6 +70,7 @@ The client opens one extra bidirectional stream per window it wants to see.
 | 0x50 | C→S | Subscribe | u32 wid |
 | 0x51 | S→C | Frame | u64 captureUs, u16 pxW, u16 pxH, u8 flags (bit0 keyframe, bit1 lossless, bit2 dark title bar, bit3 full-range YUV, bits 4–7 pixels per point), bytes data — HEVC Annex B, or with bit1 an LZ4 block of premultiplied BGRA (pxW·pxH·4 bytes) used for popups/menus |
 | 0x55 | S→C | Corners | u16 tilePx, bytes lz4 — four tilePx² premultiplied BGRA tiles (TL, TR, BL, BR) with the window's rounded, transparent corners; tilePx 0 = square corners. Applies from the next frame. |
+| 0x56 | S→C | Alpha | u16 w, u16 h, u8 kind (0 opaque again, 1 mask), bytes LZ4-raw w×h alpha plane — the window's translucency (video stream), sent before the frame it applies to, only when it changes |
 | 0x52 | C→S | RequestKeyframe | — |
 | 0x53 | C→S | Pause | u8 paused (window minimised / hidden) |
 | 0x54 | C→S | FrameAck | u64 captureUs (echo when the frame has been presented; Mac uses it for latency stats and flow control) |

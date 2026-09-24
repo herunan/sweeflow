@@ -94,6 +94,7 @@ use wayland_protocols::ext::data_control::v1::client::{
 use wayland_protocols_plasma::appmenu::client::{
     org_kde_kwin_appmenu::OrgKdeKwinAppmenu, org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager,
 };
+use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur::OrgKdeKwinBlur, org_kde_kwin_blur_manager::OrgKdeKwinBlurManager};
 
 use crate::{
     decode::GpuFrame,
@@ -182,6 +183,21 @@ struct Win {
     /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
     raw_buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
     stale: bool,
+    /// Glass: the window's alpha on the GPU, the RGBA buffers it's composited into, and KDE's
+    /// blur behind the window (None while the window is opaque).
+    glass: Option<GlassState>,
+}
+
+struct GlassState {
+    mask: Option<crate::glass::Mask>,
+    outputs: Vec<GlassBuf>,
+    blur: Option<OrgKdeKwinBlur>,
+}
+
+struct GlassBuf {
+    out: crate::glass::Output,
+    buffer: wl_buffer::WlBuffer,
+    busy: bool,
 }
 
 impl Win {
@@ -211,6 +227,12 @@ pub struct App {
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    blur_mgr: Option<OrgKdeKwinBlurManager>,
+    /// GPU compositing for glass windows (created on first use; Err once it has failed).
+    glass: Option<Result<crate::glass::Glass, ()>>,
+    render_node: String,
+    /// Glass buffers the compositor holds: buffer → window.
+    glass_busy: HashMap<wayland_client::backend::ObjectId, u32>,
     /// Clipboard access regardless of focus (KDE's ext-data-control).
     data_control: Option<ExtDataControlManagerV1>,
     clip_device: Option<ExtDataControlDeviceV1>,
@@ -295,6 +317,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let (int_tx, int_rx): (channel::Sender<Internal>, Channel<Internal>) = channel::channel();
     let scale = net_cfg.scale;
     let host = net_cfg.host.clone();
+    let render_node = net_cfg.render_node.clone();
     let net = crate::net::spawn(net_cfg, ui_tx);
 
     let mut app = App {
@@ -314,6 +337,10 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        blur_mgr: bind_opt("org_kde_kwin_blur_manager").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        glass: None,
+        render_node: render_node.clone(),
+        glass_busy: HashMap::new(),
         data_control: bind_opt("ext_data_control_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         clip_device: None,
         clip_source: None,
@@ -530,6 +557,7 @@ impl App {
                 self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)
             }
             UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles, qh),
+            UiEvent::Alpha { wid, width, height, plane } => self.set_alpha(wid, width, height, plane, qh),
         }
     }
 
@@ -643,6 +671,7 @@ impl App {
                 pending_raw: None,
                 raw_buffers: Default::default(),
                 stale: false,
+                glass: None,
             },
         );
         if !is_popup {
@@ -670,6 +699,9 @@ impl App {
         }
         for (b, _) in &w.raw_buffers {
             b.destroy();
+        }
+        if let Some(g) = w.glass {
+            self.drop_glass(g);
         }
         if let Some(am) = w.appmenu {
             am.release();
@@ -780,24 +812,34 @@ impl App {
             return;
         }
 
-        let params = match self.dmabuf.create_params(qh) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("dmabuf unavailable: {e}");
-                return;
+        // Windows with glass: video + alpha composited on the GPU into an RGBA buffer.
+        let glass_buffer = self.glass_frame(wid, &frame, qh);
+        let is_glass = glass_buffer.is_some();
+        let buffer = if let Some(b) = glass_buffer {
+            b
+        } else {
+            let params = match self.dmabuf.create_params(qh) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("dmabuf unavailable: {e}");
+                    return;
+                }
+            };
+            for (i, p) in frame.planes.iter().enumerate() {
+                let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(p.fd) };
+                params.add(fd, i as u32, p.offset, p.stride, p.modifier);
             }
+            params
+                .create_immed(
+                    frame.width as i32,
+                    frame.height as i32,
+                    frame.format,
+                    wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                )
+                .0
         };
-        for (i, p) in frame.planes.iter().enumerate() {
-            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(p.fd) };
-            params.add(fd, i as u32, p.offset, p.stride, p.modifier);
-        }
-        let (buffer, _) = params.create_immed(
-            frame.width as i32,
-            frame.height as i32,
-            frame.format,
-            wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
-            qh,
-        );
+        let Some(w) = self.windows.get_mut(&wid) else { return };
 
         // Map the frame to the window's size in points (the frame may be 2x Retina pixels; the
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
@@ -899,7 +941,146 @@ impl App {
         w.video.attach(Some(&buffer), 0, 0);
         w.video.damage_buffer(0, 0, fw as i32, fh as i32);
         w.video.commit();
-        self.in_use.insert(buffer.id(), frame);
+        if is_glass {
+            self.glass_busy.insert(buffer.id(), wid);
+        } else {
+            self.in_use.insert(buffer.id(), frame);
+        }
+    }
+
+    /// The window's alpha changed (or it's opaque again).
+    fn set_alpha(&mut self, wid: u32, width: u32, height: u32, plane: Option<Vec<u8>>, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if !matches!(w.role, Role::Toplevel(_)) {
+            return;
+        }
+        let Some(plane) = plane else {
+            if let Some(g) = w.glass.take() {
+                log::info!("window {wid}: opaque again");
+                self.drop_glass(g);
+                self.set_color_reps(wid, true, qh);
+            }
+            return;
+        };
+        if std::env::var_os("SWEEFLOW_GLASS").is_none() {
+            return; // off until it's proven safe with the compositor
+        }
+        if self.glass.is_none() {
+            self.glass = Some(crate::glass::Glass::new(&self.render_node).map_err(|e| log::warn!("glass unavailable: {e:#}")));
+        }
+        let Some(Ok(gpu)) = self.glass.as_ref() else { return };
+        let w = self.windows.get_mut(&wid).unwrap();
+        let base = w.base().clone();
+        let first = w.glass.is_none();
+        let g = w.glass.get_or_insert_with(|| GlassState { mask: None, outputs: Vec::new(), blur: None });
+        if let Err(e) = gpu.upload_mask(&mut g.mask, width, height, &plane) {
+            log::warn!("window {wid}: alpha upload failed: {e:#}");
+            return;
+        }
+        if first {
+            log::info!("window {wid}: has glass ({width}x{height})");
+            // KDE blurs what's behind the window, as macOS does behind its glass.
+            if let Some(m) = &self.blur_mgr {
+                let blur = m.create(&base, qh, ());
+                blur.set_region(None);
+                blur.commit();
+                base.commit();
+                g.blur = Some(blur);
+            }
+            self.set_color_reps(wid, false, qh);
+        }
+    }
+
+    /// Composites `frame` with the window's alpha, if it has glass. Returns the buffer to show.
+    fn glass_frame(&mut self, wid: u32, frame: &GpuFrame, qh: &QueueHandle<Self>) -> Option<wl_buffer::WlBuffer> {
+        let Some(Ok(gpu)) = self.glass.as_ref() else { return None };
+        let w = self.windows.get_mut(&wid)?;
+        let g = w.glass.as_mut()?;
+        let mask = g.mask.as_ref()?;
+        if (mask.width, mask.height) != (frame.width, frame.height) {
+            return None; // mid-resize: the matching mask is on its way
+        }
+        // Buffers of an old size go; reuse a free one, else make one (up to three in flight).
+        g.outputs.retain(|b| {
+            let keep = b.busy || (b.out.width, b.out.height) == (frame.width, frame.height);
+            if !keep {
+                b.buffer.destroy();
+            }
+            keep
+        });
+        let idx = match g.outputs.iter().position(|b| !b.busy && (b.out.width, b.out.height) == (frame.width, frame.height)) {
+            Some(i) => i,
+            None if g.outputs.len() < 4 => {
+                let out = gpu.new_output(frame.width, frame.height).map_err(|e| log::warn!("glass buffer: {e:#}")).ok()?;
+                let params = self.dmabuf.create_params(qh).ok()?;
+                for (i, (fd, offset, stride)) in out.planes.iter().enumerate() {
+                    use std::os::fd::AsFd;
+                    params.add(fd.as_fd(), i as u32, *offset, *stride, out.modifier);
+                }
+                let (buffer, _) = params.create_immed(
+                    out.width as i32,
+                    out.height as i32,
+                    out.fourcc,
+                    wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                );
+                g.outputs.push(GlassBuf { out, buffer, busy: false });
+                g.outputs.len() - 1
+            }
+            None => return None, // all busy: show this frame without glass rather than stall
+        };
+        if let Err(e) = gpu.render(frame, mask, &g.outputs[idx].out) {
+            log::warn!("window {wid}: glass render failed: {e:#}");
+            return None;
+        }
+        g.outputs[idx].busy = true;
+        Some(g.outputs[idx].buffer.clone())
+    }
+
+    fn drop_glass(&mut self, g: GlassState) {
+        if let Some(b) = g.blur {
+            b.release();
+        }
+        let gpu = match self.glass.as_ref() {
+            Some(Ok(gpu)) => Some(gpu),
+            _ => None,
+        };
+        for b in g.outputs {
+            if !b.busy {
+                b.buffer.destroy();
+            }
+            if let Some(gpu) = gpu {
+                gpu.drop_output(b.out);
+            }
+        }
+        if let (Some(m), Some(gpu)) = (g.mask, gpu) {
+            gpu.drop_mask(m);
+        }
+    }
+
+    /// YUV colour tags on the surfaces showing the video: needed for the video itself, but a
+    /// protocol error on the RGBA buffers of glass windows.
+    fn set_color_reps(&mut self, wid: u32, on: bool, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if on {
+            if let Some(m) = &self.color_rep {
+                if w.color.is_none() {
+                    w.color = Some(m.get_surface(&w.video, qh, ()));
+                }
+                if let Some(c) = w.corners.as_mut().filter(|c| c.colors.is_empty()) {
+                    c.colors = vec![m.get_surface(&c.top.1, qh, ()), m.get_surface(&c.bottom.1, qh, ())];
+                }
+            }
+        } else {
+            if let Some(c) = w.color.take() {
+                c.destroy();
+            }
+            if let Some(c) = w.corners.as_mut() {
+                c.colors.drain(..).for_each(|c| c.destroy());
+            }
+        }
+        // Declared again with the next frame.
+        w.color_full_range = None;
     }
 
     /// New corner tiles from the Mac; shown from the next frame on.
@@ -922,9 +1103,11 @@ impl App {
             let top = make();
             let bottom = make();
             let tiles = (0..4).map(|_| make()).collect();
+            let glass = w.glass.is_some();
             let colors: Vec<_> = self
                 .color_rep
                 .iter()
+                .filter(|_| !glass)
                 .flat_map(|m| [m.get_surface(&top.1, qh, ()), m.get_surface(&bottom.1, qh, ())])
                 .collect();
             let range_now = self.windows.get(&wid).and_then(|w| w.color_full_range);
@@ -1922,6 +2105,17 @@ impl DmabufHandler for App {
         log::error!("compositor rejected a dmabuf");
     }
     fn released(&mut self, _: &Connection, _: &QueueHandle<Self>, buffer: &wl_buffer::WlBuffer) {
+        // Glass buffers are reused; video frames' buffers are one-offs.
+        if let Some(wid) = self.glass_busy.remove(&buffer.id()) {
+            if let Some(g) = self.windows.get_mut(&wid).and_then(|w| w.glass.as_mut()) {
+                if let Some(b) = g.outputs.iter_mut().find(|b| b.buffer == *buffer) {
+                    b.busy = false;
+                    return;
+                }
+            }
+            buffer.destroy();
+            return;
+        }
         self.in_use.remove(&buffer.id());
         buffer.destroy();
     }
@@ -1991,6 +2185,8 @@ wayland_client::delegate_noop!(App: ignore WpCursorShapeDeviceV1);
 
 wayland_client::delegate_noop!(App: ignore WpPresentation);
 wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenuManager);
+wayland_client::delegate_noop!(App: ignore OrgKdeKwinBlurManager);
+wayland_client::delegate_noop!(App: ignore OrgKdeKwinBlur);
 wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenu);
 
 /// Logs how long a traffic-light hover update took: input event → our commit → on screen.

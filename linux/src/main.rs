@@ -1,6 +1,8 @@
 mod clipboard;
 mod config;
 mod decode;
+mod glass;
+mod glass_test;
 mod launchers;
 mod lights;
 mod menus;
@@ -53,6 +55,17 @@ fn main() -> Result<()> {
         Some("install") => setup::install(),
         Some("launch") => launchers::launch(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("status") => setup::status(),
+        Some("glass-test") => {
+            let node = config::Config::load().map(|c| c.render_node).unwrap_or_else(|_| "/dev/dri/renderD128".into());
+            glass_test::run(&node, args.get(1).map(String::as_str))
+        }
+        Some("glass-probe") => {
+            let node = config::Config::load().map(|c| c.render_node).unwrap_or_else(|_| "/dev/dri/renderD128".into());
+            let g = glass::Glass::new(&node)?;
+            let o = g.new_output(256, 256)?;
+            println!("output fourcc {:?} modifier {:#x} planes {}", o.fourcc.to_le_bytes().map(|b| b as char), o.modifier, o.planes.len());
+            Ok(())
+        }
         _ => {
             eprint!("{USAGE}");
             Ok(())
