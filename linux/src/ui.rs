@@ -482,13 +482,9 @@ impl App {
             let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, qh);
             window.set_title(display_title(&info.app_name, &info.title));
             window.set_app_id(format!("sweeflow-{}", info.bundle_id));
-            if info.kind == 2 {
-                // Floating panel (reminders, palettes): a window of its own, kept with its app;
-                // with a parent, KWin keeps it above the app and tilers leave it floating.
-                if let Some(Role::Toplevel(parent)) = self.windows.get(&info.parent).map(|p| &p.role) {
-                    window.set_parent(Some(parent));
-                }
-            } else {
+            // Floating panels (kind 2: reminders, palettes) are ordinary, independent windows
+            // here too: own taskbar entry, tiled like the rest.
+            if info.kind != 2 {
                 window.set_min_size(Some((100, 60)));
             }
             window.commit();
