@@ -1,6 +1,7 @@
 import AppKit
 import Network
 import ScreenCaptureKit
+import CoreImage
 
 /// Development hook: a localhost-only line protocol for driving the host over SSH
 /// (`echo "rclick 4053 300 200" | nc 127.0.0.1 PORT`). Off unless `debugPort` is set in config.
@@ -89,6 +90,29 @@ final class DebugPort {
                 let r = s.debugAX(wid)
                 DispatchQueue.main.async { reply(r) }
             }
+        case "streamtest" where p.count == 3:
+            // Streams one window through a display filter for 2 s and saves the last frame:
+            // does macOS badge windows captured this way?
+            let wid = UInt32(p[1]) ?? 0
+            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+                guard let w = content?.windows.first(where: { $0.windowID == wid }),
+                      let d = content?.displays.first(where: { $0.frame.intersects(w.frame) }) else { return reply("no window") }
+                let cfg = SCStreamConfiguration()
+                cfg.sourceRect = w.frame.offsetBy(dx: -d.frame.minX, dy: -d.frame.minY)
+                cfg.width = Int(w.frame.width * 2); cfg.height = Int(w.frame.height * 2)
+                cfg.showsCursor = false
+                let sink = FrameSink(path: p[2])
+                let stream = SCStream(filter: SCContentFilter(display: d, including: [w]), configuration: cfg, delegate: nil)
+                try? stream.addStreamOutput(sink, type: .screen, sampleHandlerQueue: .main)
+                stream.startCapture { err in
+                    if let err { return reply("start failed \(err)") }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        sink.save()
+                        stream.stopCapture { _ in reply("ok (frames \(sink.count))") }
+                        _ = sink
+                    }
+                }
+            }
         case "windows":
             guard let s = session else { return reply("no session") }
             s.queue.async {
@@ -110,5 +134,22 @@ final class DebugPort {
                 reply("ok \(image.width)x\(image.height)")
             } catch { reply("write failed: \(error)") }
         }
+    }
+}
+
+/// Keeps the newest frame of a test stream.
+final class FrameSink: NSObject, SCStreamOutput {
+    let path: String
+    var last: CVPixelBuffer?
+    var count = 0
+    init(path: String) { self.path = path }
+    func stream(_ s: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        if let pb = CMSampleBufferGetImageBuffer(sb) { last = pb; count += 1 }
+    }
+    func save() {
+        guard let pb = last else { return }
+        let ci = CIImage(cvPixelBuffer: pb)
+        let rep = NSBitmapImageRep(ciImage: ci)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
     }
 }

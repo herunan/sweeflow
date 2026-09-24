@@ -76,10 +76,11 @@ final class WindowTracker {
                   let bounds = CGRect(dictionaryRepresentation: boundsDict),
                   (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.01,
                   let (bid, appName) = appInfo(pid), allowed(bid) else { continue }
-            // macOS's "being captured" badge is a window of the app itself that is not
-            // shareable (sharing state 0); recognise it that way at any size (it grows on hover).
-            if layer == 0, (info[kCGWindowSharingState as String] as? Int) == 0 {
-                badges[pid, default: []].append(bounds)
+            // Windows macOS injects into a shared app — the purple "being captured" badge and the
+            // live preview it pops up on hover — are not shareable (sharing state 0). Never
+            // stream them; remember the badge (layer 0) so it can be erased from captures.
+            if (info[kCGWindowSharingState as String] as? Int) == 0 {
+                if layer == 0 { badges[pid, default: []].append(bounds) }
                 continue
             }
             let title = info[kCGWindowName as String] as? String ?? ""

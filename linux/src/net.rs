@@ -106,6 +106,16 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
 }
 
 /// Local socket for `sweeflow launch <bundle id>` (used by the Mac app launchers).
+/// Launch requests made while the Mac is offline, delivered on (re)connect.
+static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn notify(summary: &str, body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=sweeflow", "--icon=computer-laptop", summary, body])
+        .status();
+}
+
 fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
     use std::io::BufRead;
     let path = crate::launchers::socket_path();
@@ -123,8 +133,24 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
             for conn in listener.incoming().flatten() {
                 for line in std::io::BufReader::new(conn).lines().map_while(Result::ok) {
                     if let Some(bid) = line.strip_prefix("launch ") {
-                        log::info!("launching {bid} on the Mac");
-                        let _ = tx.send(NetCmd::Control(W::new(t::LAUNCH_APP).str(bid.trim()).finish()));
+                        let bid = bid.trim().to_string();
+                        if CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
+                            log::info!("launching {bid} on the Mac");
+                            let _ = tx.send(NetCmd::Control(W::new(t::LAUNCH_APP).str(&bid).finish()));
+                        } else {
+                            // Hold it until we reconnect; tell the user if that takes too long.
+                            log::info!("Mac offline; holding launch of {bid}");
+                            PENDING_LAUNCHES.lock().unwrap().push((bid.clone(), std::time::Instant::now()));
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_secs(15));
+                                let mut p = PENDING_LAUNCHES.lock().unwrap();
+                                if let Some(i) = p.iter().position(|(b, _)| *b == bid) {
+                                    p.remove(i);
+                                    drop(p);
+                                    notify("Mac not connected", &format!("Couldn't open {bid}: sweeflow can't reach your Mac."));
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -168,9 +194,22 @@ async fn session(
         .context("host did not resolve")?;
     let conn = endpoint.connect(addr, "sweeflow")?.await.context("connect")?;
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
+    struct Online;
+    impl Drop for Online {
+        fn drop(&mut self) {
+            CONNECTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    CONNECTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _online = Online;
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
     ctl_tx.write_all(&W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(cfg.capture_scale as f32).finish()).await?;
+    let held: Vec<String> = PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect();
+    for bid in held {
+        log::info!("launching {bid} (requested while offline)");
+        ctl_tx.write_all(&W::new(t::LAUNCH_APP).str(&bid).finish()).await?;
+    }
 
     let ui2 = ui.clone();
     let mut reader = tokio::spawn(async move {

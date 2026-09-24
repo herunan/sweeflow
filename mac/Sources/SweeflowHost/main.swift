@@ -7,6 +7,8 @@ struct Config: Codable {
     /// Bundle identifiers whose windows are streamed. Empty = every regular app (anything with
     /// a Dock icon), which is the default.
     var apps: [String] = []
+    /// Bundle identifiers never streamed (applies on top of `apps`).
+    var excludeApps: [String] = []
     /// Mute the Mac's own speakers while a client is connected (sound plays on Linux instead).
     var muteMacWhileStreaming = true
 
@@ -26,11 +28,12 @@ struct Config: Codable {
         apps = try c.decodeIfPresent([String].self, forKey: .apps) ?? d.apps
         virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? d.virtualDisplay
         debugPort = try c.decodeIfPresent(UInt16.self, forKey: .debugPort) ?? 0
+        excludeApps = try c.decodeIfPresent([String].self, forKey: .excludeApps) ?? []
         muteMacWhileStreaming = try c.decodeIfPresent(Bool.self, forKey: .muteMacWhileStreaming) ?? d.muteMacWhileStreaming
     }
 
     func allows(_ bundleId: String) -> Bool {
-        if bundleId == Bundle.main.bundleIdentifier { return false }
+        if bundleId == Bundle.main.bundleIdentifier || excludeApps.contains(bundleId) { return false }
         if !apps.isEmpty { return apps.contains(bundleId) }
         // Regular apps only: menu-bar utilities and background agents have no real windows.
         return NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
