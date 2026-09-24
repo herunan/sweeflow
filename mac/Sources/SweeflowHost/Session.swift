@@ -308,11 +308,19 @@ final class Session {
         }
     }
 
-    /// Moves a streamed window onto the virtual display (top-left, below its menu bar).
+    /// Keeps a streamed window (or floating panel) fully on the virtual display: input is injected
+    /// at its real position on the Mac, so any part off-screen there can't be clicked.
     private func placeOnVirtualDisplay(_ w: TrackedWindow) {
-        guard w.kind == .toplevel, let area = vdArea else { return }
-        if area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)) { return }
-        control_.setPosition(w.wid, pid: w.pid, area.origin)
+        guard w.kind != .popup, let area = vdArea else { return }
+        if area.contains(w.frame) { return }
+        var origin = w.frame.origin
+        if w.kind == .toplevel && !area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)) {
+            origin = area.origin   // not on the display at all yet: top-left
+        }
+        // Clamp so the whole window is visible (as far as it fits).
+        origin.x = min(max(origin.x, area.minX), max(area.minX, area.maxX - w.frame.width))
+        origin.y = min(max(origin.y, area.minY), max(area.minY, area.maxY - w.frame.height))
+        if origin != w.frame.origin { control_.setPosition(w.wid, pid: w.pid, origin) }
     }
 
     // MARK: debug hooks (DebugPort)
@@ -462,6 +470,7 @@ final class Session {
     }
 
     private func sendChanged(_ w: TrackedWindow) {
+        placeOnVirtualDisplay(w)
         for st in streamers.values where st.wid == w.wid { st.windowResized(to: w.frame.size) }
         var m = MsgWriter(.windowChanged)
         m.u32(w.wid); m.str(w.title)
