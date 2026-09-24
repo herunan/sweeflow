@@ -271,6 +271,7 @@ final class TrackpadScroller {
     /// Recent per-tick output, for the release velocity.
     private var recent: [CGVector] = []
     private var velocity = CGVector.zero
+    private var liftVelocity = CGVector.zero
     private var coasting = false
     /// The Mac's trackpad acceleration and its running velocity.
     private let accel = ScrollAcceleration.load(.trackpad)
@@ -279,8 +280,8 @@ final class TrackpadScroller {
 
     /// Share of the backlog sent per tick (~one tick of smoothing).
     private let drain: CGFloat = 0.55
-    /// Momentum kept per 120 Hz tick (close to macOS's own deceleration).
-    private let friction: CGFloat = 0.972
+    /// Momentum kept per 120 Hz tick: Apple's standard deceleration, 0.998 per millisecond.
+    private let friction: CGFloat = pow(0.998, 1000 / 120)
 
     init(post: @escaping (CGFloat, CGFloat, UInt8) -> Void, momentum: @escaping (CGFloat, CGFloat, Int64) -> Void) {
         self.post = post
@@ -309,7 +310,16 @@ final class TrackpadScroller {
                 self.pending.dx += dx * gain
                 self.pending.dy += dy * gain
             }
-            if phase == 3 { self.ending = true }
+            if phase == 3 {
+                self.ending = true
+                // Fling speed as the fingers lift: what was being scrolled per tick just now,
+                // including what's still queued (measured later, the queue's tail would make
+                // every flick look slow).
+                let n = CGFloat(max(self.recent.count, 1))
+                let sent = CGVector(dx: self.recent.reduce(0) { $0 + $1.dx } / n, dy: self.recent.reduce(0) { $0 + $1.dy } / n)
+                let queued = CGVector(dx: self.pending.dx * self.drain, dy: self.pending.dy * self.drain)
+                self.liftVelocity = hypot(queued.dx, queued.dy) > hypot(sent.dx, sent.dy) ? queued : sent
+            }
             self.startTimer()
         }
     }
@@ -337,9 +347,7 @@ final class TrackpadScroller {
                 touching = false
                 ending = false
                 post(0, 0, 3)
-                // Release velocity: the average of the last few ticks (~50 ms).
-                let n = CGFloat(max(recent.count, 1))
-                velocity = CGVector(dx: recent.reduce(0) { $0 + $1.dx } / n, dy: recent.reduce(0) { $0 + $1.dy } / n)
+                velocity = liftVelocity
                 if hypot(velocity.dx, velocity.dy) > 1.5 {
                     coasting = true
                     momentum(velocity.dx, velocity.dy, 1)
