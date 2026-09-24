@@ -12,17 +12,29 @@ import Carbon.HIToolbox
 /// the Mac side once Linux has taken the drag over.
 final class DragBridge: NSObject, NSDraggingSource {
     private var panel: NSPanel?
-    private var pendingFiles: [URL] = []
+    /// Something dropped from Linux.
+    enum Item: CustomStringConvertible {
+        case file(URL), link(URL), text(String)
+        var description: String {
+            switch self {
+            case .file(let u): return u.lastPathComponent
+            case .link(let u): return u.absoluteString
+            case .text(let t): return "text (\(t.count) chars)"
+            }
+        }
+    }
+
+    private var pending: [Item] = []
     private var dragChangeCount = NSPasteboard(name: .drag).changeCount
     /// Files of the Mac drag in progress (for Linux to fetch on drop).
     private(set) var draggedFiles: [URL] = []
 
     // MARK: Linux → Mac
 
-    /// Drops `files` at `point` (global CG coordinates, top-left origin). Main thread only.
-    func drop(files: [URL], at point: CGPoint) {
-        guard !files.isEmpty else { return }
-        pendingFiles = files
+    /// Drops `items` at `point` (global CG coordinates, top-left origin). Main thread only.
+    func drop(_ items: [Item], at point: CGPoint) {
+        guard !items.isEmpty else { return }
+        pending = items
         // NSScreen coordinates are bottom-left based.
         let primaryHeight = NSScreen.screens.first?.frame.maxY ?? 0
         let size: CGFloat = 6
@@ -59,9 +71,21 @@ final class DragBridge: NSObject, NSDraggingSource {
     }
 
     fileprivate func beginDrag(from view: NSView, event: NSEvent) {
-        let items = pendingFiles.map { url -> NSDraggingItem in
-            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
-            item.setDraggingFrame(NSRect(x: 0, y: 0, width: 32, height: 32), contents: NSWorkspace.shared.icon(forFile: url.path))
+        let items = pending.map { it -> NSDraggingItem in
+            let writer: NSPasteboardWriting, icon: NSImage
+            switch it {
+            case .file(let url):
+                writer = url as NSURL
+                icon = NSWorkspace.shared.icon(forFile: url.path)
+            case .link(let url):
+                writer = url as NSURL
+                icon = NSImage(systemSymbolName: "link", accessibilityDescription: nil) ?? NSImage()
+            case .text(let text):
+                writer = text as NSString
+                icon = NSImage(systemSymbolName: "doc.plaintext", accessibilityDescription: nil) ?? NSImage()
+            }
+            let item = NSDraggingItem(pasteboardWriter: writer)
+            item.setDraggingFrame(NSRect(x: 0, y: 0, width: 32, height: 32), contents: icon)
             return item
         }
         view.beginDraggingSession(with: items, event: event, source: self)

@@ -1780,12 +1780,20 @@ impl SeatHandler for App {
 impl DataDeviceHandler for App {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice, x: f64, y: f64, surface: &wl_surface::WlSurface) {
         let Some(offer) = self.dnd_device.as_ref().and_then(|d| d.data().drag_offer()) else { return };
-        // Files dragged onto a Mac window (not our own drag coming back in).
-        let files = offer.with_mime_types(|m| m.iter().any(|t| t == "text/uri-list"));
+        // Files, images, links or text dragged onto a Mac window (not our own drag coming back).
+        let mimes = offer.with_mime_types(|m| m.to_vec());
+        let accept = crate::clipboard::drop_mime(&mimes);
+        log::debug!("drag entered with {mimes:?}");
         match self.wid_for(surface) {
-            Some(wid) if files && self.drag_source.is_none() => {
+            // A drag out of a Mac window landing on another one: the Mac drops its own files.
+            Some(wid) if self.drag_source.is_some() => {
                 offer.accept_mime_type(offer.serial, Some("text/uri-list".into()));
-                offer.set_actions(DndAction::Copy, DndAction::Copy);
+                offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
+                self.dnd_target = Some((wid, x, y));
+            }
+            Some(wid) if accept.is_some() => {
+                offer.accept_mime_type(offer.serial, accept);
+                offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
                 self.dnd_target = Some((wid, x, y));
             }
             _ => {
@@ -1812,23 +1820,43 @@ impl DataDeviceHandler for App {
         else {
             return;
         };
-        let Ok(mut pipe) = offer.receive("text/uri-list".into()) else { return };
+        if self.drag_source.is_some() {
+            log::info!("Mac drag dropped on Mac window {wid}");
+            self.send(W::new(t::DRAG_DROP_LOCAL).u32(wid).f32(x as f32).f32(y as f32).finish());
+            offer.finish();
+            offer.destroy();
+            return;
+        }
+        // Ask for every representation we might use now (the offer is finished after reading),
+        // then decide in the thread which one to send.
+        let mimes = offer.with_mime_types(|m| m.to_vec());
+        let wanted = crate::clipboard::drop_reads(&mimes);
+        let pipes: Vec<(String, _)> =
+            wanted.into_iter().filter_map(|m| offer.receive(m.clone()).ok().map(|p| (m, p))).collect();
+        if pipes.is_empty() {
+            return;
+        }
         let net = self.net.clone();
         let done = self.internal.clone();
         let _ = self.conn.flush();
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut uris = Vec::new();
-            let _ = pipe.read_to_end(&mut uris);
+            let mut data = Vec::new();
+            for (mime, mut pipe) in pipes {
+                let mut buf = Vec::new();
+                let _ = pipe.by_ref().take(crate::clipboard::MAX_BYTES as u64).read_to_end(&mut buf);
+                data.push((mime, buf));
+            }
             let _ = done.send(Internal::DropRead);
-            let files = crate::clipboard::items_from("text/uri-list", uris);
-            if files.is_empty() {
+            let items = crate::clipboard::drop_items(data);
+            if items.is_empty() {
+                log::info!("nothing usable in the drop on Mac window {wid} (offered {mimes:?})");
                 return;
             }
-            log::info!("dropping {} file(s) on Mac window {wid}", files.len());
-            let mut w = W::new(t::DROP_FILES).u32(wid).f32(x as f32).f32(y as f32).u16(files.len() as u16);
-            for f in &files {
-                w = w.str(&f.name).bytes(&f.data);
+            log::info!("dropping {:?} on Mac window {wid}", items.iter().map(|i| (&i.kind, &i.name)).collect::<Vec<_>>());
+            let mut w = W::new(t::DROP_FILES).u32(wid).f32(x as f32).f32(y as f32).u16(items.len() as u16);
+            for it in &items {
+                w = w.str(&it.kind).str(&it.name).bytes(&it.data);
             }
             let _ = net.send(NetCmd::ClipStream(w.finish()));
         });
@@ -1841,10 +1869,13 @@ impl DataOfferHandler for App {
 }
 
 impl DataSourceHandler for App {
-    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: Option<String>) {}
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, mime: Option<String>) {
+        log::info!("drag out: target accepts {mime:?}");
+    }
 
     /// A Linux app wants the files of a drag out of a Mac window: fetch them from the Mac.
-    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: String, mut fd: WritePipe) {
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, mime: String, mut fd: WritePipe) {
+        log::info!("drag out: target asks for {mime}");
         if let Some(uris) = self.drag_uris.clone() {
             std::thread::spawn(move || {
                 use std::io::Write;
@@ -1859,17 +1890,22 @@ impl DataSourceHandler for App {
     }
 
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
+        log::info!("drag out: cancelled (no target took it)");
         self.drag_source = None;
         self.drag_waiting.clear();
     }
 
-    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {}
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
+        log::info!("drag out: dropped");
+    }
 
     fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
         self.drag_source = None;
     }
 
-    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: DndAction) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, a: DndAction) {
+        log::info!("drag out: action {a:?}");
+    }
 }
 
 // --- buffers ---------------------------------------------------------------------------

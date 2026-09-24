@@ -274,7 +274,7 @@ async fn session(
                     // The dragged Mac files: save them, hand the UI a URI list.
                     let parsed = crate::clipboard::decode(&body);
                     if let Ok(items) = parsed {
-                        let offers = tokio::task::spawn_blocking(move || crate::clipboard::offers_for(&items)).await;
+                        let offers = tokio::task::spawn_blocking(move || crate::clipboard::offers_for(&items, "drags")).await;
                         let uris = offers.ok().and_then(|o| o.get("text/uri-list").map(|v| v.to_vec())).unwrap_or_default();
                         let _ = ui3.send(UiEvent::DragData(uris));
                     }
@@ -286,7 +286,7 @@ async fn session(
                 match crate::clipboard::decode(&body) {
                     Ok(items) => {
                         // Saving files can take a while; keep it off the UI thread.
-                        let offers = tokio::task::spawn_blocking(move || crate::clipboard::offers_for(&items)).await;
+                        let offers = tokio::task::spawn_blocking(move || crate::clipboard::offers_for(&items, "clipboard")).await;
                         if let Ok(offers) = offers {
                             let _ = ui3.send(UiEvent::Clipboard(offers));
                         }

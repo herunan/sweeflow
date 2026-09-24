@@ -11,6 +11,7 @@ struct Config: Codable {
     var excludeApps: [String] = []
     /// Mute the Mac's own speakers while a client is connected (sound plays on Linux instead).
     var muteMacWhileStreaming = true
+    var dimMacScreenWhileStreaming = true
 
     /// Put streamed windows on an invisible display sized to the Linux monitor (lets windows be
     /// as large as that monitor and keeps working with the lid closed). Turn off to keep windows
@@ -30,6 +31,7 @@ struct Config: Codable {
         debugPort = try c.decodeIfPresent(UInt16.self, forKey: .debugPort) ?? 0
         excludeApps = try c.decodeIfPresent([String].self, forKey: .excludeApps) ?? []
         muteMacWhileStreaming = try c.decodeIfPresent(Bool.self, forKey: .muteMacWhileStreaming) ?? d.muteMacWhileStreaming
+        dimMacScreenWhileStreaming = try c.decodeIfPresent(Bool.self, forKey: .dimMacScreenWhileStreaming) ?? d.dimMacScreenWhileStreaming
     }
 
     func allows(_ bundleId: String) -> Bool {
@@ -83,6 +85,7 @@ final class HostState {
         sessions += 1
         teardown?.cancel()
         wake.hold()
+        if config.dimMacScreenWhileStreaming { BuiltInScreen.startDimming() }
         if config.muteMacWhileStreaming && !mutedByUs {
             // Remember the user's own setting so it is restored exactly.
             DispatchQueue.global().async {
@@ -100,6 +103,10 @@ final class HostState {
     func sessionEnded() {
         sessions = max(0, sessions - 1)
         guard sessions == 0 else { return }
+        // Brightness comes back quickly (you may be back at the Mac); the rest after a grace period.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            if self?.sessions == 0 { BuiltInScreen.stopDimming() }
+        }
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.sessions == 0 else { return }
             log("no client for a while: removing virtual display, allowing sleep")
@@ -118,6 +125,7 @@ final class HostState {
 
 let host = HostState()
 Wakefulness.resetLidSleep()   // in case a previous run died while streaming
+BuiltInScreen.restore()
 
 let server = Server(identity: identity) { group, queue in Session(group: group, queue: queue, config: config) }
 do { try server.start(port: config.port) } catch { log("listen failed: \(error)"); exit(1) }

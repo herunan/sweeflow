@@ -190,24 +190,44 @@ final class Session {
                     }
                 }
             }
+        case .dragDropLocal:
+            // A drag out of one Mac window dropped on another (via Linux): drop the same files.
+            let wid = try m.u32(), x = try m.f32(), y = try m.f32()
+            guard let win = tracker.windows[wid] else { return }
+            let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
+            if win.kind == .toplevel { raise(win) }
+            DispatchQueue.main.async {
+                let files = self.drag.draggedFiles
+                log("drag between Mac windows: \(files.map(\.lastPathComponent)) → \(wid)")
+                self.drag.drop(files.map { .file($0) }, at: point)
+            }
         case .dropFiles:
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
             let n = Int(try m.u16())
-            var files: [(String, Data)] = []
-            for _ in 0..<n { files.append((try m.str(), try m.bytes())) }
+            var items: [(kind: String, name: String, data: Data)] = []
+            for _ in 0..<n { items.append((try m.str(), try m.str(), try m.bytes())) }
             guard let win = tracker.windows[wid] else { return }
             let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
             if win.kind == .toplevel { raise(win) }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let dir = FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent("Library/Caches/sweeflow/drops/\(Int(Date().timeIntervalSince1970 * 1000))")
-                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                let urls = files.compactMap { name, data -> URL? in
-                    let url = dir.appendingPathComponent((name as NSString).lastPathComponent)
-                    return (try? data.write(to: url)) != nil ? url : nil
+                var objects: [DragBridge.Item] = []
+                for it in items {
+                    switch it.kind {
+                    case "file":
+                        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                        let name = (it.name as NSString).lastPathComponent
+                        let url = dir.appendingPathComponent(name.isEmpty ? "file" : name)
+                        if (try? it.data.write(to: url)) != nil { objects.append(.file(url)) }
+                    case "url":
+                        if let url = URL(string: String(decoding: it.data, as: UTF8.self)) { objects.append(.link(url)) }
+                    default:
+                        objects.append(.text(String(decoding: it.data, as: UTF8.self)))
+                    }
                 }
-                log("drop from Linux: \(urls.map(\.lastPathComponent)) at \(point)")
-                DispatchQueue.main.async { self?.drag.drop(files: urls, at: point) }
+                log("drop from Linux: \(objects) at \(point)")
+                DispatchQueue.main.async { self?.drag.drop(objects, at: point) }
             }
         case .clipboard:
             let n = Int(try m.u16())

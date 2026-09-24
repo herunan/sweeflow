@@ -50,11 +50,12 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x33 | C→S | Key | u32 evdevKeycode, u8 pressed |
 | 0x34 | C→S | ReleaseAll | (no payload) — client lost focus; release held keys/buttons |
 | 0x40 | both | Clipboard | u16 n, n × (str kind, str name, bytes data) — kind `text/plain;charset=utf-8`, `image/png` or `file` (name = file name; folders as .zip). Sent on the clipboard stream. |
-| 0x46 | C→S | DropFiles | u32 wid, f32 x, f32 y, u16 n, n × (str name, bytes data) — files dropped on a window (clipboard stream) |
+| 0x46 | C→S | DropFiles | u32 wid, f32 x, f32 y, u16 n, n × (str kind, str name, bytes data) — dropped on a window (clipboard stream); kind `file`, `url` or `text/plain;charset=utf-8` |
 | 0x47 | S→C | DragBegan | u32 wid, u16 n, n × str name — a file drag started in a Mac window |
 | 0x48 | C→S | DragTaken | u32 wid — Linux took the drag over; cancel it on the Mac |
 | 0x49 | C→S | DragFetch | — send the dragged files (clipboard stream) |
 | 0x4A | S→C | DragData | u16 n, n × (str kind, str name, bytes data) — the dragged files (clipboard stream) |
+| 0x4B | C→S | DragDropLocal | u32 wid, f32 x, f32 y — a drag out of a Mac window was dropped on another Mac window: drop the dragged files there |
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 
