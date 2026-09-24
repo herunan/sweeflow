@@ -25,6 +25,14 @@ final class DragBridge: NSObject, NSDraggingSource {
     }
 
     private var pending: [Item] = []
+
+    /// True while a drop is being replayed (pointer input from Linux is held off meanwhile).
+    static var replaying: Bool { replayLock.lock(); defer { replayLock.unlock() }; return DispatchTime.now() < replayUntil }
+    private static let replayLock = NSLock()
+    private static var replayUntil = DispatchTime.now()
+    private static func replay(for seconds: Double) {
+        replayLock.lock(); replayUntil = .now() + seconds; replayLock.unlock()
+    }
     private var dragChangeCount = NSPasteboard(name: .drag).changeCount
     /// Files of the Mac drag in progress (for Linux to fetch on drop).
     private(set) var draggedFiles: [URL] = []
@@ -48,26 +56,31 @@ final class DragBridge: NSObject, NSDraggingSource {
         p.orderFrontRegardless()
         panel = p
 
-        // Press on our panel (starts the drag), wiggle so AppKit registers dragging, release
-        // at the drop point once the panel is out of the way.
+        // Press on our panel (starts the drag), then move around the drop point like a hand
+        // would, one event per frame, so the app underneath sees the drag enter and settle
+        // before the release. Too fast and some apps miss the drop.
         let src = CGEventSource(stateID: .hidSystemState)
         func post(_ type: CGEventType, _ at: CGPoint) {
             CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: .left)?.post(tap: .cghidEventTap)
         }
+        let path: [CGVector] = [.init(dx: 2, dy: 0), .init(dx: 5, dy: 1), .init(dx: 9, dy: 2), .init(dx: 12, dy: 3), .init(dx: 10, dy: 2),
+                                .init(dx: 7, dy: 1), .init(dx: 4, dy: 1), .init(dx: 2, dy: 0), .init(dx: 1, dy: 0), .init(dx: 0, dy: 0)]
         post(.mouseMoved, point)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            post(.leftMouseDown, point)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                for dx in [3.0, 6.0, 9.0, 6.0, 3.0] { post(.leftMouseDragged, CGPoint(x: point.x + dx, y: point.y)) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                    post(.leftMouseDragged, point)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        post(.leftMouseUp, point)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.panel?.orderOut(nil); self.panel = nil }
-                    }
-                }
-            }
+        var t = 0.05
+        DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseDown, point) }
+        t += 0.1
+        for v in path {
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseDragged, CGPoint(x: point.x + v.dx, y: point.y + v.dy)) }
+            t += 0.016
         }
+        // Rest on the target (spring-loaded folders, drop highlights), then release.
+        for _ in 0..<4 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseDragged, point) }
+            t += 0.04
+        }
+        Self.replay(for: t + 0.1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseUp, point) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + t + 0.5) { self.panel?.orderOut(nil); self.panel = nil }
     }
 
     fileprivate func beginDrag(from view: NSView, event: NSEvent) {

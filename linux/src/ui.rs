@@ -493,7 +493,11 @@ impl App {
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
             UiEvent::Clipboard(offers) => self.set_clipboard(offers, qh),
             UiEvent::DragBegan { wid, names } => {
-                log::info!("Mac drag in {wid}: {names:?}");
+                log::info!(
+                    "Mac drag in {wid}: {names:?} (button {}, pointer over {})",
+                    if self.left_down == Some(wid) { "held" } else { "already released" },
+                    self.pointer_at.0
+                );
                 self.mac_drag = Some(wid);
                 self.maybe_take_drag(qh);
             }
@@ -1786,11 +1790,15 @@ impl DataDeviceHandler for App {
                 self.dnd_target = Some((wid, x, y));
             }
             Some(wid) if accept.is_some() => {
+                log::info!("drag from Linux entered Mac window {wid} (will drop {accept:?})");
                 offer.accept_mime_type(offer.serial, accept);
                 offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Copy);
                 self.dnd_target = Some((wid, x, y));
             }
-            _ => {
+            other => {
+                if other.is_some() {
+                    log::info!("drag from Linux refused: nothing usable in {mimes:?}");
+                }
                 offer.accept_mime_type(offer.serial, None);
                 self.dnd_target = None;
             }

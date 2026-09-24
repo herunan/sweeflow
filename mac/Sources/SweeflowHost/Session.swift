@@ -315,7 +315,8 @@ final class Session {
 
         case .pointerMove:
             let (wid, p) = try pointerTarget(&m)
-            if let p { ensureFront(wid, at: p); input.move(to: p) }
+            // A drop from Linux is being replayed with the Mac's own pointer: don't pull it away.
+            if let p, !DragBridge.replaying { ensureFront(wid, at: p); input.move(to: p) }
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
