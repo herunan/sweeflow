@@ -92,9 +92,24 @@ final class WindowTracker {
                 seen[wid] = w
                 order.append(wid)
             } else if layer < 1000, bounds.width >= 4, bounds.height >= 4 {
-                w.kind = .popup
+                // Below the menu-bar level (24) are floating panels, utility and modal panel
+                // windows (reminders, palettes, inspectors): real windows of their own, attached
+                // to the app. Above are menus, popovers and tooltips.
+                w.kind = layer < 24 ? .dialog : .popup
                 popups.append(w)
             }
+        }
+        // Capture badges on floating windows aren't always marked unshareable: recognise them by
+        // their fixed size, sitting at the top-left of another window of the same app.
+        let candidates = popups
+        popups.removeAll { p in
+            guard (60...72).contains(p.frame.width), (17...23).contains(p.frame.height) else { return false }
+            let others = candidates.filter { $0.wid != p.wid && $0.pid == p.pid } + Array(seen.values.filter { $0.pid == p.pid })
+            guard others.contains(where: { abs($0.frame.minX - p.frame.minX) < 30 && abs($0.frame.minY - p.frame.minY) < 30 }) else {
+                return false
+            }
+            badges[p.pid, default: []].append(p.frame)
+            return true
         }
         for var p in popups {
             // Menus from the menu bar and similar have no toplevel of their own to attach to.

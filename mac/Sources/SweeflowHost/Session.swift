@@ -244,7 +244,7 @@ final class Session {
     /// inject events at its location.
     private func ensureFront(_ wid: UInt32, at p: CGPoint) {
         guard let win = tracker.windows[wid] else { return }
-        if win.kind == .popup { return }
+        if win.kind != .toplevel { return }   // menus and floating panels are already on top
         if raisedWid == wid && tracker.isFrontmost(wid, at: p) { return }
         if !tracker.isFrontmost(wid, at: p) { raise(win) }
         raisedWid = wid
