@@ -439,6 +439,12 @@ impl App {
                 log::info!("connected to {name}");
                 self.connected = true;
                 self.send_screen_size();
+                // The Mac may have restarted and forgotten where windows sit here.
+                for w in self.windows.values() {
+                    if let Some((x, y)) = w.linux_pos {
+                        let _ = self.net.send(NetCmd::Control(W::new(t::WINDOW_POSITION).u32(w.info.wid).f32(x as f32).f32(y as f32).finish()));
+                    }
+                }
                 // Windows from before a reconnect are kept (so tiling positions survive a Wi-Fi
                 // blip) unless the Mac doesn't re-announce them shortly.
                 for w in self.windows.values_mut() {
@@ -719,7 +725,8 @@ impl App {
             return;
         }
         if let Some((_, at)) = w.requested {
-            if at.elapsed() < Duration::from_millis(1500) {
+            let wait = if matches!(w.role, Role::Toplevel(_)) && !w.floating { 3000 } else { 1500 };
+            if at.elapsed() < Duration::from_millis(wait) {
                 return;
             }
         }
@@ -739,7 +746,15 @@ impl App {
                 w.size = mac;
                 self.draw_base(wid, qh);
             }
-            _ => {}
+            Role::Toplevel(_) => {
+                // Tiled here, but the app resized itself on the Mac (a browser does, e.g. on opening
+                // a tab): ask again for the size it has here. At most every few seconds, so an
+                // app that can't be that small (Terminal snaps to character cells) isn't nagged.
+                let size = w.size;
+                w.requested = Some((size, Instant::now()));
+                log::info!("window {wid}: {}x{} on the Mac, {}x{} here: asking again", mac.0, mac.1, size.0, size.1);
+                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+            }
         }
     }
 

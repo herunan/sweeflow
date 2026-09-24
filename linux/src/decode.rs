@@ -37,6 +37,8 @@ struct AVDRMFrameDescriptor {
 type libc_int = std::os::raw::c_int;
 
 pub const DRM_FORMAT_NV12: u32 = u32::from_le_bytes(*b"NV12");
+pub const DRM_FORMAT_P010: u32 = u32::from_le_bytes(*b"P010");
+const DRM_FORMAT_R16: u32 = u32::from_le_bytes(*b"R16 ");
 
 pub struct Plane {
     pub fd: RawFd,
@@ -177,7 +179,14 @@ impl Decoder {
                     });
                 }
             }
-            let format = if desc.nb_layers == 1 { desc.layers[0].format } else { DRM_FORMAT_NV12 };
+            // Two single-plane layers: R8 + GR88 is NV12, R16 + GR1616 is P010 (10-bit video).
+            let format = if desc.nb_layers == 1 {
+                desc.layers[0].format
+            } else if desc.layers[0].format == DRM_FORMAT_R16 {
+                DRM_FORMAT_P010
+            } else {
+                DRM_FORMAT_NV12
+            };
             Ok(GpuFrame {
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,

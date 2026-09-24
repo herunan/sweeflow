@@ -578,6 +578,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // sRGB, so any other curve makes VideoToolbox shift every pixel's brightness.
             kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_sRGB,
             kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            // A ceiling on how coarse any frame may get: the encoder otherwise starves flat
+            // areas, turning smooth UI gradients into blocks.
+            kVTCompressionPropertyKey_MaxAllowedFrameQP: 30,
         ]
         for (k, v) in props {
             let r = VTSessionSetProperty(s, key: k, value: v as CFTypeRef)

@@ -35,7 +35,8 @@ final class Session {
     private var vdArea: CGRect?
     /// The virtual display's full bounds (the area plus the menu bar above it).
     private var vdBounds: CGRect?
-    /// Where windows sit on the Linux screen (points), applied here a moment later.
+    /// Where windows sit on the Linux screen (points). Kept, and applied again whenever
+    /// windows get shuffled here (the virtual display coming back, a window reappearing).
     private var linuxPositions: [UInt32: CGPoint] = [:]
     private var positionsScheduled = false
     private var started = false
@@ -326,11 +327,7 @@ final class Session {
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
             let scale = CGFloat(max(clientScale, 0.5))
             linuxPositions[wid] = CGPoint(x: x / scale, y: y / scale)
-            if !positionsScheduled {
-                positionsScheduled = true
-                // Coalesce the stream of moves during a drag.
-                queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.applyLinuxPositions() }
-            }
+            scheduleLinuxPositions()
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
             guard config.virtualDisplay else { return }
@@ -474,11 +471,19 @@ final class Session {
                     self.vdBounds = bounds
                     log("virtual display area \(area)")
                     for w in self.tracker.windows.values { self.placeOnVirtualDisplay(w) }
+                    self.scheduleLinuxPositions()
                 } else if attempt < 10 {
                     self.refreshVirtualDisplayArea(attempt: attempt + 1)
                 }
             }
         }
+    }
+
+    /// Coalesces the stream of moves during a drag.
+    private func scheduleLinuxPositions() {
+        guard !positionsScheduled else { return }
+        positionsScheduled = true
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.applyLinuxPositions() }
     }
 
     private func applyLinuxPositions() {
@@ -496,7 +501,8 @@ final class Session {
                 if !ok { log("window \(wid): can't move it to \(origin)") }
             }
         }
-        linuxPositions.removeAll()
+        // Forget windows that are gone.
+        linuxPositions = linuxPositions.filter { tracker.windows[$0.key] != nil }
     }
 
     /// Keeps a streamed window (or floating panel) fully on the virtual display: input is injected
@@ -610,9 +616,11 @@ final class Session {
 
     private func sendButtons(_ w: TrackedWindow) {
         guard w.kind == .toplevel else { return }
-        // Apps that hide the native buttons (e.g. a browser) report them outside the window.
-        let bounds = CGRect(origin: .zero, size: w.frame.size)
-        let rects = control_.buttonRects(w.wid, pid: w.pid).map { bounds.contains($0) ? $0 : .zero }
+        // Traffic lights always sit in the top-left corner. Apps that hide the native ones
+        // (e.g. a browser, which draws its own) report them elsewhere — outside the window, or inside
+        // it once it's big enough; those are ignored and the drawn ones found in the pixels.
+        let corner = CGRect(x: 0, y: 0, width: min(160, w.frame.width), height: min(80, w.frame.height))
+        let rects = control_.buttonRects(w.wid, pid: w.pid).map { corner.contains($0) ? $0 : .zero }
         // A transient failure (window mid-move) must not wipe known-good positions.
         if rects.allSatisfy({ $0 == .zero }), sentButtons[w.wid]?.contains(where: { $0 != .zero }) == true {
             return
@@ -638,6 +646,7 @@ final class Session {
         tracker.onAdded = { [weak self] w in
             self?.minimized[w.wid] = nil
             self?.placeOnVirtualDisplay(w)
+            if self?.linuxPositions[w.wid] != nil { self?.scheduleLinuxPositions() }
             self?.sendAdded(w)
         }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
