@@ -432,35 +432,46 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
 }
 
 /// Plays the Mac's audio through PipeWire (`pw-cat`), as its own "sweeflow" stream in the mixer.
+///
+/// The player runs as a transient systemd user unit reading a FIFO, not as our child: KDE's
+/// taskbar marks every window of the process tree that plays audio, and all Mac windows belong
+/// to this process, so a child player would put a speaker badge on every Mac app.
 async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     use std::io::Write;
-    let child = std::process::Command::new("pw-cat")
-        .args(["--playback", "--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms"])
-        .args(["-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .spawn();
+    let fifo = crate::launchers::socket_path().with_file_name("sweeflow-audio.fifo");
+    let _ = std::fs::remove_file(&fifo);
+    if !std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|s| s.success()) {
+        log::warn!("audio disabled: cannot create {}", fifo.display());
+        return;
+    }
+    const UNIT: &str = "sweeflow-audio";
+    let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).status();
+    let started = std::process::Command::new("systemd-run")
+        .args(["--user", "--quiet", "--collect", "--unit", UNIT, "pw-cat", "--playback", "--raw"])
+        .args(["--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms"])
+        .args(["-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }"])
+        .arg(&fifo)
+        .status();
+    if !started.is_ok_and(|s| s.success()) {
+        log::warn!("audio disabled: cannot start pw-cat");
+        return;
+    }
     /// Stops the player however this task ends (including being aborted on disconnect).
-    struct Player(std::process::Child);
+    struct Player;
     impl Drop for Player {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).status();
         }
     }
-    let mut child = match child {
-        Ok(c) => Player(c),
-        Err(e) => {
-            log::warn!("audio disabled: cannot start pw-cat ({e})");
-            return;
-        }
-    };
-    // Blocking pipe writes happen on their own thread so the network reader never stalls.
+    let _player = Player;
+
+    // Blocking FIFO writes happen on their own thread so the network reader never stalls.
     let (tx, prx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
-    let mut stdin = child.0.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
+        // Opening blocks until pw-cat opens its end.
+        let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
         while let Ok(pcm) = prx.recv() {
-            if stdin.write_all(&pcm).is_err() {
+            if pipe.write_all(&pcm).is_err() {
                 break;
             }
         }
@@ -475,7 +486,6 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
         let _ = tx.try_send(pcm);
     }
     drop(tx);
-    drop(child);
     let _ = writer.join();
 }
 
