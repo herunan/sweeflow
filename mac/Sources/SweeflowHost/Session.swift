@@ -479,6 +479,47 @@ final class Session {
         return "cg frame \(w.frame)\n" + control_.debugDescribe(wid, pid: w.pid)
     }
 
+    /// A two-finger flick at global point (x, y), reporting the scroll position under it before,
+    /// right after the fingers lift and once the glide is over.
+    func debugScroll(x: Double, y: Double, reply: @escaping (String) -> Void) {
+        let p = CGPoint(x: x, y: y)
+        func position() -> String {
+            var el: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(x), Float(y), &el) == .success, var e = el else { return "?" }
+            for _ in 0..<12 {
+                var role: CFTypeRef?
+                AXUIElementCopyAttributeValue(e, kAXRoleAttribute as CFString, &role)
+                if (role as? String) == kAXScrollAreaRole {
+                    var bar: CFTypeRef?
+                    AXUIElementCopyAttributeValue(e, kAXVerticalScrollBarAttribute as CFString, &bar)
+                    var v: CFTypeRef?
+                    if let bar { AXUIElementCopyAttributeValue(bar as! AXUIElement, kAXValueAttribute as CFString, &v) }
+                    return "\(v ?? "none" as CFTypeRef)"
+                }
+                var parent: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(e, kAXParentAttribute as CFString, &parent) == .success, let par = parent else { break }
+                e = par as! AXUIElement
+            }
+            return "no scroll area"
+        }
+        let before = position()
+        input.scroll(dx: 0, dy: 0, unit: 1, phase: 1, at: p)
+        for i in 0..<8 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.011 * Double(i + 1)) { self.input.scroll(dx: 0, dy: -25, unit: 1, phase: 2, at: p) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.input.scroll(dx: 0, dy: 0, unit: 1, phase: 3, at: p)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                let lifted = position()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    let after = position()
+                    // Scroll back where it was.
+                    reply("before \(before), at lift \(lifted), after glide \(after)")
+                }
+            }
+        }
+    }
+
     func debugPause(_ on: Bool, placeholder: Bool = false) {
         queue.async { self.streamers.values.forEach { $0.setScreenLocked(on, placeholder: placeholder) } }
     }

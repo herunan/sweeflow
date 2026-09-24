@@ -950,6 +950,7 @@ impl App {
 
     /// The window's alpha changed (or it's opaque again).
     fn set_alpha(&mut self, wid: u32, width: u32, height: u32, plane: Option<Vec<u8>>, qh: &QueueHandle<Self>) {
+        log::debug!("window {wid}: alpha message {width}x{height} {}", if plane.is_some() { "mask" } else { "opaque" });
         let Some(w) = self.windows.get_mut(&wid) else { return };
         if !matches!(w.role, Role::Toplevel(_)) {
             return;
@@ -976,6 +977,20 @@ impl App {
         if let Err(e) = gpu.upload_mask(&mut g.mask, width, height, &plane) {
             log::warn!("window {wid}: alpha upload failed: {e:#}");
             return;
+        }
+        if first || self.trace {
+            // Where the translucency is (bounding box, share of the window).
+            let (mut x0, mut y0, mut x1, mut y1, mut n) = (width, height, 0, 0, 0usize);
+            for (i, a) in plane.iter().enumerate() {
+                if *a < 250 {
+                    let (x, y) = (i as u32 % width, i as u32 / width);
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                    n += 1;
+                }
+            }
+            let mean = plane.iter().map(|&a| a as u64).sum::<u64>() / plane.len().max(1) as u64;
+            log::info!("window {wid}: alpha {width}x{height}: {:.1}% translucent in ({x0},{y0})-({x1},{y1}), mean alpha {mean}",
+                       n as f64 * 100.0 / plane.len().max(1) as f64);
         }
         if first {
             log::info!("window {wid}: has glass ({width}x{height})");

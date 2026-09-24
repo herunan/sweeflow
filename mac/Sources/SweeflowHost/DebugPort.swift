@@ -113,6 +113,9 @@ final class DebugPort {
                     }
                 }
             }
+        case "scroll" where p.count == 3:
+            guard let s = session, let x = Double(p[1]), let y = Double(p[2]) else { return reply("usage: scroll x y") }
+            s.debugScroll(x: x, y: y, reply: reply)
         case "pause" where p.count == 2:
             // Preview the locked look: pause on|off.
             session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")

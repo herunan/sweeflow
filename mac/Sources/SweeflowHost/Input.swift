@@ -81,41 +81,71 @@ final class InputInjector {
         post: { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase) },
         momentum: { [weak self] dx, dy, phase in self?.postMomentum(dx: dx, dy: dy, phase: phase) })
 
-    /// Glide after the fingers lift: momentumPhase 1 begin, 2 continue, 3 end (no scroll phase).
-    private func postMomentum(dx: CGFloat, dy: CGFloat, phase: Int64) {
-        guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
-                              wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0) else { return }
-        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(dy))
-        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Double(dx))
-        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(dy))
-        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: Double(dx))
-        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: 0)
-        e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase)
-        post(e)
-    }
-
     /// How far one wheel notch scrolls when turned slowly, in points (about three lines).
     static let pointsPerNotch: CGFloat = 40
     private var lastNotchAt: CFTimeInterval = 0
     private var notchRate: Double = 0
     private let wheelAccel = ScrollAcceleration.load(.mouse)
 
-    private lazy var wheel = SmoothWheel { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase) }
+    private lazy var wheel = SmoothWheel { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase, gesture: false) }
 
-    /// A continuous (trackpad-style) scroll event: phase 1 began, 2 changed, 3 ended.
-    private func postPixelScroll(dx: CGFloat, dy: CGFloat, phase: UInt8) {
-        guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
-                              wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0) else { return }
+    /// Scroll events as an Apple trackpad makes them (after Mac Mouse Fix's GestureScrollSimulator):
+    /// each scroll event (type 22) of a gesture is paired with a gesture event (type 29, subtype
+    /// 6 = kIOHIDEventTypeScroll). AppKit needs the pair for momentum, rubber-banding and swipes
+    /// (e.g. Mail's swipe to mark as read); plain scroll events only scroll.
+    ///
+    /// `phase`: 4 may begin (fingers down), 1 began, 2 changed, 3 ended, 5 cancelled. `gesture`: false for the
+    /// mouse wheel glide (no gesture events, like a mouse).
+    private func postPixelScroll(dx: CGFloat, dy: CGFloat, phase: UInt8, gesture: Bool = true) {
+        let hidPhase: Int64 = switch phase { case 4: 128; case 1: 1; case 2: 2; case 3: 4; case 5: 8; default: 0 }
+        postScroll22(dx: dx, dy: dy, phase: hidPhase, momentum: 0)
+        guard gesture, hidPhase != 0, let g = CGEvent(source: nil) else { return }
+        g.setIntegerValueField(CGEventField(rawValue: 55)!, value: 29)    // NSEventTypeGesture
+        g.setIntegerValueField(CGEventField(rawValue: 110)!, value: 6)    // subtype: scroll
+        g.setDoubleValueField(CGEventField(rawValue: 116)!, value: dx == 0 ? -0.0 : Double(dx) * 1.67)
+        g.setDoubleValueField(CGEventField(rawValue: 119)!, value: dy == 0 ? -0.0 : Double(dy) * 1.67)
+        g.setIntegerValueField(CGEventField(rawValue: 132)!, value: hidPhase)
+        g.post(tap: .cgSessionEventTap)
+    }
+
+    /// Glide after the fingers lift: momentumPhase 1 begin, 2 continue, 3 end (no scroll phase).
+    private func postMomentum(dx: CGFloat, dy: CGFloat, phase: Int64) {
+        postScroll22(dx: dx, dy: dy, phase: 0, momentum: phase)
+    }
+
+    /// Sub-pixel remainders, so whole-pixel point deltas add up exactly.
+    private var pixelCarry = CGVector.zero
+    /// macOS "natural" scrolling: tells apps the deltas are inverted from the device (Mail's
+    /// swipe directions follow it).
+    private lazy var naturalScrolling: Bool =
+        (CFPreferencesCopyAppValue("com.apple.swipescrolldirection" as CFString, kCFPreferencesAnyApplication) as? Bool) ?? true
+
+    private func postScroll22(dx: CGFloat, dy: CGFloat, phase: Int64, momentum: Int64) {
+        guard let e = CGEvent(source: nil) else { return }
+        pixelCarry.dx += dx
+        pixelCarry.dy += dy
+        let px = pixelCarry.dx.rounded(.towardZero), py = pixelCarry.dy.rounded(.towardZero)
+        pixelCarry.dx -= px
+        pixelCarry.dy -= py
+        if phase == 128 || momentum == 3 || phase == 4 { pixelCarry = .zero }
+        func lineInt(_ v: CGFloat) -> Int64 {
+            // As the trackpad driver: fractions up to one line round away from zero.
+            let l = v / 10
+            return Int64(abs(l) <= 1 ? (l > 0 ? ceil(l) : floor(l)) : (l > 0 ? floor(l) : ceil(l)))
+        }
+        e.setIntegerValueField(CGEventField(rawValue: 55)!, value: 22)    // NSEventTypeScrollWheel
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-        // Fixed-point deltas keep sub-pixel precision.
-        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(dy))
-        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Double(dx))
-        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(dy))
-        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: Double(dx))
-        let phaseValue: Int64 = switch phase { case 1: 1; case 2: 2; case 3: 4; default: 0 }
-        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phaseValue)
-        post(e)
+        e.setIntegerValueField(CGEventField(rawValue: 137)!, value: naturalScrolling ? 1 : 0)
+        e.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: lineInt(py))
+        e.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(py))
+        e.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Int64((dy / 10 * 65536).rounded()))
+        e.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: lineInt(px))
+        e.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(px))
+        e.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Int64((dx / 10 * 65536).rounded()))
+        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+        e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
+        e.location = lastPoint
+        e.post(tap: .cgSessionEventTap)
     }
 
     func key(evdev code: UInt32, pressed: Bool, isRepeat: Bool = false) {
@@ -272,6 +302,7 @@ final class TrackpadScroller {
     private var recent: [CGVector] = []
     private var velocity = CGVector.zero
     private var liftVelocity = CGVector.zero
+    private var moved = false
     private var coasting = false
     /// The Mac's trackpad acceleration and its running velocity.
     private let accel = ScrollAcceleration.load(.trackpad)
@@ -298,7 +329,8 @@ final class TrackpadScroller {
                 self.pending = .zero
                 self.recent = []
                 self.fingerSpeed.reset()
-                self.post(0, 0, 1)
+                self.moved = false
+                self.post(0, 0, 4)   // may begin: fingers down
             }
             // The Mac's acceleration for this movement, from the average of the last few
             // (Linux reports roughly 0.4 of the Mac trackpad's units per point of travel).
@@ -340,12 +372,20 @@ final class TrackpadScroller {
             if abs(pending.dy) < 0.5 { out.dy = pending.dy }
             pending.dx -= out.dx
             pending.dy -= out.dy
-            if out.dx != 0 || out.dy != 0 { post(out.dx, out.dy, 2) }
+            if out.dx != 0 || out.dy != 0 {
+                post(out.dx, out.dy, moved ? 2 : 1)   // the first movement begins the gesture
+                moved = true
+            }
             recent.append(out)
             if recent.count > 6 { recent.removeFirst() }
             if ending && pending == .zero {
                 touching = false
                 ending = false
+                guard moved else {
+                    post(0, 0, 5)   // touched and lifted without scrolling
+                    stopTimer()
+                    return
+                }
                 post(0, 0, 3)
                 velocity = liftVelocity
                 if hypot(velocity.dx, velocity.dy) > 1.5 {

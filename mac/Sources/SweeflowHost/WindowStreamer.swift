@@ -1055,9 +1055,11 @@ final class AlphaMask {
         if !glass && isGlass {
             glass = true
             hash = 0
+            log(String(format: "alpha: %dx%d has glass (%.1f%% translucent)", w, h, Double(translucent) * 100 / Double(w * h)))
         } else if glass && opaqueFrames > 60 {
             // Opaque for a while (a second or more): back to plain video.
             glass = false
+            log("alpha: \(w)x\(h) opaque again")
             var m = MsgWriter(.alpha)
             m.u16(UInt16(w)); m.u16(UInt16(h)); m.u8(0); m.bytes(Data())
             pending = m
