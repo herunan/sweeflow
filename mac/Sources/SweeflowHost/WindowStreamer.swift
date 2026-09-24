@@ -227,7 +227,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             if let r = contentRect {
                 let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
-                let cw = r.width * contentScale * scaleFactor, ch = r.height * contentScale * scaleFactor
+                let cw = r.width * scaleFactor, ch = r.height * scaleFactor
                 if abs(cw - bw) > 2 || abs(ch - bh) > 2 {
                     self.mismatchLogs += 1
                     if self.mismatchLogs <= 5 {
@@ -273,6 +273,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.pendingCorners = (t, tiles)
                 }
                 fillCorners(pb, radiusPx: Int(28 * self.scale))
+                fillEdges(pb, ring: max(2, Int(self.scale)))
                 // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
                 // drops alpha, which would leave them darkened. Restore their real colour.
                 unpremultiply(pb)
@@ -648,6 +649,30 @@ func debugDumpTile(_ tiles: Data, t: Int, name: String) {
         }
     }
     try? rep.representation(using: .png, properties: [:])?.write(to: Identity.dir.appendingPathComponent(name))
+}
+
+/// The window's outermost pixels are a partly transparent border; with alpha dropped by the
+/// encoder they'd show as black lines along the edges. Composite them (premultiplied) over the
+/// colour just inside, keeping the border's highlight.
+func fillEdges(_ pb: CVPixelBuffer, ring: Int) {
+    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rowBytes = CVPixelBufferGetBytesPerRow(pb)
+    guard w > 2 * ring + 2, h > 2 * ring + 2 else { return }
+    func fix(_ x: Int, _ y: Int, _ ix: Int, _ iy: Int) {
+        let p = base + y * rowBytes + x * 4
+        let a = Int(p[3])
+        guard a < 255 else { return }
+        let q = base + iy * rowBytes + ix * 4
+        for c in 0..<3 { p[c] = UInt8(min(255, Int(p[c]) + Int(q[c]) * (255 - a) / 255)) }
+        p[3] = 255
+    }
+    for d in 0..<ring {
+        for x in 0..<w { fix(x, d, x, ring); fix(x, h - 1 - d, x, h - 1 - ring) }
+        for y in 0..<h { fix(d, y, ring, y); fix(w - 1 - d, y, w - 1 - ring, y) }
+    }
 }
 
 /// Premultiplied → straight BGRA in place (SIMD), so dropping alpha doesn't darken translucent
