@@ -370,7 +370,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 fillCorners(pb, radiusPx: Int(28 * self.scale))
                 fillEdges(pb, ring: max(2, Int(self.scale)))
                 // Glass (sidebars, toolbars): the video has no alpha, so it goes separately.
-                self.alpha.update(from: pb)
+                if AlphaMask.enabled { self.alpha.update(from: pb) }
                 // Translucent areas arrive premultiplied; the video carries their real colour
                 // (Linux multiplies the alpha back in, or they'd look darkened).
                 unpremultiply(pb)
@@ -1023,6 +1023,8 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
 /// translucent areas (glass sidebars, toolbars, Liquid Glass). The corners' alpha travels in
 /// the corner tiles instead.
 final class AlphaMask {
+    /// Off: the client can't show glass safely yet (see ui.rs set_alpha).
+    static let enabled = false
     private var plane = [UInt8]()
     private var hash: UInt64 = 0
     private var glass = false

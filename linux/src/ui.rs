@@ -963,8 +963,10 @@ impl App {
             }
             return;
         };
-        if std::env::var_os("SWEEFLOW_GLASS").is_none() {
-            return; // off until it's proven safe with the compositor
+        // Off: RGBA glass buffers crash KWin 6.7 (GLTexture::bind in SurfaceItem::preprocess)
+        // when windows switch between video and glass. Kept for when that's fixed upstream.
+        if std::env::var_os("SWEEFLOW_GLASS_UNSAFE").is_none() {
+            return;
         }
         if self.glass.is_none() {
             self.glass = Some(crate::glass::Glass::new(&self.render_node).map_err(|e| log::warn!("glass unavailable: {e:#}")));
