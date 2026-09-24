@@ -48,7 +48,8 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x32 | C→S | Scroll | u32 wid, f32 x, f32 y, f32 dx, f32 dy, u8 unit (0 lines, 1 pixels), u8 phase (0 none, 1 began, 2 changed, 3 ended) |
 | 0x33 | C→S | Key | u32 evdevKeycode, u8 pressed |
 | 0x34 | C→S | ReleaseAll | (no payload) — client lost focus; release held keys/buttons |
-| 0x40 | both | Clipboard | str mime, bytes data |
+| 0x40 | both | Clipboard | u16 n, n × (str kind, str name, bytes data) — kind `text/plain;charset=utf-8`, `image/png` or `file` (name = file name; folders as .zip). Sent on the clipboard stream. |
+| 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 
 `kind`: 0 = normal toplevel, 1 = popup/menu (child of `parent`), 2 = sheet/dialog.

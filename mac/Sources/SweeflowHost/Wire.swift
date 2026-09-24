@@ -7,7 +7,7 @@ enum Msg: UInt8 {
     case windowButtons = 0x16, moveStarted = 0x17, toggleMaximize = 0x18, minimize = 0x1A, menuTree = 0x1B, appList = 0x1C
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23, menuActivate = 0x24, menuRefresh = 0x25, restore = 0x26, launchApp = 0x27
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
-    case clipboard = 0x40, ping = 0x41, pong = 0x42
+    case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55
     case audioSubscribe = 0x60, audio = 0x61
 }

@@ -34,6 +34,7 @@ pub mod t {
     pub const RELEASE_ALL: u8 = 0x34;
     pub const CLIPBOARD: u8 = 0x40;
     pub const PING: u8 = 0x41;
+    pub const CLIPBOARD_SUBSCRIBE: u8 = 0x43;
     pub const PONG: u8 = 0x42;
     pub const SUBSCRIBE: u8 = 0x50;
     pub const FRAME: u8 = 0x51;

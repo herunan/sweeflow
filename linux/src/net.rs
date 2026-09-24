@@ -51,6 +51,8 @@ pub enum UiEvent {
     /// An app's menu bar (JSON from the Mac).
     MenuTree { pid: i32, json: Vec<u8> },
     Frame(u32, GpuFrame),
+    /// Mac clipboard contents, ready to offer: MIME type → bytes (files already saved).
+    Clipboard(std::collections::HashMap<String, Arc<Vec<u8>>>),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
@@ -75,6 +77,7 @@ impl UiEvent {
             UiEvent::Minimize(_) => "minimize",
             UiEvent::MenuTree { .. } => "menu tree",
             UiEvent::Frame(..) => "video frame",
+            UiEvent::Clipboard(_) => "clipboard",
             UiEvent::Corners { .. } => "corners",
             UiEvent::RawFrame { .. } => "popup frame",
         }
@@ -88,6 +91,8 @@ pub enum NetCmd {
     Unsubscribe(u32),
     /// A framed message for a window's video stream.
     Video(u32, Vec<u8>),
+    /// Linux clipboard contents for the Mac.
+    Clipboard(Vec<crate::clipboard::ClipItem>),
 }
 
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
@@ -228,6 +233,31 @@ async fn session(
         tokio::spawn(audio_task(atx, arx))
     };
 
+    // Clipboard: its own stream so large files never hold up input.
+    let (clip_tx, clip_task) = {
+        let (mut ctx, mut crx) = conn.open_bi().await?;
+        ctx.write_all(&W::new(t::CLIPBOARD_SUBSCRIBE).finish()).await?;
+        let ui3 = ui.clone();
+        let task = tokio::spawn(async move {
+            while let Ok(Some((ty, body))) = proto::read_msg(&mut crx).await {
+                if ty != t::CLIPBOARD {
+                    continue;
+                }
+                match crate::clipboard::decode(&body) {
+                    Ok(items) => {
+                        // Saving files can take a while; keep it off the UI thread.
+                        let offers = tokio::task::spawn_blocking(move || crate::clipboard::offers_for(&items)).await;
+                        if let Ok(offers) = offers {
+                            let _ = ui3.send(UiEvent::Clipboard(offers));
+                        }
+                    }
+                    Err(e) => log::warn!("bad clipboard message: {e}"),
+                }
+            }
+        });
+        (Arc::new(tokio::sync::Mutex::new(ctx)), task)
+    };
+
     let mut video: HashMap<u32, (quinn::SendStream, tokio::task::JoinHandle<()>)> = HashMap::new();
     let render_node = cfg.render_node.clone();
     let result = loop {
@@ -251,6 +281,15 @@ async fn session(
                             task.abort();
                         }
                     }
+                    NetCmd::Clipboard(items) => {
+                        let tx = clip_tx.clone();
+                        tokio::spawn(async move {
+                            let msg = crate::clipboard::encode(&items);
+                            if let Err(e) = tx.lock().await.write_all(&msg).await {
+                                log::warn!("clipboard send failed: {e}");
+                            }
+                        });
+                    }
                     NetCmd::Video(wid, m) => {
                         if let Some((tx, _)) = video.get_mut(&wid) {
                             if tx.write_all(&m).await.is_err() { video.remove(&wid); }
@@ -264,6 +303,7 @@ async fn session(
         task.abort();
     }
     audio.abort();
+    clip_task.abort();
     conn.close(0u32.into(), b"bye");
     result
 }

@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -78,6 +79,12 @@ use wayland_protocols::{
     },
 };
 
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
+    ext_data_control_manager_v1::ExtDataControlManagerV1,
+    ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
+};
 use wayland_protocols_plasma::appmenu::client::{
     org_kde_kwin_appmenu::OrgKdeKwinAppmenu, org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager,
 };
@@ -192,6 +199,13 @@ pub struct App {
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    /// Clipboard access regardless of focus (KDE's ext-data-control).
+    data_control: Option<ExtDataControlManagerV1>,
+    clip_device: Option<ExtDataControlDeviceV1>,
+    clip_source: Option<ExtDataControlSourceV1>,
+    /// Selection events to ignore: the echoes of our own set_selection.
+    clip_ignore: u32,
+    conn: Connection,
     menus: Option<Menus>,
     trace: bool,
     loop_handle: LoopHandle<'static, App>,
@@ -272,6 +286,11 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        data_control: bind_opt("ext_data_control_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        clip_device: None,
+        clip_source: None,
+        clip_ignore: 0,
+        conn: conn.clone(),
         menus: None,
         trace: std::env::var_os("SWEEFLOW_TRACE").is_some(),
         compositor,
@@ -423,6 +442,7 @@ impl App {
                 }
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
+            UiEvent::Clipboard(offers) => self.set_clipboard(offers, qh),
             UiEvent::MenuTree { pid, json } => {
                 if let Some(m) = self.menus.as_mut() {
                     m.update(pid, &json);
@@ -948,6 +968,60 @@ impl App {
                 set_menu_panel_visible(want);
             }
             TimeoutAction::Drop
+        });
+    }
+
+    /// Puts the Mac's clipboard on ours.
+    fn set_clipboard(&mut self, offers: HashMap<String, Arc<Vec<u8>>>, qh: &QueueHandle<Self>) {
+        let (Some(mgr), Some(device)) = (&self.data_control, &self.clip_device) else { return };
+        if offers.is_empty() {
+            return;
+        }
+        let mimes: Vec<String> = offers.keys().cloned().collect();
+        let source = mgr.create_data_source(qh, ClipData(offers));
+        for m in mimes {
+            source.offer(m);
+        }
+        device.set_selection(Some(&source));
+        self.clip_ignore += 1;
+        if let Some(old) = self.clip_source.replace(source) {
+            old.destroy();
+        }
+    }
+
+    /// The Linux clipboard changed: send it to the Mac (read on a thread: files can be large).
+    fn on_selection(&mut self, offer: Option<ExtDataControlOfferV1>) {
+        let Some(offer) = offer else { return };
+        if self.clip_ignore > 0 {
+            self.clip_ignore -= 1;
+            offer.destroy();
+            return;
+        }
+        let mimes = offer.data::<OfferMimes>().map(|m| m.0.lock().unwrap().clone()).unwrap_or_default();
+        let Some(mime) = crate::clipboard::pick_mime(&mimes) else {
+            offer.destroy();
+            return;
+        };
+        let Ok((mut reader, writer)) = std::io::pipe() else { return };
+        {
+            use std::os::fd::AsFd;
+            offer.receive(mime.clone(), writer.as_fd());
+        }
+        drop(writer);
+        let _ = self.conn.flush();
+        offer.destroy();
+        let net = self.net.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut data = Vec::new();
+            if reader.by_ref().take(crate::clipboard::MAX_BYTES as u64).read_to_end(&mut data).is_err() {
+                return;
+            }
+            let items = crate::clipboard::items_from(&mime, data);
+            if !items.is_empty() {
+                log::info!("clipboard to Mac: {}", mime);
+                let _ = net.send(NetCmd::Clipboard(items));
+            }
         });
     }
 
@@ -1560,6 +1634,11 @@ impl SeatHandler for App {
     }
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
         self.seat.get_or_insert(seat.clone());
+        if self.clip_device.is_none() {
+            if let Some(m) = &self.data_control {
+                self.clip_device = Some(m.get_data_device(&seat, qh, ()));
+            }
+        }
         if cap == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self
                 .seat_state
@@ -1681,6 +1760,67 @@ impl Dispatch<WpPresentationFeedback, (u32, f64)> for App {
             let ev = (shown as u64 & !0xffff_ffff) as f64 + event_ms as f64;
             log::info!("hover latency: event→commit {:.1} ms, commit→screen {:.1} ms, total {:.1} ms",
                        committed - ev, shown - committed, shown - ev);
+        }
+    }
+}
+
+/// MIME types offered by a clipboard offer.
+#[derive(Default)]
+pub struct OfferMimes(std::sync::Mutex<Vec<String>>);
+/// Our clipboard contents: MIME type → bytes.
+pub struct ClipData(HashMap<String, Arc<Vec<u8>>>);
+
+wayland_client::delegate_noop!(App: ignore ExtDataControlManagerV1);
+
+impl Dispatch<ExtDataControlDeviceV1, ()> for App {
+    fn event(app: &mut Self, dev: &ExtDataControlDeviceV1, e: ext_data_control_device_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            ext_data_control_device_v1::Event::Selection { id } => app.on_selection(id),
+            ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                if let Some(o) = id {
+                    o.destroy();
+                }
+            }
+            ext_data_control_device_v1::Event::Finished => {
+                dev.destroy();
+                app.clip_device = None;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(App, ExtDataControlDeviceV1, [
+        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, OfferMimes::default()),
+    ]);
+}
+
+impl Dispatch<ExtDataControlOfferV1, OfferMimes> for App {
+    fn event(_: &mut Self, _: &ExtDataControlOfferV1, e: ext_data_control_offer_v1::Event, d: &OfferMimes, _: &Connection, _: &QueueHandle<Self>) {
+        if let ext_data_control_offer_v1::Event::Offer { mime_type } = e {
+            d.0.lock().unwrap().push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<ExtDataControlSourceV1, ClipData> for App {
+    fn event(app: &mut Self, src: &ExtDataControlSourceV1, e: ext_data_control_source_v1::Event, d: &ClipData, _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                if let Some(bytes) = d.0.get(&mime_type).cloned() {
+                    // A paste into a slow reader must not stall the UI.
+                    std::thread::spawn(move || {
+                        use std::io::Write;
+                        let _ = std::fs::File::from(fd).write_all(&bytes);
+                    });
+                }
+            }
+            ext_data_control_source_v1::Event::Cancelled => {
+                src.destroy();
+                if app.clip_source.as_ref() == Some(src) {
+                    app.clip_source = None;
+                }
+            }
+            _ => {}
         }
     }
 }

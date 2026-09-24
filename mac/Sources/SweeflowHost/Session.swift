@@ -16,6 +16,7 @@ final class Session {
     private let input = InputInjector()
     private var streamers: [ObjectIdentifier: WindowStreamer] = [:]
     private var audio: (AudioCapture, ObjectIdentifier)?
+    private var clipboard: (ClipboardSync, MsgStream)?
     private var videoStreams: [ObjectIdentifier: MsgStream] = [:]
     private var sentIcons: Set<String> = []
     private var raisedWid: UInt32 = 0
@@ -60,6 +61,7 @@ final class Session {
             self.videoStreams[key] = nil
             if let st = self.streamers.removeValue(forKey: key) { st.stop() }
             if let (a, k) = self.audio, k == key { a.stop(); self.audio = nil }
+            if let (c, cs) = self.clipboard, ObjectIdentifier(cs) == key { c.stop(); self.clipboard = nil }
             if self.control.map({ ObjectIdentifier($0) }) == key { self.shutdown() }
         }
         s.start()
@@ -79,6 +81,8 @@ final class Session {
         streamers.removeAll()
         audio?.0.stop()
         audio = nil
+        clipboard?.0.stop()
+        clipboard = nil
         videoStreams.values.forEach { $0.close() }
         videoStreams.removeAll()
         control = nil
@@ -140,6 +144,30 @@ final class Session {
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
+        case .clipboardSubscribe:
+            clipboard?.0.stop()
+            let sync = ClipboardSync()
+            sync.onChange = { [weak self, weak s] items in
+                self?.queue.async {
+                    guard let s else { return }
+                    var m = MsgWriter(.clipboard)
+                    m.u16(UInt16(items.count))
+                    for it in items { m.str(it.kind.rawValue); m.str(it.name); m.bytes(it.data) }
+                    s.send(m)
+                    log("clipboard to Linux: \(items.map { $0.kind == .file ? $0.name : $0.kind.rawValue })")
+                }
+            }
+            sync.start()
+            clipboard = (sync, s)
+        case .clipboard:
+            let n = Int(try m.u16())
+            var items: [ClipItem] = []
+            for _ in 0..<n {
+                let kind = ClipItem.Kind(rawValue: try m.str())
+                let name = try m.str(), data = try m.bytes()
+                if let kind { items.append(ClipItem(kind: kind, name: name, data: data)) }
+            }
+            clipboard?.0.apply(items)
         case .audioSubscribe:
             audio?.0.stop()
             let cap = AudioCapture(allowed: { [config] in config.allows($0) })
