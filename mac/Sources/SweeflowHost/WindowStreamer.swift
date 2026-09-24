@@ -492,16 +492,19 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
         let p = base + y * stride + x * 4
         if p[3] > 250 { samples.append((p[0], p[1], p[2])) }
     }
-    for x in stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
-    for y in stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
+    for x in Swift.stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
+    for y in Swift.stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
     guard !samples.isEmpty else { return nil }
-    func median(_ k: (UInt8, UInt8, UInt8) -> UInt8) -> UInt8 { samples.map(k).sorted()[samples.count / 2] }
-    let (bb, bgc, br) = (median { $0.0 }, median { $0.1 }, median { $0.2 })
+    let mid = samples.count / 2
+    let bb = samples.map { $0.0 }.sorted()[mid]
+    let bgc = samples.map { $0.1 }.sorted()[mid]
+    let br = samples.map { $0.2 }.sorted()[mid]
     for y in y0..<y1 {
         let row = base + y * stride
         for x in x0..<x1 { let p = row + x * 4; p[0] = bb; p[1] = bgc; p[2] = br; p[3] = 255 }
     }
-    return (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10 < 128
+    let luminance = (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10
+    return luminance < 128
 }
 
 /// Converts a length-prefixed HEVC sample to Annex B, prepending VPS/SPS/PPS on keyframes.
