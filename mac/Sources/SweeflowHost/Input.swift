@@ -61,19 +61,31 @@ final class InputInjector {
     /// `unit` 0 = wheel lines, 1 = pixels (touchpad); `phase` 0 none, 1 began, 2 changed, 3 ended.
     func scroll(dx: CGFloat, dy: CGFloat, unit: UInt8, phase: UInt8, at p: CGPoint) {
         if p != lastPoint { move(to: p) }
-        let units: CGScrollEventUnit = unit == 0 ? .line : .pixel
-        guard let e = CGEvent(scrollWheelEvent2Source: source, units: units, wheelCount: 2,
-                              wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0) else { return }
-        if unit == 1 {
-            e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-            // Fixed-point deltas keep sub-pixel precision for smooth touchpad scrolling.
-            e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(dy))
-            e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Double(dx))
-            e.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(dy))
-            e.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: Double(dx))
-            let phaseValue: Int64 = switch phase { case 1: 1; case 2: 2; case 3: 4; default: 0 }
-            e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phaseValue)
+        if unit == 0 {
+            // Mouse wheel (in notches, fractional for high-resolution wheels): glide.
+            wheel.add(dx: dx * Self.pointsPerNotch, dy: dy * Self.pointsPerNotch)
+            return
         }
+        postPixelScroll(dx: dx, dy: dy, phase: phase)
+    }
+
+    /// How far one wheel notch scrolls, in points (about three lines of text).
+    static let pointsPerNotch: CGFloat = 60
+
+    private lazy var wheel = SmoothWheel { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase) }
+
+    /// A continuous (trackpad-style) scroll event: phase 1 began, 2 changed, 3 ended.
+    private func postPixelScroll(dx: CGFloat, dy: CGFloat, phase: UInt8) {
+        guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                              wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0) else { return }
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        // Fixed-point deltas keep sub-pixel precision.
+        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(dy))
+        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Double(dx))
+        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(dy))
+        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: Double(dx))
+        let phaseValue: Int64 = switch phase { case 1: 1; case 2: 2; case 3: 4; default: 0 }
+        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phaseValue)
         post(e)
     }
 
@@ -168,3 +180,50 @@ let evdevToMac: [UInt32: Int] = [
     // Apple keyboards' language keys on JIS/Korean layouts.
     122: kVK_JIS_Kana, 123: kVK_JIS_Eisu,
 ]
+
+/// Turns wheel notches into a short eased glide of pixel scroll events (like smooth scrolling on
+/// Linux), animated here on the Mac so network timing can't make it stutter. Notches arriving
+/// mid-glide extend it.
+final class SmoothWheel {
+    private let post: (CGFloat, CGFloat, UInt8) -> Void
+    private let queue = DispatchQueue(label: "smooth-wheel", qos: .userInteractive)
+    private var remaining = CGVector.zero
+    private var timer: DispatchSourceTimer?
+    /// Share of the remaining distance covered per 120 Hz tick: ~95 % in about 130 ms.
+    private let step: CGFloat = 0.2
+
+    init(post: @escaping (CGFloat, CGFloat, UInt8) -> Void) { self.post = post }
+
+    func add(dx: CGFloat, dy: CGFloat) {
+        queue.async {
+            // Reversing direction drops what's left of the old glide.
+            if self.remaining.dy * dy < 0 { self.remaining.dy = 0 }
+            if self.remaining.dx * dx < 0 { self.remaining.dx = 0 }
+            self.remaining.dx += dx
+            self.remaining.dy += dy
+            guard self.timer == nil else { return }
+            self.post(0, 0, 1)
+            let t = DispatchSource.makeTimerSource(queue: self.queue)
+            t.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / 120), leeway: .microseconds(500))
+            t.setEventHandler { [weak self] in self?.tick() }
+            t.resume()
+            self.timer = t
+        }
+    }
+
+    private func tick() {
+        var dx = remaining.dx * step, dy = remaining.dy * step
+        // Don't crawl at the tail: at least half a point per tick, then finish.
+        if abs(dx) < 0.5 { dx = abs(remaining.dx) < 0.5 ? remaining.dx : (remaining.dx < 0 ? -0.5 : 0.5) }
+        if abs(dy) < 0.5 { dy = abs(remaining.dy) < 0.5 ? remaining.dy : (remaining.dy < 0 ? -0.5 : 0.5) }
+        remaining.dx -= dx
+        remaining.dy -= dy
+        if dx != 0 || dy != 0 { post(dx, dy, 2) }
+        if abs(remaining.dx) < 0.01 && abs(remaining.dy) < 0.01 {
+            remaining = .zero
+            post(0, 0, 3)
+            timer?.cancel()
+            timer = nil
+        }
+    }
+}

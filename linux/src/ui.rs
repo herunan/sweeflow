@@ -256,7 +256,6 @@ pub struct App {
     pointer_focus: Option<u32>,
     kb_focus: Option<u32>,
     scroll_active: bool,
-    wheel_accum: (f64, f64),
     /// Serial of the last pointer enter, needed to set the cursor image.
     enter_serial: u32,
     /// The Mac's current cursor, drawn locally so it moves with zero latency.
@@ -350,7 +349,6 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         pointer_focus: None,
         kb_focus: None,
         scroll_active: false,
-        wheel_accum: (0.0, 0.0),
         enter_serial: 0,
         cursor_surface: None,
         cursor_buffer: None,
@@ -1628,15 +1626,11 @@ impl PointerHandler for App {
                                 a.absolute / 15.0
                             }
                         };
-                        self.wheel_accum.0 += v120(&horizontal);
-                        self.wheel_accum.1 += v120(&vertical);
-                        let lx = self.wheel_accum.0.trunc();
-                        let ly = self.wheel_accum.1.trunc();
-                        if lx != 0.0 || ly != 0.0 {
-                            self.wheel_accum.0 -= lx;
-                            self.wheel_accum.1 -= ly;
+                        // Fractional notches as they come (high-resolution wheels); the Mac glides.
+                        let (nx, ny) = (v120(&horizontal), v120(&vertical));
+                        if nx != 0.0 || ny != 0.0 {
                             self.send(
-                                W::new(t::SCROLL).u32(wid).f32(x).f32(y).f32(-lx as f32).f32(-ly as f32).u8(0).u8(0).finish(),
+                                W::new(t::SCROLL).u32(wid).f32(x).f32(y).f32(-nx as f32).f32(-ny as f32).u8(0).u8(0).finish(),
                             );
                         }
                     }

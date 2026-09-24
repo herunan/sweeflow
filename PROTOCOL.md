@@ -46,7 +46,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x23 | C→S | ScreenSize | u16 w, u16 h — logical size of the client's largest monitor (sizes the Mac's virtual display) |
 | 0x30 | C→S | PointerMove | u32 wid, f32 x, f32 y (window-relative points) |
 | 0x31 | C→S | PointerButton | u32 wid, f32 x, f32 y, u8 button (0 left,1 right,2 middle,3+ other), u8 pressed |
-| 0x32 | C→S | Scroll | u32 wid, f32 x, f32 y, f32 dx, f32 dy, u8 unit (0 lines, 1 pixels), u8 phase (0 none, 1 began, 2 changed, 3 ended) |
+| 0x32 | C→S | Scroll | u32 wid, f32 x, f32 y, f32 dx, f32 dy, u8 unit (0 wheel notches, fractional — the host animates them; 1 pixels), u8 phase (0 none, 1 began, 2 changed, 3 ended) |
 | 0x33 | C→S | Key | u32 evdevKeycode, u8 pressed |
 | 0x34 | C→S | ReleaseAll | (no payload) — client lost focus; release held keys/buttons |
 | 0x40 | both | Clipboard | u16 n, n × (str kind, str name, bytes data) — kind `text/plain;charset=utf-8`, `image/png` or `file` (name = file name; folders as .zip). Sent on the clipboard stream. |
