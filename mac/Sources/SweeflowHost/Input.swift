@@ -69,7 +69,8 @@ final class InputInjector {
             lastNotchAt = now
             let rate = min(Double(hypot(dx, dy)) / dt, 200)   // notches per second
             notchRate = dt > 0.3 ? rate : notchRate + (rate - notchRate) * 0.4
-            let per = Self.pointsPerNotch * max(1, CGFloat(wheelAccel.gain(notchRate / 8)))
+            // The Mac's mouse curve by spin rate: ~10 notches/s is the knee, faster multiplies.
+            let per = Self.pointsPerNotch * max(1, CGFloat(wheelAccel.gain(notchRate * 0.6)))
             wheel.add(dx: dx * per, dy: dy * per)
             return
         }
@@ -98,7 +99,7 @@ final class InputInjector {
     static let pointsPerNotch: CGFloat = 40
     private var lastNotchAt: CFTimeInterval = 0
     private var notchRate: Double = 0
-    private let wheelAccel = ScrollAcceleration.trackpad()
+    private let wheelAccel = ScrollAcceleration.load(.mouse)
 
     private lazy var wheel = SmoothWheel { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase) }
 
@@ -271,9 +272,10 @@ final class TrackpadScroller {
     private var recent: [CGVector] = []
     private var velocity = CGVector.zero
     private var coasting = false
-    /// Smoothed finger speed (points per tick) and the Mac's curve for it.
-    private var speed: CGFloat = 0
-    private let accel = ScrollAcceleration.trackpad()
+    /// The Mac's trackpad acceleration and its running velocity.
+    private let accel = ScrollAcceleration.load(.trackpad)
+    private var fingerSpeed = ScrollVelocity()
+    private static let unitsPerPoint = 0.4
 
     /// Share of the backlog sent per tick (~one tick of smoothing).
     private let drain: CGFloat = 0.55
@@ -294,11 +296,19 @@ final class TrackpadScroller {
                 self.ending = false
                 self.pending = .zero
                 self.recent = []
-                self.speed = 0
+                self.fingerSpeed.reset()
                 self.post(0, 0, 1)
             }
-            self.pending.dx += dx
-            self.pending.dy += dy
+            // The Mac's acceleration for this movement, from the average of the last few
+            // (Linux reports roughly 0.4 of the Mac trackpad's units per point of travel).
+            let size = hypot(dx, dy)
+            if size > 0 {
+                let axis = abs(dy) >= abs(dx) ? dy : dx
+                let v = self.fingerSpeed.add(Double(size) * Self.unitsPerPoint, signed: Double(axis), at: CACurrentMediaTime())
+                let gain = CGFloat(self.accel.gain(v))
+                self.pending.dx += dx * gain
+                self.pending.dy += dy * gain
+            }
             if phase == 3 { self.ending = true }
             self.startTimer()
         }
@@ -320,12 +330,6 @@ final class TrackpadScroller {
             if abs(pending.dy) < 0.5 { out.dy = pending.dy }
             pending.dx -= out.dx
             pending.dy -= out.dy
-            // The Mac's acceleration curve, on a smoothed speed so the gain doesn't flicker
-            // with the size of each network burst.
-            speed += (hypot(out.dx, out.dy) - speed) * 0.35
-            let gain = CGFloat(accel.gain(Double(speed)))
-            out.dx *= gain
-            out.dy *= gain
             if out.dx != 0 || out.dy != 0 { post(out.dx, out.dy, 2) }
             recent.append(out)
             if recent.count > 6 { recent.removeFirst() }

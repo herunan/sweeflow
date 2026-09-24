@@ -1,83 +1,142 @@
 import Foundation
 import IOKit
 
-/// The Mac's own scroll acceleration: the curve its HID system applies for the user's scroll
-/// speed setting, read from the IORegistry table (`HIDScrollAccelerationTable`) so scrolling
-/// from Linux travels as far as it would on the Mac itself.
+/// The Mac's own scroll acceleration, reproduced from IOHIDFamily (IOHIDScrollAccelerator with
+/// IOHIDParametricAcceleration, the algorithm macOS uses for Apple trackpads and mice): the
+/// device's curve set (`HIDScrollAccelCurves` in the IORegistry) interpolated at the user's
+/// scroll speed setting, applied to the average of the last few movements. So scrolling from
+/// Linux accelerates the way the Mac would, with the user's own settings.
 struct ScrollAcceleration {
-    /// (input speed, output) points; the output is also scaled by `scale`.
-    private let points: [(x: Double, y: Double)]
-    private let scale: Double
+    struct Curve {
+        var index = 0.0, gainLinear = 0.0, gainParabolic = 0.0, gainCubic = 0.0, gainQuartic = 0.0
+        var tangentLinear = 0.0, tangentRoot = 0.0
+    }
+    private let c: Curve
+    private var m0 = 0.0, b0 = 0.0, m1 = 0.0, b1 = 0.0
+    private var t0 = Double.greatestFiniteMagnitude, t1 = Double.greatestFiniteMagnitude
+    /// IOHIDFamily's device scale: scroll resolution (units per inch) over report rate.
+    private let deviceScale = 400.0 / 67.0
 
-    /// Gain for a scroll speed `x` (points per 1/120 s): how much to multiply the movement by.
-    func gain(_ x: Double) -> Double {
-        guard x > 0.01, let first = points.first, let last = points.last else { return 1 }
-        let y: Double
-        if x <= first.x {
-            y = first.y * x / first.x
-        } else if x >= last.x {
-            y = last.y   // the curve flattens out: very fast flicks are capped
-        } else {
-            let i = points.firstIndex { $0.x >= x }!
-            let a = points[i - 1], b = points[i]
-            y = a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x)
+    private static func poly(_ c: Curve, _ x: Double) -> Double {
+        c.gainLinear * x + pow(c.gainParabolic * x, 2) + pow(c.gainCubic * x, 3) + pow(c.gainQuartic * x, 4)
+    }
+
+    init(_ curve: Curve) {
+        let c = curve
+        self.c = c
+        func poly(_ x: Double) -> Double { Self.poly(c, x) }
+        // As IOHIDParametricAcceleration::CreateWithParameters: a polynomial up to the first
+        // tangent speed, then its tangent line, then a square-root tail (it never flattens).
+        if c.tangentLinear != 0 {
+            let x = c.tangentLinear
+            m0 = c.gainLinear + 2 * x * pow(c.gainParabolic, 2) + 3 * x * x * pow(c.gainCubic, 3) + 4 * pow(x, 3) * pow(c.gainQuartic, 4)
+            b0 = poly(x) - m0 * x
+            t0 = x
+            if c.tangentRoot != 0 {
+                let y1 = m0 * c.tangentRoot + b0
+                m1 = 2 * y1 * m0
+                b1 = y1 * y1 - m1 * c.tangentRoot
+                t1 = c.tangentRoot
+            }
         }
-        return y * scale / x
     }
 
-    /// The trackpad curve for the current setting (System Settings → Trackpad → scroll speed).
-    static func trackpad() -> ScrollAcceleration {
-        let setting = preference("com.apple.trackpad.scrolling") ?? 0.3125
-        if let table = registryTable(), let accel = parse(table, setting: setting) { return accel }
-        log("scroll acceleration: using the built-in default curve")
-        return fallback
+    /// IOHIDParametricAcceleration::multiplier (without its constant cursor scale).
+    private func output(_ velocity: Double) -> Double {
+        let x = velocity / deviceScale
+        if x <= t0 { return Self.poly(c, x) }
+        if x <= t1 { return m0 * x + b0 }
+        return sqrt(max(m1 * x + b1, 0))
     }
 
-    private static func preference(_ key: String) -> Double? {
-        (CFPreferencesCopyAppValue(key as CFString, kCFPreferencesAnyApplication) as? NSNumber)?.doubleValue
+    /// How much to scale a movement at `velocity` (device units), relative to slow movement,
+    /// so the slowest scrolling stays 1:1 and faster scrolling is multiplied the Mac's way.
+    func gain(_ velocity: Double) -> Double {
+        let v = max(velocity, 0.01)
+        let slope = c.gainLinear / deviceScale
+        return slope > 0 ? output(v) / v / slope : 1
     }
 
-    private static func registryTable() -> Data? {
+    // MARK: loading
+
+    enum Device { case trackpad, mouse }
+
+    static func load(_ device: Device) -> ScrollAcceleration {
+        let (typeName, prefKey, fallback) = device == .trackpad
+            ? ("HIDTrackpadScrollAcceleration", "com.apple.trackpad.scrolling", defaultTrackpad)
+            : ("HIDMouseScrollAcceleration", "com.apple.scrollwheel.scaling", defaultMouse)
+        let setting = (CFPreferencesCopyAppValue(prefKey as CFString, kCFPreferencesAnyApplication) as? NSNumber)?.doubleValue ?? 0.3125
+        guard let curves = registryCurves(type: typeName), let curve = interpolate(curves, at: setting) else {
+            log("scroll acceleration (\(device)): built-in default curve")
+            return ScrollAcceleration(fallback)
+        }
+        log(String(format: "scroll acceleration (%@): setting %.4f, linear %.3f parabolic %.3f tangents %.2f/%.2f",
+                   "\(device)", setting, curve.gainLinear, curve.gainParabolic, curve.tangentLinear, curve.tangentRoot))
+        return ScrollAcceleration(curve)
+    }
+
+    /// The `HIDScrollAccelCurves` of a service whose scroll acceleration type is `type`.
+    private static func registryCurves(type: String) -> [Curve]? {
+        var it: io_iterator_t = 0
         let root = IORegistryGetRootEntry(kIOMainPortDefault)
         defer { IOObjectRelease(root) }
-        return IORegistryEntrySearchCFProperty(root, kIOServicePlane, "HIDScrollAccelerationTable" as CFString, nil,
-                                               IOOptionBits(kIORegistryIterateRecursively)) as? Data
-    }
-
-    /// Table layout (big-endian): fixed scale, 'USB*', u16 curve count, then per curve a fixed
-    /// acceleration setting, u16 point count and (fixed x, fixed y) points. The curve for a
-    /// setting between two is blended from its neighbours, as the HID system does.
-    static func parse(_ d: Data, setting: Double) -> ScrollAcceleration? {
-        let b = [UInt8](d)
-        func u16(_ o: Int) -> Int { Int(b[o]) << 8 | Int(b[o + 1]) }
-        func fixed(_ o: Int) -> Double { Double(UInt32(b[o]) << 24 | UInt32(b[o + 1]) << 16 | UInt32(b[o + 2]) << 8 | UInt32(b[o + 3])) / 65536 }
-        guard b.count >= 10 else { return nil }
-        let scale = fixed(0)
-        var o = 10
-        var curves: [(accel: Double, pts: [(x: Double, y: Double)])] = []
-        for _ in 0..<u16(8) {
-            guard o + 6 <= b.count else { return nil }
-            let accel = fixed(o), n = u16(o + 4)
-            o += 6
-            guard o + 8 * n <= b.count else { return nil }
-            curves.append((accel, (0..<n).map { (fixed(o + 8 * $0), fixed(o + 8 * $0 + 4)) }))
-            o += 8 * n
+        guard IORegistryEntryCreateIterator(root, kIOServicePlane, IOOptionBits(kIORegistryIterateRecursively), &it) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(it) }
+        while case let e = IOIteratorNext(it), e != 0 {
+            defer { IOObjectRelease(e) }
+            guard let t = IORegistryEntryCreateCFProperty(e, "HIDScrollAccelerationType" as CFString, nil, 0)?.takeRetainedValue() as? String,
+                  t == type,
+                  let arr = IORegistryEntryCreateCFProperty(e, "HIDScrollAccelCurves" as CFString, nil, 0)?.takeRetainedValue() as? [[String: Any]]
+            else { continue }
+            func f(_ d: [String: Any], _ k: String) -> Double { ((d[k] as? NSNumber)?.doubleValue ?? 0) / 65536 }
+            let curves = arr.map { d in
+                Curve(index: f(d, "HIDAccelIndex"), gainLinear: f(d, "HIDAccelGainLinear"), gainParabolic: f(d, "HIDAccelGainParabolic"),
+                      gainCubic: f(d, "HIDAccelGainCubic"), gainQuartic: f(d, "HIDAccelGainQuartic"),
+                      tangentLinear: f(d, "HIDAccelTangentSpeedLinear"), tangentRoot: f(d, "HIDAccelTangentSpeedParabolicRoot"))
+            }
+            if !curves.isEmpty { return curves }
         }
-        curves = curves.filter { $0.pts.count > 1 }.sorted { $0.accel < $1.accel }
-        guard let lo = curves.last(where: { $0.accel <= setting }) ?? curves.first,
-              let hi = curves.first(where: { $0.accel >= setting }) ?? curves.last else { return nil }
-        if lo.accel == hi.accel { return ScrollAcceleration(points: lo.pts, scale: scale) }
-        // Blend: sample both curves at the lower curve's x positions.
-        let t = (setting - lo.accel) / (hi.accel - lo.accel)
-        let hiCurve = ScrollAcceleration(points: hi.pts, scale: 1)
-        let pts = lo.pts.map { p in (x: p.x, y: p.y * (1 - t) + hiCurve.gain(p.x) * p.x * t) }
-        return ScrollAcceleration(points: pts, scale: scale)
+        return nil
     }
 
-    /// macOS's default trackpad curve (scroll speed 0.3125), in case the table can't be read.
-    static let fallback = ScrollAcceleration(points: [
-        (0.44, 0.30), (1.00, 2.38), (2.00, 6.88), (3.00, 12.38), (4.75, 23.00), (6.75, 36.00), (9.00, 50.00),
-        (11.24, 65.40), (13.44, 80.76), (15.67, 96.29), (17.66, 110.30), (19.31, 119.83), (20.81, 126.86),
-        (23.48, 134.85), (26.51, 142.62), (29.54, 147.74), (32.87, 151.36), (36.23, 153.55), (39.63, 154.44),
-    ], scale: 0.5)
+    /// The curve for a setting between two defined ones is blended linearly, as IOHIDFamily does.
+    private static func interpolate(_ curves: [Curve], at setting: Double) -> Curve? {
+        guard !curves.isEmpty else { return nil }
+        var i = 0
+        for (n, c) in curves.enumerated() where setting >= c.index { i = n }
+        let a = curves[i]
+        guard a.index < setting, i + 1 < curves.count else { return a }
+        let b = curves[i + 1]
+        let r = (setting - a.index) / (b.index - a.index)
+        func mix(_ x: Double, _ y: Double) -> Double { x + r * (y - x) }
+        return Curve(index: setting, gainLinear: mix(a.gainLinear, b.gainLinear), gainParabolic: mix(a.gainParabolic, b.gainParabolic),
+                     gainCubic: mix(a.gainCubic, b.gainCubic), gainQuartic: mix(a.gainQuartic, b.gainQuartic),
+                     tangentLinear: mix(a.tangentLinear, b.tangentLinear), tangentRoot: mix(a.tangentRoot, b.tangentRoot))
+    }
+
+    /// macOS's curves at the default speed (0.3125), in case the registry can't be read.
+    static let defaultTrackpad = Curve(index: 0.3125, gainLinear: 0.925, gainParabolic: 0.75, tangentLinear: 6.3, tangentRoot: 12)
+    static let defaultMouse = Curve(index: 0.3125, gainLinear: 1.6, gainParabolic: 0.6, tangentLinear: 11, tangentRoot: 18)
+}
+
+/// IOHIDScrollAccelerator's velocity: the average movement of the last events (up to 9, within
+/// half a second, restarting on a change of direction or a pause), times IOHIDFamily's timing
+/// polynomial (≈1.36 at trackpad report rates, so taken as constant here: the Linux events'
+/// arrival times carry network jitter).
+struct ScrollVelocity {
+    private var events: [(t: CFTimeInterval, size: Double)] = []
+    private var sign = 0.0
+
+    mutating func add(_ size: Double, signed: Double, at t: CFTimeInterval) -> Double {
+        let s: Double = signed > 0 ? 1 : -1
+        if s != sign || (events.last.map { t - $0.t > 0.15 } ?? true) { events.removeAll() }
+        sign = s
+        events.append((t, size))
+        events.removeAll { t - $0.t > 0.5 }
+        if events.count > 9 { events.removeFirst(events.count - 9) }
+        let avg = events.reduce(0) { $0 + $1.size } / Double(events.count)
+        return 1.36 * avg
+    }
+
+    mutating func reset() { events.removeAll() }
 }
