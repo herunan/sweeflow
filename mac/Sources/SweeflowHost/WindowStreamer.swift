@@ -45,6 +45,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var visibleSize: CGSize?
     /// The app's icon, shown on the placeholder when the Mac is locked before the first frame.
     var appIcon: CGImage?
+    /// Pixels per point of the display the window is on (looked up from its position).
+    var displayScale: (() -> CGFloat?)?
+    private var scaleCheckCountdown = 0
     /// Called when traffic lights drawn by the app itself were found in the pixels.
     var onDetectedButtons: (([CGRect]) -> Void)?
     private var detectCountdown = 0
@@ -293,21 +296,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
                 log("stream \(self.wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
             }
-            // The window moved to a display with another scale (e.g. the virtual HiDPI display
-            // went away): capture at the new scale instead of padding with black.
-            if scaleFactor > 0, abs(scaleFactor - self.scale) > 0.01, !self.stopped, let stream = self.stream {
-                log("stream \(self.wid): display scale \(self.scale) → \(scaleFactor)")
-                self.scale = scaleFactor
-                if self.lossless, let win = self.scWindow {
-                    stream.stopCapture { _ in }
-                    self.stream = nil
-                    self.startCapture(win)
-                } else {
-                    self.applySize(to: self.config)
-                    stream.updateConfiguration(self.config) { err in if let err { log("updateConfiguration: \(err)") } }
-                }
-                return
-            }
             if let r = contentRect {
                 let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
                 let cw = r.width * scaleFactor, ch = r.height * scaleFactor
@@ -386,6 +374,24 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// When the window goes idle, re-encode the last frame a couple of times: the rate controller
     /// spends the spare bits refining it, so static content converges to near-lossless.
     private func tick() {
+        // The window moved to a display with another scale (e.g. the virtual HiDPI display came
+        // or went): capture at that scale rather than padding with black or losing detail.
+        scaleCheckCountdown -= 1
+        if scaleCheckCountdown <= 0 {
+            scaleCheckCountdown = 5
+            if let want = displayScale?(), want > 0, abs(want - scale) > 0.01, let stream, !stopped {
+                log("stream \(wid): display scale \(scale) → \(want)")
+                scale = want
+                if lossless, let win = scWindow {
+                    stream.stopCapture { _ in }
+                    self.stream = nil
+                    startCapture(win)
+                } else {
+                    applySize(to: config)
+                    stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
+                }
+            }
+        }
         let idleMs = (DispatchTime.now().uptimeNanoseconds - lastEncodeAt.uptimeNanoseconds) / 1_000_000
         if refinementsLeft > 0, idleMs >= 120, pendingBuffer == nil, let b = lastBuffer {
             refinementsLeft -= 1

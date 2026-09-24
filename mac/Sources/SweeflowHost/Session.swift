@@ -141,6 +141,10 @@ final class Session {
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.visibleSize = requestedSizes[wid]
+            st.displayScale = { [weak tracker] in
+                guard let f = tracker?.windows[wid]?.frame else { return nil }
+                return displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40)))
+            }
             if let app = NSRunningApplication(processIdentifier: win.pid) {
                 var r = CGRect(x: 0, y: 0, width: 256, height: 256)
                 st.appIcon = app.icon?.cgImage(forProposedRect: &r, context: nil, hints: nil)
@@ -663,4 +667,14 @@ func backingScale(of frame: CGRect) -> CGFloat {
         if area > best.0 { best = (area, screen.backingScaleFactor) }
     }
     return best.1
+}
+
+/// Pixels per point of the display at `p` (global CG coordinates).
+func displayScale(at p: CGPoint) -> CGFloat? {
+    var id = CGDirectDisplayID(0)
+    var n: UInt32 = 0
+    guard CGGetDisplaysWithPoint(p, 1, &id, &n) == .success, n > 0, let mode = CGDisplayCopyDisplayMode(id), mode.width > 0 else {
+        return nil
+    }
+    return CGFloat(mode.pixelWidth) / CGFloat(mode.width)
 }
