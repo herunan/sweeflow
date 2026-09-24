@@ -10,6 +10,7 @@ mod net;
 mod proto;
 mod setup;
 mod ui;
+mod wallpaper;
 
 use anyhow::Result;
 

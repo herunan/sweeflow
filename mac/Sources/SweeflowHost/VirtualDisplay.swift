@@ -28,6 +28,38 @@ final class VirtualDisplay {
         return CGRect(x: b.minX, y: b.minY + menuBar, width: b.width, height: b.height - menuBar)
     }
 
+    /// Wallpaper for the virtual display (the Linux one), applied whenever the display exists.
+    private var wallpaper: URL?
+
+    func setWallpaper(_ url: URL) {
+        wallpaper = url
+        applyWallpaper(attempt: 0)
+    }
+
+    /// The display's NSScreen shows up a moment after it's created: retry for a few seconds.
+    private func applyWallpaper(attempt: Int) {
+        guard let url = wallpaper, let id = displayID else { return }
+        guard let screen = NSScreen.screens.first(where: {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
+        }) else {
+            if attempt < 20 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.applyWallpaper(attempt: attempt + 1) }
+            }
+            return
+        }
+        if NSWorkspace.shared.desktopImageURL(for: screen) == url { return }
+        do {
+            // Fill the screen, cropping as needed (as Plasma's default "scaled and cropped").
+            try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [
+                .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
+                .allowClipping: true,
+            ])
+            log("virtual display wallpaper: \(url.lastPathComponent)")
+        } catch {
+            log("virtual display wallpaper failed: \(error)")
+        }
+    }
+
     /// Size the client asked for, kept so a failed creation can be retried.
     private var wanted: CGSize = .zero
     private var retries = 0
@@ -92,6 +124,7 @@ final class VirtualDisplay {
         display = vd
         size = points
         log("virtual display \(vd.displayID) created: \(w)x\(h) points")
+        applyWallpaper(attempt: 0)
     }
 }
 

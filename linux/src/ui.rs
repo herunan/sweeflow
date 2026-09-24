@@ -1330,6 +1330,7 @@ impl App {
             // Mac points == our logical pixels.
             let (w, h) = ((w as f64 / self.scale) as u16, (h as f64 / self.scale) as u16);
             self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).finish());
+            crate::wallpaper::set_screen_aspect(w as f64 / h.max(1) as f64);
         }
     }
 

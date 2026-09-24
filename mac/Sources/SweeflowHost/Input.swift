@@ -105,6 +105,7 @@ final class InputInjector {
         g.setDoubleValueField(CGEventField(rawValue: 116)!, value: dx == 0 ? -0.0 : Double(dx) * 1.67)
         g.setDoubleValueField(CGEventField(rawValue: 119)!, value: dy == 0 ? -0.0 : Double(dy) * 1.67)
         g.setIntegerValueField(CGEventField(rawValue: 132)!, value: hidPhase)
+        g.timestamp = eventTimestamp()
         g.post(tap: .cgSessionEventTap)
     }
 
@@ -112,6 +113,9 @@ final class InputInjector {
     private func postMomentum(dx: CGFloat, dy: CGFloat, phase: Int64) {
         postScroll22(dx: dx, dy: dy, phase: 0, momentum: phase)
     }
+
+    /// Event time (nanoseconds since boot), as real input carries.
+    private func eventTimestamp() -> CGEventTimestamp { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
 
     /// Sub-pixel remainders, so whole-pixel point deltas add up exactly.
     private var pixelCarry = CGVector.zero
@@ -145,6 +149,8 @@ final class InputInjector {
         e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
         e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
         e.location = lastPoint
+        // Apps that run their own glide (Mail) measure the fling speed from these.
+        e.timestamp = eventTimestamp()
         e.post(tap: .cgSessionEventTap)
     }
 
@@ -303,6 +309,8 @@ final class TrackpadScroller {
     private var velocity = CGVector.zero
     private var liftVelocity = CGVector.zero
     private var moved = false
+    private var glideEvents = 0
+    private var glideTotal: CGFloat = 0
     private var coasting = false
     /// The Mac's trackpad acceleration and its running velocity.
     private let accel = ScrollAcceleration.load(.trackpad)
@@ -370,6 +378,12 @@ final class TrackpadScroller {
             var out = CGVector(dx: pending.dx * drain, dy: pending.dy * drain)
             if abs(pending.dx) < 0.5 { out.dx = pending.dx }
             if abs(pending.dy) < 0.5 { out.dy = pending.dy }
+            if ending {
+                // Fingers lifted: send what's left now, then "ended" right after. AppKit takes
+                // the fling speed from the last movements before "ended" (native apps glide
+                // on their own); a trail of shrinking remainders would read as a stop.
+                out = pending
+            }
             pending.dx -= out.dx
             pending.dy -= out.dy
             if out.dx != 0 || out.dy != 0 {
@@ -390,6 +404,8 @@ final class TrackpadScroller {
                 velocity = liftVelocity
                 if hypot(velocity.dx, velocity.dy) > 1.5 {
                     coasting = true
+                    glideEvents = 1
+                    glideTotal = hypot(velocity.dx, velocity.dy)
                     momentum(velocity.dx, velocity.dy, 1)
                 } else {
                     stopTimer()
@@ -401,10 +417,13 @@ final class TrackpadScroller {
             velocity.dx *= friction
             velocity.dy *= friction
             if hypot(velocity.dx, velocity.dy) < 0.2 {
+                log(String(format: "momentum: %d events, %.0f pt", glideEvents, glideTotal))
                 momentum(0, 0, 3)
                 coasting = false
                 stopTimer()
             } else {
+                glideEvents += 1
+                glideTotal += hypot(velocity.dx, velocity.dy)
                 momentum(velocity.dx, velocity.dy, 2)
             }
             return

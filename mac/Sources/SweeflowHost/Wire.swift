@@ -8,7 +8,7 @@ enum Msg: UInt8 {
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23, menuActivate = 0x24, menuRefresh = 0x25, restore = 0x26, launchApp = 0x27
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
     case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
-    case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
+    case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B, wallpaper = 0x4C
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55, alpha = 0x56
     case audioSubscribe = 0x60, audio = 0x61
 }

@@ -56,6 +56,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x49 | C→S | DragFetch | — send the dragged files (clipboard stream) |
 | 0x4A | S→C | DragData | u16 n, n × (str kind, str name, bytes data) — the dragged files (clipboard stream) |
 | 0x4B | C→S | DragDropLocal | u32 wid, f32 x, f32 y — a drag out of a Mac window was dropped on another Mac window: drop the dragged files there |
+| 0x4C | C→S | Wallpaper | str sha256, str ext, bytes image — the Linux wallpaper, set on the virtual display (macOS tints window materials with the wallpaper) (clipboard stream) |
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 
