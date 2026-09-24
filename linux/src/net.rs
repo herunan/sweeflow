@@ -22,6 +22,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct WinInfo {
     pub wid: u32,
+    pub pid: i32,
     pub bundle_id: String,
     pub app_name: String,
     pub title: String,
@@ -47,6 +48,8 @@ pub enum UiEvent {
     MoveStarted(u32),
     ToggleMaximize(u32),
     Minimize(u32),
+    /// An app's menu bar (JSON from the Mac).
+    MenuTree { pid: i32, json: Vec<u8> },
     Frame(u32, GpuFrame),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
@@ -70,6 +73,7 @@ impl UiEvent {
             UiEvent::MoveStarted(_) => "move started",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
             UiEvent::Minimize(_) => "minimize",
+            UiEvent::MenuTree { .. } => "menu tree",
             UiEvent::Frame(..) => "video frame",
             UiEvent::Corners { .. } => "corners",
             UiEvent::RawFrame { .. } => "popup frame",
@@ -205,9 +209,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::WINDOW_ADDED => {
             let wid = r.u32()?;
-            let _pid = r.i32()?;
+            let pid = r.i32()?;
             UiEvent::WindowAdded(WinInfo {
                 wid,
+                pid,
                 bundle_id: r.str()?,
                 app_name: r.str()?,
                 title: r.str()?,
@@ -244,6 +249,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
+        t::MENU_TREE => UiEvent::MenuTree { pid: r.i32()?, json: r.bytes()?.to_vec() },
         t::PONG => return Ok(()),
         _ => {
             log::debug!("ignoring control message {ty:#x}");

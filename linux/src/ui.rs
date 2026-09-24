@@ -78,9 +78,14 @@ use wayland_protocols::{
     },
 };
 
+use wayland_protocols_plasma::appmenu::client::{
+    org_kde_kwin_appmenu::OrgKdeKwinAppmenu, org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager,
+};
+
 use crate::{
     decode::GpuFrame,
     lights,
+    menus::Menus,
     net::{NetCmd, UiEvent, WinInfo},
     proto::{t, W},
 };
@@ -138,6 +143,8 @@ struct Win {
     /// Our drawing of the traffic lights (a subsurface above the video).
     lights: Option<Lights>,
     corners: Option<Corners>,
+    /// Points KWin's Global Menu at this app's menu bar.
+    appmenu: Option<OrgKdeKwinAppmenu>,
     dark_titlebar: bool,
     /// Pointer over the traffic-light group.
     lights_hover: bool,
@@ -178,6 +185,8 @@ pub struct App {
     cursor_mgr: Option<WpCursorShapeManagerV1>,
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
+    appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    menus: Option<Menus>,
     trace: bool,
     loop_handle: LoopHandle<'static, App>,
 
@@ -254,6 +263,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         icon_mgr: bind_opt("xdg_toplevel_icon_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        menus: None,
         trace: std::env::var_os("SWEEFLOW_TRACE").is_some(),
         compositor,
         subcompositor,
@@ -291,6 +302,14 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     };
 
     // A 1x1 opaque buffer stretched behind the video; shows while a resize is catching up.
+    app.menus = match Menus::new(app.net.clone()) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            log::warn!("no D-Bus session: Mac menus won't appear in the Global Menu ({e})");
+            None
+        }
+    };
+
     let bg = app.single_pixel.get()?.create_u32_rgba_buffer(0x1e1e_1e1e, 0x1e1e_1e1e, 0x1e1e_1e1e, u32::MAX, &qh, ());
     app.background = Some(bg);
     app.clear = Some(app.single_pixel.get()?.create_u32_rgba_buffer(0, 0, 0, 0, &qh, ()));
@@ -395,6 +414,11 @@ impl App {
                 }
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
+            UiEvent::MenuTree { pid, json } => {
+                if let Some(m) = self.menus.as_mut() {
+                    m.update(pid, &json);
+                }
+            }
             UiEvent::Minimize(wid) => {
                 if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
                     t.set_minimized();
@@ -476,6 +500,14 @@ impl App {
             _ => None,
         };
 
+        let appmenu = match (&role, &self.appmenu_mgr, &self.menus) {
+            (Role::Toplevel(_), Some(mgr), Some(menus)) => {
+                let am = mgr.create(&base, qh, ());
+                am.set_address(menus.service(), Menus::object_path(info.pid));
+                Some(am)
+            }
+            _ => None,
+        };
         self.surfaces.insert(base.id(), wid);
         self.surfaces.insert(video.id(), wid);
         let size = (info.w.max(1.0) as u32, info.h.max(1.0) as u32);
@@ -500,6 +532,7 @@ impl App {
                 buttons: [[0.0; 4]; 3],
                 lights: None,
                 corners: None,
+                appmenu,
                 dark_titlebar: true,
                 lights_hover: false,
                 lights_pressed: None,
@@ -534,6 +567,9 @@ impl App {
         }
         for (b, _) in &w.raw_buffers {
             b.destroy();
+        }
+        if let Some(am) = w.appmenu {
+            am.release();
         }
         if let Some(c) = w.corners {
             for (bufs, _) in &c.tile_buffers {
@@ -1541,6 +1577,8 @@ wayland_client::delegate_noop!(App: ignore WpCursorShapeManagerV1);
 wayland_client::delegate_noop!(App: ignore WpCursorShapeDeviceV1);
 
 wayland_client::delegate_noop!(App: ignore WpPresentation);
+wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenuManager);
+wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenu);
 
 /// Logs how long a traffic-light hover update took: input event → our commit → on screen.
 impl Dispatch<WpPresentationFeedback, (u32, f64)> for App {

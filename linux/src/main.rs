@@ -1,6 +1,7 @@
 mod config;
 mod decode;
 mod lights;
+mod menus;
 mod net;
 mod proto;
 mod setup;

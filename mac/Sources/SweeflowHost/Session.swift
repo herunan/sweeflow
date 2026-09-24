@@ -30,6 +30,7 @@ final class Session {
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
     private var started = false
+    private let menuQueue = DispatchQueue(label: "sweeflow.menus", qos: .userInitiated)
     /// The window with keyboard focus on the Linux side (0 = none of ours).
     private var clientFocus: UInt32 = 0
 
@@ -154,6 +155,19 @@ final class Session {
             let wid = try m.u32(), w = try m.f32(), h = try m.f32()
             guard let win = tracker.windows[wid] else { return }
             control_.setSize(wid, pid: win.pid, CGSize(width: w, height: h))
+        case .menuRefresh:
+            sendMenus(pid: pid_t(try m.i32()))
+        case .menuActivate:
+            let pid = pid_t(try m.i32())
+            let n = Int(try m.u16())
+            var path: [Int] = []
+            for _ in 0..<n { path.append(Int(try m.u16())) }
+            menuQueue.async { [weak self] in
+                let ok = MenuReader.press(pid: pid, path: path)
+                log("menu \(path) in \(pid): \(ok ? "pressed" : "not found")")
+                // Items change state after use (checkmarks, enabled): resend shortly after.
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { self?.sendMenus(pid: pid) }
+            }
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
             guard config.virtualDisplay else { return }
@@ -304,9 +318,24 @@ final class Session {
         }.joined(separator: "\n")
     }
 
+    /// Reads an app's menu bar (off the network queue: big menus take a while) and sends it.
+    private func sendMenus(pid: pid_t) {
+        menuQueue.async { [weak self] in
+            guard let items = MenuReader.read(pid: pid),
+                  let json = try? JSONEncoder().encode(items) else { return }
+            self?.queue.async {
+                var m = MsgWriter(.menuTree)
+                m.i32(pid)
+                m.bytes(json)
+                self?.control?.send(m)
+            }
+        }
+    }
+
     private func setClientFocus(_ wid: UInt32) {
         guard wid != clientFocus else { return }
         clientFocus = wid
+        if let w = tracker.windows[wid] { sendMenus(pid: w.pid) }
         for st in streamers.values {
             let active = st.wid == wid
             if st.active != active { st.active = active; st.requestRepaint() }

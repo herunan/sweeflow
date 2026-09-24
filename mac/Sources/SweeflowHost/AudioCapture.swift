@@ -13,6 +13,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var apps: Set<String> = []
     private var timer: DispatchSourceTimer?
     private var stopped = false
+    private var peak: Float = 0
+    private var lastLevelLog = Date()
 
     init(allowed: @escaping (String) -> Bool) {
         self.allowed = allowed
@@ -39,7 +41,11 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, _ in
             guard let self, let content else { return }
             self.queue.async {
-                guard !self.stopped, let display = content.displays.first else { return }
+                // The display the streamed windows are on (the virtual one): audio capture follows
+                // the filter's display.
+                let vd = DispatchQueue.main.sync { host.display.displayID }
+                guard !self.stopped,
+                      let display = content.displays.first(where: { $0.displayID == vd }) ?? content.displays.first else { return }
                 let targets = content.applications.filter { self.allowed($0.bundleIdentifier) }
                 let ids = Set(targets.map(\.bundleIdentifier))
                 guard ids != self.apps || self.stream == nil, !targets.isEmpty else { return }
@@ -111,11 +117,17 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             for i in 0..<frames {
                 for ch in 0..<2 {
                     let v = max(-1, min(1, sample(ch, i)))
+                    peak = max(peak, abs(v))
                     dst[i * 2 + ch] = Int16((v * 32767).rounded()).littleEndian
                 }
             }
         }
         onPCM?(out)
+        if Date().timeIntervalSince(lastLevelLog) > 5 {
+            log(String(format: "audio: peak level %.3f over the last 5s", peak))
+            peak = 0
+            lastLevelLog = Date()
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

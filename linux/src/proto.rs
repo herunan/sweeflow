@@ -17,10 +17,13 @@ pub mod t {
     pub const MOVE_STARTED: u8 = 0x17;
     pub const TOGGLE_MAXIMIZE: u8 = 0x18;
     pub const MINIMIZE: u8 = 0x1A;
+    pub const MENU_TREE: u8 = 0x1B;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;
     pub const SCREEN_SIZE: u8 = 0x23;
+    pub const MENU_ACTIVATE: u8 = 0x24;
+    pub const MENU_REFRESH: u8 = 0x25;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;
@@ -49,6 +52,7 @@ impl W {
         W(v)
     }
     pub fn u8(mut self, v: u8) -> Self { self.0.push(v); self }
+    pub fn i32(mut self, v: i32) -> Self { self.0.extend_from_slice(&v.to_le_bytes()); self }
     pub fn u16(mut self, v: u16) -> Self { self.0.extend_from_slice(&v.to_le_bytes()); self }
     pub fn u32(mut self, v: u32) -> Self { self.0.extend_from_slice(&v.to_le_bytes()); self }
     pub fn u64(mut self, v: u64) -> Self { self.0.extend_from_slice(&v.to_le_bytes()); self }
