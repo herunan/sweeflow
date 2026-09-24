@@ -59,8 +59,6 @@ pub enum UiEvent {
     Clipboard(std::collections::HashMap<String, Arc<Vec<u8>>>),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
-    /// A window's alpha plane (its glass), or None when it's opaque again.
-    Alpha { wid: u32, width: u32, height: u32, plane: Option<Vec<u8>> },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
     RawFrame { wid: u32, w: u16, h: u16, px_per_pt: u8, capture_us: u64, bgra: Vec<u8> },
 }
@@ -87,7 +85,6 @@ impl UiEvent {
             UiEvent::DragBegan { .. } => "drag began",
             UiEvent::DragData(_) => "drag data",
             UiEvent::Corners { .. } => "corners",
-            UiEvent::Alpha { .. } => "alpha",
             UiEvent::RawFrame { .. } => "popup frame",
         }
     }
@@ -301,34 +298,6 @@ async fn session(
         (Arc::new(tokio::sync::Mutex::new(ctx)), task)
     };
 
-    // The Linux wallpaper for the Mac's virtual display (window materials are tinted with it),
-    // now and whenever it changes.
-    let wallpaper_task = {
-        let tx = clip_tx.clone();
-        tokio::spawn(async move {
-            let mut sent: Option<String> = None;
-            loop {
-                let found = tokio::task::spawn_blocking(|| {
-                    crate::wallpaper::current(crate::wallpaper::screen_aspect()).and_then(|p| crate::wallpaper::load(&p).map(|l| (p, l)))
-                })
-                .await
-                .ok()
-                .flatten();
-                if let Some((path, (hash, data))) = found {
-                    if sent.as_deref() != Some(hash.as_str()) {
-                        let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "png".into());
-                        let msg = W::new(t::WALLPAPER).str(&hash).str(&ext).bytes(&data).finish();
-                        if tx.lock().await.write_all(&msg).await.is_ok() {
-                            log::info!("wallpaper sent to the Mac: {} ({} KB)", path.display(), data.len() / 1024);
-                            sent = Some(hash);
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        })
-    };
-
     let mut video: HashMap<u32, (quinn::SendStream, tokio::task::JoinHandle<()>)> = HashMap::new();
     let render_node = cfg.render_node.clone();
     let result = loop {
@@ -383,7 +352,6 @@ async fn session(
     }
     audio.abort();
     clip_task.abort();
-    wallpaper_task.abort();
     conn.close(0u32.into(), b"bye");
     result
 }
@@ -558,22 +526,6 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
             }
         };
         let (ty, body) = msg;
-        if ty == t::ALPHA {
-            let parsed = (|| -> Result<_> {
-                let mut r = R::new(&body);
-                let (w, h, kind) = (r.u16()? as u32, r.u16()? as u32, r.u8()?);
-                let data = r.bytes()?;
-                let plane = if kind == 1 { Some(lz4_flex::block::decompress(data, (w * h) as usize)?) } else { None };
-                Ok((w, h, plane))
-            })();
-            match parsed {
-                Ok((width, height, plane)) => {
-                    let _ = ui.send(UiEvent::Alpha { wid, width, height, plane });
-                }
-                Err(e) => log::warn!("bad alpha for {wid}: {e}"),
-            }
-            continue;
-        }
         if ty == t::CORNERS {
             let parsed = (|| -> Result<_> {
                 let mut r = R::new(&body);

@@ -42,7 +42,6 @@ pub mod t {
     pub const DRAG_FETCH: u8 = 0x49;
     pub const DRAG_DATA: u8 = 0x4A;
     pub const DRAG_DROP_LOCAL: u8 = 0x4B;
-    pub const WALLPAPER: u8 = 0x4C;
     pub const PONG: u8 = 0x42;
     pub const SUBSCRIBE: u8 = 0x50;
     pub const FRAME: u8 = 0x51;
@@ -50,7 +49,6 @@ pub mod t {
     pub const PAUSE: u8 = 0x53;
     pub const FRAME_ACK: u8 = 0x54;
     pub const CORNERS: u8 = 0x55;
-    pub const ALPHA: u8 = 0x56;
     pub const AUDIO_SUBSCRIBE: u8 = 0x60;
     pub const AUDIO: u8 = 0x61;
 }

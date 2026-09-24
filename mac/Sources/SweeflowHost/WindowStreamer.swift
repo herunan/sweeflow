@@ -211,8 +211,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         visibleSize.map { CGSize(width: $0.width * scale, height: $0.height * scale) }
     }
 
-    private let alpha = AlphaMask()
-
     /// The colour frame shown before the Mac locked, put back when it unlocks (a static window
     /// sends no new frame by itself).
     private var colourBeforeLock: CVPixelBuffer?
@@ -369,10 +367,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 fillCorners(pb, radiusPx: Int(28 * self.scale))
                 fillEdges(pb, ring: max(2, Int(self.scale)))
-                // Glass (sidebars, toolbars): the video has no alpha, so it goes separately.
-                if AlphaMask.enabled { self.alpha.update(from: pb) }
-                // Translucent areas arrive premultiplied; the video carries their real colour
-                // (Linux multiplies the alpha back in, or they'd look darkened).
+                // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
+                // drops alpha, which would leave them darkened. Restore their real colour.
                 unpremultiply(pb)
                 let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
                 if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", self.wid, ms)) }
@@ -453,7 +449,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func encode(_ pb: CVPixelBuffer) {
         flushCorners()
-        if let m = alpha.takePending() { out.send(m) }
         let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
         if encoder == nil || encoderSize != (w, h) {
             if let e = encoder { VTCompressionSessionInvalidate(e) }
@@ -760,20 +755,6 @@ func detectTrafficLights(_ pb: CVPixelBuffer, scale: CGFloat) -> [CGRect]? {
     return nil
 }
 
-/// Writes the top-left corner tile as a PNG in the support directory (diagnostics).
-func debugDumpTile(_ tiles: Data, t: Int, name: String) {
-    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: t, pixelsHigh: t, bitsPerSample: 8,
-                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                                     bytesPerRow: t * 4, bitsPerPixel: 32), let dst = rep.bitmapData else { return }
-    tiles.withUnsafeBytes { src in
-        let p = src.bindMemory(to: UInt8.self)
-        for i in 0..<(t * t) {   // BGRA premultiplied → RGBA premultiplied
-            dst[i * 4] = p[i * 4 + 2]; dst[i * 4 + 1] = p[i * 4 + 1]; dst[i * 4 + 2] = p[i * 4]; dst[i * 4 + 3] = p[i * 4 + 3]
-        }
-    }
-    try? rep.representation(using: .png, properties: [:])?.write(to: Identity.dir.appendingPathComponent(name))
-}
-
 /// The window's outermost pixels are a partly transparent border; with alpha dropped by the
 /// encoder they'd show as black lines along the edges. Composite them (premultiplied) over the
 /// colour just inside, keeping the border's highlight.
@@ -1017,77 +998,4 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     }
     ctx.fillPath()
     return out
-}
-
-/// A window's alpha for Linux, sent only when it changes and only while the window actually has
-/// translucent areas (glass sidebars, toolbars, Liquid Glass). The corners' alpha travels in
-/// the corner tiles instead.
-final class AlphaMask {
-    /// Off: the client can't show glass safely yet (see ui.rs set_alpha).
-    static let enabled = false
-    private var plane = [UInt8]()
-    private var hash: UInt64 = 0
-    private var glass = false
-    private var opaqueFrames = 0
-    private var pending: MsgWriter?
-
-    /// Looks at a prepared frame (corners and edges already filled in, still premultiplied).
-    func update(from pb: CVPixelBuffer) {
-        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return }
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
-        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
-        if plane.count != w * h { plane = [UInt8](repeating: 0, count: w * h); hash = 0 }
-        var translucent = 0
-        plane.withUnsafeMutableBytes { dst in
-            var src = vImage_Buffer(data: base, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: CVPixelBufferGetBytesPerRow(pb))
-            var d = vImage_Buffer(data: dst.baseAddress, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
-            vImageExtractChannel_ARGB8888(&src, &d, 3, vImage_Flags(kvImageNoFlags))   // BGRA: alpha is byte 3
-            var hist = [vImagePixelCount](repeating: 0, count: 256)
-            vImageHistogramCalculation_Planar8(&d, &hist, vImage_Flags(kvImageNoFlags))
-            translucent = Int(hist[0..<250].reduce(0, +))
-        }
-        // Stray anti-aliased pixels don't make a window glass: needs a real area (0.5 %).
-        let isGlass = translucent > w * h / 200
-        if isGlass {
-            opaqueFrames = 0
-        } else if glass {
-            opaqueFrames += 1
-        }
-        if !glass && isGlass {
-            glass = true
-            hash = 0
-            log(String(format: "alpha: %dx%d has glass (%.1f%% translucent)", w, h, Double(translucent) * 100 / Double(w * h)))
-        } else if glass && opaqueFrames > 60 {
-            // Opaque for a while (a second or more): back to plain video.
-            glass = false
-            log("alpha: \(w)x\(h) opaque again")
-            var m = MsgWriter(.alpha)
-            m.u16(UInt16(w)); m.u16(UInt16(h)); m.u8(0); m.bytes(Data())
-            pending = m
-            return
-        }
-        guard glass else { return }
-        let hNow = plane.withUnsafeBytes { raw -> UInt64 in
-            var x: UInt64 = 0xcbf2_9ce4_8422_2325
-            let words = raw.bindMemory(to: UInt64.self)
-            for v in words { x = (x ^ v) &* 0x100_0000_01b3 }
-            return x
-        }
-        guard hNow != hash else { return }
-        hash = hNow
-        var out = [UInt8](repeating: 0, count: plane.count + plane.count / 255 + 64)
-        let n = plane.withUnsafeBufferPointer { src in
-            compression_encode_buffer(&out, out.count, src.baseAddress!, plane.count, nil, COMPRESSION_LZ4_RAW)
-        }
-        guard n > 0 else { return }
-        var m = MsgWriter(.alpha)
-        m.u16(UInt16(w)); m.u16(UInt16(h)); m.u8(1); m.bytes(Data(out[0..<n]))
-        pending = m
-    }
-
-    func takePending() -> MsgWriter? {
-        defer { pending = nil }
-        return pending
-    }
 }

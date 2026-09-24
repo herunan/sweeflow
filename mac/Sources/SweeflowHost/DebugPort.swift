@@ -56,65 +56,6 @@ final class DebugPort {
                 cfg.showsCursor = false
                 capture(SCContentFilter(display: d, including: [w]), cfg, to: p[2], reply: reply)
             }
-        case "matte" where p.count == 3:
-            // Difference matting: a black, then a white window right behind the window, each
-            // captured as composited on the display (glass shows what's behind it).
-            let wid = UInt32(p[1]) ?? 0
-            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
-                guard let w = content?.windows.first(where: { $0.windowID == wid }),
-                      let d = content?.displays.first(where: { $0.frame.intersects(w.frame) }) else { return reply("no window") }
-                DispatchQueue.main.async {
-                    let primaryH = NSScreen.screens.first?.frame.maxY ?? 0
-                    let f = w.frame
-                    let bg = NSWindow(contentRect: NSRect(x: f.minX, y: primaryH - f.maxY, width: f.width, height: f.height),
-                                      styleMask: .borderless, backing: .buffered, defer: false)
-                    bg.isReleasedWhenClosed = false
-                    bg.hasShadow = false
-                    bg.backgroundColor = .black
-                    bg.order(.below, relativeTo: Int(wid))
-                    let cfg = SCStreamConfiguration()
-                    cfg.sourceRect = f.offsetBy(dx: -d.frame.minX, dy: -d.frame.minY)
-                    cfg.width = Int(f.width * 2); cfg.height = Int(f.height * 2)
-                    cfg.showsCursor = false
-                    let filter = SCContentFilter(display: d, excludingWindows: [])
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        capture(filter, cfg, to: p[2] + "-black.png") { r1 in
-                            DispatchQueue.main.async {
-                                bg.backgroundColor = .white
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                    capture(filter, cfg, to: p[2] + "-white.png") { r2 in
-                                        DispatchQueue.main.async { bg.orderOut(nil) }
-                                        reply("black: \(r1), white: \(r2)")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        case "wallpaper" where p.count == 2:
-            // Sets the virtual display's wallpaper (the user's own screens are left alone).
-            DispatchQueue.main.async {
-                guard let id = host.display.displayID,
-                      let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id })
-                else { return reply("no virtual display") }
-                do {
-                    let old = NSWorkspace.shared.desktopImageURL(for: screen)?.path ?? "none"
-                    try NSWorkspace.shared.setDesktopImageURL(URL(fileURLWithPath: p[1]), for: screen, options: [:])
-                    reply("ok (was \(old))")
-                } catch { reply("failed: \(error)") }
-            }
-        case "cgshot" where p.count == 3:
-            // The pre-ScreenCaptureKit window capture (obsolete in the SDK, still in CoreGraphics).
-            let wid = UInt32(p[1]) ?? 0
-            typealias CreateImage = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
-            guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return reply("no symbol") }
-            let f = unsafeBitCast(sym, to: CreateImage.self)
-            // optionIncludingWindow = 1 << 3; boundsIgnoreFraming = 1 << 0, bestResolution = 1 << 3
-            guard let img = f(.null, 1 << 3, wid, (1 << 0) | (1 << 3))?.takeRetainedValue() else { return reply("capture failed") }
-            let rep = NSBitmapImageRep(cgImage: img)
-            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: p[2]))
-            reply("ok \(img.width)x\(img.height) alphaInfo \(img.alphaInfo.rawValue)")
         case "move", "click":
             guard p.count >= 4, let wid = UInt32(p[1]), let x = Double(p[2]), let y = Double(p[3]),
                   let s = session else { return reply("usage / no session") }

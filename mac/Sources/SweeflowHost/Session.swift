@@ -199,24 +199,6 @@ final class Session {
                     }
                 }
             }
-        case .wallpaper:
-            // The Linux wallpaper, for the virtual display (window materials are tinted with it).
-            let hash = try m.str(), ext = try m.str(), data = try m.bytes()
-            DispatchQueue.global(qos: .utility).async {
-                let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
-                let safeExt = ext.allSatisfy { $0.isLetter || $0.isNumber } ? ext : "png"
-                let url = dir.appendingPathComponent("wallpaper-\(hash.prefix(12)).\(safeExt)")
-                if !FileManager.default.fileExists(atPath: url.path) {
-                    // One file per wallpaper (macOS caches by path), old ones removed.
-                    for old in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-                    where old.lastPathComponent.hasPrefix("wallpaper-") {
-                        try? FileManager.default.removeItem(at: old)
-                    }
-                    try? data.write(to: url)
-                }
-                log("wallpaper from Linux: \(url.lastPathComponent) (\(data.count / 1024) KB)")
-                DispatchQueue.main.async { host.display.setWallpaper(url) }
-            }
         case .dragDropLocal:
             // A drag out of one Mac window dropped on another (via Linux): drop the same files.
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
