@@ -94,6 +94,7 @@ pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEv
 
 pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
     let (tx, rx) = mpsc::unbounded_channel();
+    listen_local(tx.clone());
     std::thread::Builder::new()
         .name("net".into())
         .spawn(move || {
@@ -102,6 +103,33 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
         })
         .unwrap();
     tx
+}
+
+/// Local socket for `sweeflow launch <bundle id>` (used by the Mac app launchers).
+fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
+    use std::io::BufRead;
+    let path = crate::launchers::socket_path();
+    let _ = std::fs::remove_file(&path);
+    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("launch socket unavailable: {e}");
+            return;
+        }
+    };
+    std::thread::Builder::new()
+        .name("launch-socket".into())
+        .spawn(move || {
+            for conn in listener.incoming().flatten() {
+                for line in std::io::BufReader::new(conn).lines().map_while(Result::ok) {
+                    if let Some(bid) = line.strip_prefix("launch ") {
+                        log::info!("launching {bid} on the Mac");
+                        let _ = tx.send(NetCmd::Control(W::new(t::LAUNCH_APP).str(bid.trim()).finish()));
+                    }
+                }
+            }
+        })
+        .unwrap();
 }
 
 async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
@@ -171,7 +199,8 @@ async fn session(
                 match cmd {
                     NetCmd::Control(m) => ctl_tx.write_all(&m).await?,
                     NetCmd::Subscribe(wid) => {
-                        if video.contains_key(&wid) { continue; }
+                        // A window minimised on the Mac loses its capture; its task has ended.
+                        if video.get(&wid).is_some_and(|(_, task)| !task.is_finished()) { continue; }
                         let (mut tx, rx) = conn.open_bi().await?;
                         tx.write_all(&W::new(t::SUBSCRIBE).u32(wid).finish()).await?;
                         let task = tokio::spawn(video_task(wid, rx, ui.clone(), render_node.clone()));
@@ -250,6 +279,19 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
         t::MENU_TREE => UiEvent::MenuTree { pid: r.i32()?, json: r.bytes()?.to_vec() },
+        t::APP_LIST => {
+            let n = r.u16()?;
+            let mut apps = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                apps.push((r.str()?, r.str()?, r.bytes()?.to_vec()));
+            }
+            std::thread::spawn(move || {
+                if let Err(e) = crate::launchers::sync(&apps) {
+                    log::warn!("launcher entries: {e:#}");
+                }
+            });
+            return Ok(());
+        }
         t::PONG => return Ok(()),
         _ => {
             log::debug!("ignoring control message {ty:#x}");

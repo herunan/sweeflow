@@ -34,6 +34,9 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x1A | S→C | Minimize | u32 wid — the window was minimised on the Mac (restored there); client minimises its window |
 | 0x1B | S→C | MenuTree | i32 pid, bytes json — the app's menu bar: `[{t,e,sep?,k?,m?,c?,sub?}]` (Apple menu omitted) |
 | 0x24 | C→S | MenuActivate | i32 pid, u16 n, n × u16 path — press that menu item (indices as in MenuTree) |
+| 0x1C | S→C | AppList | u16 n, n × (str bundleId, str name, bytes png128) — installed apps, for launchers |
+| 0x27 | C→S | LaunchApp | str bundleId — open (or reopen) the app on the Mac |
+| 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
 | 0x25 | C→S | MenuRefresh | i32 pid — re-read and resend the app's menus |
 | 0x18 | S→C | ToggleMaximize | u32 wid — the app zoomed its window (title-bar double-click); client toggles maximised |
 | 0x20 | C→S | Resize | u32 wid, f32 w, f32 h |

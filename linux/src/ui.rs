@@ -146,6 +146,8 @@ struct Win {
     /// Points KWin's Global Menu at this app's menu bar.
     appmenu: Option<OrgKdeKwinAppmenu>,
     dark_titlebar: bool,
+    /// Minimised on the Mac (not by us): restoring it here must restore it there.
+    mac_minimized: bool,
     /// Pointer over the traffic-light group.
     lights_hover: bool,
     /// Traffic light being pressed, and whether the pointer is still on it.
@@ -229,6 +231,8 @@ pub struct App {
     host: String,
     connected: bool,
     trace_event_ms: Option<u32>,
+    /// Whether the Global Menu panel is currently shown (it only shows for Mac windows).
+    menu_panel_shown: Option<bool>,
 }
 
 pub fn run(net_cfg: crate::config::Config) -> Result<()> {
@@ -299,6 +303,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         host,
         connected: false,
         trace_event_ms: None,
+        menu_panel_shown: None,
     };
 
     // A 1x1 opaque buffer stretched behind the video; shows while a resize is catching up.
@@ -420,8 +425,11 @@ impl App {
                 }
             }
             UiEvent::Minimize(wid) => {
-                if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
-                    t.set_minimized();
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.mac_minimized = true;
+                    if let Role::Toplevel(t) = &w.role {
+                        t.set_minimized();
+                    }
                 }
             }
             UiEvent::Frame(wid, frame) => self.present(wid, frame, qh),
@@ -534,6 +542,7 @@ impl App {
                 corners: None,
                 appmenu,
                 dark_titlebar: true,
+                mac_minimized: false,
                 lights_hover: false,
                 lights_pressed: None,
                 pending: None,
@@ -884,6 +893,19 @@ impl App {
         mgr.set_icon(t.xdg_toplevel(), Some(&self.icons[&bid].0));
     }
 
+    /// Shows the Global Menu panel only while a Mac window has keyboard focus. Debounced, so moving
+    /// focus between two Mac windows (leave + enter) doesn't flicker it.
+    fn schedule_menu_panel(&self) {
+        let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(150)), |_, _, app| {
+            let want = app.kb_focus.is_some();
+            if app.menu_panel_shown != Some(want) {
+                app.menu_panel_shown = Some(want);
+                set_menu_panel_visible(want);
+            }
+            TimeoutAction::Drop
+        });
+    }
+
     /// Tells the Mac how big our largest monitor is, so its virtual display can match.
     fn send_screen_size(&self) {
         if !self.connected {
@@ -1104,6 +1126,23 @@ const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 
+/// Shows or auto-hides the Plasma panel holding the Global Menu (found by its widget). "Dodge
+/// windows" rather than "always visible" so it never reserves space: toggling it must not make
+/// the tiling layout jump.
+fn set_menu_panel_visible(visible: bool) {
+    let mode = if visible { "dodgewindows" } else { "autohide" };
+    let script = format!(
+        "panels().forEach(function (p) {{ if (p.widgets().some(function (w) {{ return w.type == \"org.kde.plasma.appmenu\"; }})) p.hiding = \"{mode}\"; }});"
+    );
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("qdbus6")
+            .args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
+
 /// Opens KWin's window switcher. Our windows inhibit compositor shortcuts (so Cmd+letter reaches
 /// the Mac), which also blocks Meta+Tab; invoke it explicitly instead.
 fn switch_windows(reverse: bool) {
@@ -1200,6 +1239,11 @@ impl WindowHandler for App {
         }
         if cfg.decoration_mode != DecorationMode::Server && first {
             log::debug!("compositor declined server-side decorations");
+        }
+        if was_suspended && !w.suspended && w.mac_minimized {
+            // Restored from the taskbar: restore it on the Mac too.
+            w.mac_minimized = false;
+            let _ = self.net.send(NetCmd::Control(W::new(t::RESTORE).u32(wid).finish()));
         }
         if was_suspended != w.suspended {
             // Minimised (or fully hidden): stop encoding on the Mac to save bandwidth.
@@ -1396,6 +1440,7 @@ impl KeyboardHandler for App {
             self.send(W::new(t::FOCUS).u32(wid).finish());
             self.update_lights(wid, qh);
         }
+        self.schedule_menu_panel();
     }
 
     fn leave(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
@@ -1403,6 +1448,7 @@ impl KeyboardHandler for App {
         if let Some(wid) = was {
             self.update_lights(wid, qh);
         }
+        self.schedule_menu_panel();
         self.meta_down = 0;
         self.shift_down = 0;
         self.swallowed.clear();

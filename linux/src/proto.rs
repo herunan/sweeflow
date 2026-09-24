@@ -18,12 +18,15 @@ pub mod t {
     pub const TOGGLE_MAXIMIZE: u8 = 0x18;
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
+    pub const APP_LIST: u8 = 0x1C;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;
     pub const SCREEN_SIZE: u8 = 0x23;
     pub const MENU_ACTIVATE: u8 = 0x24;
     pub const MENU_REFRESH: u8 = 0x25;
+    pub const RESTORE: u8 = 0x26;
+    pub const LAUNCH_APP: u8 = 0x27;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;

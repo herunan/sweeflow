@@ -4,14 +4,11 @@ import ScreenCaptureKit
 /// User configuration: ~/Library/Application Support/sweeflow/config.json
 struct Config: Codable {
     var port: UInt16 = 44120
-    /// Bundle identifiers whose windows are streamed. Empty = every regular app.
-    var apps: [String] = [
-        "com.example.chat",
-        "com.example.videocall",
-        "com.example.assistant",
-        "com.apple.Terminal",
-        "com.example.browser",
-    ]
+    /// Bundle identifiers whose windows are streamed. Empty = every regular app (anything with
+    /// a Dock icon), which is the default.
+    var apps: [String] = []
+    /// Mute the Mac's own speakers while a client is connected (sound plays on Linux instead).
+    var muteMacWhileStreaming = true
 
     /// Put streamed windows on an invisible display sized to the Linux monitor (lets windows be
     /// as large as that monitor and keeps working with the lid closed). Turn off to keep windows
@@ -29,11 +26,15 @@ struct Config: Codable {
         apps = try c.decodeIfPresent([String].self, forKey: .apps) ?? d.apps
         virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? d.virtualDisplay
         debugPort = try c.decodeIfPresent(UInt16.self, forKey: .debugPort) ?? 0
+        muteMacWhileStreaming = try c.decodeIfPresent(Bool.self, forKey: .muteMacWhileStreaming) ?? d.muteMacWhileStreaming
     }
 
     func allows(_ bundleId: String) -> Bool {
         if bundleId == Bundle.main.bundleIdentifier { return false }
-        return apps.isEmpty || apps.contains(bundleId)
+        if !apps.isEmpty { return apps.contains(bundleId) }
+        // Regular apps only: menu-bar utilities and background agents have no real windows.
+        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+            .contains { $0.activationPolicy == .regular }
     }
 
     static func load() -> Config {
@@ -73,10 +74,24 @@ final class HostState {
     private var sessions = 0
     private var teardown: DispatchWorkItem?
 
+    private var mutedByUs = false
+
     func sessionStarted() {
         sessions += 1
         teardown?.cancel()
         wake.hold()
+        if config.muteMacWhileStreaming && !mutedByUs {
+            // Remember the user's own setting so it is restored exactly.
+            DispatchQueue.global().async {
+                let was = (try? run("/usr/bin/osascript", ["-e", "output muted of (get volume settings)"]))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+                if !was {
+                    _ = try? run("/usr/bin/osascript", ["-e", "set volume output muted true"])
+                    DispatchQueue.main.async { self.mutedByUs = true }
+                    log("muted the Mac's speakers while streaming")
+                }
+            }
+        }
     }
 
     func sessionEnded() {
@@ -87,6 +102,11 @@ final class HostState {
             log("no client for a while: removing virtual display, allowing sleep")
             self.display.remove()
             self.wake.release()
+            if self.mutedByUs {
+                self.mutedByUs = false
+                DispatchQueue.global().async { _ = try? run("/usr/bin/osascript", ["-e", "set volume output muted false"]) }
+                log("unmuted the Mac's speakers")
+            }
         }
         teardown = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)

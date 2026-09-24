@@ -30,6 +30,9 @@ final class Session {
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
     private var started = false
+    /// Windows minimised on the Mac: kept (not reported removed) so the Linux window stays in the
+    /// taskbar, minimised, until the user restores it there.
+    private var minimized: [UInt32: TrackedWindow] = [:]
     private let menuQueue = DispatchQueue(label: "sweeflow.menus", qos: .userInitiated)
     /// The window with keyboard focus on the Linux side (0 = none of ours).
     private var clientFocus: UInt32 = 0
@@ -111,6 +114,7 @@ final class Session {
             }
             cw.start()
             cursor = cw
+            sendAppList()
         case .ping:
             var w = MsgWriter(.pong); w.u64(try m.u64()); s.send(w)
 
@@ -155,6 +159,19 @@ final class Session {
             let wid = try m.u32(), w = try m.f32(), h = try m.f32()
             guard let win = tracker.windows[wid] else { return }
             control_.setSize(wid, pid: win.pid, CGSize(width: w, height: h))
+        case .launchApp:
+            let bid = try m.str()
+            log("launching \(bid)")
+            // `open -b` also reopens a running app that has no windows (like clicking its Dock icon).
+            DispatchQueue.global().async { _ = try? run("/usr/bin/open", ["-b", bid]) }
+        case .restore:
+            // Restored from the Linux taskbar: bring the Mac window back; the tracker then
+            // re-announces it and the client resubscribes to its video.
+            let wid = try m.u32()
+            if let w = minimized.removeValue(forKey: wid) {
+                control_.unminimize(wid, pid: w.pid)
+                control_.focus(wid, pid: w.pid)
+            }
         case .menuRefresh:
             sendMenus(pid: pid_t(try m.i32()))
         case .menuActivate:
@@ -369,22 +386,29 @@ final class Session {
     // MARK: window list
 
     private func startTracking() {
-        tracker.onAdded = { [weak self] w in self?.placeOnVirtualDisplay(w); self?.sendAdded(w) }
+        tracker.onAdded = { [weak self] w in
+            self?.minimized[w.wid] = nil
+            self?.placeOnVirtualDisplay(w)
+            self?.sendAdded(w)
+        }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
         tracker.onRemoved = { [weak self] w in
             guard let self else { return }
             let wid = w.wid
-            // Minimised on the Mac (⌘M, or an app's own button): a minimised window can't be
-            // captured, so restore it there and minimise the Linux window instead.
-            if w.kind == .toplevel, self.control_.isMinimized(wid, pid: w.pid) {
-                log("window \(wid) minimised on the Mac → minimising on Linux instead")
-                self.control_.unminimize(wid, pid: w.pid)
-                var m = MsgWriter(.minimize); m.u32(wid); self.control?.send(m)
-                return
+            if self.minimized[wid] != nil { return }
+            guard w.kind == .toplevel else { self.windowGone(wid); return }
+            // A minimising window leaves the screen before the minimise animation finishes and
+            // AX reports it minimised, so decide a moment later.
+            self.queue.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self, self.tracker.windows[wid] == nil else { return }
+                if self.control_.isMinimized(wid, pid: w.pid) {
+                    log("window \(wid) minimised on the Mac → minimised on Linux too")
+                    self.minimized[wid] = w
+                    var m = MsgWriter(.minimize); m.u32(wid); self.control?.send(m)
+                } else {
+                    self.windowGone(wid)
+                }
             }
-            self.control_.forget(wid)
-            self.sentButtons[wid] = nil
-            var m = MsgWriter(.windowRemoved); m.u32(wid); self.control?.send(m)
         }
         tracker.start()
 
@@ -393,6 +417,25 @@ final class Session {
         t.setEventHandler { [weak self] in self?.checkFocus() }
         t.resume()
         focusTimer = t
+    }
+
+    private func sendAppList() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let apps = AppList.scan()
+            self?.queue.async {
+                var m = MsgWriter(.appList)
+                m.u16(UInt16(apps.count))
+                for a in apps { m.str(a.bundleId); m.str(a.name); m.bytes(a.iconPNG) }
+                self?.control?.send(m)
+                log("sent \(apps.count) installed apps")
+            }
+        }
+    }
+
+    private func windowGone(_ wid: UInt32) {
+        control_.forget(wid)
+        sentButtons[wid] = nil
+        var m = MsgWriter(.windowRemoved); m.u32(wid); control?.send(m)
     }
 
     private func checkFocus() {
