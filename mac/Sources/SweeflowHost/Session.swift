@@ -30,6 +30,8 @@ final class Session {
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
     private var started = false
+    /// Sizes the client shows windows at (from its resize requests).
+    private var requestedSizes: [UInt32: CGSize] = [:]
     /// Windows minimised on the Mac: kept (not reported removed) so the Linux window stays in the
     /// taskbar, minimised, until the user restores it there.
     private var minimized: [UInt32: TrackedWindow] = [:]
@@ -126,6 +128,7 @@ final class Session {
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
+            st.visibleSize = requestedSizes[wid]
             st.onDetectedButtons = { [weak self] rects in
                 guard let self else { return }
                 self.sentButtons[wid] = rects
@@ -158,6 +161,8 @@ final class Session {
         case .resize:
             let wid = try m.u32(), w = try m.f32(), h = try m.f32()
             guard let win = tracker.windows[wid] else { return }
+            requestedSizes[wid] = CGSize(width: w, height: h)
+            for st in streamers.values where st.wid == wid { st.visibleSize = CGSize(width: w, height: h) }
             control_.setSize(wid, pid: win.pid, CGSize(width: w, height: h))
         case .launchApp:
             let bid = try m.str()

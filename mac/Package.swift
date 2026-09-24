@@ -18,6 +18,7 @@ let package = Package(
                 .linkedFramework("Network"),
                 .linkedFramework("AppKit"),
                 .linkedFramework("ApplicationServices"),
+                .linkedFramework("Accelerate"),
             ]
         ),
     ]

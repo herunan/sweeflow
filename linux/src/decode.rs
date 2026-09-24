@@ -58,6 +58,8 @@ pub struct GpuFrame {
     pub dark_titlebar: bool,
     /// Pixels per point (from the Mac); 0 = unknown.
     pub px_per_pt: u8,
+    /// Full-range (0–255) YUV rather than limited (16–235), as signalled in the stream.
+    pub full_range: bool,
 }
 
 // The AVFrame is exclusively owned; FFmpeg frames are safe to move between threads.
@@ -185,6 +187,7 @@ impl Decoder {
                 capture_us,
                 dark_titlebar: true,
                 px_per_pt: 0,
+                full_range: (*self.frame).color_range == AVColorRange::AVCOL_RANGE_JPEG,
             })
         }
     }

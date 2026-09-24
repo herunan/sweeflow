@@ -349,6 +349,7 @@ struct Encoded {
     dark: bool,
     /// Pixels per point of this frame (2 for Retina captures).
     px_per_pt: u8,
+    full_range: bool,
     data: Vec<u8>,
 }
 
@@ -395,6 +396,8 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                     Ok(Some(mut frame)) => {
                         frame.dark_titlebar = f.dark;
                         frame.px_per_pt = f.px_per_pt;
+                        // The Mac knows the encoder's range; FFmpeg's VA-API frames don't report it.
+                        frame.full_range = f.full_range;
                         if ui2.send(UiEvent::Frame(wid, frame)).is_err() {
                             return;
                         }
@@ -456,6 +459,7 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                 lossless: flags & 2 != 0,
                 dark: flags & 4 != 0,
                 px_per_pt: flags >> 4,
+                full_range: flags & 8 != 0,
                 data: r.bytes()?.to_vec(),
             })
         })();

@@ -106,6 +106,8 @@ struct Corners {
     split: bool,
     /// Middle strip's offset from the window's top edge (logical px).
     middle_y: i32,
+    /// Colour representation of the top and bottom strips (they show the video too).
+    colors: Vec<WpColorRepresentationSurfaceV1>,
 }
 
 struct Lights {
@@ -128,7 +130,9 @@ struct Win {
     video: wl_surface::WlSurface,
     video_sub: wl_subsurface::WlSubsurface,
     video_viewport: WpViewport,
-    _color: Option<WpColorRepresentationSurfaceV1>,
+    color: Option<WpColorRepresentationSurfaceV1>,
+    /// Range last declared to the compositor (None until the first frame).
+    color_full_range: Option<bool>,
     _inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     configured: bool,
     /// Logical size of the window as configured by the compositor.
@@ -497,12 +501,8 @@ impl App {
         empty.destroy();
         // Only HEVC windows carry YUV video; popups show RGB images, which must not be tagged.
         let is_video = !matches!(role, Role::Popup(_));
-        let color = self.color_rep.as_ref().filter(|_| is_video).map(|m| {
-            let c = m.get_surface(&video, qh, ());
-            // VideoToolbox encodes BT.709 limited range.
-            c.set_coefficients_and_range(crs::Coefficients::Bt709, crs::Range::Limited);
-            c
-        });
+        // BT.709 YUV; the range is declared per frame from what the stream signals.
+        let color = self.color_rep.as_ref().filter(|_| is_video).map(|m| m.get_surface(&video, qh, ()));
         let inhibitor = match (&role, &self.inhibit_mgr, &self.seat) {
             (Role::Toplevel(_), Some(m), Some(seat)) => Some(m.inhibit_shortcuts(&base, seat, qh, ())),
             _ => None,
@@ -529,7 +529,8 @@ impl App {
                 video,
                 video_sub,
                 video_viewport,
-                _color: color,
+                color,
+                color_full_range: None,
                 _inhibitor: inhibitor,
                 configured: false,
                 size,
@@ -581,6 +582,9 @@ impl App {
             am.release();
         }
         if let Some(c) = w.corners {
+            for cr in &c.colors {
+                cr.destroy();
+            }
             for (bufs, _) in &c.tile_buffers {
                 bufs.iter().for_each(|b| b.destroy());
             }
@@ -660,6 +664,17 @@ impl App {
             self.update_lights(wid, qh);
         }
         let Some(w) = self.windows.get_mut(&wid) else { return };
+        let full_range = frame.full_range;
+        if w.color_full_range != Some(full_range) {
+            let range = if full_range { crs::Range::Full } else { crs::Range::Limited };
+            // Every surface showing this video (middle and the corner layout's strips) must
+            // agree, or the strips show as bars in a different brightness.
+            for c in w.color.iter().chain(w.corners.iter().flat_map(|c| c.colors.iter())) {
+                c.set_coefficients_and_range(crs::Coefficients::Bt709, range);
+            }
+            log::info!("window {wid}: video is {} range", if full_range { "full" } else { "limited" });
+            w.color_full_range = Some(full_range);
+        }
         let capture_us = frame.capture_us;
         // Always ack so the Mac keeps streaming, even if we drop this frame.
         let ack = W::new(t::FRAME_ACK).u64(capture_us).finish();
@@ -814,6 +829,18 @@ impl App {
             let top = make();
             let bottom = make();
             let tiles = (0..4).map(|_| make()).collect();
+            let colors: Vec<_> = self
+                .color_rep
+                .iter()
+                .flat_map(|m| [m.get_surface(&top.1, qh, ()), m.get_surface(&bottom.1, qh, ())])
+                .collect();
+            let range_now = self.windows.get(&wid).and_then(|w| w.color_full_range);
+            if let Some(full) = range_now {
+                let range = if full { crs::Range::Full } else { crs::Range::Limited };
+                for c in &colors {
+                    c.set_coefficients_and_range(crs::Coefficients::Bt709, range);
+                }
+            }
             let corners = Corners {
                 t_px: 0,
                 top,
@@ -823,6 +850,7 @@ impl App {
                 pending: None,
                 split: false,
                 middle_y: 0,
+                colors,
             };
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.corners = Some(corners);
@@ -834,6 +862,19 @@ impl App {
             log::info!("window {wid}: corner radius {t_px}px");
         }
         c.t_px = t_px;
+        if self.trace && t_px > 0 {
+            // Four tiles side by side: TL, TR, BL, BR.
+            let n = (t_px * t_px * 4) as usize;
+            let mut sheet = vec![0u8; n * 4];
+            for i in 0..4usize {
+                for y in 0..t_px as usize {
+                    let src = &tile_px[i * n + y * t_px as usize * 4..][..t_px as usize * 4];
+                    let dst = (y * t_px as usize * 4 + i * t_px as usize) * 4;
+                    sheet[dst..dst + t_px as usize * 4].copy_from_slice(src);
+                }
+            }
+            dump_bgra(&format!("/tmp/sweeflow-corners-{wid}.png"), t_px * 4, t_px, &sheet);
+        }
         c.pending = (t_px > 0).then_some((t_px, tile_px));
     }
 

@@ -4,6 +4,7 @@ import ScreenCaptureKit
 import VideoToolbox
 import CoreMedia
 import Compression
+import Accelerate
 
 /// Captures one window with ScreenCaptureKit, encodes it with the hardware HEVC encoder and
 /// writes frames to a video stream. Flow control is end-to-end: at most `maxInFlight` frames may
@@ -38,6 +39,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var buttons: [CGRect] = []
     /// Where macOS's capture badge overlaps this window (window points), looked up per frame.
     var badgeRect: () -> CGRect? = { nil }
+    /// The size Linux shows this window at (points). When the Mac window can't shrink that far
+    /// (app minimum size), Linux crops it, so the bottom/right corners must be cut at the
+    /// visible edge rather than the window's real edge.
+    var visibleSize: CGSize?
     /// Called when traffic lights drawn by the app itself were found in the pixels.
     var onDetectedButtons: (([CGRect]) -> Void)?
     private var detectCountdown = 0
@@ -45,6 +50,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
     private var cornersHash: UInt64 = 0
+    private var mismatchLogs = 0
+    private var loggedAttachments = false
     /// Corner radii measured across all windows (points → count). Standard macOS windows share
     /// one radius, so every window uses the most common measurement: individual measurements
     /// can be thrown off by what an app draws at its edge (Terminal, a browser).
@@ -109,6 +116,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 4
         config.showsCursor = false
         config.ignoreShadowsSingleWindow = true
+        // A shared window's capture otherwise gets its menus/popups composited in (scaled and
+        // misplaced); we stream those as their own windows.
+        config.includeChildWindows = false
         config.shouldBeOpaque = false
         config.capturesAudio = false
         let s = SCStream(filter: filter, configuration: config, delegate: self)
@@ -202,8 +212,30 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+        // Where the window's content actually is in the buffer: when it doesn't fill it (the
+        // configured size is stale), ScreenCaptureKit pads with black.
+        let info = attachments.first ?? [:]
+        let contentRect = (info[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        let contentScale = info[.contentScale] as? CGFloat ?? 1
+        let scaleFactor = info[.scaleFactor] as? CGFloat ?? 1
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
+            if !self.loggedAttachments {
+                self.loggedAttachments = true
+                let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
+                log("stream \(self.wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
+            }
+            if let r = contentRect {
+                let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
+                let cw = r.width * contentScale * scaleFactor, ch = r.height * contentScale * scaleFactor
+                if abs(cw - bw) > 2 || abs(ch - bh) > 2 {
+                    self.mismatchLogs += 1
+                    if self.mismatchLogs <= 5 {
+                        log(String(format: "stream %u: content %.0fx%.0f (rect %@ contentScale %.2f scaleFactor %.1f) in buffer %.0fx%.0f, pointSize %@",
+                                   self.wid, cw, ch, NSStringFromRect(r), contentScale, scaleFactor, bw, bh, NSStringFromSize(self.pointSize)))
+                    }
+                }
+            }
             if !self.lossless {
                 // Apps that hide the standard buttons and draw their own: find them in the pixels
                 // (a few times a second until found).
@@ -234,12 +266,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
                 let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * self.scale).rounded())
-                if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: self.scale),
+                let visiblePx = self.visibleSize.map { CGSize(width: $0.width * self.scale, height: $0.height * self.scale) }
+                if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: self.scale, visible: visiblePx),
                    hash != self.cornersHash {
                     self.cornersHash = hash
                     self.pendingCorners = (t, tiles)
                 }
                 fillCorners(pb, radiusPx: Int(28 * self.scale))
+                // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
+                // drops alpha, which would leave them darkened. Restore their real colour.
+                unpremultiply(pb)
                 let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
                 if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", self.wid, ms)) }
             }
@@ -325,7 +361,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 return
             }
             let (data, key) = annexB(sb)
-            self.queue.async { self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, data: data) }
+            // The low-latency encoder emits full-range YUV whatever the input; tell the client.
+            let fullRange = CMSampleBufferGetFormatDescription(sb).flatMap {
+                CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
+            } ?? false
+            self.queue.async { self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, fullRange: fullRange, data: data) }
         }
     }
 
@@ -361,12 +401,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         statBytes += bytes
     }
 
-    private func sendFrame(captureUs: UInt64, w: Int32, h: Int32, key: Bool, data: Data) {
+    private func sendFrame(captureUs: UInt64, w: Int32, h: Int32, key: Bool, fullRange: Bool, data: Data) {
         guard !stopped else { return }
         var m = MsgWriter(.frame)
         m.u64(captureUs)
         m.u16(UInt16(w)); m.u16(UInt16(h))
-        m.u8((key ? 1 : 0) | (darkTitleBar ? 4 : 0) | (UInt8(min(15, max(1, scale.rounded()))) << 4))
+        m.u8((key ? 1 : 0) | (darkTitleBar ? 4 : 0) | (fullRange ? 8 : 0) | (UInt8(min(15, max(1, scale.rounded()))) << 4))
         m.bytes(data)
         out.send(m)
         statFrames += 1
@@ -455,12 +495,15 @@ func measureCornerRadius(_ pb: CVPixelBuffer, scale: CGFloat) -> Int? {
 /// anti-aliased rounded mask of radius `r` px. Colours come from the nearest pixel inside the
 /// window, so whatever the capture has in the corner (transparency, an erased badge, an app's own
 /// square edge) can't leak through. Returns (tile px, tiles, hash).
-func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat) -> (Int, Data, UInt64)? {
+func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, visible: CGSize? = nil) -> (Int, Data, UInt64)? {
     guard r > 0, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
-    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+    let bufW = CVPixelBufferGetWidth(pb), bufH = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+    // The corners go where Linux's view of the window ends (it crops windows it can't shrink).
+    let w = min(bufW, visible.map { Int($0.width.rounded()) } ?? bufW)
+    let h = min(bufH, visible.map { Int($0.height.rounded()) } ?? bufH)
     let s = max(1, Int(scale.rounded()))
     let t = ((r + s - 1) / s) * s          // whole points, so the client can place it exactly
     guard t <= w / 3, t <= h / 3 else { return nil }
@@ -493,7 +536,9 @@ func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat) -> (Int, Da
                     // inside the curve along the ray from the circle centre.
                     var sxp = fx, syp = fy
                     let src0 = base + fy * stride + fx * 4
-                    if src0[3] < 250 || cover < 1 {
+                    // Only genuinely transparent pixels (outside the app's own rounded corner)
+                    // borrow colour from further in; translucent content keeps its own.
+                    if src0[3] < 16 || cover < 1 {
                         // Walk inward along the ray from the circle centre until the capture has
                         // solid window pixels (the app's own corner may be rounder than ours).
                         let ddx = Double(fx) + 0.5 - cx, ddy = Double(fy) + 0.5 - cy
@@ -503,7 +548,7 @@ func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat) -> (Int, Da
                             let k = max(0, dist / d)
                             sxp = min(w - 1, max(0, Int(cx + ddx * k)))
                             syp = min(h - 1, max(0, Int(cy + ddy * k)))
-                            if (base + syp * stride + sxp * 4)[3] >= 250 || dist <= 0 { break }
+                            if (base + syp * stride + sxp * 4)[3] >= 16 || dist <= 0 { break }
                             dist -= 1
                         }
                     }
@@ -603,6 +648,19 @@ func debugDumpTile(_ tiles: Data, t: Int, name: String) {
         }
     }
     try? rep.representation(using: .png, properties: [:])?.write(to: Identity.dir.appendingPathComponent(name))
+}
+
+/// Premultiplied → straight BGRA in place (SIMD), so dropping alpha doesn't darken translucent
+/// pixels.
+func unpremultiply(_ pb: CVPixelBuffer) {
+    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
+    var buf = vImage_Buffer(data: base, height: vImagePixelCount(CVPixelBufferGetHeight(pb)),
+                            width: vImagePixelCount(CVPixelBufferGetWidth(pb)), rowBytes: CVPixelBufferGetBytesPerRow(pb))
+    // Alpha is last in BGRA as in RGBA; the colour order does not matter here.
+    vImageUnpremultiplyData_RGBA8888(&buf, &buf, vImage_Flags(kvImageNoFlags))
 }
 
 /// macOS windows have rounded, transparent corners. The Linux window is a plain rectangle, so
