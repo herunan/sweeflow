@@ -18,6 +18,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var pointSize: CGSize
 
     private var stream: SCStream?
+    private var scWindow: SCWindow?
     private var config = SCStreamConfiguration()
     private var encoder: VTCompressionSession?
     private var encoderSize: (Int32, Int32) = (0, 0)
@@ -85,6 +86,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func startCapture(_ win: SCWindow) {
+        scWindow = win
         let filter = SCContentFilter(desktopIndependentWindow: win)
         applySize(to: config)
         // BGRA with alpha so the rounded window corners can be filled in (see fillCorners);
@@ -128,6 +130,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     func windowResized(to size: CGSize) {
         guard size != pointSize, let stream else { pointSize = size; return }
         pointSize = size
+        if lossless, let win = scWindow {
+            // Menus are static: after a reconfigure ScreenCaptureKit would not deliver a frame
+            // until the content changes, leaving the old-size image. A fresh capture always
+            // starts with a frame.
+            stream.stopCapture { _ in }
+            self.stream = nil
+            startCapture(win)
+            return
+        }
         applySize(to: config)
         stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
@@ -468,14 +479,24 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
 
-    // The badge is a pill around all three buttons; clear it to the title-bar colour sampled
-    // just to its right.
+    // The badge is a pill around all three buttons; clear it to the surrounding title bar.
     let x0 = max(0, Int(union.minX * scale)), x1 = min(w, Int(union.maxX * scale))
     let y0 = max(0, Int(union.minY * scale)), y1 = min(h, Int(union.maxY * scale))
-    let sx = min(w - 1, x1 + Int(4 * scale)), sy = min(h - 1, (y0 + y1) / 2)
     guard x1 > x0, y1 > y0 else { return nil }
-    let bg = base + sy * stride + sx * 4
-    let (bb, bgc, br) = (bg[0], bg[1], bg[2])
+    // Fill colour: median of the pixels just outside the region (robust to a logo or text next
+    // to the buttons, which a single sample would pick up).
+    var samples: [(UInt8, UInt8, UInt8)] = []
+    let pad = max(2, Int(scale * 1.5))
+    func sample(_ x: Int, _ y: Int) {
+        guard x >= 0, x < w, y >= 0, y < h else { return }
+        let p = base + y * stride + x * 4
+        if p[3] > 250 { samples.append((p[0], p[1], p[2])) }
+    }
+    for x in stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
+    for y in stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
+    guard !samples.isEmpty else { return nil }
+    func median(_ k: (UInt8, UInt8, UInt8) -> UInt8) -> UInt8 { samples.map(k).sorted()[samples.count / 2] }
+    let (bb, bgc, br) = (median { $0.0 }, median { $0.1 }, median { $0.2 })
     for y in y0..<y1 {
         let row = base + y * stride
         for x in x0..<x1 { let p = row + x * 4; p[0] = bb; p[1] = bgc; p[2] = br; p[3] = 255 }

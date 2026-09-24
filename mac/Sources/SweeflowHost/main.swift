@@ -17,6 +17,8 @@ struct Config: Codable {
     /// as large as that monitor and keeps working with the lid closed). Turn off to keep windows
     /// on the Mac's own screen while also using the Mac directly.
     var virtualDisplay = true
+    /// Localhost debug hook port (development only); 0 = off.
+    var debugPort: UInt16 = 0
 
     init() {}
 
@@ -26,6 +28,7 @@ struct Config: Codable {
         port = try c.decodeIfPresent(UInt16.self, forKey: .port) ?? d.port
         apps = try c.decodeIfPresent([String].self, forKey: .apps) ?? d.apps
         virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? d.virtualDisplay
+        debugPort = try c.decodeIfPresent(UInt16.self, forKey: .debugPort) ?? 0
     }
 
     func allows(_ bundleId: String) -> Bool {
@@ -95,5 +98,8 @@ Wakefulness.resetLidSleep()   // in case a previous run died while streaming
 
 let server = Server(identity: identity) { group, queue in Session(group: group, queue: queue, config: config) }
 do { try server.start(port: config.port) } catch { log("listen failed: \(error)"); exit(1) }
+
+let debugPort = DebugPort()
+if config.debugPort != 0 { debugPort.start(port: config.debugPort) }
 
 app.run()

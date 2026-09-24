@@ -5,7 +5,7 @@ import Network
 /// tracker feeding them. Everything runs on the server's serial queue.
 final class Session {
     private let group: NWConnectionGroup
-    private let queue: DispatchQueue
+    let queue: DispatchQueue
     private let config: Config
     private var control: MsgStream?
     private var clientScale: CGFloat = 1
@@ -85,6 +85,7 @@ final class Session {
             captureScale = (try? m.f32()) ?? 0
             log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
             control = s
+            DebugPort.session = self
             if !started {
                 started = true
                 DispatchQueue.main.async { host.sessionStarted() }
@@ -250,6 +251,26 @@ final class Session {
         guard w.kind == .toplevel, let area = vdArea else { return }
         if area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)) { return }
         control_.setPosition(w.wid, pid: w.pid, area.origin)
+    }
+
+    // MARK: debug hooks (DebugPort)
+
+    func debugPointer(wid: UInt32, x: Double, y: Double, click: Bool, right: Bool) -> String {
+        guard let win = tracker.windows[wid] else { return "no window \(wid)" }
+        let p = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
+        ensureFront(wid, at: p)
+        input.move(to: p)
+        if click {
+            input.button(right ? 1 : 0, pressed: true, at: p)
+            input.button(right ? 1 : 0, pressed: false, at: p)
+        }
+        return "ok \(p)"
+    }
+
+    func debugWindows() -> String {
+        tracker.windows.values.sorted { $0.wid < $1.wid }.map {
+            "\($0.wid) \($0.appName) kind=\($0.kind) parent=\($0.parent) layer=\($0.layer) frame=\($0.frame) rel=\($0.rel)"
+        }.joined(separator: "\n")
     }
 
     private func setClientFocus(_ wid: UInt32) {

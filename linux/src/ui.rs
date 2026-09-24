@@ -783,6 +783,7 @@ impl App {
         let s = self.scale;
         let (bw, bh) = w.size;
         let px_per_pt = px_per_pt(ppp, fw, w.info.w, s);
+        log::info!("popup {wid}: frame {fw}x{fh} ppp {ppp} window {bw}x{bh} info {}x{}", w.info.w, w.info.h);
         let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
         let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);
         w.video_viewport.set_source(0.0, 0.0, vis_w * px_per_pt, vis_h * px_per_pt);
@@ -905,9 +906,8 @@ impl App {
             region.destroy();
             w.lights = Some(Lights { surface, sub, viewport, buffers: Default::default(), drawn: None });
         }
-        // Render at 2x and let the compositor downsample, like the video.
-        let scale = 2.0 * self.scale;
-        let (pw, ph, px) = lights::render(&w.buttons, rect, scale, state);
+        // Sprites are 2x; the compositor downsamples them like the video.
+        let (pw, ph, px) = lights::render(&w.buttons, rect, state);
         let Ok(mut pool) = RawPool::new(px.len(), &self.shm) else { return };
         pool.mmap().copy_from_slice(&px);
         let buf = pool.create_buffer(0, pw as i32, ph as i32, (pw * 4) as i32, wl_shm::Format::Argb8888, (), qh);

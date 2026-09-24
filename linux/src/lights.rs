@@ -3,16 +3,32 @@
 //! over the group, lighter while pressed. Colours and geometry were sampled from AppKit's own
 //! rendering of the buttons.
 
-/// Circle radius and glyph geometry, in points.
-const RADIUS: f64 = 6.0;
-const STROKE: f64 = 0.62; // half stroke width
-const CROSS: f64 = 2.6; // × arm half-extent (before round caps)
-const BAR: f64 = 3.4; // − and + half-length (before round caps)
+/// Real macOS Golden Gate window buttons, captured from a live window on the Mac and turned into
+/// premultiplied RGBA sprites (assets/extract-traffic-lights.py). 40x40 px boxes at 2x:
+/// rows = inactive, active, hover (glyphs), pressed; columns = close, minimise, zoom.
+const SHEET_PNG: &[u8] = include_bytes!("../assets/traffic-lights.png");
+const BOX: usize = 40;
+const SPRITE_SCALE: f64 = 2.0;
+/// Room around each 16 pt button rect for the sprite (pressed buttons grow a little).
+const MARGIN: f64 = 3.0;
 
-const FILL: [[u8; 3]; 3] = [[237, 106, 94], [250, 228, 65], [89, 239, 80]];
-const FILL_PRESSED: [[u8; 3]; 3] = [[240, 147, 137], [251, 235, 116], [134, 243, 127]];
-const GLYPH: [[u8; 3]; 3] = [[140, 26, 16], [151, 128, 36], [59, 140, 35]];
-const GLYPH_PRESSED: [[u8; 3]; 3] = [[105, 18, 10], [112, 95, 27], [44, 104, 26]];
+struct Sheet {
+    w: usize,
+    rgba: Vec<u8>,
+}
+
+fn sheet() -> &'static Sheet {
+    static SHEET: std::sync::OnceLock<Sheet> = std::sync::OnceLock::new();
+    SHEET.get_or_init(|| {
+        let mut dec = png::Decoder::new(std::io::Cursor::new(SHEET_PNG));
+        dec.set_transformations(png::Transformations::EXPAND);
+        let mut r = dec.read_info().expect("traffic-light sheet");
+        let mut buf = vec![0; r.output_buffer_size().unwrap_or(0)];
+        let info = r.next_frame(&mut buf).expect("traffic-light sheet");
+        buf.truncate(info.buffer_size());
+        Sheet { w: info.width as usize, rgba: buf }
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct State {
@@ -24,91 +40,66 @@ pub struct State {
     pub dark_titlebar: bool,
 }
 
-/// Union of the three button rects (x, y, w, h in window points), or None if any is missing.
+/// Union of the three button rects plus a margin (x, y, w, h in window points), or None if
+/// any button is missing.
 pub fn group_rect(buttons: &[[f32; 4]; 3]) -> Option<[f64; 4]> {
     if buttons.iter().any(|r| r[2] <= 0.0 || r[3] <= 0.0) {
         return None;
     }
-    let x0 = buttons.iter().map(|r| r[0] as f64).fold(f64::MAX, f64::min);
-    let y0 = buttons.iter().map(|r| r[1] as f64).fold(f64::MAX, f64::min);
-    let x1 = buttons.iter().map(|r| (r[0] + r[2]) as f64).fold(f64::MIN, f64::max);
-    let y1 = buttons.iter().map(|r| (r[1] + r[3]) as f64).fold(f64::MIN, f64::max);
+    let x0 = buttons.iter().map(|r| r[0] as f64).fold(f64::MAX, f64::min) - MARGIN;
+    let y0 = buttons.iter().map(|r| r[1] as f64).fold(f64::MAX, f64::min) - MARGIN;
+    let x1 = buttons.iter().map(|r| (r[0] + r[2]) as f64).fold(f64::MIN, f64::max) + MARGIN;
+    let y1 = buttons.iter().map(|r| (r[1] + r[3]) as f64).fold(f64::MIN, f64::max) + MARGIN;
     Some([x0.floor(), y0.floor(), (x1 - x0.floor()).ceil(), (y1 - y0.floor()).ceil()])
 }
 
-fn seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
-    let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
-    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
-}
-
-fn in_glyph(i: usize, p: (f64, f64)) -> bool {
-    let d = match i {
-        0 => seg_dist(p, (-CROSS, -CROSS), (CROSS, CROSS)).min(seg_dist(p, (-CROSS, CROSS), (CROSS, -CROSS))),
-        1 => seg_dist(p, (-BAR, 0.0), (BAR, 0.0)),
-        _ => seg_dist(p, (-BAR, 0.0), (BAR, 0.0)).min(seg_dist(p, (0.0, -BAR), (0.0, BAR))),
-    };
-    d <= STROKE
-}
-
-/// Renders the group into premultiplied ARGB8888 (wl_shm byte order: B, G, R, A).
-/// `rect` is the group rect from [`group_rect`]; returns (pixel width, pixel height, pixels).
-pub fn render(buttons: &[[f32; 4]; 3], rect: [f64; 4], scale: f64, st: State) -> (u32, u32, Vec<u8>) {
-    let pw = (rect[2] * scale).round().max(1.0) as u32;
-    let ph = (rect[3] * scale).round().max(1.0) as u32;
-    let mut out = vec![0u8; (pw * ph * 4) as usize];
-    const SS: usize = 4; // 4x4 supersampling for anti-aliasing
-    let inactive: [u8; 4] = if st.dark_titlebar { [255, 255, 255, 36] } else { [0, 0, 0, 30] };
-
+/// Renders the group into premultiplied ARGB8888 (wl_shm byte order: B, G, R, A) at the
+/// sprites' native 2x; returns (pixel width, pixel height, pixels).
+pub fn render(buttons: &[[f32; 4]; 3], rect: [f64; 4], st: State) -> (u32, u32, Vec<u8>) {
+    let s = SPRITE_SCALE;
+    let pw = (rect[2] * s).round().max(1.0) as usize;
+    let ph = (rect[3] * s).round().max(1.0) as usize;
+    let mut out = vec![0u8; pw * ph * 4];
+    let sh = sheet();
     for (i, b) in buttons.iter().enumerate() {
-        let cx = (b[0] as f64 + b[2] as f64 / 2.0 - rect[0]) * scale;
-        let cy = (b[1] as f64 + b[3] as f64 / 2.0 - rect[1]) * scale;
-        let r_px = RADIUS * scale;
-        let pressed = st.pressed == Some(i);
-        let coloured = st.active || st.hover || pressed;
-        let fill = if pressed { FILL_PRESSED[i] } else { FILL[i] };
-        let glyph = if pressed { GLYPH_PRESSED[i] } else { GLYPH[i] };
-        let show_glyph = st.hover || pressed;
-
-        let x0 = (cx - r_px - 1.0).floor().max(0.0) as u32;
-        let x1 = ((cx + r_px + 1.0).ceil() as u32).min(pw);
-        let y0 = (cy - r_px - 1.0).floor().max(0.0) as u32;
-        let y1 = ((cy + r_px + 1.0).ceil() as u32).min(ph);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let (mut r, mut g, mut bl, mut a) = (0f64, 0f64, 0f64, 0f64);
-                for sy in 0..SS {
-                    for sx in 0..SS {
-                        // Sample position relative to the circle centre, in points.
-                        let px = (x as f64 + (sx as f64 + 0.5) / SS as f64 - cx) / scale;
-                        let py = (y as f64 + (sy as f64 + 0.5) / SS as f64 - cy) / scale;
-                        if px * px + py * py > RADIUS * RADIUS {
-                            continue;
-                        }
-                        let (c, alpha) = if !coloured {
-                            ([inactive[0], inactive[1], inactive[2]], inactive[3] as f64 / 255.0)
-                        } else if show_glyph && in_glyph(i, (px, py)) {
-                            (glyph, 1.0)
-                        } else {
-                            (fill, 1.0)
-                        };
-                        r += c[0] as f64 * alpha;
-                        g += c[1] as f64 * alpha;
-                        bl += c[2] as f64 * alpha;
-                        a += alpha;
-                    }
+        let row = if st.pressed == Some(i) {
+            3
+        } else if st.hover || st.pressed.is_some() {
+            2
+        } else if st.active {
+            1
+        } else {
+            0
+        };
+        let cx = ((b[0] as f64 + b[2] as f64 / 2.0 - rect[0]) * s).round() as isize;
+        let cy = ((b[1] as f64 + b[3] as f64 / 2.0 - rect[1]) * s).round() as isize;
+        let (ox, oy) = (cx - BOX as isize / 2, cy - BOX as isize / 2);
+        for y in 0..BOX {
+            let dy = oy + y as isize;
+            if dy < 0 || dy >= ph as isize {
+                continue;
+            }
+            for x in 0..BOX {
+                let dx = ox + x as isize;
+                if dx < 0 || dx >= pw as isize {
+                    continue;
                 }
-                let n = (SS * SS) as f64;
-                let o = ((y * pw + x) * 4) as usize;
-                out[o] = (bl / n).round() as u8;
-                out[o + 1] = (g / n).round() as u8;
-                out[o + 2] = (r / n).round() as u8;
-                out[o + 3] = (a / n * 255.0).round() as u8;
+                let si = ((row * BOX + y) * sh.w + i * BOX + x) * 4;
+                let [r, g, bl, a] = [sh.rgba[si], sh.rgba[si + 1], sh.rgba[si + 2], sh.rgba[si + 3]];
+                if a == 0 {
+                    continue;
+                }
+                // Premultiplied "over" onto what is already there.
+                let o = (dy as usize * pw + dx as usize) * 4;
+                let inv = 255 - a as u32;
+                out[o] = (bl as u32 + out[o] as u32 * inv / 255) as u8;
+                out[o + 1] = (g as u32 + out[o + 1] as u32 * inv / 255) as u8;
+                out[o + 2] = (r as u32 + out[o + 2] as u32 * inv / 255) as u8;
+                out[o + 3] = (a as u32 + out[o + 3] as u32 * inv / 255) as u8;
             }
         }
     }
-    (pw, ph, out)
+    (pw as u32, ph as u32, out)
 }
 
 #[cfg(test)]
@@ -130,7 +121,7 @@ mod tests {
         let mut sheet = Vec::new();
         let mut size = (0, 0);
         for st in states {
-            let (w, h, px) = render(&buttons, rect, 4.0, st);
+            let (w, h, px) = render(&buttons, rect, st);
             assert_eq!(px.len(), (w * h * 4) as usize);
             assert!(px.chunks(4).any(|p| p[3] > 0), "state {st:?} drew nothing");
             size = (w, size.1 + h);
