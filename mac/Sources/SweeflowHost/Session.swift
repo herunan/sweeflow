@@ -15,6 +15,7 @@ final class Session {
     private let control_ = WindowControl()
     private let input = InputInjector()
     private var streamers: [ObjectIdentifier: WindowStreamer] = [:]
+    private var audio: (AudioCapture, ObjectIdentifier)?
     private var videoStreams: [ObjectIdentifier: MsgStream] = [:]
     private var sentIcons: Set<String> = []
     private var raisedWid: UInt32 = 0
@@ -52,6 +53,7 @@ final class Session {
             guard let self else { return }
             self.videoStreams[key] = nil
             if let st = self.streamers.removeValue(forKey: key) { st.stop() }
+            if let (a, k) = self.audio, k == key { a.stop(); self.audio = nil }
             if self.control.map({ ObjectIdentifier($0) }) == key { self.shutdown() }
         }
         s.start()
@@ -69,6 +71,8 @@ final class Session {
         input.releaseAll()
         streamers.values.forEach { $0.stop() }
         streamers.removeAll()
+        audio?.0.stop()
+        audio = nil
         videoStreams.values.forEach { $0.close() }
         videoStreams.removeAll()
         control = nil
@@ -128,6 +132,20 @@ final class Session {
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
+        case .audioSubscribe:
+            audio?.0.stop()
+            let cap = AudioCapture(allowed: { [config] in config.allows($0) })
+            cap.onPCM = { [weak self, weak s] pcm in
+                self?.queue.async {
+                    // Drop rather than queue: late audio is worse than a tiny gap.
+                    guard let s, s.pendingBytes < 64_000 else { return }
+                    var m = MsgWriter(.audio)
+                    m.bytes(pcm)
+                    s.send(m)
+                }
+            }
+            cap.start()
+            audio = (cap, ObjectIdentifier(s))
         case .requestKeyframe: streamers[ObjectIdentifier(s)]?.requestKeyframe()
         case .pause: streamers[ObjectIdentifier(s)]?.setPaused(try m.u8() != 0)
         case .frameAck: streamers[ObjectIdentifier(s)]?.ack(try m.u64())

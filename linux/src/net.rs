@@ -150,6 +150,13 @@ async fn session(
         anyhow::Ok(())
     });
 
+    // Mac app audio → PipeWire.
+    let audio = {
+        let (mut atx, arx) = conn.open_bi().await?;
+        atx.write_all(&W::new(t::AUDIO_SUBSCRIBE).finish()).await?;
+        tokio::spawn(audio_task(atx, arx))
+    };
+
     let mut video: HashMap<u32, (quinn::SendStream, tokio::task::JoinHandle<()>)> = HashMap::new();
     let render_node = cfg.render_node.clone();
     let result = loop {
@@ -184,6 +191,7 @@ async fn session(
     for (_, (_, task)) in video.drain() {
         task.abort();
     }
+    audio.abort();
     conn.close(0u32.into(), b"bye");
     result
 }
@@ -373,6 +381,54 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
             Err(e) => log::warn!("bad frame: {e}"),
         }
     }
+}
+
+/// Plays the Mac's audio through PipeWire (`pw-cat`), as its own "sweeflow" stream in the mixer.
+async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
+    use std::io::Write;
+    let child = std::process::Command::new("pw-cat")
+        .args(["--playback", "--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms"])
+        .args(["-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn();
+    /// Stops the player however this task ends (including being aborted on disconnect).
+    struct Player(std::process::Child);
+    impl Drop for Player {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = match child {
+        Ok(c) => Player(c),
+        Err(e) => {
+            log::warn!("audio disabled: cannot start pw-cat ({e})");
+            return;
+        }
+    };
+    // Blocking pipe writes happen on their own thread so the network reader never stalls.
+    let (tx, prx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+    let mut stdin = child.0.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        while let Ok(pcm) = prx.recv() {
+            if stdin.write_all(&pcm).is_err() {
+                break;
+            }
+        }
+    });
+    log::info!("audio: playing Mac app sound");
+    while let Ok(Some((ty, body))) = proto::read_msg(&mut rx).await {
+        if ty != t::AUDIO {
+            continue;
+        }
+        let Ok(pcm) = R::new(&body).bytes().map(<[u8]>::to_vec) else { continue };
+        // If the player falls behind, drop audio rather than letting latency build up.
+        let _ = tx.try_send(pcm);
+    }
+    drop(tx);
+    drop(child);
+    let _ = writer.join();
 }
 
 // --- TLS -----------------------------------------------------------------------------------

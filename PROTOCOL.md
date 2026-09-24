@@ -61,3 +61,10 @@ The client opens one extra bidirectional stream per window it wants to see.
 | 0x54 | C→S | FrameAck | u64 captureUs (echo when the frame has been presented; Mac uses it for latency stats and flow control) |
 
 Closing a video stream unsubscribes.
+
+## Audio stream
+
+| type | dir | name | payload |
+|------|-----|------|---------|
+| 0x60 | C→S | AudioSubscribe | — (on a new bidirectional stream) |
+| 0x61 | S→C | Audio | bytes pcm — 48 kHz stereo s16le, the streamed apps' audio mixed |

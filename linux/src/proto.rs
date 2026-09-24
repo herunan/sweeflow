@@ -35,6 +35,8 @@ pub mod t {
     pub const PAUSE: u8 = 0x53;
     pub const FRAME_ACK: u8 = 0x54;
     pub const CORNERS: u8 = 0x55;
+    pub const AUDIO_SUBSCRIBE: u8 = 0x60;
+    pub const AUDIO: u8 = 0x61;
 }
 
 /// Builds one framed message.
