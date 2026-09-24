@@ -66,7 +66,25 @@ final class InputInjector {
             wheel.add(dx: dx * Self.pointsPerNotch, dy: dy * Self.pointsPerNotch)
             return
         }
-        postPixelScroll(dx: dx, dy: dy, phase: phase)
+        trackpad.feed(dx: dx, dy: dy, phase: phase)
+    }
+
+    private lazy var trackpad = TrackpadScroller(
+        post: { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase) },
+        momentum: { [weak self] dx, dy, phase in self?.postMomentum(dx: dx, dy: dy, phase: phase) })
+
+    /// Glide after the fingers lift: momentumPhase 1 begin, 2 continue, 3 end (no scroll phase).
+    private func postMomentum(dx: CGFloat, dy: CGFloat, phase: Int64) {
+        guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                              wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0) else { return }
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(dy))
+        e.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Double(dx))
+        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: Double(dy))
+        e.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: Double(dx))
+        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: 0)
+        e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase)
+        post(e)
     }
 
     /// How far one wheel notch scrolls, in points (about three lines of text).
@@ -225,5 +243,109 @@ final class SmoothWheel {
             timer?.cancel()
             timer = nil
         }
+    }
+}
+
+/// Trackpad scrolling from Linux, made to feel like a Mac trackpad: deltas that arrive in
+/// network bursts are spread over 120 Hz ticks, and lifting the fingers mid-swipe carries on
+/// with momentum (Linux leaves inertia to the app; Mac apps expect it from the system).
+final class TrackpadScroller {
+    private let post: (CGFloat, CGFloat, UInt8) -> Void
+    private let momentum: (CGFloat, CGFloat, Int64) -> Void
+    private let queue = DispatchQueue(label: "trackpad-scroll", qos: .userInteractive)
+    private var timer: DispatchSourceTimer?
+    private var pending = CGVector.zero
+    private var touching = false
+    private var ending = false
+    /// Recent per-tick output, for the release velocity.
+    private var recent: [CGVector] = []
+    private var velocity = CGVector.zero
+    private var coasting = false
+
+    /// Share of the backlog sent per tick (~one tick of smoothing).
+    private let drain: CGFloat = 0.55
+    /// Momentum kept per 120 Hz tick (close to macOS's own deceleration).
+    private let friction: CGFloat = 0.972
+
+    init(post: @escaping (CGFloat, CGFloat, UInt8) -> Void, momentum: @escaping (CGFloat, CGFloat, Int64) -> Void) {
+        self.post = post
+        self.momentum = momentum
+    }
+
+    func feed(dx: CGFloat, dy: CGFloat, phase: UInt8) {
+        queue.async {
+            if phase == 1 || !self.touching && phase != 3 {
+                // Fingers down: stop any glide, start a new gesture.
+                if self.coasting { self.momentum(0, 0, 3); self.coasting = false }
+                self.touching = true
+                self.ending = false
+                self.pending = .zero
+                self.recent = []
+                self.post(0, 0, 1)
+            }
+            // macOS accelerates trackpad scrolling: slow movements stay precise, quick swipes
+            // travel much further. Linux sends raw finger movement, so apply a similar curve
+            // (by the size of each ~8 ms step).
+            let gain = min(1 + 0.09 * hypot(dx, dy), 3.5)
+            self.pending.dx += dx * gain
+            self.pending.dy += dy * gain
+            if phase == 3 { self.ending = true }
+            self.startTimer()
+        }
+    }
+
+    private func startTimer() {
+        guard timer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / 120), leeway: .microseconds(500))
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        timer = t
+    }
+
+    private func tick() {
+        if touching {
+            var out = CGVector(dx: pending.dx * drain, dy: pending.dy * drain)
+            if abs(pending.dx) < 0.5 { out.dx = pending.dx }
+            if abs(pending.dy) < 0.5 { out.dy = pending.dy }
+            pending.dx -= out.dx
+            pending.dy -= out.dy
+            if out.dx != 0 || out.dy != 0 { post(out.dx, out.dy, 2) }
+            recent.append(out)
+            if recent.count > 6 { recent.removeFirst() }
+            if ending && pending == .zero {
+                touching = false
+                ending = false
+                post(0, 0, 3)
+                // Release velocity: the average of the last few ticks (~50 ms).
+                let n = CGFloat(max(recent.count, 1))
+                velocity = CGVector(dx: recent.reduce(0) { $0 + $1.dx } / n, dy: recent.reduce(0) { $0 + $1.dy } / n)
+                if hypot(velocity.dx, velocity.dy) > 1.5 {
+                    coasting = true
+                    momentum(velocity.dx, velocity.dy, 1)
+                } else {
+                    stopTimer()
+                }
+            }
+            return
+        }
+        if coasting {
+            velocity.dx *= friction
+            velocity.dy *= friction
+            if hypot(velocity.dx, velocity.dy) < 0.2 {
+                momentum(0, 0, 3)
+                coasting = false
+                stopTimer()
+            } else {
+                momentum(velocity.dx, velocity.dy, 2)
+            }
+            return
+        }
+        stopTimer()
+    }
+
+    private func stopTimer() {
+        timer?.cancel()
+        timer = nil
     }
 }

@@ -25,7 +25,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoderSize: (Int32, Int32) = (0, 0)
 
     private var inFlight: [UInt64] = []
-    private let maxInFlight = 2
+    // Enough for 100–120 fps over a ~25 ms pipeline; more only queues frames in the encoder.
+    private let maxInFlight = 3
     private var pendingBuffer: CVPixelBuffer?   // newest capture not yet encoded (throttled)
     private var lastBuffer: CVPixelBuffer?      // last encoded capture, reused for refinement
     private var lastEncodeAt = DispatchTime.now()
@@ -51,7 +52,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Called when traffic lights drawn by the app itself were found in the pixels.
     var onDetectedButtons: (([CGRect]) -> Void)?
     private var detectCountdown = 0
-    var active = false
+    /// Focused on Linux. The hardware encoder is shared by every window, so only the focused one
+    /// gets the full frame rate; the rest are capped (they rarely need more, and at full rate
+    /// they queue up in the encoder and add tens of milliseconds to everything).
+    var active = false {
+        didSet { if active != oldValue { applyFrameRate() } }
+    }
+    private static let activeFps: Int32 = 120, backgroundFps: Int32 = 30
+
+    private func applyFrameRate() {
+        config.minimumFrameInterval = CMTime(value: 1, timescale: active ? Self.activeFps : Self.backgroundFps)
+        stream?.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
+    }
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
     private var cornersHash: UInt64 = 0
@@ -70,6 +82,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // Stats
     private var statFrames = 0, statBytes = 0, statLatencySum: UInt64 = 0, statLatencyN = 0
+    private var statEncodeSum: UInt64 = 0, statEncodeN = 0, statCaptureLagSum: UInt64 = 0, statCaptureLagN = 0
     private var statSince = DispatchTime.now()
 
     /// Menus, tooltips and other popups: sent as lossless BGRA with alpha (LZ4) instead of HEVC,
@@ -117,7 +130,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // the encoder converts to 4:2:0 in hardware.
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: active ? Self.activeFps : Self.backgroundFps)
         config.queueDepth = 4
         config.showsCursor = false
         config.ignoreShadowsSingleWindow = true
@@ -288,9 +301,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let info = attachments.first ?? [:]
         let contentRect = (info[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
         let contentScale = info[.contentScale] as? CGFloat ?? 1
+        // How long ScreenCaptureKit took to hand us the frame (its timestamp is host time).
+        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        let lagUs: UInt64 = {
+            guard pts.isValid else { return 0 }
+            let now = CMClockGetTime(CMClockGetHostTimeClock())
+            let d = CMTimeGetSeconds(CMTimeSubtract(now, pts))
+            return d > 0 && d < 1 ? UInt64(d * 1e6) : 0
+        }()
         let scaleFactor = info[.scaleFactor] as? CGFloat ?? 1
         queue.async { [weak self] in
             guard let self, !self.stopped, !self.showingPause else { return }
+            if lagUs > 0 { self.statCaptureLagSum += lagUs; self.statCaptureLagN += 1 }
             if !self.loggedAttachments {
                 self.loggedAttachments = true
                 let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
@@ -401,9 +423,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let el = Double(DispatchTime.now().uptimeNanoseconds - statSince.uptimeNanoseconds) / 1e9
         if el >= 5, statFrames > 0 {
             let lat = statLatencyN > 0 ? Double(statLatencySum) / Double(statLatencyN) / 1000 : -1
-            log(String(format: "stream %u: %.1f fps, %.1f Mbit/s, capture→present %.1f ms", wid,
-                       Double(statFrames) / el, Double(statBytes) * 8 / el / 1e6, lat))
+            let enc = statEncodeN > 0 ? Double(statEncodeSum) / Double(statEncodeN) / 1000 : -1
+            let lag = statCaptureLagN > 0 ? Double(statCaptureLagSum) / Double(statCaptureLagN) / 1000 : -1
+            log(String(format: "stream %u: %.1f fps, %.1f Mbit/s, capture→present %.1f ms (capture lag %.1f, encode %.1f, in flight %d)", wid,
+                       Double(statFrames) / el, Double(statBytes) * 8 / el / 1e6, lat, lag, enc, inFlight.count))
             statFrames = 0; statBytes = 0; statLatencySum = 0; statLatencyN = 0; statSince = .now()
+            statEncodeSum = 0; statEncodeN = 0; statCaptureLagSum = 0; statCaptureLagN = 0
         }
     }
 
@@ -455,7 +480,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let fullRange = CMSampleBufferGetFormatDescription(sb).flatMap {
                 CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
             } ?? false
-            self.queue.async { self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, fullRange: fullRange, data: data) }
+            let encodeUs = hostMicros() - captureUs
+            self.queue.async {
+                self.statEncodeSum += encodeUs; self.statEncodeN += 1
+                self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, fullRange: fullRange, data: data)
+            }
         }
     }
 

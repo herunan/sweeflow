@@ -79,10 +79,15 @@ final class VirtualDisplay {
         }
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
-        settings.modes = [CGVirtualDisplayMode(width: w, height: h, refreshRate: 60)]
-        guard vd.apply(settings) else {
-            log("virtual display: applySettings failed")
-            return
+        // 120 Hz so apps animate (and scroll) at more than the Linux screen's rate; 60 if refused.
+        settings.modes = [CGVirtualDisplayMode(width: w, height: h, refreshRate: 120)]
+        if !vd.apply(settings) {
+            settings.modes = [CGVirtualDisplayMode(width: w, height: h, refreshRate: 60)]
+            guard vd.apply(settings) else {
+                log("virtual display: applySettings failed")
+                return
+            }
+            log("virtual display: 120 Hz refused, using 60 Hz")
         }
         display = vd
         size = points
