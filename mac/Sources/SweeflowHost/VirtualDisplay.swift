@@ -28,15 +28,28 @@ final class VirtualDisplay {
         return CGRect(x: b.minX, y: b.minY + menuBar, width: b.width, height: b.height - menuBar)
     }
 
+    /// Size the client asked for, kept so a failed creation can be retried.
+    private var wanted: CGSize = .zero
+    private var retries = 0
+
     func remove() {
         display = nil
         size = .zero
+        wanted = .zero
+    }
+
+    /// Tries again to create the display if it's wanted but missing (e.g. after an unlock).
+    func retry() {
+        guard display == nil, wanted != .zero else { return }
+        ensure(points: wanted)
     }
 
     /// Creates or resizes the display to `points` (logical size of the Linux monitor).
     func ensure(points: CGSize) {
         let w = UInt32(points.width.rounded()), h = UInt32(points.height.rounded())
         guard w >= 640, h >= 480 else { return }
+        if wanted != points { retries = 0 }
+        wanted = points
         if display != nil && size == points { return }
         display = nil   // releasing the object removes the display
 
@@ -52,7 +65,18 @@ final class VirtualDisplay {
         desc.serialNum = 1
         desc.terminationHandler = { _, _ in log("virtual display terminated") }
 
-        guard let vd = CGVirtualDisplay(descriptor: desc) else { log("virtual display: creation failed"); return }
+        guard let vd = CGVirtualDisplay(descriptor: desc) else {
+            // Fails while the screen is locked, among other transient states: keep trying.
+            retries += 1
+            log("virtual display: creation failed (attempt \(retries))")
+            if retries < 60 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, self.wanted == points else { return }
+                    self.ensure(points: points)
+                }
+            }
+            return
+        }
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
         settings.modes = [CGVirtualDisplayMode(width: w, height: h, refreshRate: 60)]

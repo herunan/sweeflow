@@ -100,6 +100,9 @@ final class InputInjector {
         post(e)
     }
 
+    /// Forget held buttons without posting releases (the drag bridge already released them).
+    func forgetButtons() { buttonsDown.removeAll() }
+
     /// Releases everything we believe is held (client lost focus or disconnected).
     func releaseAll() {
         for code in keysDown { key(evdev: code, pressed: false) }

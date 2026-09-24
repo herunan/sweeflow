@@ -19,6 +19,7 @@ pub mod t {
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;
+    pub const SCREEN_LOCKED: u8 = 0x1D;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;
@@ -35,6 +36,11 @@ pub mod t {
     pub const CLIPBOARD: u8 = 0x40;
     pub const PING: u8 = 0x41;
     pub const CLIPBOARD_SUBSCRIBE: u8 = 0x43;
+    pub const DROP_FILES: u8 = 0x46;
+    pub const DRAG_BEGAN: u8 = 0x47;
+    pub const DRAG_TAKEN: u8 = 0x48;
+    pub const DRAG_FETCH: u8 = 0x49;
+    pub const DRAG_DATA: u8 = 0x4A;
     pub const PONG: u8 = 0x42;
     pub const SUBSCRIBE: u8 = 0x50;
     pub const FRAME: u8 = 0x51;

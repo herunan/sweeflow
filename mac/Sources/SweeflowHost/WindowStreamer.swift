@@ -212,6 +212,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+        // A locked Mac captures as blank: keep showing the last real frame instead.
+        guard !ScreenLock.isLocked else { return }
         // Where the window's content actually is in the buffer: when it doesn't fill it (the
         // configured size is stale), ScreenCaptureKit pads with black.
         let info = attachments.first ?? [:]
@@ -224,6 +226,21 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.loggedAttachments = true
                 let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
                 log("stream \(self.wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
+            }
+            // The window moved to a display with another scale (e.g. the virtual HiDPI display
+            // went away): capture at the new scale instead of padding with black.
+            if scaleFactor > 0, abs(scaleFactor - self.scale) > 0.01, !self.stopped, let stream = self.stream {
+                log("stream \(self.wid): display scale \(self.scale) → \(scaleFactor)")
+                self.scale = scaleFactor
+                if self.lossless, let win = self.scWindow {
+                    stream.stopCapture { _ in }
+                    self.stream = nil
+                    self.startCapture(win)
+                } else {
+                    self.applySize(to: self.config)
+                    stream.updateConfiguration(self.config) { err in if let err { log("updateConfiguration: \(err)") } }
+                }
+                return
             }
             if let r = contentRect {
                 let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))

@@ -17,6 +17,9 @@ final class Session {
     private var streamers: [ObjectIdentifier: WindowStreamer] = [:]
     private var audio: (AudioCapture, ObjectIdentifier)?
     private var clipboard: (ClipboardSync, MsgStream)?
+    /// Main-thread only.
+    private let drag = DragBridge()
+    private var dragTimer: Timer?
     private var videoStreams: [ObjectIdentifier: MsgStream] = [:]
     private var sentIcons: Set<String> = []
     private var raisedWid: UInt32 = 0
@@ -121,6 +124,11 @@ final class Session {
             cw.start()
             cursor = cw
             sendAppList()
+            if !watchingLock {
+                watchingLock = true
+                ScreenLock.onChange { [weak self] in self?.queue.async { self?.sendLockState() } }
+            }
+            sendLockState()
         case .ping:
             var w = MsgWriter(.pong); w.u64(try m.u64()); s.send(w)
 
@@ -159,6 +167,48 @@ final class Session {
             }
             sync.start()
             clipboard = (sync, s)
+        case .dragTaken:
+            _ = try m.u32()
+            let p = input.lastPoint
+            DispatchQueue.main.async { self.dragTimer?.invalidate(); self.drag.cancelDrag(at: p) }
+            input.forgetButtons()
+        case .dragFetch:
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let urls = self.drag.draggedFiles
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let items = urls.compactMap { url -> ClipItem? in
+                        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+                        return ClipItem(kind: .file, name: url.lastPathComponent, data: data)
+                    }
+                    self.queue.async {
+                        var out = MsgWriter(.dragData)
+                        out.u16(UInt16(items.count))
+                        for it in items { out.str(it.kind.rawValue); out.str(it.name); out.bytes(it.data) }
+                        s.send(out)
+                        log("drag to Linux: \(items.map(\.name))")
+                    }
+                }
+            }
+        case .dropFiles:
+            let wid = try m.u32(), x = try m.f32(), y = try m.f32()
+            let n = Int(try m.u16())
+            var files: [(String, Data)] = []
+            for _ in 0..<n { files.append((try m.str(), try m.bytes())) }
+            guard let win = tracker.windows[wid] else { return }
+            let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
+            if win.kind == .toplevel { raise(win) }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let dir = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Caches/sweeflow/drops/\(Int(Date().timeIntervalSince1970 * 1000))")
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let urls = files.compactMap { name, data -> URL? in
+                    let url = dir.appendingPathComponent((name as NSString).lastPathComponent)
+                    return (try? data.write(to: url)) != nil ? url : nil
+                }
+                log("drop from Linux: \(urls.map(\.lastPathComponent)) at \(point)")
+                DispatchQueue.main.async { self?.drag.drop(files: urls, at: point) }
+            }
         case .clipboard:
             let n = Int(try m.u16())
             var items: [ClipItem] = []
@@ -243,7 +293,10 @@ final class Session {
             if let p {
                 if pressed { ensureFront(wid, at: p) }
                 input.button(b, pressed: pressed, at: p)
-                if b == 0 { watchGesture(wid, buttonDown: pressed) }
+                if b == 0 {
+                    watchGesture(wid, buttonDown: pressed)
+                    watchDrag(wid, buttonDown: pressed)
+                }
             }
         case .scroll:
             let (_, p) = try pointerTarget(&m)
@@ -276,6 +329,32 @@ final class Session {
         if raisedWid == wid && tracker.isFrontmost(wid, at: p) { return }
         if !tracker.isFrontmost(wid, at: p) { raise(win) }
         raisedWid = wid
+    }
+
+    /// While the left button is held in a streamed window, watch for a file drag starting there
+    /// (reported to Linux, which takes it over when the pointer leaves the window).
+    private func watchDrag(_ wid: UInt32, buttonDown: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.dragTimer?.invalidate()
+            self.dragTimer = nil
+            guard buttonDown else { return }
+            self.drag.armDragDetection()
+            let t = Timer(timeInterval: 0.03, repeats: true) { [weak self] timer in
+                guard let self, let urls = self.drag.pollDragStart() else { return }
+                timer.invalidate()
+                self.queue.async {
+                    var m = MsgWriter(.dragBegan)
+                    m.u32(wid)
+                    m.u16(UInt16(urls.count))
+                    for u in urls { m.str(u.lastPathComponent) }
+                    self.control?.send(m)
+                    log("drag began in \(wid): \(urls.map(\.lastPathComponent))")
+                }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            self.dragTimer = t
+        }
     }
 
     private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
@@ -458,6 +537,21 @@ final class Session {
         t.setEventHandler { [weak self] in self?.checkFocus() }
         t.resume()
         focusTimer = t
+    }
+
+    private var watchingLock = false
+
+    private func sendLockState() {
+        let locked = ScreenLock.isLocked
+        var m = MsgWriter(.screenLocked)
+        m.u8(locked ? 1 : 0)
+        control?.send(m)
+        // Fresh pictures right away once it's unlocked.
+        if !locked { streamers.values.forEach { $0.requestKeyframe() } }
+        if !locked && config.virtualDisplay {
+            DispatchQueue.main.async { host.display.retry() }
+            refreshVirtualDisplayArea(attempt: 0)
+        }
     }
 
     private func sendAppList() {

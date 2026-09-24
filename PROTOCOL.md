@@ -35,6 +35,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x1B | S→C | MenuTree | i32 pid, bytes json — the app's menu bar: `[{t,e,sep?,k?,m?,c?,sub?}]` (Apple menu omitted) |
 | 0x24 | C→S | MenuActivate | i32 pid, u16 n, n × u16 path — press that menu item (indices as in MenuTree) |
 | 0x1C | S→C | AppList | u16 n, n × (str bundleId, str name, bytes png128) — installed apps, for launchers |
+| 0x1D | S→C | ScreenLocked | u8 locked — while locked the host sends no frames (capture is blank) |
 | 0x27 | C→S | LaunchApp | str bundleId — open (or reopen) the app on the Mac |
 | 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
 | 0x25 | C→S | MenuRefresh | i32 pid — re-read and resend the app's menus |
@@ -49,6 +50,11 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x33 | C→S | Key | u32 evdevKeycode, u8 pressed |
 | 0x34 | C→S | ReleaseAll | (no payload) — client lost focus; release held keys/buttons |
 | 0x40 | both | Clipboard | u16 n, n × (str kind, str name, bytes data) — kind `text/plain;charset=utf-8`, `image/png` or `file` (name = file name; folders as .zip). Sent on the clipboard stream. |
+| 0x46 | C→S | DropFiles | u32 wid, f32 x, f32 y, u16 n, n × (str name, bytes data) — files dropped on a window (clipboard stream) |
+| 0x47 | S→C | DragBegan | u32 wid, u16 n, n × str name — a file drag started in a Mac window |
+| 0x48 | C→S | DragTaken | u32 wid — Linux took the drag over; cancel it on the Mac |
+| 0x49 | C→S | DragFetch | — send the dragged files (clipboard stream) |
+| 0x4A | S→C | DragData | u16 n, n × (str kind, str name, bytes data) — the dragged files (clipboard stream) |
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 

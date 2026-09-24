@@ -51,6 +51,10 @@ pub enum UiEvent {
     /// An app's menu bar (JSON from the Mac).
     MenuTree { pid: i32, json: Vec<u8> },
     Frame(u32, GpuFrame),
+    /// A file drag started in a Mac window (file names).
+    DragBegan { wid: u32, names: Vec<String> },
+    /// The files of the Mac drag, saved locally, as a URI list.
+    DragData(Vec<u8>),
     /// Mac clipboard contents, ready to offer: MIME type → bytes (files already saved).
     Clipboard(std::collections::HashMap<String, Arc<Vec<u8>>>),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
@@ -78,6 +82,8 @@ impl UiEvent {
             UiEvent::MenuTree { .. } => "menu tree",
             UiEvent::Frame(..) => "video frame",
             UiEvent::Clipboard(_) => "clipboard",
+            UiEvent::DragBegan { .. } => "drag began",
+            UiEvent::DragData(_) => "drag data",
             UiEvent::Corners { .. } => "corners",
             UiEvent::RawFrame { .. } => "popup frame",
         }
@@ -93,6 +99,8 @@ pub enum NetCmd {
     Video(u32, Vec<u8>),
     /// Linux clipboard contents for the Mac.
     Clipboard(Vec<crate::clipboard::ClipItem>),
+    /// A framed message for the clipboard stream (drag and drop data).
+    ClipStream(Vec<u8>),
 }
 
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
@@ -114,6 +122,27 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
 /// Launch requests made while the Mac is offline, delivered on (re)connect.
 static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
+/// brief network blip doesn't make them flicker).
+fn watch_launcher_visibility() {
+    use std::sync::atomic::Ordering;
+    let grace = std::time::Duration::from_secs(20);
+    let mut shown: Option<bool> = None;
+    let mut offline_since = std::time::Instant::now();
+    loop {
+        let online = CONNECTED.load(Ordering::SeqCst);
+        if online {
+            offline_since = std::time::Instant::now();
+        }
+        let want = online || offline_since.elapsed() < grace;
+        if shown != Some(want) {
+            crate::launchers::set_visible(want);
+            shown = Some(want);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
 
 fn notify(summary: &str, body: &str) {
     let _ = std::process::Command::new("notify-send")
@@ -164,6 +193,7 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
 }
 
 async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
+    std::thread::spawn(watch_launcher_visibility);
     let endpoint = match make_endpoint(&cfg) {
         Ok(e) => e,
         Err(e) => {
@@ -240,6 +270,16 @@ async fn session(
         let ui3 = ui.clone();
         let task = tokio::spawn(async move {
             while let Ok(Some((ty, body))) = proto::read_msg(&mut crx).await {
+                if ty == t::DRAG_DATA {
+                    // The dragged Mac files: save them, hand the UI a URI list.
+                    let parsed = crate::clipboard::decode(&body);
+                    if let Ok(items) = parsed {
+                        let offers = tokio::task::spawn_blocking(move || crate::clipboard::offers_for(&items)).await;
+                        let uris = offers.ok().and_then(|o| o.get("text/uri-list").map(|v| v.to_vec())).unwrap_or_default();
+                        let _ = ui3.send(UiEvent::DragData(uris));
+                    }
+                    continue;
+                }
                 if ty != t::CLIPBOARD {
                     continue;
                 }
@@ -287,6 +327,14 @@ async fn session(
                             let msg = crate::clipboard::encode(&items);
                             if let Err(e) = tx.lock().await.write_all(&msg).await {
                                 log::warn!("clipboard send failed: {e}");
+                            }
+                        });
+                    }
+                    NetCmd::ClipStream(msg) => {
+                        let tx = clip_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx.lock().await.write_all(&msg).await {
+                                log::warn!("clipboard stream send failed: {e}");
                             }
                         });
                     }
@@ -357,6 +405,12 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
+        t::DRAG_BEGAN => {
+            let wid = r.u32()?;
+            let n = r.u16()?;
+            let names = (0..n).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
+            UiEvent::DragBegan { wid, names }
+        }
         t::MENU_TREE => UiEvent::MenuTree { pid: r.i32()?, json: r.bytes()?.to_vec() },
         t::APP_LIST => {
             let n = r.u16()?;
@@ -369,6 +423,16 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
                     log::warn!("launcher entries: {e:#}");
                 }
             });
+            return Ok(());
+        }
+        t::SCREEN_LOCKED => {
+            let locked = r.u8()? != 0;
+            log::info!("Mac screen {}", if locked { "locked" } else { "unlocked" });
+            if locked {
+                std::thread::spawn(|| {
+                    notify("Your Mac is locked", "Mac windows are paused until you unlock it (Touch ID or password on the Mac).")
+                });
+            }
             return Ok(());
         }
         t::PONG => return Ok(()),

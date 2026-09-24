@@ -13,6 +13,12 @@ use std::{
 use anyhow::Result;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        data_source::{DataSourceHandler, DragSource},
+        DataDeviceManagerState, WritePipe,
+    },
     delegate_registry,
     dmabuf::{DmabufFeedback, DmabufHandler, DmabufState},
     output::{OutputHandler, OutputState},
@@ -46,7 +52,7 @@ use smithay_client_toolkit::{
 use tokio::sync::mpsc::UnboundedSender;
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_subsurface, wl_surface},
+    protocol::{wl_buffer, wl_data_device, wl_data_device_manager::DndAction, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_subsurface, wl_surface},
     Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols::{
@@ -123,6 +129,12 @@ struct Lights {
     viewport: WpViewport,
     buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
     drawn: Option<(lights::State, [f64; 4])>,
+}
+
+/// Work finished on a helper thread that must continue on the Wayland thread.
+pub enum Internal {
+    /// The URI list of a drop was read: finish the offer.
+    DropRead,
 }
 
 enum Role {
@@ -206,6 +218,22 @@ pub struct App {
     /// Selection events to ignore: the echoes of our own set_selection.
     clip_ignore: u32,
     conn: Connection,
+    /// Drag and drop (the regular data device).
+    ddm: Option<DataDeviceManagerState>,
+    dnd_device: Option<DataDevice>,
+    /// Linux drag carrying files out of a Mac window.
+    drag_source: Option<DragSource>,
+    /// Drop targets waiting for the Mac files of that drag.
+    drag_waiting: Vec<WritePipe>,
+    drag_uris: Option<Arc<Vec<u8>>>,
+    /// A file drag that started in this Mac window (reported by the Mac).
+    mac_drag: Option<u32>,
+    /// Mac window where the left button is down (forwarded to the Mac).
+    left_down: Option<u32>,
+    pointer_at: (u32, f64, f64),
+    /// Mac window under a Linux drag, and where.
+    dnd_target: Option<(u32, f64, f64)>,
+    internal: channel::Sender<Internal>,
     menus: Option<Menus>,
     trace: bool,
     loop_handle: LoopHandle<'static, App>,
@@ -265,6 +293,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let bind_opt = |name: &str| globals.contents().with_list(|l| l.iter().any(|g| g.interface == name));
 
     let (ui_tx, ui_rx): (channel::Sender<UiEvent>, Channel<UiEvent>) = channel::channel();
+    let (int_tx, int_rx): (channel::Sender<Internal>, Channel<Internal>) = channel::channel();
     let scale = net_cfg.scale;
     let host = net_cfg.host.clone();
     let net = crate::net::spawn(net_cfg, ui_tx);
@@ -291,6 +320,16 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         clip_source: None,
         clip_ignore: 0,
         conn: conn.clone(),
+        ddm: DataDeviceManagerState::bind(&globals, &qh).ok(),
+        dnd_device: None,
+        drag_source: None,
+        drag_waiting: Vec::new(),
+        drag_uris: None,
+        mac_drag: None,
+        left_down: None,
+        pointer_at: (0, 0.0, 0.0),
+        dnd_target: None,
+        internal: int_tx,
         menus: None,
         trace: std::env::var_os("SWEEFLOW_TRACE").is_some(),
         compositor,
@@ -353,6 +392,18 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
                 if ms > 30.0 {
                     log::warn!("UI stall: handling {kind} took {ms:.0} ms");
+                }
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    event_loop
+        .handle()
+        .insert_source(int_rx, |ev, _, app: &mut App| {
+            if let channel::Event::Msg(Internal::DropRead) = ev {
+                if let Some(offer) = app.dnd_device.as_ref().and_then(|d| d.data().drag_offer()) {
+                    offer.finish();
+                    offer.destroy();
                 }
             }
         })
@@ -443,6 +494,22 @@ impl App {
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
             UiEvent::Clipboard(offers) => self.set_clipboard(offers, qh),
+            UiEvent::DragBegan { wid, names } => {
+                log::info!("Mac drag in {wid}: {names:?}");
+                self.mac_drag = Some(wid);
+                self.maybe_take_drag(qh);
+            }
+            UiEvent::DragData(uris) => {
+                let uris = Arc::new(uris);
+                for mut pipe in self.drag_waiting.drain(..) {
+                    let u = uris.clone();
+                    std::thread::spawn(move || {
+                        use std::io::Write;
+                        let _ = pipe.write_all(&u);
+                    });
+                }
+                self.drag_uris = Some(uris);
+            }
             UiEvent::MenuTree { pid, json } => {
                 if let Some(m) = self.menus.as_mut() {
                     m.update(pid, &json);
@@ -971,6 +1038,30 @@ impl App {
         });
     }
 
+    /// A file drag started in a Mac window and the pointer (button still down) has left it:
+    /// continue it as a Linux drag so it can be dropped in Dolphin, the desktop, etc.
+    fn maybe_take_drag(&mut self, qh: &QueueHandle<Self>) {
+        let (wid, x, y) = self.pointer_at;
+        let (Some(dw), Some(held)) = (self.mac_drag, self.left_down) else { return };
+        if dw != wid || held != wid || self.drag_source.is_some() {
+            return;
+        }
+        let Some(w) = self.windows.get(&wid) else { return };
+        let (bw, bh) = (w.size.0 as f64, w.size.1 as f64);
+        if x >= 0.0 && y >= 0.0 && x < bw && y < bh {
+            return; // still inside: the Mac handles drags within its own window
+        }
+        let (Some(ddm), Some(dev)) = (&self.ddm, &self.dnd_device) else { return };
+        let source = ddm.create_drag_and_drop_source(qh, ["text/uri-list"], DndAction::Copy);
+        source.start_drag(dev, w.base(), None, self.press_serial);
+        self.drag_source = Some(source);
+        self.drag_uris = None;
+        self.mac_drag = None;
+        self.left_down = None;
+        self.send(W::new(t::DRAG_TAKEN).u32(wid).finish());
+        log::info!("took over the Mac drag from window {wid}");
+    }
+
     /// Puts the Mac's clipboard on ours.
     fn set_clipboard(&mut self, offers: HashMap<String, Arc<Vec<u8>>>, qh: &QueueHandle<Self>) {
         let (Some(mgr), Some(device)) = (&self.data_control, &self.clip_device) else { return };
@@ -1442,6 +1533,10 @@ impl PointerHandler for App {
                     self.update_lights(wid, qh);
                 }
                 PointerEventKind::Motion { time } => {
+                    self.pointer_at = (wid, e.position.0, e.position.1);
+                    if self.mac_drag.is_some() {
+                        self.maybe_take_drag(qh);
+                    }
                     let edge = self.edge_at(wid, e.position.0, e.position.1);
                     self.set_edge_cursor(edge, pointer, qh);
                     self.lights_pointer_at(wid, e.position.0, e.position.1, Some(time), qh);
@@ -1473,6 +1568,10 @@ impl PointerHandler for App {
                         }
                     }
                     self.press_serial = serial;
+                    if button == BTN_LEFT {
+                        self.left_down = Some(wid);
+                        self.mac_drag = None;
+                    }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).finish());
                 }
                 PointerEventKind::Release { button, .. } => {
@@ -1494,6 +1593,10 @@ impl PointerHandler for App {
                         }
                         self.lights_pointer(wid, e.position.0, e.position.1, qh);
                         continue;
+                    }
+                    if button == BTN_LEFT {
+                        self.left_down = None;
+                        self.mac_drag = None;
                     }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());
                 }
@@ -1639,6 +1742,11 @@ impl SeatHandler for App {
                 self.clip_device = Some(m.get_data_device(&seat, qh, ()));
             }
         }
+        if self.dnd_device.is_none() {
+            if let Some(ddm) = &self.ddm {
+                self.dnd_device = Some(ddm.get_data_device(qh, &seat));
+            }
+        }
         if cap == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self
                 .seat_state
@@ -1665,6 +1773,103 @@ impl SeatHandler for App {
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+// --- drag and drop ---------------------------------------------------------------------
+
+impl DataDeviceHandler for App {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice, x: f64, y: f64, surface: &wl_surface::WlSurface) {
+        let Some(offer) = self.dnd_device.as_ref().and_then(|d| d.data().drag_offer()) else { return };
+        // Files dragged onto a Mac window (not our own drag coming back in).
+        let files = offer.with_mime_types(|m| m.iter().any(|t| t == "text/uri-list"));
+        match self.wid_for(surface) {
+            Some(wid) if files && self.drag_source.is_none() => {
+                offer.accept_mime_type(offer.serial, Some("text/uri-list".into()));
+                offer.set_actions(DndAction::Copy, DndAction::Copy);
+                self.dnd_target = Some((wid, x, y));
+            }
+            _ => {
+                offer.accept_mime_type(offer.serial, None);
+                self.dnd_target = None;
+            }
+        }
+    }
+
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        self.dnd_target = None;
+    }
+
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice, x: f64, y: f64) {
+        if let Some((wid, _, _)) = self.dnd_target {
+            self.dnd_target = Some((wid, x, y));
+        }
+    }
+
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {}
+
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        let (Some((wid, x, y)), Some(offer)) = (self.dnd_target.take(), self.dnd_device.as_ref().and_then(|d| d.data().drag_offer()))
+        else {
+            return;
+        };
+        let Ok(mut pipe) = offer.receive("text/uri-list".into()) else { return };
+        let net = self.net.clone();
+        let done = self.internal.clone();
+        let _ = self.conn.flush();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut uris = Vec::new();
+            let _ = pipe.read_to_end(&mut uris);
+            let _ = done.send(Internal::DropRead);
+            let files = crate::clipboard::items_from("text/uri-list", uris);
+            if files.is_empty() {
+                return;
+            }
+            log::info!("dropping {} file(s) on Mac window {wid}", files.len());
+            let mut w = W::new(t::DROP_FILES).u32(wid).f32(x as f32).f32(y as f32).u16(files.len() as u16);
+            for f in &files {
+                w = w.str(&f.name).bytes(&f.data);
+            }
+            let _ = net.send(NetCmd::ClipStream(w.finish()));
+        });
+    }
+}
+
+impl DataOfferHandler for App {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+}
+
+impl DataSourceHandler for App {
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: Option<String>) {}
+
+    /// A Linux app wants the files of a drag out of a Mac window: fetch them from the Mac.
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: String, mut fd: WritePipe) {
+        if let Some(uris) = self.drag_uris.clone() {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = fd.write_all(&uris);
+            });
+            return;
+        }
+        if self.drag_waiting.is_empty() {
+            let _ = self.net.send(NetCmd::ClipStream(W::new(t::DRAG_FETCH).finish()));
+        }
+        self.drag_waiting.push(fd);
+    }
+
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
+        self.drag_source = None;
+        self.drag_waiting.clear();
+    }
+
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {}
+
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
+        self.drag_source = None;
+    }
+
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: DndAction) {}
 }
 
 // --- buffers ---------------------------------------------------------------------------
