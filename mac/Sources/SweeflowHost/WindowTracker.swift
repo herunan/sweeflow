@@ -111,9 +111,23 @@ final class WindowTracker {
             badges[p.pid, default: []].append(p.frame)
             return true
         }
-        for var p in popups {
-            // Menus from the menu bar and similar have no toplevel of their own to attach to.
-            guard let parent = frontToplevel[p.pid] else { continue }
+        // Floating panels (dialogs) are windows in their own right; menus go last.
+        for d in popups where d.kind == .dialog {
+            var d = d
+            if let parent = frontToplevel[d.pid] {
+                d.parent = parent.wid
+                d.rel = CGPoint(x: d.frame.minX - parent.frame.minX, y: d.frame.minY - parent.frame.minY)
+            }
+            seen[d.wid] = d
+            order.append(d.wid)
+        }
+        // Each menu belongs to the frontmost window of its app that it touches (a panel's own
+        // dropdown must not be positioned relative to the app's main window).
+        let owners = order.compactMap { seen[$0] }   // front-to-back: toplevels, then panels
+        for var p in popups where p.kind == .popup {
+            let near = owners.filter { $0.pid == p.pid && $0.frame.insetBy(dx: -40, dy: -40).intersects(p.frame) }
+            // Prefer a panel (drawn above its app's windows), then the frontmost window.
+            guard let parent = near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
             p.parent = parent.wid
             p.rel = CGPoint(x: p.frame.minX - parent.frame.minX, y: p.frame.minY - parent.frame.minY)
             seen[p.wid] = p
