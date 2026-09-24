@@ -10,6 +10,7 @@ calloop-wayland-source = "0.4.1"
 env_logger = "0.11.11"
 ffmpeg-next = "9"
 hex = "0.4.3"
+inotify = "0.11.5"
 log = "0.4.34"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "std"] }
 png = "0.18.1"

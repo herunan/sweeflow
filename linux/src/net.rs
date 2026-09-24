@@ -303,11 +303,13 @@ async fn session(
 
     // The Linux wallpaper for the Mac's virtual display: macOS tints window materials
     // (sidebars, toolbars) with the wallpaper under the window, so with ours (and the windows
-    // placed as they are here) they look as they would on this desktop. Resent when it changes.
+    // placed as they are here) they look as they would on this desktop. Sent again as soon as
+    // Plasma saves a change.
     let wallpaper_task = {
         let tx = clip_tx.clone();
         tokio::spawn(async move {
             let mut sent: Option<String> = None;
+            let mut changes = crate::wallpaper::changes();
             loop {
                 let found = tokio::task::spawn_blocking(|| {
                     crate::wallpaper::current(crate::wallpaper::screen_aspect()).and_then(|p| crate::wallpaper::load(&p).map(|l| (p, l)))
@@ -325,7 +327,20 @@ async fn session(
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Plasma saving its config (new wallpaper, light/dark switch) wakes this up; a
+                // slow check covers anything the watch misses.
+                tokio::select! {
+                    r = changes.changed() => {
+                        if r.is_err() {
+                            tokio::time::sleep(Duration::from_secs(600)).await;
+                        }
+                        // Let Plasma finish writing (it can save in several steps).
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        changes.borrow_and_update();
+                        log::info!("Plasma settings saved: checking the wallpaper");
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(600)) => {}
+                }
             }
         })
     };

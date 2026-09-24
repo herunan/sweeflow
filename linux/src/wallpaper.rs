@@ -67,3 +67,43 @@ pub fn load(path: &std::path::Path) -> Option<(String, Vec<u8>)> {
     let hash = hex::encode(Sha256::digest(&data));
     Some((hash, data))
 }
+
+/// Bumps whenever Plasma saves its desktop config (where the wallpaper choice lives) or the
+/// colour scheme (light/dark wallpaper variants) changes. One watcher for the whole run.
+pub fn changes() -> tokio::sync::watch::Receiver<u64> {
+    static TX: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, _) = tokio::sync::watch::channel(0u64);
+        let sender = tx.clone();
+        std::thread::Builder::new()
+            .name("wallpaper-watch".into())
+            .spawn(move || {
+                if let Err(e) = watch_config(&sender) {
+                    log::warn!("wallpaper changes won't be noticed right away: {e}");
+                }
+            })
+            .ok();
+        tx
+    })
+    .subscribe()
+}
+
+fn watch_config(tx: &tokio::sync::watch::Sender<u64>) -> std::io::Result<()> {
+    use inotify::{Inotify, WatchMask};
+    let mut inotify = Inotify::init()?;
+    // The directory, not the files: KDE saves by writing a new file and renaming it over.
+    inotify.watches().add(dirs_config(), WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE)?;
+    let mut buf = [0u8; 4096];
+    loop {
+        let events = inotify.read_events_blocking(&mut buf)?;
+        let relevant = events.into_iter().any(|e| {
+            e.name.is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n == "plasma-org.kde.plasma.desktop-appletsrc" || n == "kdeglobals"
+            })
+        });
+        if relevant {
+            tx.send_modify(|n| *n += 1);
+        }
+    }
+}
