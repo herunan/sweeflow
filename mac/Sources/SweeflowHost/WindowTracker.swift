@@ -76,16 +76,17 @@ final class WindowTracker {
                   let bounds = CGRect(dictionaryRepresentation: boundsDict),
                   (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.01,
                   let (bid, appName) = appInfo(pid), allowed(bid) else { continue }
+            // macOS's "being captured" badge is a window of the app itself that is not
+            // shareable (sharing state 0); recognise it that way at any size (it grows on hover).
+            if layer == 0, (info[kCGWindowSharingState as String] as? Int) == 0 {
+                badges[pid, default: []].append(bounds)
+                continue
+            }
             let title = info[kCGWindowName as String] as? String ?? ""
             var w = TrackedWindow(wid: wid, pid: pid, bundleId: bid, appName: appName, title: title,
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
             if layer == 0 {
-                guard bounds.width >= 40, bounds.height >= 30 else {
-                    if (50...90).contains(bounds.width) && (14...28).contains(bounds.height) {
-                        badges[pid, default: []].append(bounds)
-                    }
-                    continue
-                }
+                guard bounds.width >= 40, bounds.height >= 30 else { continue }
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
                 order.append(wid)

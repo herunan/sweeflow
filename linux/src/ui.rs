@@ -300,14 +300,26 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         .handle()
         .insert_source(ui_rx, move |ev, _, app: &mut App| {
             if let channel::Event::Msg(ev) = ev {
+                let kind = ev.kind();
+                let t0 = Instant::now();
                 app.on_net(ev, &qh2);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if ms > 30.0 {
+                    log::warn!("UI stall: handling {kind} took {ms:.0} ms");
+                }
             }
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     log::info!("sweeflow client started, connecting to {}", app.host);
     loop {
+        let t0 = Instant::now();
         event_loop.dispatch(Duration::from_millis(100), &mut app)?;
+        // A dispatch that returns late without having waited the full timeout was busy.
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if ms > 130.0 {
+            log::warn!("UI stall: event loop iteration took {ms:.0} ms");
+        }
         if let Some(e) = conn.protocol_error() {
             anyhow::bail!("Wayland protocol error: {e:?}");
         }
@@ -398,6 +410,8 @@ impl App {
 
     fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
+        log::info!("window {wid} added: {} kind {} parent {} {}x{} at {},{}",
+                   info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
         if let Some(w) = self.windows.get_mut(&wid) {
             // Re-announced after a reconnect: keep the native window, restart the video.
             w.stale = false;
@@ -503,6 +517,7 @@ impl App {
 
     fn remove_window(&mut self, wid: u32) {
         let Some(w) = self.windows.remove(&wid) else { return };
+        log::info!("window {wid} removed ({})", w.info.app_name);
         let _ = self.net.send(NetCmd::Unsubscribe(wid));
         self.surfaces.remove(&w.base().id());
         self.surfaces.remove(&w.video.id());
@@ -787,6 +802,9 @@ impl App {
             return;
         }
         let (fw, fh) = (pw as u32, ph as u32);
+        if self.trace {
+            dump_bgra(&format!("/tmp/sweeflow-popup-{wid}.png"), fw, fh, &bgra);
+        }
         let Ok(mut pool) = RawPool::new(bgra.len(), &self.shm) else { return };
         pool.mmap().copy_from_slice(&bgra);
         let buffer = pool.create_buffer(0, fw as i32, fh as i32, (fw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
@@ -1061,6 +1079,19 @@ fn switch_windows(reverse: bool) {
             .stderr(std::process::Stdio::null())
             .status();
     });
+}
+
+/// Diagnostics: writes premultiplied BGRA as an RGBA PNG.
+fn dump_bgra(path: &str, w: u32, h: u32, bgra: &[u8]) {
+    let rgba: Vec<u8> = bgra.chunks(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+    if let Ok(f) = std::fs::File::create(path) {
+        let mut enc = png::Encoder::new(f, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        if let Ok(mut wr) = enc.write_header() {
+            let _ = wr.write_image_data(&rgba);
+        }
+    }
 }
 
 fn monotonic_ms() -> f64 {

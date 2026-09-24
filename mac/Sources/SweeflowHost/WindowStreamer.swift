@@ -45,11 +45,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
     private var cornersHash: UInt64 = 0
-    /// Largest corner radius seen (px); stable across frames where the app paints its edge.
-    private var cornerRadiusPx = 0
-    /// Radius measured on any window: standard windows share it, so apps that paint their own
-    /// edge (a browser) still get the system's rounded corners.
-    static var sharedRadiusPt: CGFloat = 0
+    /// Corner radii measured across all windows (points → count). Standard macOS windows share
+    /// one radius, so every window uses the most common measurement: individual measurements
+    /// can be thrown off by what an app draws at its edge (Terminal, a browser).
+    static var radiusVotes: [Int: Int] = [:]
+    static var consensusRadiusPt: Int {
+        radiusVotes.max { a, b in a.value == b.value ? a.key < b.key : a.value < b.value }?.key ?? 0
+    }
+    private var radiusSamples = 0
+    private var measureCountdown = 0
     private var pendingCorners: (Int, Data)?
 
     // Stats
@@ -218,13 +222,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
                 if let dark = eraseCaptureBadge(pb, buttons: self.buttons, badge: self.badgeRect(), scale: self.scale) { self.darkTitleBar = dark }
                 let t0 = DispatchTime.now().uptimeNanoseconds
-                if let r = measureCornerRadius(pb, scale: self.scale), r > self.cornerRadiusPx {
-                    self.cornerRadiusPx = r
-                    WindowStreamer.sharedRadiusPt = max(WindowStreamer.sharedRadiusPt, CGFloat(r) / self.scale)
-                    log("stream \(self.wid): corner radius \(r)px")
+                // A few radius measurements per window (not every frame) feed the shared vote.
+                self.measureCountdown -= 1
+                if self.radiusSamples < 5, self.measureCountdown <= 0 {
+                    self.measureCountdown = 15
+                    if let r = measureCornerRadius(pb, scale: self.scale) {
+                        self.radiusSamples += 1
+                        let pt = Int((CGFloat(r) / self.scale).rounded())
+                        WindowStreamer.radiusVotes[pt, default: 0] += 1
+                        log("stream \(self.wid): corner radius sample \(pt)pt → consensus \(WindowStreamer.consensusRadiusPt)pt")
+                    }
                 }
-                let radius = self.cornerRadiusPx > 0 ? self.cornerRadiusPx
-                    : Int((WindowStreamer.sharedRadiusPt * self.scale).rounded())
+                let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * self.scale).rounded())
                 if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: self.scale),
                    hash != self.cornersHash {
                     self.cornersHash = hash
@@ -485,11 +494,18 @@ func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat) -> (Int, Da
                     var sxp = fx, syp = fy
                     let src0 = base + fy * stride + fx * 4
                     if src0[3] < 250 || cover < 1 {
+                        // Walk inward along the ray from the circle centre until the capture has
+                        // solid window pixels (the app's own corner may be rounder than ours).
                         let ddx = Double(fx) + 0.5 - cx, ddy = Double(fy) + 0.5 - cy
                         let d = max(1e-6, (ddx * ddx + ddy * ddy).squareRoot())
-                        let k = min(1, max(0, (rf - 2) / d))
-                        sxp = min(w - 1, max(0, Int(cx + ddx * k)))
-                        syp = min(h - 1, max(0, Int(cy + ddy * k)))
+                        var dist = min(d, rf - 2)
+                        while true {
+                            let k = max(0, dist / d)
+                            sxp = min(w - 1, max(0, Int(cx + ddx * k)))
+                            syp = min(h - 1, max(0, Int(cy + ddy * k)))
+                            if (base + syp * stride + sxp * 4)[3] >= 250 || dist <= 0 { break }
+                            dist -= 1
+                        }
                     }
                     let src = base + syp * stride + sxp * 4
                     let o = dst + (i * t * t + ty * t + tx) * 4

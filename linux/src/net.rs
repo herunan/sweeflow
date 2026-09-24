@@ -54,6 +54,29 @@ pub enum UiEvent {
     RawFrame { wid: u32, w: u16, h: u16, px_per_pt: u8, capture_us: u64, bgra: Vec<u8> },
 }
 
+impl UiEvent {
+    /// Short name for diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            UiEvent::Connected(_) => "connected",
+            UiEvent::Disconnected(_) => "disconnected",
+            UiEvent::WindowAdded(_) => "window added",
+            UiEvent::WindowChanged { .. } => "window changed",
+            UiEvent::WindowRemoved(_) => "window removed",
+            UiEvent::AppIcon { .. } => "app icon",
+            UiEvent::Cursor { .. } => "cursor",
+            UiEvent::Focused(_) => "focused",
+            UiEvent::WindowButtons(..) => "window buttons",
+            UiEvent::MoveStarted(_) => "move started",
+            UiEvent::ToggleMaximize(_) => "toggle maximize",
+            UiEvent::Minimize(_) => "minimize",
+            UiEvent::Frame(..) => "video frame",
+            UiEvent::Corners { .. } => "corners",
+            UiEvent::RawFrame { .. } => "popup frame",
+        }
+    }
+}
+
 pub enum NetCmd {
     /// A framed control-stream message.
     Control(Vec<u8>),
