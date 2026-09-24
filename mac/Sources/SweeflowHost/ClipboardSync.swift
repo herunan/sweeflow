@@ -76,7 +76,8 @@ final class ClipboardSync {
         }
     }
 
-    /// Puts the Linux clipboard on the Mac clipboard. Files are saved to ~/Downloads/From Linux.
+    /// Puts the Linux clipboard on the Mac clipboard. Files live in a private cache (replaced on
+    /// the next copy) and only appear where they're pasted.
     func apply(_ items: [ClipItem]) {
         DispatchQueue.main.async {
             let pb = NSPasteboard.general
@@ -84,7 +85,10 @@ final class ClipboardSync {
             var objects: [NSPasteboardWriting] = []
             let files = items.filter { $0.kind == .file }
             if !files.isEmpty {
-                let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/From Linux")
+                let cache = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Caches/sweeflow/clipboard")
+                try? FileManager.default.removeItem(at: cache)
+                let dir = cache.appendingPathComponent(String(Int(Date().timeIntervalSince1970 * 1000)))
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 for f in files {
                     let name = (f.name as NSString).lastPathComponent

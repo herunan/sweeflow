@@ -54,10 +54,13 @@ pub fn fingerprint(items: &[ClipItem]) -> u64 {
 }
 
 /// What we offer on the Linux clipboard for items from the Mac: MIME type → bytes.
-/// Files are saved to ~/Downloads/From Mac first and offered as URIs (what Dolphin pastes).
+/// Files live in a private cache (like a clipboard would hold them) and are offered as URIs, so
+/// they only appear where you paste them; the cache is replaced on the next copy.
 pub fn offers_for(items: &[ClipItem]) -> HashMap<String, Arc<Vec<u8>>> {
     let mut out: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
-    let files: Vec<PathBuf> = items.iter().filter(|i| i.kind == FILE).filter_map(save_from_mac).collect();
+    let dir = fresh_cache_dir();
+    let files: Vec<PathBuf> =
+        items.iter().filter(|i| i.kind == FILE).filter_map(|i| dir.as_ref().and_then(|d| save_to(d, i))).collect();
     if !files.is_empty() {
         let uris: Vec<String> = files.iter().map(|p| format!("file://{}", uri_escape(&p.to_string_lossy()))).collect();
         out.insert("text/uri-list".into(), Arc::new(format!("{}\r\n", uris.join("\r\n")).into_bytes()));
@@ -77,33 +80,22 @@ pub fn offers_for(items: &[ClipItem]) -> HashMap<String, Arc<Vec<u8>>> {
     out
 }
 
-fn downloads() -> PathBuf {
-    // Honour the XDG downloads dir when set, else ~/Downloads.
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    std::fs::read_to_string(home.join(".config/user-dirs.dirs"))
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| l.strip_prefix("XDG_DOWNLOAD_DIR=")).map(|v| {
-                PathBuf::from(v.trim_matches('"').replace("$HOME", &home.to_string_lossy()))
-            })
-        })
-        .unwrap_or_else(|| home.join("Downloads"))
+/// ~/.cache/sweeflow/clipboard/<n>: a new directory per copy, older ones removed.
+fn fresh_cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
+        .join("sweeflow/clipboard");
+    let _ = std::fs::remove_dir_all(&base);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+    let dir = base.join(stamp.to_string());
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
-fn save_from_mac(item: &ClipItem) -> Option<PathBuf> {
-    let dir = downloads().join("From Mac");
-    std::fs::create_dir_all(&dir).ok()?;
+fn save_to(dir: &std::path::Path, item: &ClipItem) -> Option<PathBuf> {
     let name = std::path::Path::new(&item.name).file_name()?.to_string_lossy().into_owned();
-    let mut path = dir.join(&name);
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (name.clone(), String::new()),
-    };
-    let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{stem} {n}{ext}"));
-        n += 1;
-    }
+    let path = dir.join(name);
     std::fs::write(&path, &item.data).ok()?;
     Some(path)
 }
