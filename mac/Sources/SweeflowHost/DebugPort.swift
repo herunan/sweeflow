@@ -83,6 +83,12 @@ final class DebugPort {
             let l = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
             let f = l.first { ($0[kCGWindowOwnerName as String] as? String) == "Finder" && ($0[kCGWindowLayer as String] as? Int) == 0 }
             reply(f.map { "\($0[kCGWindowNumber as String]!) \($0[kCGWindowBounds as String]!)" } ?? "none")
+        case "ax" where p.count == 2:
+            guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
+            s.queue.async {
+                let r = s.debugAX(wid)
+                DispatchQueue.main.async { reply(r) }
+            }
         case "windows":
             guard let s = session else { return reply("no session") }
             s.queue.async {

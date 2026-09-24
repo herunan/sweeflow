@@ -117,6 +117,14 @@ final class Session {
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
+            st.onDetectedButtons = { [weak self] rects in
+                guard let self else { return }
+                self.sentButtons[wid] = rects
+                var m = MsgWriter(.windowButtons)
+                m.u32(wid)
+                for r in rects { m.f32(r.minX); m.f32(r.minY); m.f32(r.width); m.f32(r.height) }
+                self.control?.send(m)
+            }
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
@@ -265,6 +273,11 @@ final class Session {
             input.button(right ? 1 : 0, pressed: false, at: p)
         }
         return "ok \(p)"
+    }
+
+    func debugAX(_ wid: UInt32) -> String {
+        guard let w = tracker.windows[wid] else { return "no window" }
+        return "cg frame \(w.frame)\n" + control_.debugDescribe(wid, pid: w.pid)
     }
 
     func debugWindows() -> String {

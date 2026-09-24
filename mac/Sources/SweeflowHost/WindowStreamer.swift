@@ -38,10 +38,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var buttons: [CGRect] = []
     /// Where macOS's capture badge overlaps this window (window points), looked up per frame.
     var badgeRect: () -> CGRect? = { nil }
+    /// Called when traffic lights drawn by the app itself were found in the pixels.
+    var onDetectedButtons: (([CGRect]) -> Void)?
+    private var detectCountdown = 0
     var active = false
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
     private var cornersHash: UInt64 = 0
+    /// Largest corner radius seen (px); stable across frames where the app paints its edge.
+    private var cornerRadiusPx = 0
+    /// Radius measured on any window: standard windows share it, so apps that paint their own
+    /// edge (a browser) still get the system's rounded corners.
+    static var sharedRadiusPt: CGFloat = 0
     private var pendingCorners: (Int, Data)?
 
     // Stats
@@ -193,16 +201,38 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             if !self.lossless {
+                // Apps that hide the standard buttons and draw their own: find them in the pixels
+                // (a few times a second until found).
+                if !self.buttons.contains(where: { $0.width > 0 }), self.onDetectedButtons != nil {
+                    self.detectCountdown -= 1
+                    if self.detectCountdown <= 0 {
+                        self.detectCountdown = 20
+                        if let found = detectTrafficLights(pb, scale: self.scale) {
+                            log("stream \(self.wid): found app-drawn traffic lights at \(found.map { "\(Int($0.minX)),\(Int($0.minY))" })")
+                            self.buttons = found
+                            self.onDetectedButtons?(found)
+                        }
+                    }
+                }
                 // Order matters: erase the capture badge first (it overlaps the top-left
                 // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
                 if let dark = eraseCaptureBadge(pb, buttons: self.buttons, badge: self.badgeRect(), scale: self.scale) { self.darkTitleBar = dark }
-                if let (t, tiles, hash) = cornerTiles(pb, scale: self.scale), hash != self.cornersHash {
-                    log("stream \(self.wid): corner tiles \(t)px (buttons known: \(self.buttons.filter { $0.width > 0 }.count))")
-                    debugDumpTile(tiles, t: t, name: "tile-\(self.wid).png")
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                if let r = measureCornerRadius(pb, scale: self.scale), r > self.cornerRadiusPx {
+                    self.cornerRadiusPx = r
+                    WindowStreamer.sharedRadiusPt = max(WindowStreamer.sharedRadiusPt, CGFloat(r) / self.scale)
+                    log("stream \(self.wid): corner radius \(r)px")
+                }
+                let radius = self.cornerRadiusPx > 0 ? self.cornerRadiusPx
+                    : Int((WindowStreamer.sharedRadiusPt * self.scale).rounded())
+                if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: self.scale),
+                   hash != self.cornersHash {
                     self.cornersHash = hash
                     self.pendingCorners = (t, tiles)
                 }
                 fillCorners(pb, radiusPx: Int(28 * self.scale))
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", self.wid, ms)) }
             }
             self.pendingBuffer = pb
             self.refinementsLeft = 2
@@ -380,35 +410,169 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-/// The window's rounded corners as four square BGRA tiles (TL, TR, BL, BR; premultiplied, with
-/// alpha), sized to the corner radius rounded up to whole points. Returns (tile px, tiles, hash);
-/// nil when the window has square corners.
-func cornerTiles(_ pb: CVPixelBuffer, scale: CGFloat) -> (Int, Data, UInt64)? {
+/// Measures the window's corner radius (px) by fitting a circle to the anti-aliased top-left
+/// edge (the soft fade along the top row would overestimate it). nil when the edge is opaque in
+/// this frame (some apps paint it) or doesn't look like a rounded corner.
+func measureCornerRadius(_ pb: CVPixelBuffer, scale: CGFloat) -> Int? {
     guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rowBytes = CVPixelBufferGetBytesPerRow(pb)
+    let n = min(Int(48 * scale), w / 3, h / 3)
+    // Sub-pixel edge per row: how much of the row's first n pixels is transparent.
+    var pts: [(y: Double, x: Double)] = []
+    for y in 0..<n {
+        let row = base + y * rowBytes
+        var clear = 0.0
+        for x in 0..<n { clear += 1 - Double(row[x * 4 + 3]) / 255 }
+        if clear > 0.05 { pts.append((Double(y) + 0.5, clear)) }
+    }
+    guard pts.count >= Int(3 * scale), pts[0].x >= Double(2 * scale) else { return nil }
+    var best: (r: Double, err: Double) = (0, .infinity)
+    for r in Swift.stride(from: 4 * Double(scale), through: Double(n), by: 0.25) {
+        var err = 0.0, count = 0
+        for p in pts where p.y < r {
+            let dy = r - p.y
+            let x = r - (r * r - dy * dy).squareRoot()
+            err += (x - p.x) * (x - p.x); count += 1
+        }
+        if count > 0, err / Double(count) < best.err { best = (r, err / Double(count)) }
+    }
+    return best.err < 4 ? Int(best.r.rounded()) : nil
+}
+
+/// The window's four corners (TL, TR, BL, BR) as square premultiplied BGRA tiles with an exact
+/// anti-aliased rounded mask of radius `r` px. Colours come from the nearest pixel inside the
+/// window, so whatever the capture has in the corner (transparency, an erased badge, an app's own
+/// square edge) can't leak through. Returns (tile px, tiles, hash).
+func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat) -> (Int, Data, UInt64)? {
+    guard r > 0, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-    // Radius ≈ run of non-opaque pixels at the start of the top row.
-    let limit = min(Int(40 * scale), w / 3, h / 3)
-    var r = 0
-    while r < limit && base[r * 4 + 3] < 250 { r += 1 }
-    guard r >= 2 else { return nil }
     let s = max(1, Int(scale.rounded()))
-    let t = ((r + s - 1) / s) * s
-    guard t <= w / 2, t <= h / 2 else { return nil }
+    let t = ((r + s - 1) / s) * s          // whole points, so the client can place it exactly
+    guard t <= w / 3, t <= h / 3 else { return nil }
+    let rf = Double(r)
     var tiles = Data(count: t * t * 4 * 4)
     tiles.withUnsafeMutableBytes { raw in
         let dst = raw.bindMemory(to: UInt8.self).baseAddress!
-        for (i, (ox, oy)) in [(0, 0), (w - t, 0), (0, h - t), (w - t, h - t)].enumerated() {
-            for y in 0..<t {
-                memcpy(dst + (i * t * t + y * t) * 4, base + (oy + y) * stride + ox * 4, t * 4)
+        // Per corner: tile origin in the frame, and the corner circle's centre in frame pixels.
+        let corners: [(Int, Int, Double, Double)] = [
+            (0, 0, rf, rf), (w - t, 0, Double(w) - rf, rf),
+            (0, h - t, rf, Double(h) - rf), (w - t, h - t, Double(w) - rf, Double(h) - rf),
+        ]
+        for (i, (ox, oy, cx, cy)) in corners.enumerated() {
+            for ty in 0..<t {
+                for tx in 0..<t {
+                    let fx = ox + tx, fy = oy + ty
+                    // Coverage of the rounded shape (4x4 supersampled) — only pixels beyond the
+                    // centre in both axes are in the rounded part.
+                    var cover = 0.0
+                    for sy in 0..<4 {
+                        for sx in 0..<4 {
+                            let px = Double(fx) + (Double(sx) + 0.5) / 4, py = Double(fy) + (Double(sy) + 0.5) / 4
+                            let dx = (px < cx) == (cx < Double(w) / 2) ? abs(px - cx) : 0
+                            let dy = (py < cy) == (cy < Double(h) / 2) ? abs(py - cy) : 0
+                            if dx * dx + dy * dy <= rf * rf { cover += 1 }
+                        }
+                    }
+                    cover /= 16
+                    // Colour: this pixel if it is solid window content, else the point 2px
+                    // inside the curve along the ray from the circle centre.
+                    var sxp = fx, syp = fy
+                    let src0 = base + fy * stride + fx * 4
+                    if src0[3] < 250 || cover < 1 {
+                        let ddx = Double(fx) + 0.5 - cx, ddy = Double(fy) + 0.5 - cy
+                        let d = max(1e-6, (ddx * ddx + ddy * ddy).squareRoot())
+                        let k = min(1, max(0, (rf - 2) / d))
+                        sxp = min(w - 1, max(0, Int(cx + ddx * k)))
+                        syp = min(h - 1, max(0, Int(cy + ddy * k)))
+                    }
+                    let src = base + syp * stride + sxp * 4
+                    let o = dst + (i * t * t + ty * t + tx) * 4
+                    let a = Double(src[3]) / 255
+                    for c in 0..<3 {
+                        // Un-premultiply the source, then premultiply by the mask.
+                        let v = a > 0 ? Double(src[c]) / a : 0
+                        o[c] = UInt8(min(255, (v * cover).rounded()))
+                    }
+                    o[3] = UInt8((cover * 255).rounded())
+                }
             }
         }
     }
     var hash: UInt64 = 0xcbf29ce484222325
     for b in tiles { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
     return (t, tiles, hash)
+}
+
+/// Finds traffic lights an app draws itself (hiding the standard ones, e.g. a browser): three equal
+/// round shapes in a row near the top-left, at macOS size and spacing. Returns their frames in
+/// window points (16x16, centred on each circle), or nil.
+func detectTrafficLights(_ pb: CVPixelBuffer, scale: CGFloat) -> [CGRect]? {
+    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), rowBytes = CVPixelBufferGetBytesPerRow(pb)
+    let sc = max(1, Int(scale.rounded()))
+    // Work on a 1-point grid over the top-left 140x70 pt.
+    let gw = min(140, w / sc), gh = min(70, h / sc)
+    guard gw > 40, gh > 20 else { return nil }
+    func px(_ x: Int, _ y: Int) -> (Int, Int, Int) {
+        let p = base + (y * sc) * rowBytes + (x * sc) * 4
+        return (Int(p[0]), Int(p[1]), Int(p[2]))
+    }
+    // Background: the median colour of the whole region (the title bar dominates it).
+    var bgSamples: [(Int, Int, Int)] = []
+    for y in Swift.stride(from: 0, to: gh, by: 2) { for x in Swift.stride(from: 0, to: gw, by: 2) { bgSamples.append(px(x, y)) } }
+    let bg = (bgSamples.map { $0.0 }.sorted()[bgSamples.count / 2],
+              bgSamples.map { $0.1 }.sorted()[bgSamples.count / 2],
+              bgSamples.map { $0.2 }.sorted()[bgSamples.count / 2])
+    var mask = [Bool](repeating: false, count: gw * gh)
+    for y in 0..<gh {
+        for x in 0..<gw {
+            let c = px(x, y)
+            mask[y * gw + x] = abs(c.0 - bg.0) + abs(c.1 - bg.1) + abs(c.2 - bg.2) > 30
+        }
+    }
+    // Connected components → circle-like blobs about 10–16 pt across.
+    var seen = [Bool](repeating: false, count: gw * gh)
+    var blobs: [(cx: Double, cy: Double, d: Double)] = []
+    for start in 0..<(gw * gh) where mask[start] && !seen[start] {
+        var stack = [start], cells: [Int] = []
+        seen[start] = true
+        while let c = stack.popLast() {
+            cells.append(c)
+            let x = c % gw, y = c / gw
+            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] where nx >= 0 && ny >= 0 && nx < gw && ny < gh {
+                let n = ny * gw + nx
+                if mask[n] && !seen[n] { seen[n] = true; stack.append(n) }
+            }
+        }
+        let xs = cells.map { $0 % gw }, ys = cells.map { $0 / gw }
+        let bw = Double(xs.max()! - xs.min()! + 1), bh = Double(ys.max()! - ys.min()! + 1)
+        let fill = Double(cells.count) / (bw * bh)
+        guard (10...17).contains(bw), abs(bw - bh) <= 2, fill > 0.6, fill < 0.95 else { continue }
+        blobs.append((Double(xs.min()!) + bw / 2, Double(ys.min()!) + bh / 2, bw))
+    }
+    // Three in a row, evenly spaced 18–28 pt apart.
+    blobs.sort { $0.cx < $1.cx }
+    for i in 0..<blobs.count {
+        for j in (i + 1)..<max(i + 1, blobs.count) {
+            for k in (j + 1)..<max(j + 1, blobs.count) {
+                let (a, b, c) = (blobs[i], blobs[j], blobs[k])
+                let s1 = b.cx - a.cx, s2 = c.cx - b.cx
+                guard (18...28).contains(s1), abs(s1 - s2) <= 2, abs(a.cy - b.cy) <= 2, abs(b.cy - c.cy) <= 2,
+                      abs(a.d - b.d) <= 2, abs(b.d - c.d) <= 2 else { continue }
+                return [a, b, c].map { CGRect(x: $0.cx - 8, y: $0.cy - 8, width: 16, height: 16) }
+            }
+        }
+    }
+    return nil
 }
 
 /// Writes the top-left corner tile as a PNG in the support directory (diagnostics).

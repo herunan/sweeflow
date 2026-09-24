@@ -64,6 +64,10 @@ use wayland_protocols::{
         },
         single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+        presentation_time::client::{
+            wp_presentation::WpPresentation,
+            wp_presentation_feedback::{self, WpPresentationFeedback},
+        },
     },
     xdg::{
         shell::client::{xdg_positioner, xdg_toplevel},
@@ -172,6 +176,9 @@ pub struct App {
     inhibit_mgr: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     icon_mgr: Option<XdgToplevelIconManagerV1>,
     cursor_mgr: Option<WpCursorShapeManagerV1>,
+    /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
+    presentation: Option<WpPresentation>,
+    trace: bool,
     loop_handle: LoopHandle<'static, App>,
 
     net: UnboundedSender<NetCmd>,
@@ -212,6 +219,7 @@ pub struct App {
     scale: f64,
     host: String,
     connected: bool,
+    trace_event_ms: Option<u32>,
 }
 
 pub fn run(net_cfg: crate::config::Config) -> Result<()> {
@@ -245,6 +253,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
             .flatten(),
         icon_mgr: bind_opt("xdg_toplevel_icon_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        trace: std::env::var_os("SWEEFLOW_TRACE").is_some(),
         compositor,
         subcompositor,
         loop_handle: event_loop.handle(),
@@ -277,6 +287,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         scale,
         host,
         connected: false,
+        trace_event_ms: None,
     };
 
     // A 1x1 opaque buffer stretched behind the video; shows while a resize is catching up.
@@ -917,6 +928,11 @@ impl App {
         l.viewport.set_destination((rect[2] * s).round() as i32, (rect[3] * s).round() as i32);
         l.surface.attach(Some(&buf), 0, 0);
         l.surface.damage_buffer(0, 0, pw as i32, ph as i32);
+        if self.trace {
+            if let (Some(p), Some(ev)) = (&self.presentation, self.trace_event_ms.take()) {
+                p.feedback(&l.surface, qh, (ev, monotonic_ms()));
+            }
+        }
         l.surface.commit();
         l.drawn = Some((state, rect));
         l.buffers.push_back((buf, pool));
@@ -931,6 +947,12 @@ impl App {
 
     /// Tracks the pointer over the traffic lights (hover shows the glyphs).
     fn lights_pointer(&mut self, wid: u32, x: f64, y: f64, qh: &QueueHandle<Self>) {
+        self.lights_pointer_at(wid, x, y, None, qh)
+    }
+
+    /// `event_ms`: the compositor's timestamp of the pointer event (for latency tracing).
+    fn lights_pointer_at(&mut self, wid: u32, x: f64, y: f64, event_ms: Option<u32>, qh: &QueueHandle<Self>) {
+        self.trace_event_ms = event_ms;
         let over = self.button_at(wid, x, y);
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let in_group = lights::group_rect(&w.buttons)
@@ -1039,6 +1061,17 @@ fn switch_windows(reverse: bool) {
             .stderr(std::process::Stdio::null())
             .status();
     });
+}
+
+fn monotonic_ms() -> f64 {
+    let mut ts = [0i64; 2];
+    // SAFETY: clock_gettime writes a timespec into the buffer.
+    unsafe { clock_gettime(1 /* CLOCK_MONOTONIC */, ts.as_mut_ptr()) };
+    ts[0] as f64 * 1000.0 + ts[1] as f64 / 1e6
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clk: i32, ts: *mut i64) -> i32;
 }
 
 fn display_title(app: &str, title: &str) -> String {
@@ -1178,10 +1211,10 @@ impl PointerHandler for App {
                     }
                     self.update_lights(wid, qh);
                 }
-                PointerEventKind::Motion { .. } => {
+                PointerEventKind::Motion { time } => {
                     let edge = self.edge_at(wid, e.position.0, e.position.1);
                     self.set_edge_cursor(edge, pointer, qh);
-                    self.lights_pointer(wid, e.position.0, e.position.1, qh);
+                    self.lights_pointer_at(wid, e.position.0, e.position.1, Some(time), qh);
                     if self.windows.get(&wid).is_some_and(|w| w.lights_pressed.is_some()) {
                         continue; // dragging off a traffic light: not for the Mac
                     }
@@ -1475,6 +1508,22 @@ wayland_client::delegate_noop!(App: ignore XdgToplevelIconManagerV1);
 wayland_client::delegate_noop!(App: ignore XdgToplevelIconV1);
 wayland_client::delegate_noop!(App: ignore WpCursorShapeManagerV1);
 wayland_client::delegate_noop!(App: ignore WpCursorShapeDeviceV1);
+
+wayland_client::delegate_noop!(App: ignore WpPresentation);
+
+/// Logs how long a traffic-light hover update took: input event → our commit → on screen.
+impl Dispatch<WpPresentationFeedback, (u32, f64)> for App {
+    fn event(_: &mut Self, _: &WpPresentationFeedback, e: wp_presentation_feedback::Event, d: &(u32, f64), _: &Connection, _: &QueueHandle<Self>) {
+        if let wp_presentation_feedback::Event::Presented { tv_sec_hi, tv_sec_lo, tv_nsec, .. } = e {
+            let shown = (((tv_sec_hi as u64) << 32 | tv_sec_lo as u64) as f64) * 1000.0 + tv_nsec as f64 / 1e6;
+            let (event_ms, committed) = *d;
+            // Event timestamps are 32-bit milliseconds of the same monotonic clock.
+            let ev = (shown as u64 & !0xffff_ffff) as f64 + event_ms as f64;
+            log::info!("hover latency: event→commit {:.1} ms, commit→screen {:.1} ms, total {:.1} ms",
+                       committed - ev, shown - committed, shown - ev);
+        }
+    }
+}
 
 impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
     fn event(_: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, e: zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {

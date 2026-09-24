@@ -93,6 +93,26 @@ final class WindowControl {
         }
     }
 
+    /// Diagnostics: the window's AX frame and every button-like child with its frame.
+    func debugDescribe(_ wid: UInt32, pid: pid_t) -> String {
+        guard let e = element(wid, pid: pid) else { return "no AX element" }
+        func frame(_ el: AXUIElement) -> CGRect {
+            var pos: CFTypeRef?, size: CFTypeRef?
+            var p = CGPoint.zero, s = CGSize.zero
+            if AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &pos) == .success { AXValueGetValue(pos as! AXValue, .cgPoint, &p) }
+            if AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &size) == .success { AXValueGetValue(size as! AXValue, .cgSize, &s) }
+            return CGRect(origin: p, size: s)
+        }
+        var out = "ax window \(frame(e))\n"
+        for attr in [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute, kAXFullScreenButtonAttribute] {
+            var v: CFTypeRef?
+            if AXUIElementCopyAttributeValue(e, attr as CFString, &v) == .success, let b = v {
+                out += "\(attr): \(frame(b as! AXUIElement))\n"
+            } else { out += "\(attr): none\n" }
+        }
+        return out
+    }
+
     /// The window the user is typing into on the Mac, if any.
     func focusedWindowID() -> UInt32? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
