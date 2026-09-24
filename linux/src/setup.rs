@@ -131,7 +131,7 @@ pub fn install() -> Result<()> {
              ExecStart={}\n\
              Restart=always\n\
              RestartSec=2\n\
-             Environment=RUST_LOG=info\n\n\
+             Environment=RUST_LOG=info,zbus=warn,tracing=warn\n\n\
              [Install]\n\
              WantedBy=graphical-session.target\n",
             target.display()

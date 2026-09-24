@@ -141,6 +141,10 @@ final class Session {
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.visibleSize = requestedSizes[wid]
+            if let app = NSRunningApplication(processIdentifier: win.pid) {
+                var r = CGRect(x: 0, y: 0, width: 256, height: 256)
+                st.appIcon = app.icon?.cgImage(forProposedRect: &r, context: nil, hints: nil)
+            }
             st.onDetectedButtons = { [weak self] rects in
                 guard let self else { return }
                 self.sentButtons[wid] = rects
@@ -152,6 +156,7 @@ final class Session {
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
+            if ScreenLock.isLocked { st.setScreenLocked(true) }
         case .clipboardSubscribe:
             clipboard?.0.stop()
             let sync = ClipboardSync()
@@ -469,6 +474,10 @@ final class Session {
         return "cg frame \(w.frame)\n" + control_.debugDescribe(wid, pid: w.pid)
     }
 
+    func debugPause(_ on: Bool, placeholder: Bool = false) {
+        queue.async { self.streamers.values.forEach { $0.setScreenLocked(on, placeholder: placeholder) } }
+    }
+
     func debugWindows() -> String {
         tracker.windows.values.sorted { $0.wid < $1.wid }.map {
             "\($0.wid) \($0.appName) kind=\($0.kind) parent=\($0.parent) layer=\($0.layer) frame=\($0.frame) rel=\($0.rel)"
@@ -567,7 +576,7 @@ final class Session {
         m.u8(locked ? 1 : 0)
         control?.send(m)
         // Fresh pictures right away once it's unlocked.
-        if !locked { streamers.values.forEach { $0.requestKeyframe() } }
+        streamers.values.forEach { $0.setScreenLocked(locked) }
         if !locked && config.virtualDisplay {
             DispatchQueue.main.async { host.display.retry() }
             refreshVirtualDisplayArea(attempt: 0)

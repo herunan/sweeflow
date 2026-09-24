@@ -43,6 +43,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// (app minimum size), Linux crops it, so the bottom/right corners must be cut at the
     /// visible edge rather than the window's real edge.
     var visibleSize: CGSize?
+    /// The app's icon, shown on the placeholder when the Mac is locked before the first frame.
+    var appIcon: CGImage?
     /// Called when traffic lights drawn by the app itself were found in the pixels.
     var onDetectedButtons: (([CGRect]) -> Void)?
     private var detectCountdown = 0
@@ -180,6 +182,70 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         pump()
     }
 
+    /// Corner tiles cut from `pb` (sent ahead of its frame), so they match what it shows.
+    private func updateCorners(from pb: CVPixelBuffer) {
+        let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded())
+        if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale, visible: visiblePx()), hash != cornersHash {
+            cornersHash = hash
+            pendingCorners = (t, tiles)
+        }
+    }
+
+    private func visiblePx() -> CGSize? {
+        visibleSize.map { CGSize(width: $0.width * scale, height: $0.height * scale) }
+    }
+
+    /// The colour frame shown before the Mac locked, put back when it unlocks (a static window
+    /// sends no new frame by itself).
+    private var colourBeforeLock: CVPixelBuffer?
+    /// The paused picture is up: captures are dropped until unlocked.
+    private var showingPause = false
+
+    /// The Mac locked or unlocked: show the last frame greyed out with a pause symbol meanwhile.
+    func setScreenLocked(_ locked: Bool, placeholder: Bool = false) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.lossless else { return }
+            if locked {
+                guard !self.showingPause else { return }
+                self.showingPause = true
+                if !placeholder, let b = self.lastBuffer {
+                    guard let grey = pausedCopy(of: b, scale: self.scale, visible: self.visiblePx()) else { return }
+                    self.colourBeforeLock = b
+                    self.updateCorners(from: grey)
+                    self.pendingBuffer = grey
+                } else {
+                    // Locked before the first frame: a dark placeholder with the pause symbol.
+                    let (w, h) = self.pixelSize()
+                    guard let blank = solidBuffer(width: w, height: h, gray: 0x3A) else { return }
+                    if let icon = self.appIcon { drawCentred(icon, in: blank, size: 72 * self.scale, visible: self.visiblePx()) }
+                    guard let grey = pausedCopy(of: blank, scale: self.scale, visible: self.visiblePx()) else { return }
+                    self.updateCorners(from: grey)
+                    self.pendingBuffer = grey
+                }
+            } else {
+                guard self.showingPause else { return }
+                self.showingPause = false
+                guard let b = self.colourBeforeLock else {
+                    self.pendingBuffer = nil
+                    // Only a placeholder was shown: a fresh capture starts with a real frame.
+                    if let win = self.scWindow, let stream = self.stream {
+                        stream.stopCapture { _ in }
+                        self.stream = nil
+                        self.startCapture(win)
+                    }
+                    return
+                }
+                self.colourBeforeLock = nil
+                self.updateCorners(from: b)
+                // Covers windows that don't change (fresh captures replace it as they come).
+                self.pendingBuffer = b
+            }
+            self.forceKeyframe = true
+            self.refinementsLeft = 2
+            self.pump()
+        }
+    }
+
     func requestKeyframe() {
         forceKeyframe = true
         if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b }
@@ -221,7 +287,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let contentScale = info[.contentScale] as? CGFloat ?? 1
         let scaleFactor = info[.scaleFactor] as? CGFloat ?? 1
         queue.async { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.stopped, !self.showingPause else { return }
             if !self.loggedAttachments {
                 self.loggedAttachments = true
                 let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
@@ -833,4 +899,82 @@ func annexB(_ sb: CMSampleBuffer) -> (Data, Bool) {
 
 func hostMicros() -> UInt64 {
     clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000
+}
+
+func solidBuffer(width w: Int, height h: Int, gray: UInt8) -> CVPixelBuffer? {
+    var out: CVPixelBuffer?
+    let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+    guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs, &out) == kCVReturnSuccess, let out else { return nil }
+    CVPixelBufferLockBaseAddress(out, [])
+    defer { CVPixelBufferUnlockBaseAddress(out, []) }
+    guard let base = CVPixelBufferGetBaseAddress(out) else { return nil }
+    let row = CVPixelBufferGetBytesPerRow(out)
+    let px = base.bindMemory(to: UInt32.self, capacity: row / 4 * h)
+    let v = UInt32(gray)
+    let fill = 0xFF00_0000 | v << 16 | v << 8 | v
+    for i in 0..<(row / 4 * h) { px[i] = fill }
+    return out
+}
+
+/// Draws `image` (`size` px square) in the middle of the part of `pb` shown on Linux.
+func drawCentred(_ image: CGImage, in pb: CVPixelBuffer, size: CGFloat, visible: CGSize?) {
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+    CVPixelBufferLockBaseAddress(pb, [])
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pb),
+          let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return }
+    let vw = min(CGFloat(w), visible?.width ?? CGFloat(w)), vh = min(CGFloat(h), visible?.height ?? CGFloat(h))
+    let side = min(size, vw * 0.5, vh * 0.5)
+    ctx.interpolationQuality = .high
+    ctx.draw(image, in: CGRect(x: vw / 2 - side / 2, y: CGFloat(h) - vh / 2 - side / 2, width: side, height: side))
+}
+
+/// A greyscale copy of `pb` with a flat pause symbol in the middle (shown while the Mac is locked).
+func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) -> CVPixelBuffer? {
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+    var out: CVPixelBuffer?
+    let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+    guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs, &out) == kCVReturnSuccess, let out else { return nil }
+    CVPixelBufferLockBaseAddress(pb, .readOnly)
+    CVPixelBufferLockBaseAddress(out, [])
+    defer {
+        CVPixelBufferUnlockBaseAddress(out, [])
+        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+    }
+    guard let src = CVPixelBufferGetBaseAddress(pb), let dst = CVPixelBufferGetBaseAddress(out) else { return nil }
+    var s = vImage_Buffer(data: src, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: CVPixelBufferGetBytesPerRow(pb))
+    var d = vImage_Buffer(data: dst, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: CVPixelBufferGetBytesPerRow(out))
+    // Rec. 709 luma into B, G and R (memory order BGRA), alpha kept; a little darker, to read as
+    // inactive. dest[j] = Σ src[i] · m[i·4 + j] / divisor.
+    let k: Double = 0.85 * 256
+    let (b, g, r) = (Int16(0.0722 * k), Int16(0.7152 * k), Int16(0.2126 * k))
+    let m: [Int16] = [b, b, b, 0,
+                      g, g, g, 0,
+                      r, r, r, 0,
+                      0, 0, 0, 256]
+    guard vImageMatrixMultiply_ARGB8888(&s, &d, m, 256, nil, nil, vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
+
+    guard let ctx = CGContext(data: dst, width: w, height: h, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(out),
+                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return out }
+    // A dark disc with two white bars, sized to the window within sensible limits.
+    // A small badge in the top-right corner of the part shown on Linux (the top-left `visible`
+    // pixels; CG's origin is bottom-left): a dark disc with two white bars, always the same size.
+    let vw = min(CGFloat(w), visible?.width ?? CGFloat(w))
+    let radius = 11 * scale, inset = 14 * scale
+    let c = CGPoint(x: vw - inset - radius, y: CGFloat(h) - inset - radius)
+    ctx.setFillColor(CGColor(gray: 0, alpha: 0.55))
+    ctx.fillEllipse(in: CGRect(x: c.x - radius, y: c.y - radius, width: radius * 2, height: radius * 2))
+    let barW = radius * 0.28, barH = radius * 0.9, gap = radius * 0.28
+    ctx.setFillColor(CGColor(gray: 1, alpha: 0.95))
+    for x in [c.x - gap / 2 - barW, c.x + gap / 2] {
+        let bar = CGRect(x: x, y: c.y - barH / 2, width: barW, height: barH)
+        ctx.addPath(CGPath(roundedRect: bar, cornerWidth: barW * 0.3, cornerHeight: barW * 0.3, transform: nil))
+    }
+    ctx.fillPath()
+    return out
 }

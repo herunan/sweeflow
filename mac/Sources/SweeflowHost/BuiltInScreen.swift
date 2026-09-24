@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-/// The MacBook's own screen, turned down to black while streaming, so it can run with the lid
+/// The MacBook's own screen, turned down to near-black while streaming, so it can run with the lid
 /// slightly open (a closed lid locks the Mac, and a locked Mac can't be captured) without
 /// lighting up or heating. Restored when streaming stops.
 enum BuiltInScreen {
@@ -11,6 +11,7 @@ enum BuiltInScreen {
     private static let getBrightness = lib.flatMap { dlsym($0, "DisplayServicesGetBrightness") }.map { unsafeBitCast($0, to: Get.self) }
     private static let setBrightness = lib.flatMap { dlsym($0, "DisplayServicesSetBrightness") }.map { unsafeBitCast($0, to: Set.self) }
     /// Kept on disk so a crash while dimmed still gets the brightness back on the next start.
+    static let dimLevel: Float = 0.01
     private static let savedKey = "builtInBrightnessBeforeDim"
 
     private static var builtIn: CGDirectDisplayID? {
@@ -55,10 +56,12 @@ enum BuiltInScreen {
         guard let id = builtIn, let get = getBrightness, let set = setBrightness else { return }
         var current: Float = 0
         guard get(id, &current) == 0 else { return }
-        if UserDefaults.standard.object(forKey: savedKey) == nil {
+        if UserDefaults.standard.object(forKey: savedKey) == nil && current > dimLevel {
             UserDefaults.standard.set(current, forKey: savedKey)
         }
-        if set(id, 0) == 0 { log(String(format: "built-in screen dimmed (was %.2f)", current)) }
+        // Not 0: that switches the backlight off, which macOS counts as the display turning off
+        // (and the Mac may then lock within seconds).
+        if set(id, dimLevel) == 0 { log(String(format: "built-in screen dimmed (was %.2f)", current)) }
     }
 
     /// True once nothing is left to restore.

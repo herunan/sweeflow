@@ -113,6 +113,10 @@ final class DebugPort {
                     }
                 }
             }
+        case "pause" where p.count == 2:
+            // Preview the locked look: pause on|off.
+            session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")
+            reply("ok")
         case "windows":
             guard let s = session else { return reply("no session") }
             s.queue.async {
