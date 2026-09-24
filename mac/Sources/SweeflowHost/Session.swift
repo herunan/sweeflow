@@ -33,6 +33,11 @@ final class Session {
     private var sentButtons: [UInt32: [CGRect]] = [:]
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
+    /// The virtual display's full bounds (the area plus the menu bar above it).
+    private var vdBounds: CGRect?
+    /// Where windows sit on the Linux screen (points), applied here a moment later.
+    private var linuxPositions: [UInt32: CGPoint] = [:]
+    private var positionsScheduled = false
     private var started = false
     /// Sizes the client shows windows at (from its resize requests).
     private var requestedSizes: [UInt32: CGSize] = [:]
@@ -199,6 +204,24 @@ final class Session {
                     }
                 }
             }
+        case .wallpaper:
+            // The Linux wallpaper, for the virtual display (window materials are tinted with it).
+            let hash = try m.str(), ext = try m.str(), data = try m.bytes()
+            DispatchQueue.global(qos: .utility).async {
+                let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
+                let safeExt = ext.allSatisfy { $0.isLetter || $0.isNumber } ? ext : "png"
+                let url = dir.appendingPathComponent("wallpaper-\(hash.prefix(12)).\(safeExt)")
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    // One file per wallpaper (macOS caches by path), old ones removed.
+                    for old in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+                    where old.lastPathComponent.hasPrefix("wallpaper-") {
+                        try? FileManager.default.removeItem(at: old)
+                    }
+                    try? data.write(to: url)
+                }
+                log("wallpaper from Linux: \(url.lastPathComponent) (\(data.count / 1024) KB)")
+                DispatchQueue.main.async { host.display.setWallpaper(url) }
+            }
         case .dragDropLocal:
             // A drag out of one Mac window dropped on another (via Linux): drop the same files.
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
@@ -296,6 +319,17 @@ final class Session {
                 log("menu \(path) in \(pid): \(ok ? "pressed" : "not found")")
                 // Items change state after use (checkmarks, enabled): resend shortly after.
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { self?.sendMenus(pid: pid) }
+            }
+        case .windowPosition:
+            // Where the window is on the Linux screen: put it in the same place here, so the
+            // wallpaper behind it (which tints its sidebar and toolbar) is the same patch.
+            let wid = try m.u32(), x = try m.f32(), y = try m.f32()
+            let scale = CGFloat(max(clientScale, 0.5))
+            linuxPositions[wid] = CGPoint(x: x / scale, y: y / scale)
+            if !positionsScheduled {
+                positionsScheduled = true
+                // Coalesce the stream of moves during a drag.
+                queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.applyLinuxPositions() }
             }
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
@@ -432,10 +466,12 @@ final class Session {
     private func refreshVirtualDisplayArea(attempt: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 0.3 : 0.5)) { [weak self] in
             let area = host.display.usableBounds
+            let bounds = host.display.bounds
             self?.queue.async {
                 guard let self else { return }
                 if let area, area.width > 0 {
                     self.vdArea = area
+                    self.vdBounds = bounds
                     log("virtual display area \(area)")
                     for w in self.tracker.windows.values { self.placeOnVirtualDisplay(w) }
                 } else if attempt < 10 {
@@ -443,6 +479,24 @@ final class Session {
                 }
             }
         }
+    }
+
+    private func applyLinuxPositions() {
+        positionsScheduled = false
+        guard let area = vdArea, let bounds = vdBounds else { return }
+        for (wid, p) in linuxPositions {
+            guard let w = tracker.windows[wid], w.kind == .toplevel, minimized[wid] == nil else { continue }
+            // Same place relative to the screen; the Mac keeps windows below its menu bar and
+            // on the display.
+            var origin = CGPoint(x: bounds.minX + p.x, y: bounds.minY + p.y)
+            origin.x = min(max(origin.x, area.minX), max(area.minX, area.maxX - w.frame.width))
+            origin.y = min(max(origin.y, area.minY), max(area.minY, area.maxY - w.frame.height))
+            if abs(origin.x - w.frame.minX) > 1 || abs(origin.y - w.frame.minY) > 1 {
+                let ok = control_.setPosition(wid, pid: w.pid, origin)
+                if !ok { log("window \(wid): can't move it to \(origin)") }
+            }
+        }
+        linuxPositions.removeAll()
     }
 
     /// Keeps a streamed window (or floating panel) fully on the virtual display: input is injected

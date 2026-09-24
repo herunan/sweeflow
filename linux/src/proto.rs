@@ -28,6 +28,7 @@ pub mod t {
     pub const MENU_REFRESH: u8 = 0x25;
     pub const RESTORE: u8 = 0x26;
     pub const LAUNCH_APP: u8 = 0x27;
+    pub const WINDOW_POSITION: u8 = 0x28;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;
@@ -42,6 +43,7 @@ pub mod t {
     pub const DRAG_FETCH: u8 = 0x49;
     pub const DRAG_DATA: u8 = 0x4A;
     pub const DRAG_DROP_LOCAL: u8 = 0x4B;
+    pub const WALLPAPER: u8 = 0x4C;
     pub const PONG: u8 = 0x42;
     pub const SUBSCRIBE: u8 = 0x50;
     pub const FRAME: u8 = 0x51;

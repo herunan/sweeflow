@@ -182,6 +182,8 @@ struct Win {
     /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
     raw_buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
     stale: bool,
+    /// Where KWin has the window (logical px), as last sent to the Mac.
+    linux_pos: Option<(i32, i32)>,
 }
 
 impl Win {
@@ -211,6 +213,8 @@ pub struct App {
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    /// Serves the window-position reports of our KWin script (kept alive here).
+    _positions: Option<zbus::blocking::Connection>,
     /// Clipboard access regardless of focus (KDE's ext-data-control).
     data_control: Option<ExtDataControlManagerV1>,
     clip_device: Option<ExtDataControlDeviceV1>,
@@ -295,6 +299,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let (int_tx, int_rx): (channel::Sender<Internal>, Channel<Internal>) = channel::channel();
     let scale = net_cfg.scale;
     let host = net_cfg.host.clone();
+    let positions = crate::positions::start(ui_tx.clone()).map_err(|e| log::warn!("window positions: {e}")).ok();
     let net = crate::net::spawn(net_cfg, ui_tx);
 
     let mut app = App {
@@ -314,6 +319,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        _positions: positions,
         data_control: bind_opt("ext_data_control_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         clip_device: None,
         clip_source: None,
@@ -530,6 +536,7 @@ impl App {
                 self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)
             }
             UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles, qh),
+            UiEvent::LinuxPosition { app_id, caption, x, y, minimized } => self.linux_position(&app_id, &caption, x, y, minimized),
         }
     }
 
@@ -643,6 +650,7 @@ impl App {
                 pending_raw: None,
                 raw_buffers: Default::default(),
                 stale: false,
+                linux_pos: None,
             },
         );
         if !is_popup {
@@ -902,6 +910,36 @@ impl App {
         self.in_use.insert(buffer.id(), frame);
     }
 
+    /// KWin moved a Mac window (or retitled it): tell the Mac where it is, so it sits on the same
+    /// part of the wallpaper there.
+    fn linux_position(&mut self, app_id: &str, caption: &str, x: i32, y: i32, minimized: bool) {
+        if minimized {
+            return;
+        }
+        let Some(bundle) = app_id.strip_prefix("sweeflow-") else { return };
+        let mine = |w: &&Win| matches!(w.role, Role::Toplevel(_)) && w.info.bundle_id == bundle;
+        // Several windows of one app are told apart by title.
+        let wid = {
+            let same_app: Vec<&Win> = self.windows.values().filter(mine).collect();
+            match same_app.iter().find(|w| w.info.title == caption) {
+                Some(w) => Some(w.info.wid),
+                None if same_app.len() == 1 => Some(same_app[0].info.wid),
+                None => None,
+            }
+        };
+        let Some(wid) = wid else {
+            log::debug!("position report for unknown window {app_id} \"{caption}\"");
+            return;
+        };
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.linux_pos == Some((x, y)) {
+            return;
+        }
+        w.linux_pos = Some((x, y));
+        log::debug!("window {wid} is at {x},{y} here");
+        let _ = self.net.send(NetCmd::Control(W::new(t::WINDOW_POSITION).u32(wid).f32(x as f32).f32(y as f32).finish()));
+    }
+
     /// New corner tiles from the Mac; shown from the next frame on.
     fn set_corners(&mut self, wid: u32, t_px: u32, tile_px: Vec<u8>, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get(&wid) else { return };
@@ -1132,6 +1170,7 @@ impl App {
             // Mac points == our logical pixels.
             let (w, h) = ((w as f64 / self.scale) as u16, (h as f64 / self.scale) as u16);
             self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).finish());
+            crate::wallpaper::set_screen_aspect(w as f64 / h.max(1) as f64);
         }
     }
 
