@@ -148,8 +148,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         stream = s
         s.startCapture { [weak self] err in
-            if let err { log("stream \(self?.wid ?? 0): startCapture failed: \(err)"); self?.queue.async { self?.out.close() } }
-            else { log("stream \(self?.wid ?? 0): capturing") }
+            guard let self else { return }
+            self.queue.async {
+                // Replaced while it was starting (a stop before the start completes doesn't
+                // take): stop it now, or it keeps sending frames alongside its replacement.
+                guard self.stream === s, !self.stopped else {
+                    if err == nil { s.stopCapture { _ in } }
+                    return
+                }
+                if let err { log("stream \(self.wid): startCapture failed: \(err)"); self.out.close() }
+                else { log("stream \(self.wid): capturing") }
+            }
         }
     }
 
@@ -311,7 +320,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }()
         let scaleFactor = info[.scaleFactor] as? CGFloat ?? 1
         queue.async { [weak self] in
-            guard let self, !self.stopped, !self.showingPause else { return }
+            // Only the current capture's frames (a replaced one can still deliver a few).
+            guard let self, !self.stopped, !self.showingPause, stream === self.stream else { return }
             if lagUs > 0 { self.statCaptureLagSum += lagUs; self.statCaptureLagN += 1 }
             if !self.loggedAttachments {
                 self.loggedAttachments = true
@@ -404,13 +414,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             if let want = displayScale?(), want > 0, abs(want - scale) > 0.01, let stream, !stopped {
                 log("stream \(wid): display scale \(scale) → \(want)")
                 scale = want
-                if lossless, let win = scWindow {
+                // A fresh capture, not a reconfigure: after a reconfigure ScreenCaptureKit sends
+                // nothing until the window's content changes, so a window sitting still (native
+                // apps don't redraw on moving display) would keep its old-scale picture.
+                if let win = scWindow {
                     stream.stopCapture { _ in }
                     self.stream = nil
+                    forceKeyframe = true
                     startCapture(win)
-                } else {
-                    applySize(to: config)
-                    stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
                 }
             }
         }
