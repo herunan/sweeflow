@@ -223,6 +223,45 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// The colour frame shown before the Mac locked, put back when it unlocks (a static window
     /// sends no new frame by itself).
     private var colourBeforeLock: CVPixelBuffer?
+    private var loggedFormat = false
+    /// Encode 10-bit (smooth gradients). Colours checked against the Mac with a known grey.
+    static let tenBit = true
+    private var transfer: VTPixelTransferSession?
+    private var yuvPool: CVPixelBufferPool?
+    private var yuvPoolSize = (0, 0)
+
+    /// BGRA → 10-bit 4:2:0 limited-range BT.709 YUV (tagged sRGB like the capture, so no
+    /// brightness curve is applied on the way).
+    private func toVideoRange10(_ pb: CVPixelBuffer) -> CVPixelBuffer? {
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        if transfer == nil {
+            var t: VTPixelTransferSession?
+            guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &t) == noErr, let t else { return nil }
+            VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+            VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
+            VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationTransferFunction, value: kCVImageBufferTransferFunction_sRGB)
+            transfer = t
+        }
+        if yuvPool == nil || yuvPoolSize != (w, h) {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                kCVPixelBufferWidthKey: w, kCVPixelBufferHeightKey: h,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+            yuvPool = pool
+            yuvPoolSize = (w, h)
+        }
+        guard let pool = yuvPool, let t = transfer else { return nil }
+        var out: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) == kCVReturnSuccess, let out else { return nil }
+        CVBufferSetAttachment(out, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(out, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(out, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+        guard VTPixelTransferSessionTransferImage(t, from: pb, to: out) == noErr else { return nil }
+        return out
+    }
     /// The paused picture is up: captures are dropped until unlocked.
     private var showingPause = false
 
@@ -478,7 +517,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         inFlight.append(captureUs)
         let pts = CMTime(value: CMTimeValue(captureUs), timescale: 1_000_000)
-        VTCompressionSessionEncodeFrame(enc, imageBuffer: pb, presentationTimeStamp: pts, duration: .invalid,
+        // 10-bit goes in as limited-range YUV we convert ourselves: from BGRA the encoder writes
+        // full-range 10-bit, which KWin shows as limited whatever it's tagged (too dark).
+        let input = Self.tenBit ? (toVideoRange10(pb) ?? pb) : pb
+        VTCompressionSessionEncodeFrame(enc, imageBuffer: input, presentationTimeStamp: pts, duration: .invalid,
                                         frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
             guard status == noErr, let sb else {
@@ -488,6 +530,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             let (data, key) = annexB(sb)
             // The low-latency encoder emits full-range YUV whatever the input; tell the client.
+            if !self.loggedFormat, let fd = CMSampleBufferGetFormatDescription(sb) {
+                self.loggedFormat = true
+                let ext = CMFormatDescriptionGetExtensions(fd) as? [String: Any] ?? [:]
+                let keys = ["FullRangeVideo", "BitsPerComponent", "Depth", "CVImageBufferTransferFunction",
+                            "CVImageBufferYCbCrMatrix", "CVImageBufferColorPrimaries"]
+                log("stream \(self.wid): encoded format \(keys.compactMap { k in ext[k].map { "\(k)=\($0)" } })")
+            }
             let fullRange = CMSampleBufferGetFormatDescription(sb).flatMap {
                 CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
             } ?? false
@@ -567,7 +616,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
-            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_HEVC_Main_AutoLevel,
+            // 10-bit: subtle UI gradients (sidebars, glass) get four times the steps.
+            kVTCompressionPropertyKey_ProfileLevel: WindowStreamer.tenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: 100_000,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 3600,
             kVTCompressionPropertyKey_ExpectedFrameRate: 120,
@@ -936,10 +986,21 @@ func hostMicros() -> UInt64 {
     clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000
 }
 
+/// Tags a buffer we made ourselves as sRGB, like the captured frames (untagged ones can be
+/// converted with a different curve on the way to 10-bit).
+func tagSRGB(_ pb: CVPixelBuffer) {
+    if let cs = CGColorSpace(name: CGColorSpace.sRGB) {
+        CVBufferSetAttachment(pb, kCVImageBufferCGColorSpaceKey, cs, .shouldPropagate)
+    }
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+}
+
 func solidBuffer(width w: Int, height h: Int, gray: UInt8) -> CVPixelBuffer? {
     var out: CVPixelBuffer?
     let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
     guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs, &out) == kCVReturnSuccess, let out else { return nil }
+    tagSRGB(out)
     CVPixelBufferLockBaseAddress(out, [])
     defer { CVPixelBufferUnlockBaseAddress(out, []) }
     guard let base = CVPixelBufferGetBaseAddress(out) else { return nil }
@@ -973,6 +1034,7 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     var out: CVPixelBuffer?
     let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
     guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs, &out) == kCVReturnSuccess, let out else { return nil }
+    tagSRGB(out)
     CVPixelBufferLockBaseAddress(pb, .readOnly)
     CVPixelBufferLockBaseAddress(out, [])
     defer {

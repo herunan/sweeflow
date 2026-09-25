@@ -78,6 +78,8 @@ pub struct Decoder {
     hw_device: *mut AVBufferRef,
     pkt: *mut AVPacket,
     frame: *mut AVFrame,
+    /// The first frame's colour description has been logged.
+    logged: bool,
 }
 
 unsafe impl Send for Decoder {}
@@ -122,7 +124,7 @@ impl Decoder {
             if r < 0 {
                 bail!("avcodec_open2 failed ({r})");
             }
-            Ok(Decoder { ctx, hw_device, pkt: av_packet_alloc(), frame: av_frame_alloc() })
+            Ok(Decoder { ctx, hw_device, pkt: av_packet_alloc(), frame: av_frame_alloc(), logged: false })
         }
     }
 
@@ -187,6 +189,16 @@ impl Decoder {
             } else {
                 DRM_FORMAT_NV12
             };
+            if !self.logged {
+                self.logged = true;
+                let f = &*self.frame;
+                log::info!(
+                    "decoded format: {:?} range {:?} matrix {:?} transfer {:?} primaries {:?}, DRM {}",
+                    desc.layers[..desc.nb_layers as usize].iter().map(|l| String::from_utf8_lossy(&l.format.to_le_bytes()).into_owned()).collect::<Vec<_>>(),
+                    f.color_range, f.colorspace, f.color_trc, f.color_primaries,
+                    String::from_utf8_lossy(&format.to_le_bytes())
+                );
+            }
             Ok(GpuFrame {
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,

@@ -91,6 +91,12 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
     ext_data_control_source_v1::{self, ExtDataControlSourceV1},
 };
+use wayland_protocols::wp::color_management::v1::client::{
+    wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+    wp_color_manager_v1::{self, WpColorManagerV1},
+    wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+    wp_image_description_v1::{self, WpImageDescriptionV1},
+};
 use wayland_protocols_plasma::appmenu::client::{
     org_kde_kwin_appmenu::OrgKdeKwinAppmenu, org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager,
 };
@@ -213,6 +219,13 @@ pub struct App {
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
+    /// 10-bit video, and guesses darker). Usable once the compositor says it's ready.
+    srgb: Option<WpImageDescriptionV1>,
+    srgb_ready: bool,
+    color_mgr: Option<WpColorManagerV1>,
+    /// Surfaces already described as sRGB.
+    srgb_tagged: HashMap<wayland_client::backend::ObjectId, WpColorManagementSurfaceV1>,
     /// Serves the window-position reports of our KWin script (kept alive here).
     _positions: Option<zbus::blocking::Connection>,
     /// Clipboard access regardless of focus (KDE's ext-data-control).
@@ -319,6 +332,10 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        srgb: None,
+        srgb_ready: false,
+        color_mgr: bind_opt("wp_color_manager_v1").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        srgb_tagged: HashMap::new(),
         _positions: positions,
         data_control: bind_opt("ext_data_control_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         clip_device: None,
@@ -383,6 +400,12 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
 
     let bg = app.single_pixel.get()?.create_u32_rgba_buffer(0x1e1e_1e1e, 0x1e1e_1e1e, 0x1e1e_1e1e, u32::MAX, &qh, ());
     app.background = Some(bg);
+    if let Some(cm) = &app.color_mgr {
+        let params = cm.create_parametric_creator(&qh, ());
+        params.set_primaries_named(wp_color_manager_v1::Primaries::Srgb);
+        params.set_tf_named(wp_color_manager_v1::TransferFunction::Gamma22);
+        app.srgb = Some(params.create(&qh, ()));
+    }
     app.clear = Some(app.single_pixel.get()?.create_u32_rgba_buffer(0, 0, 0, 0, &qh, ()));
 
     let qh2 = qh.clone();
@@ -671,6 +694,16 @@ impl App {
         let _ = self.net.send(NetCmd::Unsubscribe(wid));
         self.surfaces.remove(&w.base().id());
         self.surfaces.remove(&w.video.id());
+        if let Some(c) = self.srgb_tagged.remove(&w.video.id()) {
+            c.destroy();
+        }
+        if let Some(cr) = &w.corners {
+            for id in [cr.top.1.id(), cr.bottom.1.id()] {
+                if let Some(c) = self.srgb_tagged.remove(&id) {
+                    c.destroy();
+                }
+            }
+        }
         if self.pointer_focus == Some(wid) {
             self.pointer_focus = None;
         }
@@ -791,6 +824,8 @@ impl App {
             log::info!("window {wid}: video is {} range", if full_range { "full" } else { "limited" });
             w.color_full_range = Some(full_range);
         }
+        self.describe_srgb(wid, qh);
+        let Some(w) = self.windows.get_mut(&wid) else { return };
         let capture_us = frame.capture_us;
         // Always ack so the Mac keeps streaming, even if we drop this frame.
         let ack = W::new(t::FRAME_ACK).u64(capture_us).finish();
@@ -923,6 +958,28 @@ impl App {
         w.video.damage_buffer(0, 0, fw as i32, fh as i32);
         w.video.commit();
         self.in_use.insert(buffer.id(), frame);
+    }
+
+    /// States sRGB on the surfaces showing the window's video (the middle and the strips).
+    fn describe_srgb(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let (Some(cm), Some(desc)) = (&self.color_mgr, &self.srgb) else { return };
+        if !self.srgb_ready {
+            return;
+        }
+        let Some(w) = self.windows.get(&wid) else { return };
+        let mut surfaces = vec![w.video.clone()];
+        if let Some(c) = &w.corners {
+            surfaces.push(c.top.1.clone());
+            surfaces.push(c.bottom.1.clone());
+        }
+        for surf in surfaces {
+            if self.srgb_tagged.contains_key(&surf.id()) {
+                continue;
+            }
+            let cms = cm.get_surface(&surf, qh, ());
+            cms.set_image_description(desc, wp_color_manager_v1::RenderIntent::Perceptual);
+            self.srgb_tagged.insert(surf.id(), cms);
+        }
     }
 
     /// KWin moved a Mac window (or retitled it): tell the Mac where it is, so it sits on the same
@@ -2045,6 +2102,22 @@ wayland_client::delegate_noop!(App: ignore WpCursorShapeDeviceV1);
 
 wayland_client::delegate_noop!(App: ignore WpPresentation);
 wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenuManager);
+wayland_client::delegate_noop!(App: ignore WpColorManagerV1);
+wayland_client::delegate_noop!(App: ignore WpImageDescriptionCreatorParamsV1);
+wayland_client::delegate_noop!(App: ignore WpColorManagementSurfaceV1);
+
+impl Dispatch<WpImageDescriptionV1, ()> for App {
+    fn event(app: &mut Self, _: &WpImageDescriptionV1, event: wp_image_description_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wp_image_description_v1::Event::Ready { .. } | wp_image_description_v1::Event::Ready2 { .. } => {
+                app.srgb_ready = true;
+                log::info!("sRGB image description ready");
+            }
+            wp_image_description_v1::Event::Failed { cause, msg } => log::warn!("sRGB image description failed: {cause:?} {msg}"),
+            _ => {}
+        }
+    }
+}
 wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenu);
 
 /// Logs how long a traffic-light hover update took: input event → our commit → on screen.
