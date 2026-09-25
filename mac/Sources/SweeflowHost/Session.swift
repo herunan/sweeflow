@@ -323,6 +323,7 @@ final class Session {
             if let p {
                 if pressed { ensureFront(wid, at: p) }
                 input.button(b, pressed: pressed, at: p)
+                tracker.pollFast()
                 if b == 0 {
                     watchGesture(wid, buttonDown: pressed)
                     watchDrag(wid, buttonDown: pressed)

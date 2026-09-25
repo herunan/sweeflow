@@ -62,6 +62,29 @@ final class WindowTracker {
         timer = t
     }
 
+    /// Clicks open and close menus and popovers: look closely for a moment (every 8 ms for
+    /// half a second), so one that closes vanishes on Linux almost at once.
+    func pollFast() {
+        fastUntil = .now() + 0.5
+        guard fastTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.poll()
+            if DispatchTime.now() > self.fastUntil {
+                self.fastTimer?.cancel()
+                self.fastTimer = nil
+            }
+        }
+        t.resume()
+        fastTimer = t
+    }
+    private var fastTimer: DispatchSourceTimer?
+    private var fastUntil = DispatchTime.now()
+    /// Diagnostics: popups' frames during their first moments (to see open/close animations).
+    private var popupBorn: [UInt32: DispatchTime] = [:]
+
     func stop() { timer?.cancel(); timer = nil }
 
     private func appInfo(_ pid: pid_t) -> (String, String)? {
@@ -166,12 +189,23 @@ final class WindowTracker {
         let live = Set(seen.keys).union(popups.map(\.wid))
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         for (wid, old) in windows where seen[wid] == nil {
+            if old.kind == .popup, let born = popupBorn.removeValue(forKey: wid) {
+                log("popup \(wid) gone after \((DispatchTime.now().uptimeNanoseconds - born.uptimeNanoseconds) / 1_000_000) ms")
+            }
             windows[wid] = nil
             onRemoved?(old)
         }
         // Parents before children so the client can attach popups.
         for wid in order {
             let w = seen[wid]!
+            if w.kind == .popup {
+                let born = popupBorn[wid] ?? .now()
+                popupBorn[wid] = born
+                let ms = (DispatchTime.now().uptimeNanoseconds - born.uptimeNanoseconds) / 1_000_000
+                if ms < 800, windows[wid]?.frame != w.frame {
+                    log("popup \(wid) +\(ms) ms: \(w.frame)")
+                }
+            }
             if let old = windows[wid] {
                 if old != w { windows[wid] = w; onChanged?(w) }
             } else {
