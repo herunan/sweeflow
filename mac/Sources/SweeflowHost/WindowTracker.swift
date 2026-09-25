@@ -202,7 +202,7 @@ final class WindowTracker {
                 let born = popupBorn[wid] ?? .now()
                 popupBorn[wid] = born
                 let ms = (DispatchTime.now().uptimeNanoseconds - born.uptimeNanoseconds) / 1_000_000
-                if ms < 800, windows[wid]?.frame != w.frame {
+                if windows[wid]?.frame != w.frame {
                     log("popup \(wid) +\(ms) ms: \(w.frame)")
                 }
             }
