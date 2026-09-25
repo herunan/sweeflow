@@ -89,23 +89,24 @@ final class WindowTracker {
     /// size, rather than followed step by step. Frame and when it last changed.
     private var growing: [UInt32: (frame: CGRect, since: DispatchTime)] = [:]
 
-    /// A new popup that is still animating open (started tiny, or changed in the last 60 ms).
+    /// A new popup still animating open: held until its frame has stayed put for 40 ms (a menu
+    /// that opens at full size waits just that; a zooming card waits until it has settled).
     private func stillOpening(_ p: TrackedWindow) -> Bool {
         let now = DispatchTime.now()
-        if var g = growing[p.wid] {
-            if g.frame != p.frame {
-                g = (p.frame, now)
-                growing[p.wid] = g
-                return true
-            }
-            if now.uptimeNanoseconds - g.since.uptimeNanoseconds < 60_000_000 { return true }
-            growing[p.wid] = nil
-            return false
+        guard var g = growing[p.wid] else {
+            growing[p.wid] = (p.frame, now)
+            pollFast()   // watch it closely until it settles
+            return true
         }
-        guard p.frame.width < 40 || p.frame.height < 40 else { return false }
-        growing[p.wid] = (p.frame, now)
-        pollFast()   // watch it closely until it settles
-        return true
+        if g.frame != p.frame {
+            g = (p.frame, now)
+            growing[p.wid] = g
+            pollFast()
+            return true
+        }
+        if now.uptimeNanoseconds - g.since.uptimeNanoseconds < 40_000_000 { return true }
+        growing[p.wid] = nil
+        return false
     }
 
     func stop() { timer?.cancel(); timer = nil }
