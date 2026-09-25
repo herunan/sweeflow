@@ -1131,6 +1131,36 @@ impl App {
         });
     }
 
+    /// A click outside an app's popups closes them on the Mac; hide them here right away rather
+    /// than when the Mac reports them gone (a visible moment later). Their picture layer is
+    /// cleared (the popup itself stays mapped); one still open shortly after is shown again.
+    fn hide_popups_on_outside_click(&mut self, clicked: u32) {
+        let Some(c) = self.windows.get(&clicked) else { return };
+        if matches!(c.role, Role::Popup(_)) {
+            return; // a click inside a popup (a menu item, a button on a card)
+        }
+        let pid = c.info.pid;
+        let popups: Vec<u32> = self
+            .windows
+            .values()
+            .filter(|w| matches!(w.role, Role::Popup(_)) && w.info.pid == pid)
+            .map(|w| w.info.wid)
+            .collect();
+        for wid in popups {
+            if let Some(w) = self.windows.get(&wid) {
+                w.video.attach(None, 0, 0);
+                w.video.commit();
+            }
+            let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(400)), move |_, _, app| {
+                // Still open: show it again (its next frame redraws it).
+                if app.windows.contains_key(&wid) {
+                    let _ = app.net.send(NetCmd::Video(wid, W::new(t::REQUEST_KEYFRAME).finish()));
+                }
+                TimeoutAction::Drop
+            });
+        }
+    }
+
     /// A file drag started in a Mac window and the pointer (button still down) has left it:
     /// continue it as a Linux drag so it can be dropped in Dolphin, the desktop, etc.
     fn maybe_take_drag(&mut self, qh: &QueueHandle<Self>) {
@@ -1661,6 +1691,7 @@ impl PointerHandler for App {
                         }
                     }
                     self.press_serial = serial;
+                    self.hide_popups_on_outside_click(wid);
                     if button == BTN_LEFT {
                         self.left_down = Some(wid);
                         self.mac_drag = None;
