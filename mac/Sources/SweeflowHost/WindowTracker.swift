@@ -82,8 +82,9 @@ final class WindowTracker {
     }
     private var fastTimer: DispatchSourceTimer?
     private var fastUntil = DispatchTime.now()
-    /// Diagnostics: popups' frames during their first moments (to see open/close animations).
-    private var popupBorn: [UInt32: DispatchTime] = [:]
+    /// Popups' largest size so far, and those that have started their closing animation.
+    private var popupMax: [UInt32: CGSize] = [:]
+    private var closing: Set<UInt32> = []
 
     func stop() { timer?.cancel(); timer = nil }
 
@@ -177,6 +178,16 @@ final class WindowTracker {
         // dropdown must not be positioned relative to the app's main window).
         let owners = order.compactMap { seen[$0] }   // front-to-back: toplevels, then panels
         for var p in popups where p.kind == .popup {
+            // Closing: macOS shrinks popovers (a calendar app's event card) toward where they opened.
+            // Shrinking in both directions at once only happens then, so it's gone from now on
+            // (a list that gets shorter shrinks in height only).
+            if closing.contains(p.wid) { continue }
+            let big = popupMax[p.wid] ?? p.frame.size
+            if p.frame.width < big.width * 0.9 && p.frame.height < big.height * 0.9 {
+                closing.insert(p.wid)
+                continue
+            }
+            popupMax[p.wid] = CGSize(width: max(big.width, p.frame.width), height: max(big.height, p.frame.height))
             let near = owners.filter { $0.pid == p.pid && $0.frame.insetBy(dx: -40, dy: -40).intersects(p.frame) }
             // Prefer a panel (drawn above its app's windows), then the frontmost window.
             guard let parent = near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
@@ -187,25 +198,17 @@ final class WindowTracker {
         }
 
         let live = Set(seen.keys).union(popups.map(\.wid))
+        popupMax = popupMax.filter { live.contains($0.key) }
+        closing = closing.filter { id in popups.contains { $0.wid == id } }
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         for (wid, old) in windows where seen[wid] == nil {
-            if old.kind == .popup, let born = popupBorn.removeValue(forKey: wid) {
-                log("popup \(wid) gone after \((DispatchTime.now().uptimeNanoseconds - born.uptimeNanoseconds) / 1_000_000) ms")
-            }
+
             windows[wid] = nil
             onRemoved?(old)
         }
         // Parents before children so the client can attach popups.
         for wid in order {
             let w = seen[wid]!
-            if w.kind == .popup {
-                let born = popupBorn[wid] ?? .now()
-                popupBorn[wid] = born
-                let ms = (DispatchTime.now().uptimeNanoseconds - born.uptimeNanoseconds) / 1_000_000
-                if windows[wid]?.frame != w.frame {
-                    log("popup \(wid) +\(ms) ms: \(w.frame)")
-                }
-            }
             if let old = windows[wid] {
                 if old != w { windows[wid] = w; onChanged?(w) }
             } else {
