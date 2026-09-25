@@ -85,6 +85,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var statEncodeSum: UInt64 = 0, statEncodeN = 0, statCaptureLagSum: UInt64 = 0, statCaptureLagN = 0
     private var statSince = DispatchTime.now()
 
+    /// Windows are captured as the display composites them, with only the window and the desktop
+    /// picture included: sidebars and toolbars then show the patch of wallpaper right behind
+    /// them, as on the Mac's own screen (a window-only capture gets just an averaged tint). The
+    /// rounded corners, then filled with wallpaper, are cut from the window's corner radius.
+    static let composite = true
+    private var display: SCDisplay?
+    private var desktop: [SCWindow] = []
+    /// The window's frame (global points), from the window tracker.
+    var windowFrame: (() -> CGRect?)?
+
     /// Menus, tooltips and other popups: sent as lossless BGRA with alpha (LZ4) instead of HEVC,
     /// so their rounded corners and translucency survive. They are small and short-lived.
     let lossless: Bool
@@ -112,6 +122,20 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 // Keep pointSize: the tracker's size (from init or windowResized) is newer than
                 // this snapshot, which can lag a resize we just requested.
+                if Self.composite, !self.lossless, let content {
+                    let mid = CGPoint(x: win.frame.midX, y: win.frame.minY + 10)
+                    self.display = content.displays.first { $0.frame.contains(mid) }
+                        ?? content.displays.first { $0.frame.intersects(win.frame) }
+                    if let d = self.display {
+                        // The desktop picture and what WindowServer draws with it (full-screen, below
+                        // every window).
+                        self.desktop = content.windows.filter {
+                            $0.windowLayer < 0 && abs($0.frame.width - d.frame.width) < 1 && abs($0.frame.height - d.frame.height) < 1
+                                && abs($0.frame.minX - d.frame.minX) < 1
+                        }
+                    }
+                    self.measureRadiusOnce(win)
+                }
                 self.startCapture(win)
             }
         }
@@ -124,7 +148,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func startCapture(_ win: SCWindow) {
         scWindow = win
-        let filter = SCContentFilter(desktopIndependentWindow: win)
+        let filter: SCContentFilter
+        if Self.composite, !lossless, let d = display {
+            filter = SCContentFilter(display: d, including: desktop + [win])
+            config.sourceRect = CGRect(origin: sourceOrigin(on: d) ?? .zero, size: pointSize)
+            config.ignoreShadowsDisplay = true
+        } else {
+            filter = SCContentFilter(desktopIndependentWindow: win)
+        }
         applySize(to: config)
         // BGRA with alpha so the rounded window corners can be filled in (see fillCorners);
         // the encoder converts to 4:2:0 in hardware.
@@ -162,6 +193,43 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Where the window is on its display (points, the display's own coordinates).
+    private func sourceOrigin(on d: SCDisplay) -> CGPoint? {
+        guard let f = windowFrame?() else { return nil }
+        return CGPoint(x: f.minX - d.frame.minX, y: f.minY - d.frame.minY)
+    }
+
+    /// Composite capture: follow the window around its display.
+    private func followWindow() {
+        guard Self.composite, !lossless, let d = display, let stream, let o = sourceOrigin(on: d) else { return }
+        let want = CGRect(origin: o, size: pointSize)
+        guard abs(want.minX - config.sourceRect.minX) > 0.5 || abs(want.minY - config.sourceRect.minY) > 0.5
+                || want.size != config.sourceRect.size else { return }
+        config.sourceRect = want
+        stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
+    }
+
+    /// The composite capture has no transparent corners to measure, so one window-only shot at
+    /// the start measures the radius (for the shared vote).
+    private func measureRadiusOnce(_ win: SCWindow) {
+        let cfg = SCStreamConfiguration()
+        let (w, h) = pixelSize()
+        cfg.width = w; cfg.height = h
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        cfg.ignoreShadowsSingleWindow = true
+        cfg.shouldBeOpaque = false
+        cfg.showsCursor = false
+        let scale = self.scale
+        SCScreenshotManager.captureSampleBuffer(contentFilter: SCContentFilter(desktopIndependentWindow: win), configuration: cfg) { [weak self] sb, _ in
+            guard let self, let sb, let pb = CMSampleBufferGetImageBuffer(sb), let r = measureCornerRadius(pb, scale: scale) else { return }
+            self.queue.async {
+                let pt = Int((CGFloat(r) / scale).rounded())
+                WindowStreamer.radiusVotes[pt, default: 0] += 1
+                log("stream \(self.wid): corner radius \(pt)pt (from a window-only shot) → consensus \(WindowStreamer.consensusRadiusPt)pt")
+            }
+        }
+    }
+
     private func pixelSize() -> (Int, Int) {
         // Even dimensions for 4:2:0.
         let w = Int((pointSize.width * scale).rounded()) & ~1
@@ -189,6 +257,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         applySize(to: config)
+        if Self.composite, let d = display, let o = sourceOrigin(on: d) {
+            config.sourceRect = CGRect(origin: o, size: size)
+        }
         stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
 
@@ -409,9 +480,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
                 if let dark = eraseCaptureBadge(pb, buttons: self.buttons, badge: self.badgeRect(), scale: self.scale) { self.darkTitleBar = dark }
                 let t0 = DispatchTime.now().uptimeNanoseconds
+                if Self.composite, self.display != nil {
+                    // Composite frames are opaque (wallpaper in the corners): cut the corners.
+                    applyCornerMask(pb, radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * self.scale).rounded()))
+                }
                 // A few radius measurements per window (not every frame) feed the shared vote.
                 self.measureCountdown -= 1
-                if self.radiusSamples < 5, self.measureCountdown <= 0 {
+                if self.display == nil, self.radiusSamples < 5, self.measureCountdown <= 0 {
                     self.measureCountdown = 15
                     if let r = measureCornerRadius(pb, scale: self.scale) {
                         self.radiusSamples += 1
@@ -458,6 +533,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// When the window goes idle, re-encode the last frame a couple of times: the rate controller
     /// spends the spare bits refining it, so static content converges to near-lossless.
     private func tick() {
+        followWindow()
         // The window moved to a display with another scale (e.g. the virtual HiDPI display came
         // or went): capture at that scale rather than padding with black or losing detail.
         scaleCheckCountdown -= 1
@@ -1087,4 +1163,28 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     }
     ctx.fillPath()
     return out
+}
+
+/// Makes the four corners outside a rounded rectangle of radius `r` transparent (anti-aliased,
+/// premultiplied), as a window-only capture would have them.
+func applyCornerMask(_ pb: CVPixelBuffer, radiusPx r: Int) {
+    guard r > 1, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
+    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+    guard w > 2 * r, h > 2 * r else { return }
+    let rf = Double(r)
+    for y in 0..<r {
+        for x in 0..<r {
+            // Coverage of the pixel by the quarter circle centred at (r, r).
+            let d = hypot(rf - (Double(x) + 0.5), rf - (Double(y) + 0.5))
+            let cov = min(max(rf - d + 0.5, 0), 1)
+            guard cov < 1 else { continue }
+            for (px, py) in [(x, y), (w - 1 - x, y), (x, h - 1 - y), (w - 1 - x, h - 1 - y)] {
+                let p = base + py * stride + px * 4
+                for c in 0..<4 { p[c] = UInt8((Double(p[c]) * cov).rounded()) }
+            }
+        }
+    }
 }
