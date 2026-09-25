@@ -111,6 +111,16 @@ final class WindowTracker {
             badges[p.pid, default: []].append(p.frame)
             return true
         }
+        // Untitled floating windows over one of their app's windows belong to it: a search
+        // field's suggestions, an event's hover card (a calendar app). Shown attached, like menus.
+        // Titled ones (a reminder, an inspector) stay windows of their own.
+        let appWindows = Array(seen.values)
+        for i in popups.indices where popups[i].kind == .dialog && popups[i].title.isEmpty {
+            let p = popups[i]
+            if appWindows.contains(where: { $0.pid == p.pid && $0.frame.intersects(p.frame) }) {
+                popups[i].kind = .popup
+            }
+        }
         // Floating panels (dialogs) are windows in their own right; menus go last.
         for d in popups where d.kind == .dialog {
             var d = d
