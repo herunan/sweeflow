@@ -23,45 +23,6 @@ final class WindowControl {
 
     func forget(_ wid: UInt32) { cache[wid] = nil }
 
-    /// Width in points of the window's sidebar, if it has one: the part left of the first
-    /// splitter of its split view, when that part holds a source list (an outline or list, as in
-    /// Mail, Finder, Notes, Music, Settings). 0 if none.
-    func sidebarWidth(_ wid: UInt32, pid: pid_t) -> CGFloat {
-        guard let win = element(wid, pid: pid) else { return 0 }
-        func attr(_ e: AXUIElement, _ a: String) -> CFTypeRef? {
-            var v: CFTypeRef?
-            return AXUIElementCopyAttributeValue(e, a as CFString, &v) == .success ? v : nil
-        }
-        func role(_ e: AXUIElement) -> String { attr(e, kAXRoleAttribute) as? String ?? "" }
-        func children(_ e: AXUIElement) -> [AXUIElement] { attr(e, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
-        func frame(_ e: AXUIElement) -> CGRect {
-            var p = CGPoint.zero, s = CGSize.zero
-            if let v = attr(e, kAXPositionAttribute) { AXValueGetValue(v as! AXValue, .cgPoint, &p) }
-            if let v = attr(e, kAXSizeAttribute) { AXValueGetValue(v as! AXValue, .cgSize, &s) }
-            return CGRect(origin: p, size: s)
-        }
-        func holdsList(_ e: AXUIElement, _ depth: Int) -> Bool {
-            let r = role(e)
-            if r == kAXOutlineRole || r == kAXListRole { return true }
-            return depth < 3 && children(e).prefix(8).contains { holdsList($0, depth + 1) }
-        }
-        let wf = frame(win)
-        let top = children(win)
-        let split = top.first { role($0) == kAXSplitGroupRole }
-            ?? top.lazy.flatMap { children($0) }.first { role($0) == kAXSplitGroupRole }
-        guard let split else { return 0 }
-        var before: [AXUIElement] = []
-        for c in children(split) {
-            if role(c) == kAXSplitterRole {
-                let w = frame(c).minX - wf.minX
-                guard w >= 80, w <= wf.width * 0.45, before.contains(where: { holdsList($0, 0) }) else { return 0 }
-                return w
-            }
-            before.append(c)
-        }
-        return 0
-    }
-
     @discardableResult
     func setSize(_ wid: UInt32, pid: pid_t, _ size: CGSize) -> Bool {
         guard let e = element(wid, pid: pid) else { return false }

@@ -1,7 +1,6 @@
 mod clipboard;
 mod config;
 mod decode;
-mod glass;
 mod launchers;
 mod lights;
 mod menus;

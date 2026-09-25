@@ -19,7 +19,6 @@ pub mod t {
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;
-    pub const SIDEBAR: u8 = 0x1E;
     pub const SCREEN_LOCKED: u8 = 0x1D;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;

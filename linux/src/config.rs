@@ -19,9 +19,6 @@ pub struct Config {
     pub capture_scale: f64,
     /// DRM render node of the GPU the compositor uses (decode there for zero-copy).
     pub render_node: String,
-    /// Apps (bundle ids) whose sidebar is shown see-through, and how opaque it stays.
-    pub glass_apps: Vec<String>,
-    pub sidebar_opacity: f64,
 }
 
 pub fn dir() -> PathBuf {
@@ -39,7 +36,7 @@ impl Config {
     pub fn load() -> Result<Config> {
         let text = fs::read_to_string(Self::path())
             .with_context(|| format!("no config at {} — run `sweeflow setup user@mac` first", Self::path().display()))?;
-        let mut c = Config { host: String::new(), host_fingerprint: String::new(), scale: 1.0, capture_scale: 0.0, render_node: String::new(), glass_apps: vec!["com.apple.mail".into()], sidebar_opacity: 0.8 };
+        let mut c = Config { host: String::new(), host_fingerprint: String::new(), scale: 1.0, capture_scale: 0.0, render_node: String::new() };
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') || line.is_empty() {
@@ -53,8 +50,6 @@ impl Config {
                 "scale" => c.scale = v.parse().context("scale")?,
                 "capture_scale" => c.capture_scale = v.parse().context("capture_scale")?,
                 "render_node" => c.render_node = v,
-                "glass_apps" => c.glass_apps = v.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
-                "sidebar_opacity" => c.sidebar_opacity = v.parse::<f64>().context("sidebar_opacity")?.clamp(0.2, 1.0),
                 _ => {}
             }
         }
@@ -74,11 +69,8 @@ impl Config {
             format!(
                 "# sweeflow client configuration\nhost = \"{}\"\nhost_fingerprint = \"{}\"\nscale = {}\n\
                  # 0 = capture at the Mac's native Retina resolution (sharpest); 1 = half the bandwidth\n\
-                 capture_scale = {}\nrender_node = \"{}\"\n\
-                 # Apps whose sidebar is see-through (desktop blurred behind), comma separated\n\
-                 glass_apps = \"{}\"\nsidebar_opacity = {}\n",
-                self.host, self.host_fingerprint, self.scale, self.capture_scale, self.render_node,
-                self.glass_apps.join(","), self.sidebar_opacity
+                 capture_scale = {}\nrender_node = \"{}\"\n",
+                self.host, self.host_fingerprint, self.scale, self.capture_scale, self.render_node
             ),
         )?;
         Ok(())

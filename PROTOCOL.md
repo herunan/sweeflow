@@ -36,7 +36,6 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x24 | C→S | MenuActivate | i32 pid, u16 n, n × u16 path — press that menu item (indices as in MenuTree) |
 | 0x1C | S→C | AppList | u16 n, n × (str bundleId, str name, bytes png128) — installed apps, for launchers |
 | 0x1D | S→C | ScreenLocked | u8 locked — while locked the host sends no frames (capture is blank) |
-| 0x1E | S→C | Sidebar | u32 wid, f32 width — the window's sidebar width in points (0 = none), from the Accessibility tree |
 | 0x27 | C→S | LaunchApp | str bundleId — open (or reopen) the app on the Mac |
 | 0x28 | C→S | WindowPosition | u32 wid, f32 x, f32 y — where the window is on the Linux screen (logical px); the host puts it in the same place on the virtual display (same wallpaper behind it) |
 | 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
