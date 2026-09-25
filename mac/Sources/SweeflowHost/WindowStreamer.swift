@@ -150,7 +150,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     if err == nil { s.stopCapture { _ in } }
                     return
                 }
-                if let err { log("stream \(self.wid): startCapture failed: \(err)"); self.out.close() }
+                if let err {
+                    log("stream \(self.wid): startCapture failed: \(err)")
+                    self.stream = nil
+                    self.resumeAfterStop()
+                }
                 else {
                     log("stream \(self.wid): capturing")
                     self.expectFirstFrame(from: s, win: win)
@@ -359,6 +363,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // Only the current capture's frames (a replaced one can still deliver a few).
             guard let self, !self.stopped, !self.showingPause, stream === self.stream else { return }
             self.framesSinceStart += 1
+            self.stopRetries = 0
             if lagUs > 0 { self.statCaptureLagSum += lagUs; self.statCaptureLagN += 1 }
             if !self.loggedAttachments {
                 self.loggedAttachments = true
@@ -430,7 +435,36 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("stream \(wid) stopped: \(error)")
-        queue.async { [weak self] in self?.out.close() }
+        queue.async { [weak self] in
+            guard let self, !self.stopped, stream === self.stream else { return }
+            self.stream = nil
+            self.resumeAfterStop()
+        }
+    }
+
+    /// The capture died under us (typically macOS's capture service, replayd, crashing and
+    /// taking every stream with it): start again once it's back, if the window still exists.
+    private var stopRetries = 0
+
+    private func resumeAfterStop() {
+        guard stopRetries < 5 else { log("stream \(wid): giving up after repeated stops"); out.close(); return }
+        stopRetries += 1
+        queue.asyncAfter(deadline: .now() + Double(stopRetries)) { [weak self] in
+            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, _ in
+                guard let self else { return }
+                self.queue.async {
+                    guard !self.stopped, self.stream == nil else { return }
+                    guard let win = content?.windows.first(where: { $0.windowID == self.wid }) else {
+                        // No list at all: the service isn't back yet. No window: it's gone.
+                        if content == nil { self.resumeAfterStop() } else { self.out.close() }
+                        return
+                    }
+                    log("stream \(self.wid): resuming capture")
+                    self.forceKeyframe = true
+                    self.startCapture(win)
+                }
+            }
+        }
     }
 
     // MARK: encode
@@ -463,7 +497,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             s.stopCapture { _ in }
             self.stream = nil
             self.forceKeyframe = true
-            self.startCapture(win)
+            // A fresh look-up: the window as ScreenCaptureKit saw it when it first appeared (an
+            // app still opening it) can stay frameless however often it's restarted.
+            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, _ in
+                guard let self else { return }
+                self.queue.async {
+                    guard !self.stopped, self.stream == nil else { return }
+                    self.startCapture(content?.windows.first(where: { $0.windowID == self.wid }) ?? win)
+                }
+            }
         }
     }
 
