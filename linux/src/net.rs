@@ -59,6 +59,8 @@ pub enum UiEvent {
     Clipboard(std::collections::HashMap<String, Arc<Vec<u8>>>),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
+    /// A window's sidebar width in points (0 = none).
+    Sidebar(u32, f32),
     /// Where KWin has a Mac window (from the positions script).
     LinuxPosition { app_id: String, caption: String, x: i32, y: i32, minimized: bool },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
@@ -87,6 +89,7 @@ impl UiEvent {
             UiEvent::DragBegan { .. } => "drag began",
             UiEvent::DragData(_) => "drag data",
             UiEvent::Corners { .. } => "corners",
+            UiEvent::Sidebar(..) => "sidebar",
             UiEvent::LinuxPosition { .. } => "position",
             UiEvent::RawFrame { .. } => "popup frame",
         }
@@ -450,6 +453,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             }
             UiEvent::WindowButtons(wid, rects)
         }
+        t::SIDEBAR => UiEvent::Sidebar(r.u32()?, r.f32()?),
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),

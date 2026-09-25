@@ -93,6 +93,8 @@ pub fn setup(target: &str) -> Result<()> {
         scale: Config::load().map(|c| c.scale).unwrap_or(1.0),
         capture_scale: Config::load().map(|c| c.capture_scale).unwrap_or(0.0),
         render_node: config::default_render_node(),
+        glass_apps: Config::load().map(|c| c.glass_apps).unwrap_or_else(|_| vec!["com.apple.mail".into()]),
+        sidebar_opacity: Config::load().map(|c| c.sidebar_opacity).unwrap_or(0.8),
     };
     cfg.save()?;
     println!("==> paired. Config written to {}", Config::path().display());

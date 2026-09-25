@@ -97,6 +97,7 @@ use wayland_protocols::wp::color_management::v1::client::{
     wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
     wp_image_description_v1::{self, WpImageDescriptionV1},
 };
+use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur::OrgKdeKwinBlur, org_kde_kwin_blur_manager::OrgKdeKwinBlurManager};
 use wayland_protocols_plasma::appmenu::client::{
     org_kde_kwin_appmenu::OrgKdeKwinAppmenu, org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager,
 };
@@ -119,8 +120,10 @@ struct Corners {
     bottom: (wl_subsurface::WlSubsurface, wl_surface::WlSurface, WpViewport),
     tiles: Vec<(wl_subsurface::WlSubsurface, wl_surface::WlSurface, WpViewport)>,
     tile_buffers: std::collections::VecDeque<(Vec<wl_buffer::WlBuffer>, RawPool)>,
-    /// New tile pixels to upload with the next frame.
+    /// New tile pixels to upload with the next frame, and the last ones uploaded (to redo them
+    /// when the see-through sidebar changes).
     pending: Option<(u32, Vec<u8>)>,
+    last: Option<(u32, Vec<u8>)>,
     /// Whether the split layout was used for the last frame.
     split: bool,
     /// Middle strip's offset from the window's top edge (logical px).
@@ -190,6 +193,26 @@ struct Win {
     stale: bool,
     /// Where KWin has the window (logical px), as last sent to the Mac.
     linux_pos: Option<(i32, i32)>,
+    /// See-through sidebar (chosen apps only): the window shows GPU-composited RGBA buffers
+    /// from its first frame on, never the plain video buffers.
+    glass: Option<GlassState>,
+}
+
+#[derive(Default)]
+struct GlassState {
+    /// Render targets in use or ready; `retired` ones (an old size) go once released.
+    outputs: Vec<GlassBuf>,
+    retired: Vec<GlassBuf>,
+    blur: Option<OrgKdeKwinBlur>,
+    /// Sidebar width (points) and the blur region last set for it (logical px).
+    sidebar_pt: f32,
+    blur_width: i32,
+}
+
+struct GlassBuf {
+    out: crate::glass::Output,
+    buffer: wl_buffer::WlBuffer,
+    busy: bool,
 }
 
 impl Win {
@@ -219,6 +242,15 @@ pub struct App {
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    blur_mgr: Option<OrgKdeKwinBlurManager>,
+    /// GPU compositing for see-through sidebars (made on first use; Err if unavailable).
+    glass: Option<Result<crate::glass::Glass, ()>>,
+    render_node: String,
+    /// Apps shown with a see-through sidebar, and its opacity (empty: none).
+    glass_apps: Vec<String>,
+    sidebar_opacity: f32,
+    /// Glass buffers the compositor holds: buffer → window.
+    glass_busy: HashMap<wayland_client::backend::ObjectId, u32>,
     /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
     /// 10-bit video, and guesses darker). Usable once the compositor says it's ready.
     srgb: Option<WpImageDescriptionV1>,
@@ -311,6 +343,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let (ui_tx, ui_rx): (channel::Sender<UiEvent>, Channel<UiEvent>) = channel::channel();
     let (int_tx, int_rx): (channel::Sender<Internal>, Channel<Internal>) = channel::channel();
     let scale = net_cfg.scale;
+    let glass_cfg = (net_cfg.render_node.clone(), glass_safety(net_cfg.glass_apps.clone()), net_cfg.sidebar_opacity as f32);
     let host = net_cfg.host.clone();
     let positions = crate::positions::start(ui_tx.clone()).map_err(|e| log::warn!("window positions: {e}")).ok();
     let net = crate::net::spawn(net_cfg, ui_tx);
@@ -332,6 +365,12 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        blur_mgr: bind_opt("org_kde_kwin_blur_manager").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        glass: None,
+        render_node: glass_cfg.0,
+        glass_apps: glass_cfg.1,
+        sidebar_opacity: glass_cfg.2,
+        glass_busy: HashMap::new(),
         srgb: None,
         srgb_ready: false,
         color_mgr: bind_opt("wp_color_manager_v1").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
@@ -565,6 +604,23 @@ impl App {
                 self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)
             }
             UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles, qh),
+            UiEvent::Sidebar(wid, pt) => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    if let Some(g) = w.glass.as_mut() {
+                        if g.sidebar_pt != pt {
+                            log::info!("window {wid}: see-through sidebar {pt} pt");
+                            g.sidebar_pt = pt;
+                            // Corner tiles on the sidebar's side fade with it: upload them again.
+                            if let Some(c) = w.corners.as_mut() {
+                                if c.pending.is_none() {
+                                    c.pending = c.last.clone();
+                                }
+                            }
+                            let _ = self.net.send(NetCmd::Video(wid, W::new(t::REQUEST_KEYFRAME).finish()));
+                        }
+                    }
+                }
+            }
             UiEvent::LinuxPosition { app_id, caption, x, y, minimized } => self.linux_position(&app_id, &caption, x, y, minimized),
         }
     }
@@ -631,7 +687,10 @@ impl App {
         // Only HEVC windows carry YUV video; popups show RGB images, which must not be tagged.
         let is_video = !matches!(role, Role::Popup(_));
         // BT.709 YUV; the range is declared per frame from what the stream signals.
-        let color = self.color_rep.as_ref().filter(|_| is_video).map(|m| m.get_surface(&video, qh, ()));
+        // Chosen apps get a see-through sidebar: RGBA buffers from the start, so no YUV tags.
+        let glass = (matches!(role, Role::Toplevel(_)) && self.glass_apps.contains(&info.bundle_id) && self.glass_gpu().is_some())
+            .then(GlassState::default);
+        let color = self.color_rep.as_ref().filter(|_| is_video && glass.is_none()).map(|m| m.get_surface(&video, qh, ()));
         let inhibitor = match (&role, &self.inhibit_mgr, &self.seat) {
             (Role::Toplevel(_), Some(m), Some(seat)) => Some(m.inhibit_shortcuts(&base, seat, qh, ())),
             _ => None,
@@ -680,6 +739,7 @@ impl App {
                 raw_buffers: Default::default(),
                 stale: false,
                 linux_pos: None,
+                glass,
             },
         );
         if !is_popup {
@@ -747,6 +807,23 @@ impl App {
         w.video.destroy();
         w.base_viewport.destroy();
         drop(w.role);
+        // After the surfaces: nothing can show these buffers any more.
+        if let Some(g) = w.glass {
+            if let Some(b) = g.blur {
+                b.release();
+            }
+            let gpu = match self.glass.as_ref() {
+                Some(Ok(g)) => Some(g),
+                _ => None,
+            };
+            for b in g.outputs.into_iter().chain(g.retired) {
+                self.glass_busy.remove(&b.buffer.id());
+                b.buffer.destroy();
+                if let Some(gpu) = gpu {
+                    gpu.drop_output(b.out);
+                }
+            }
+        }
     }
 
     /// The Mac changed the window size itself (app-initiated resize). Follow it if the window
@@ -838,24 +915,36 @@ impl App {
             return;
         }
 
-        let params = match self.dmabuf.create_params(qh) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("dmabuf unavailable: {e}");
-                return;
+        let is_glass = w.glass.is_some();
+        let buffer = if is_glass {
+            // Never falls back to the video buffer: this surface stays on RGBA buffers.
+            match self.glass_frame(wid, &frame, qh) {
+                Some(b) => b,
+                None => return,
             }
+        } else {
+            let params = match self.dmabuf.create_params(qh) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("dmabuf unavailable: {e}");
+                    return;
+                }
+            };
+            for (i, p) in frame.planes.iter().enumerate() {
+                let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(p.fd) };
+                params.add(fd, i as u32, p.offset, p.stride, p.modifier);
+            }
+            params
+                .create_immed(
+                    frame.width as i32,
+                    frame.height as i32,
+                    frame.format,
+                    wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                )
+                .0
         };
-        for (i, p) in frame.planes.iter().enumerate() {
-            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(p.fd) };
-            params.add(fd, i as u32, p.offset, p.stride, p.modifier);
-        }
-        let (buffer, _) = params.create_immed(
-            frame.width as i32,
-            frame.height as i32,
-            frame.format,
-            wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
-            qh,
-        );
+        let Some(w) = self.windows.get_mut(&wid) else { return };
 
         // Map the frame to the window's size in points (the frame may be 2x Retina pixels; the
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
@@ -900,9 +989,23 @@ impl App {
                 bsurf.commit();
                 let pos = [(0, -l), (dw - l, -l), (0, dh - 2 * l), (dw - l, dh - 2 * l)];
                 let new_tiles = c.pending.take();
+                if new_tiles.is_some() {
+                    c.last = new_tiles.clone();
+                }
+                // With a see-through sidebar, the corners on its side (top-left, bottom-left)
+                // fade with it (tiles are premultiplied: scale every channel).
+                let fade = w.glass.as_ref().filter(|g| g.sidebar_pt > 0.0).map(|_| self.sidebar_opacity);
                 if let Some((tp, px)) = &new_tiles {
                     if let Ok(mut pool) = RawPool::new(px.len(), &self.shm) {
                         pool.mmap().copy_from_slice(px);
+                        if let Some(o) = fade {
+                            let n = (*tp * *tp * 4) as usize;
+                            for i in [0usize, 2] {
+                                for b in &mut pool.mmap()[i * n..(i + 1) * n] {
+                                    *b = (*b as f32 * o).round() as u8;
+                                }
+                            }
+                        }
                         let n = (*tp * *tp * 4) as usize;
                         let bufs: Vec<_> = (0..4)
                             .map(|i| {
@@ -957,7 +1060,98 @@ impl App {
         w.video.attach(Some(&buffer), 0, 0);
         w.video.damage_buffer(0, 0, fw as i32, fh as i32);
         w.video.commit();
-        self.in_use.insert(buffer.id(), frame);
+        if is_glass {
+            self.glass_busy.insert(buffer.id(), wid);
+            self.update_glass_blur(wid, qh);
+        } else {
+            self.in_use.insert(buffer.id(), frame);
+        }
+    }
+
+    fn glass_gpu(&mut self) -> Option<&crate::glass::Glass> {
+        if self.glass_apps.is_empty() {
+            return None;
+        }
+        if self.glass.is_none() {
+            self.glass = Some(crate::glass::Glass::new(&self.render_node).map_err(|e| log::warn!("see-through sidebars unavailable: {e:#}")));
+        }
+        self.glass.as_ref().and_then(|g| g.as_ref().ok())
+    }
+
+    /// Draws the frame into one of the window's RGBA buffers (sidebar see-through).
+    fn glass_frame(&mut self, wid: u32, frame: &GpuFrame, qh: &QueueHandle<Self>) -> Option<wl_buffer::WlBuffer> {
+        let scale = self.scale;
+        let opacity = self.sidebar_opacity;
+        let Some(Ok(gpu)) = self.glass.as_ref() else { return None };
+        let w = self.windows.get_mut(&wid)?;
+        let px_per_pt = px_per_pt(frame.px_per_pt, frame.width, w.info.w, scale) as f32;
+        let g = w.glass.as_mut()?;
+        let size = (frame.width, frame.height);
+        // Buffers of another size retire; they're dropped once the compositor lets go of them
+        // (never while one could still be on screen).
+        let (keep, old): (Vec<_>, Vec<_>) = g.outputs.drain(..).partition(|b| (b.out.width, b.out.height) == size);
+        g.outputs = keep;
+        for b in old {
+            if b.busy {
+                g.retired.push(b);
+            } else {
+                b.buffer.destroy();
+                gpu.drop_output(b.out);
+            }
+        }
+        let idx = match g.outputs.iter().position(|b| !b.busy) {
+            Some(i) => i,
+            None if g.outputs.len() < 4 => {
+                sidebar_armed();
+                let out = gpu.new_output(size.0, size.1).map_err(|e| log::warn!("see-through buffer: {e:#}")).ok()?;
+                let params = self.dmabuf.create_params(qh).ok()?;
+                for (i, (fd, offset, stride)) in out.planes.iter().enumerate() {
+                    use std::os::fd::AsFd;
+                    params.add(fd.as_fd(), i as u32, *offset, *stride, out.modifier);
+                }
+                let (buffer, _) = params.create_immed(
+                    out.width as i32,
+                    out.height as i32,
+                    out.fourcc,
+                    wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                );
+                g.outputs.push(GlassBuf { out, buffer, busy: false });
+                g.outputs.len() - 1
+            }
+            None => return None, // all four still on screen: skip this frame
+        };
+        let strip = g.sidebar_pt * px_per_pt;
+        if let Err(e) = gpu.render(frame, strip, opacity, &g.outputs[idx].out) {
+            log::warn!("window {wid}: see-through render failed: {e:#}");
+            return None;
+        }
+        g.outputs[idx].busy = true;
+        Some(g.outputs[idx].buffer.clone())
+    }
+
+    /// KDE's blur behind the see-through sidebar (logical px), set when its width changes.
+    fn update_glass_blur(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let scale = self.scale;
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let base = w.base().clone();
+        let h = w.size.1 as i32;
+        let Some(g) = w.glass.as_mut() else { return };
+        let width = (g.sidebar_pt as f64 * scale).round() as i32;
+        if width == g.blur_width {
+            return;
+        }
+        g.blur_width = width;
+        let Some(m) = &self.blur_mgr else { return };
+        let blur = g.blur.get_or_insert_with(|| m.create(&base, qh, ()));
+        let region = self.compositor.wl_compositor().create_region(qh, ());
+        if width > 0 {
+            region.add(0, 0, width, h.max(1));
+        }
+        blur.set_region(Some(&region));
+        blur.commit();
+        region.destroy();
+        base.commit();
     }
 
     /// States sRGB on the surfaces showing the window's video (the middle and the strips).
@@ -1032,9 +1226,11 @@ impl App {
             let top = make();
             let bottom = make();
             let tiles = (0..4).map(|_| make()).collect();
+            let glass = w.glass.is_some();
             let colors: Vec<_> = self
                 .color_rep
                 .iter()
+                .filter(|_| !glass)
                 .flat_map(|m| [m.get_surface(&top.1, qh, ()), m.get_surface(&bottom.1, qh, ())])
                 .collect();
             let range_now = self.windows.get(&wid).and_then(|w| w.color_full_range);
@@ -1051,6 +1247,7 @@ impl App {
                 tiles,
                 tile_buffers: Default::default(),
                 pending: None,
+                last: None,
                 split: false,
                 middle_y: 0,
                 colors,
@@ -2033,6 +2230,28 @@ impl DmabufHandler for App {
         log::error!("compositor rejected a dmabuf");
     }
     fn released(&mut self, _: &Connection, _: &QueueHandle<Self>, buffer: &wl_buffer::WlBuffer) {
+        // See-through buffers are reused (or dropped now if they're from an old size).
+        if let Some(wid) = self.glass_busy.remove(&buffer.id()) {
+            let gpu = match self.glass.as_ref() {
+                Some(Ok(g)) => Some(g),
+                _ => None,
+            };
+            if let Some(g) = self.windows.get_mut(&wid).and_then(|w| w.glass.as_mut()) {
+                if let Some(b) = g.outputs.iter_mut().find(|b| b.buffer == *buffer) {
+                    b.busy = false;
+                    return;
+                }
+                if let Some(i) = g.retired.iter().position(|b| b.buffer == *buffer) {
+                    let b = g.retired.remove(i);
+                    b.buffer.destroy();
+                    if let Some(gpu) = gpu {
+                        gpu.drop_output(b.out);
+                    }
+                    return;
+                }
+            }
+            return; // window gone: its buffers were dropped with it
+        }
         self.in_use.remove(&buffer.id());
         buffer.destroy();
     }
@@ -2102,6 +2321,8 @@ wayland_client::delegate_noop!(App: ignore WpCursorShapeDeviceV1);
 
 wayland_client::delegate_noop!(App: ignore WpPresentation);
 wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenuManager);
+wayland_client::delegate_noop!(App: ignore OrgKdeKwinBlurManager);
+wayland_client::delegate_noop!(App: ignore OrgKdeKwinBlur);
 wayland_client::delegate_noop!(App: ignore WpColorManagerV1);
 wayland_client::delegate_noop!(App: ignore WpImageDescriptionCreatorParamsV1);
 wayland_client::delegate_noop!(App: ignore WpColorManagementSurfaceV1);
@@ -2198,5 +2419,55 @@ impl Dispatch<ExtDataControlSourceV1, ClipData> for App {
 impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
     fn event(_: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, e: zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         log::debug!("shortcut inhibitor: {e:?}");
+    }
+}
+
+// Safety net: if the compositor goes down while see-through sidebars are in use, they're turned
+// off from then on (earlier glass work crashed KWin). The marker holds the compositor's pid;
+// finding it with a different compositor running means ours died with it.
+
+fn glass_marker() -> std::path::PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("sweeflow-glass")
+}
+
+fn glass_off_file() -> std::path::PathBuf {
+    crate::config::dir().join("glass-off")
+}
+
+fn kwin_pid() -> Option<u32> {
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+        let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+        (comm.trim() == "kwin_wayland").then_some(pid)
+    })
+}
+
+/// At start: the apps to show see-through, or none if the safety net tripped.
+fn glass_safety(apps: Vec<String>) -> Vec<String> {
+    let marker = glass_marker();
+    if let Ok(text) = std::fs::read_to_string(&marker) {
+        let _ = std::fs::remove_file(&marker);
+        if text.trim().parse::<u32>().ok() != kwin_pid() {
+            log::warn!("the compositor restarted while see-through sidebars were on: turning them off");
+            let _ = std::fs::write(glass_off_file(), "see-through sidebars were on when the desktop crashed; delete this file to re-enable\n");
+            let _ = std::process::Command::new("notify-send")
+                .args(["--app-name=sweeflow", "--icon=computer-laptop", "See-through Mac sidebars turned off",
+                       "The desktop restarted while they were on, so they're off to be safe."])
+                .status();
+        }
+    }
+    if glass_off_file().exists() {
+        return Vec::new();
+    }
+    apps
+}
+
+/// Called when see-through buffers are first made this run.
+fn sidebar_armed() {
+    let marker = glass_marker();
+    if !marker.exists() {
+        if let Some(pid) = kwin_pid() {
+            let _ = std::fs::write(marker, pid.to_string());
+        }
     }
 }

@@ -31,6 +31,8 @@ final class Session {
     private var gesture: (wid: UInt32, frame: CGRect, until: DispatchTime, buttonDown: Bool)?
     private var gestureTimer: DispatchSourceTimer?
     private var sentButtons: [UInt32: [CGRect]] = [:]
+    /// Sidebar widths sent to Linux (points; 0 = none).
+    private var sentSidebars: [UInt32: CGFloat] = [:]
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
     /// The virtual display's full bounds (the area plus the menu bar above it).
@@ -670,6 +672,14 @@ final class Session {
         }
         tracker.start()
 
+        // Sidebars (Linux can show them see-through): looked up now and then, as they can be
+        // shown, hidden or resized at any time.
+        let st = DispatchSource.makeTimerSource(queue: queue)
+        st.schedule(deadline: .now() + .seconds(1), repeating: .seconds(2))
+        st.setEventHandler { [weak self] in self?.refreshSidebars() }
+        st.resume()
+        sidebarTimer = st
+
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
         t.setEventHandler { [weak self] in self?.checkFocus() }
@@ -678,6 +688,33 @@ final class Session {
     }
 
     private var watchingLock = false
+    private var sidebarTimer: DispatchSourceTimer?
+    /// Accessibility lookups for sidebars run off the input queue (they can take a while).
+    private let sidebarQueue = DispatchQueue(label: "sidebars", qos: .utility)
+    private let sidebarAX = WindowControl()
+    private var sidebarBusy = false
+
+    private func refreshSidebars() {
+        guard !sidebarBusy else { return }
+        sidebarBusy = true
+        let wins = tracker.windows.values.filter { $0.kind == .toplevel && minimized[$0.wid] == nil }.map { ($0.wid, $0.pid, $0.appName) }
+        sidebarQueue.async { [weak self] in
+            guard let self else { return }
+            let widths = wins.map { ($0, self.sidebarAX.sidebarWidth($0.0, pid: $0.1).rounded()) }
+            self.queue.async {
+                self.sidebarBusy = false
+                let live = Set(wins.map(\.0))
+                self.sentSidebars = self.sentSidebars.filter { live.contains($0.key) }
+                for ((wid, _, name), width) in widths where self.sentSidebars[wid] != width {
+                    self.sentSidebars[wid] = width
+                    var m = MsgWriter(.sidebar)
+                    m.u32(wid); m.f32(Float(width))
+                    self.control?.send(m)
+                    log("window \(wid) (\(name)): sidebar \(Int(width)) pt")
+                }
+            }
+        }
+    }
 
     private func sendLockState() {
         let locked = ScreenLock.isLocked
