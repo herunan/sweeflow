@@ -34,6 +34,20 @@ final class WindowTracker {
     private var bundleCache: [pid_t: (String, String)] = [:]
     /// macOS's "being captured" badges (small windows it attaches to captured windows), by pid.
     private(set) var badges: [pid_t: [CGRect]] = [:]
+    /// Whether a window is one of its app's real windows (in its Accessibility window list).
+    /// Set by the session; transient popups (a calendar app's event card) aren't.
+    var isAppWindow: ((UInt32, pid_t) -> Bool)?
+    /// Untitled windows' answers, looked at for their first second (the list can lag a new
+    /// window), then kept.
+    private var appWindowSeen: [UInt32: (isApp: Bool, first: DispatchTime)] = [:]
+
+    private func looksLikeAppWindow(_ wid: UInt32, pid: pid_t) -> Bool {
+        let now = DispatchTime.now()
+        if let c = appWindowSeen[wid], now.uptimeNanoseconds - c.first.uptimeNanoseconds > 1_000_000_000 { return c.isApp }
+        let isApp = isAppWindow?(wid, pid) ?? true
+        appWindowSeen[wid] = (isApp, appWindowSeen[wid]?.first ?? now)
+        return isApp
+    }
 
     init(queue: DispatchQueue, allowed: @escaping (String) -> Bool) {
         self.queue = queue
@@ -86,7 +100,12 @@ final class WindowTracker {
             let title = info[kCGWindowName as String] as? String ?? ""
             var w = TrackedWindow(wid: wid, pid: pid, bundleId: bid, appName: appName, title: title,
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
-            if layer == 0 {
+            if layer == 0, title.isEmpty, !looksLikeAppWindow(wid, pid: pid) {
+                // Not a real window of the app but a transient one drawn at window level (a calendar app's
+                // event card): shown attached to the app window it sits on, like a popover.
+                w.kind = .popup
+                popups.append(w)
+            } else if layer == 0 {
                 guard bounds.width >= 40, bounds.height >= 30 else { continue }
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
@@ -144,6 +163,8 @@ final class WindowTracker {
             order.append(p.wid)
         }
 
+        let live = Set(seen.keys).union(popups.map(\.wid))
+        appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         for (wid, old) in windows where seen[wid] == nil {
             windows[wid] = nil
             onRemoved?(old)

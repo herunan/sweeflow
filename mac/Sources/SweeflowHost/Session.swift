@@ -607,6 +607,7 @@ final class Session {
                 }
             }
         }
+        tracker.isAppWindow = { [weak self] wid, pid in self?.control_.element(wid, pid: pid) != nil }
         tracker.start()
 
         let t = DispatchSource.makeTimerSource(queue: queue)
