@@ -312,6 +312,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let scale = net_cfg.scale;
     let host = net_cfg.host.clone();
     let net = crate::net::spawn(net_cfg, ui_tx);
+    crate::tray::start(net.clone());
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -1914,6 +1915,11 @@ impl DataDeviceHandler for App {
         else {
             return;
         };
+        if !crate::tray::allows_drag() {
+            log::info!("drop on Mac window {wid} ignored: drag and drop is switched off");
+            offer.destroy();
+            return;
+        }
         if self.drag_source.is_some() {
             log::info!("Mac drag dropped on Mac window {wid}");
             self.send(W::new(t::DRAG_DROP_LOCAL).u32(wid).f32(x as f32).f32(y as f32).finish());

@@ -1,7 +1,11 @@
 //! Launcher entries for the Mac's apps, so they show up in KDE's app menu / KRunner and the
 //! taskbar can tell each Mac app apart (it matches windows to entries by StartupWMClass).
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 
@@ -34,9 +38,10 @@ pub fn sync(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
         // would be the same on every entry.
         let entry = format!(
             "[Desktop Entry]\nType=Application\nName={name} (Mac)\nExec={} launch {bid}\nIcon={}\n\
-             StartupWMClass=sweeflow-{bid}\nCategories=X-Sweeflow;\nKeywords=mac;macos;\nTerminal=false\n",
+             StartupWMClass=sweeflow-{bid}\nCategories=X-Sweeflow;\nKeywords=mac;macos;\nTerminal=false\n{}",
             exe.display(),
-            icon.display()
+            icon.display(),
+            if VISIBLE.load(Ordering::SeqCst) { "" } else { "NoDisplay=true\n" }
         );
         let path = apps_dir.join(&file);
         if fs::read_to_string(&path).ok().as_deref() != Some(entry.as_str()) {
@@ -90,8 +95,12 @@ fn write_if_changed(path: &std::path::Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Shows or hides every Mac app entry (hidden while the Mac isn't connected).
+/// Whether the entries are shown (see `set_visible`), for entries written later.
+static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// Shows or hides every Mac app entry (hidden while the Mac isn't connected, or switched off).
 pub fn set_visible(visible: bool) {
+    VISIBLE.store(visible, Ordering::SeqCst);
     let apps_dir = data_dir().join("applications");
     let Ok(entries) = fs::read_dir(&apps_dir) else { return };
     let mut changed = 0;

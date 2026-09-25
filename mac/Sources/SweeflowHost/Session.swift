@@ -6,7 +6,6 @@ import Network
 final class Session {
     private let group: NWConnectionGroup
     let queue: DispatchQueue
-    private let config: Config
     private var control: MsgStream?
     private var clientScale: CGFloat = 1
     /// Pixels per point to capture at; 0 = the window's native (Retina) backing scale.
@@ -45,11 +44,20 @@ final class Session {
     /// The window with keyboard focus on the Linux side (0 = none of ours).
     private var clientFocus: UInt32 = 0
 
-    init(group: NWConnectionGroup, queue: DispatchQueue, config: Config) {
+    /// The Linux screen's size (points), for (re)creating the virtual display.
+    private var clientScreen: CGSize?
+    /// The streams audio and the clipboard go out on, kept so they can be switched back on.
+    private var audioStream: MsgStream?
+    private var clipboardStream: MsgStream?
+    private var settingsObserver: NSObjectProtocol?
+
+    init(group: NWConnectionGroup, queue: DispatchQueue) {
         self.group = group
         self.queue = queue
-        self.config = config
-        tracker = WindowTracker(queue: queue, allowed: { config.allows($0) })
+        tracker = WindowTracker(queue: queue, allowed: { let c = settings.config; return c.enabled && c.allows($0) })
+        settingsObserver = NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: nil) {
+            [weak self] _ in self?.queue.async { self?.settingsChanged() }
+        }
     }
 
     func addStream(_ conn: NWConnection) {
@@ -66,7 +74,9 @@ final class Session {
             self.videoStreams[key] = nil
             if let st = self.streamers.removeValue(forKey: key) { st.stop() }
             if let (a, k) = self.audio, k == key { a.stop(); self.audio = nil }
+            if self.audioStream.map({ ObjectIdentifier($0) }) == key { self.audioStream = nil }
             if let (c, cs) = self.clipboard, ObjectIdentifier(cs) == key { c.stop(); self.clipboard = nil }
+            if self.clipboardStream.map({ ObjectIdentifier($0) }) == key { self.clipboardStream = nil }
             if self.control.map({ ObjectIdentifier($0) }) == key { self.shutdown() }
         }
         s.start()
@@ -79,6 +89,7 @@ final class Session {
         }
         tracker.stop()
         if let o = screensObserver { NotificationCenter.default.removeObserver(o) }
+        if let o = settingsObserver { NotificationCenter.default.removeObserver(o) }
         cursor?.stop()
         gestureTimer?.cancel()
         input.releaseAll()
@@ -126,6 +137,7 @@ final class Session {
             cw.start()
             cursor = cw
             sendAppList()
+            sendSettings()
             if !watchingLock {
                 watchingLock = true
                 ScreenLock.onChange { [weak self] in self?.queue.async { self?.sendLockState() } }
@@ -137,13 +149,14 @@ final class Session {
         case .subscribe:
             let wid = try m.u32()
             guard let win = tracker.windows[wid] else { log("subscribe to unknown window \(wid)"); s.close(); return }
-            let scale = captureScale > 0 ? captureScale : backingScale(of: win.frame)
+            let scale = settings.config.quality == "light" ? 1 : captureScale > 0 ? captureScale : backingScale(of: win.frame)
             let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, lossless: win.kind == .popup,
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.visibleSize = requestedSizes[wid]
             st.displayScale = { [weak tracker] in
+                if settings.config.quality == "light" { return 1 }
                 guard let f = tracker?.windows[wid]?.frame else { return nil }
                 return displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40)))
             }
@@ -165,26 +178,15 @@ final class Session {
             queue.asyncAfter(deadline: .now() + 0.6) { st.checkScale() }
             if ScreenLock.isLocked { st.setScreenLocked(true) }
         case .clipboardSubscribe:
-            clipboard?.0.stop()
-            let sync = ClipboardSync()
-            sync.onChange = { [weak self, weak s] items in
-                self?.queue.async {
-                    guard let s else { return }
-                    var m = MsgWriter(.clipboard)
-                    m.u16(UInt16(items.count))
-                    for it in items { m.str(it.kind.rawValue); m.str(it.name); m.bytes(it.data) }
-                    s.send(m)
-                    log("clipboard to Linux: \(items.map { $0.kind == .file ? $0.name : $0.kind.rawValue })")
-                }
-            }
-            sync.start()
-            clipboard = (sync, s)
+            clipboardStream = s
+            updateClipboard()
         case .dragTaken:
             _ = try m.u32()
             let p = input.lastPoint
             DispatchQueue.main.async { self.dragTimer?.invalidate(); self.drag.cancelDrag(at: p) }
             input.forgetButtons()
         case .dragFetch:
+            guard settings.config.dragDrop else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let urls = self.drag.draggedFiles
@@ -205,7 +207,7 @@ final class Session {
         case .dragDropLocal:
             // A drag out of one Mac window dropped on another (via Linux): drop the same files.
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
-            guard let win = tracker.windows[wid] else { return }
+            guard settings.config.dragDrop, let win = tracker.windows[wid] else { return }
             let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
             if win.kind == .toplevel { raise(win) }
             DispatchQueue.main.async {
@@ -218,7 +220,7 @@ final class Session {
             let n = Int(try m.u16())
             var items: [(kind: String, name: String, data: Data)] = []
             for _ in 0..<n { items.append((try m.str(), try m.str(), try m.bytes())) }
-            guard let win = tracker.windows[wid] else { return }
+            guard settings.config.dragDrop, let win = tracker.windows[wid] else { return }
             let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
             if win.kind == .toplevel { raise(win) }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -251,19 +253,8 @@ final class Session {
             }
             clipboard?.0.apply(items)
         case .audioSubscribe:
-            audio?.0.stop()
-            let cap = AudioCapture(allowed: { [config] in config.allows($0) })
-            cap.onPCM = { [weak self, weak s] pcm in
-                self?.queue.async {
-                    // Drop rather than queue: late audio is worse than a tiny gap.
-                    guard let s, s.pendingBytes < 64_000 else { return }
-                    var m = MsgWriter(.audio)
-                    m.bytes(pcm)
-                    s.send(m)
-                }
-            }
-            cap.start()
-            audio = (cap, ObjectIdentifier(s))
+            audioStream = s
+            updateAudio()
         case .requestKeyframe: streamers[ObjectIdentifier(s)]?.requestKeyframe()
         case .pause: streamers[ObjectIdentifier(s)]?.setPaused(try m.u8() != 0)
         case .frameAck: streamers[ObjectIdentifier(s)]?.ack(try m.u64())
@@ -300,6 +291,8 @@ final class Session {
                 // Items change state after use (checkmarks, enabled): resend shortly after.
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { self?.sendMenus(pid: pid) }
             }
+        case .setSettings:
+            settings.apply(wire: try m.bytes())
         case .blindPress:
             let wid = try m.u32(), index = Int(try m.u16())
             if wid == 1 { log("stand-in test: button \(index) chosen") }
@@ -309,7 +302,9 @@ final class Session {
             }
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
-            guard config.virtualDisplay else { return }
+            clientScreen = CGSize(width: w, height: h)
+            let c = settings.config
+            guard c.virtualDisplay, c.enabled else { return }
             log("client screen \(Int(w))x\(Int(h))")
             DispatchQueue.main.async { host.display.ensure(points: CGSize(width: w, height: h)) }
             refreshVirtualDisplayArea(attempt: 0)
@@ -382,7 +377,7 @@ final class Session {
             guard let self else { return }
             self.dragTimer?.invalidate()
             self.dragTimer = nil
-            guard buttonDown else { return }
+            guard buttonDown, settings.config.dragDrop else { return }
             self.drag.armDragDetection()
             let t = Timer(timeInterval: 0.03, repeats: true) { [weak self] timer in
                 guard let self, let urls = self.drag.pollDragStart() else { return }
@@ -670,7 +665,7 @@ final class Session {
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) { [weak self] in
             let content = BlindWindows.read(pid: b.pid, frame: b.frame)
             self?.queue.async {
-                guard let self, self.tracker.blind[b.wid] != nil else { return }
+                guard let self, self.tracker.blind[b.wid] != nil, settings.config.enabled else { return }
                 let title = content?.title ?? ""
                 let texts = (content?.texts ?? []).filter { $0 != title && $0 != b.owner }
                 let buttons = content?.buttons ?? []
@@ -687,6 +682,76 @@ final class Session {
 
     private var watchingLock = false
 
+    // MARK: settings
+
+    private func sendSettings() {
+        var m = MsgWriter(.settings)
+        m.bytes(settings.wire())
+        control?.send(m)
+    }
+
+    /// Changed here (menu-bar item) or on Linux (tray): bring everything in line.
+    private func settingsChanged() {
+        guard control != nil else { return }
+        let c = settings.config
+        sendSettings()
+        // Windows of apps just switched off (or all of them) go, switched-on ones come.
+        tracker.burst(everyMs: 20)
+        if c.enabled && c.virtualDisplay, let size = clientScreen {
+            DispatchQueue.main.async { host.display.ensure(points: size) }
+            refreshVirtualDisplayArea(attempt: 0)
+        }
+        updateAudio()
+        updateClipboard()
+        // Quality: captures move to its scale (and encoders to its bit depth).
+        streamers.values.forEach { $0.checkScale() }
+    }
+
+    private func updateAudio() {
+        let c = settings.config
+        guard let s = audioStream, c.enabled, c.soundOnLinux else {
+            audio?.0.stop()
+            audio = nil
+            return
+        }
+        guard audio == nil else { return }
+        let cap = AudioCapture(allowed: { settings.config.allows($0) })
+        cap.onPCM = { [weak self, weak s] pcm in
+            self?.queue.async {
+                // Drop rather than queue: late audio is worse than a tiny gap.
+                guard let s, s.pendingBytes < 64_000 else { return }
+                var m = MsgWriter(.audio)
+                m.bytes(pcm)
+                s.send(m)
+            }
+        }
+        cap.start()
+        audio = (cap, ObjectIdentifier(s))
+    }
+
+    private func updateClipboard() {
+        let c = settings.config
+        guard let s = clipboardStream, c.enabled, c.clipboard else {
+            clipboard?.0.stop()
+            clipboard = nil
+            return
+        }
+        guard clipboard == nil else { return }
+        let sync = ClipboardSync()
+        sync.onChange = { [weak self, weak s] items in
+            self?.queue.async {
+                guard let s else { return }
+                var m = MsgWriter(.clipboard)
+                m.u16(UInt16(items.count))
+                for it in items { m.str(it.kind.rawValue); m.str(it.name); m.bytes(it.data) }
+                s.send(m)
+                log("clipboard to Linux: \(items.map { $0.kind == .file ? $0.name : $0.kind.rawValue })")
+            }
+        }
+        sync.start()
+        clipboard = (sync, s)
+    }
+
     private func sendLockState() {
         let locked = ScreenLock.isLocked
         var m = MsgWriter(.screenLocked)
@@ -694,7 +759,7 @@ final class Session {
         control?.send(m)
         // Fresh pictures right away once it's unlocked.
         streamers.values.forEach { $0.setScreenLocked(locked) }
-        if !locked && config.virtualDisplay {
+        if !locked && settings.config.virtualDisplay && settings.config.enabled {
             DispatchQueue.main.async { host.display.retry() }
             refreshVirtualDisplayArea(attempt: 0)
         }

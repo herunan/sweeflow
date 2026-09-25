@@ -225,8 +225,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// sends no new frame by itself).
     private var colourBeforeLock: CVPixelBuffer?
     private var loggedFormat = false
-    /// Encode 10-bit (smooth gradients). Colours checked against the Mac with a known grey.
-    static let tenBit = true
+    /// Encode 10-bit (smooth gradients), unless the "light" quality is chosen. Colours checked
+    /// against the Mac with a known grey.
+    static var tenBit: Bool { settings.config.quality != "light" }
+    /// What the current encoder was made for.
+    private var encoderTenBit = true
     private var transfer: VTPixelTransferSession?
     private var yuvPool: CVPixelBufferPool?
     private var yuvPoolSize = (0, 0)
@@ -579,7 +582,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func encode(_ pb: CVPixelBuffer) {
         flushCorners()
         let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
-        if encoder == nil || encoderSize != (w, h) {
+        if encoder == nil || encoderSize != (w, h) || encoderTenBit != Self.tenBit {
             if let e = encoder { VTCompressionSessionInvalidate(e) }
             encoder = makeEncoder(width: w, height: h)
             encoderSize = (w, h)
@@ -600,7 +603,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let pts = CMTime(value: CMTimeValue(captureUs), timescale: 1_000_000)
         // 10-bit goes in as limited-range YUV we convert ourselves: from BGRA the encoder writes
         // full-range 10-bit, which KWin shows as limited whatever it's tagged (too dark).
-        let input = Self.tenBit ? (toVideoRange10(pb) ?? pb) : pb
+        let input = encoderTenBit ? (toVideoRange10(pb) ?? pb) : pb
         VTCompressionSessionEncodeFrame(enc, imageBuffer: input, presentationTimeStamp: pts, duration: .invalid,
                                         frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
@@ -681,6 +684,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func makeEncoder(width: Int32, height: Int32) -> VTCompressionSession? {
+        encoderTenBit = Self.tenBit
         var session: VTCompressionSession?
         let spec: [CFString: Any] = [
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true,
@@ -705,7 +709,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             // 10-bit: subtle UI gradients (sidebars, glass) get four times the steps.
-            kVTCompressionPropertyKey_ProfileLevel: WindowStreamer.tenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel,
+            kVTCompressionPropertyKey_ProfileLevel: encoderTenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: 100_000,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 3600,
             kVTCompressionPropertyKey_ExpectedFrameRate: 120,

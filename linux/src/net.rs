@@ -138,8 +138,14 @@ fn set_online(online: bool) {
     }
 }
 
-/// Shows the Mac apps in the app menu while connected; hides them once the Mac has been gone
-/// for a grace period (a network blip doesn't make them flicker). Woken by connection changes.
+/// The Mac apps' launcher settings changed: show or hide the entries to match.
+pub fn launcher_setting_changed() {
+    set_online(CONNECTED.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// Shows the Mac apps in the app menu while connected (unless switched off in the tray); hides
+/// them once the Mac has been gone for a grace period (a network blip doesn't make them
+/// flicker). Woken by connection and setting changes.
 fn watch_launcher_visibility() {
     let (tx, rx) = std::sync::mpsc::channel();
     if ONLINE_EVENTS.set(tx).is_err() {
@@ -150,27 +156,23 @@ fn watch_launcher_visibility() {
     let mut online = CONNECTED.load(std::sync::atomic::Ordering::SeqCst);
     crate::launchers::set_visible(true);
     loop {
-        if online {
-            match rx.recv() {
-                Ok(o) => online = o,
-                Err(_) => return,
-            }
-            continue;
-        }
-        match rx.recv_timeout(grace) {
-            Ok(o) => online = o,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                crate::launchers::set_visible(false);
-                // Offline: wait for the Mac without a timeout.
-                match rx.recv() {
-                    Ok(o) => online = o,
-                    Err(_) => return,
+        let next = if online {
+            rx.recv().ok()
+        } else {
+            match rx.recv_timeout(grace) {
+                Ok(o) => Some(o),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    crate::launchers::set_visible(false);
+                    // Offline: wait for the Mac without a timeout.
+                    rx.recv().ok()
                 }
+                Err(_) => None,
             }
-            Err(_) => return,
-        }
+        };
+        let Some(o) = next else { return };
+        online = o;
         if online {
-            crate::launchers::set_visible(true);
+            crate::launchers::set_visible(crate::tray::launcher_wanted());
         }
     }
 }
@@ -264,6 +266,7 @@ async fn session(
     impl Drop for Online {
         fn drop(&mut self) {
             set_online(false);
+            crate::tray::connected(None);
         }
     }
     set_online(true);
@@ -352,6 +355,7 @@ async fn session(
                             task.abort();
                         }
                     }
+                    NetCmd::Clipboard(_) if !crate::tray::allows_clipboard() => {}
                     NetCmd::Clipboard(items) => {
                         let tx = clip_tx.clone();
                         tokio::spawn(async move {
@@ -392,7 +396,9 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     let ev = match ty {
         t::WELCOME => {
             let _v = r.u16()?;
-            UiEvent::Connected(r.str()?)
+            let name = r.str()?;
+            crate::tray::connected(Some(name.clone()));
+            UiEvent::Connected(name)
         }
         t::WINDOW_ADDED => {
             let wid = r.u32()?;
@@ -449,6 +455,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             for _ in 0..n {
                 apps.push((r.str()?, r.str()?, r.bytes()?.to_vec()));
             }
+            crate::tray::set_apps(apps.iter().map(|(b, n, _)| (b.clone(), n.clone())).collect());
             std::thread::spawn(move || {
                 if let Err(e) = crate::launchers::sync(&apps) {
                     log::warn!("launcher entries: {e:#}");
@@ -473,6 +480,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             let buttons = (0..r.u16()?).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
             log::info!("{app} window {id} can't be shown here: stand-in with {} button(s)", buttons.len());
             UiEvent::BlindShow { id, app, title, texts, buttons }
+        }
+        t::SETTINGS => {
+            crate::tray::set_settings(r.bytes()?);
+            return Ok(());
         }
         t::BLIND_GONE => {
             crate::blind::gone(r.u32()?);

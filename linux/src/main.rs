@@ -8,6 +8,7 @@ mod menus;
 mod net;
 mod proto;
 mod setup;
+mod tray;
 mod ui;
 
 use anyhow::Result;

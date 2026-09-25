@@ -8,18 +8,19 @@ enum AppList {
         let iconPNG: Data
     }
 
-    static func scan() -> [App] {
+    /// Installed apps, without their icons: bundle id, name, path.
+    static func found() -> [(bundleId: String, name: String, path: String)] {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         let dirs = ["/Applications", "/Applications/Utilities", "/System/Applications",
                     "/System/Applications/Utilities", home + "/Applications"]
-        var seen = Set<String>()
-        var out: [App] = []
         // Apps that live outside the Applications folders.
         let extras = ["/System/Library/CoreServices/Finder.app"]
         let paths = dirs.flatMap { dir in
             ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".app") }.map { dir + "/" + $0 }
         } + extras
+        var seen = Set<String>()
+        var out: [(bundleId: String, name: String, path: String)] = []
         for path in paths {
             let item = (path as NSString).lastPathComponent
             guard let bundle = Bundle(path: path), let bid = bundle.bundleIdentifier,
@@ -30,9 +31,13 @@ enum AppList {
             let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                 ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
                 ?? String(item.dropLast(4))
-            out.append(App(bundleId: bid, name: name, iconPNG: png(NSWorkspace.shared.icon(forFile: path), size: 128)))
+            out.append((bid, name, path))
         }
         return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    static func scan() -> [App] {
+        found().map { App(bundleId: $0.bundleId, name: $0.name, iconPNG: png(NSWorkspace.shared.icon(forFile: $0.path), size: 128)) }
     }
 
     static func png(_ image: NSImage, size: Int) -> Data {
