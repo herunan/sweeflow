@@ -21,34 +21,59 @@ unsafe extern "C" {
 
 pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String], net: UnboundedSender<NetCmd>) {
     let heading = if title.is_empty() || title == app { app.to_string() } else { format!("{app} — {title}") };
-    let text = texts.join("\n\n");
-    if buttons.is_empty() {
+    // "Help" only opens Apple's help viewer; the rest keep their Mac order (default last).
+    let shown: Vec<(usize, &String)> = buttons.iter().enumerate().filter(|(_, b)| b.as_str() != "Help").collect();
+    if shown.is_empty() {
         let _ = Command::new("notify-send")
             .args(["--app-name=sweeflow", "--icon=dialog-password", "--urgency=critical",
-                   &format!("{heading} needs you on your Mac"), &text])
+                   &format!("{heading} needs you on your Mac"), &texts.join("\n\n")])
             .spawn();
         return;
     }
+    // The Mac's cancel button (closing the dialog answers like it, as with any dialog).
+    let cancel = buttons.iter().position(|b| ["Cancel", "Deny", "Don’t Allow", "Don't Allow", "No"].contains(&b.as_str()));
+    let text = texts.join("\n\n");
+    // kdialog's buttons carry stock icons (tick, prohibited sign), so the Mac's cancel button
+    // goes where the prohibited sign is and the others where a tick or arrow fits.
     let mut cmd = Command::new("kdialog");
     cmd.args(["--title", &heading]);
-    match buttons.len() {
-        1 => {
-            cmd.args(["--msgbox", &text, "--ok-label", &buttons[0]]);
+    let others: Vec<usize> = shown.iter().map(|(i, _)| *i).filter(|i| Some(*i) != cancel).collect();
+    let label = |i: usize| buttons[i].as_str();
+    // Which Mac button each kdialog exit code (0, 1, 2) stands for.
+    let mut codes: Vec<Option<usize>> = vec![None; 3];
+    let menu = match (others.as_slice(), cancel) {
+        ([only], None) => {
+            cmd.args(["--msgbox", &text, "--ok-label", label(*only)]);
+            codes[0] = Some(*only);
+            false
         }
-        2 => {
-            cmd.args(["--yesno", &text, "--yes-label", &buttons[0], "--no-label", &buttons[1]]);
+        ([go], Some(c)) => {
+            cmd.args(["--warningcontinuecancel", &text, "--continue-label", label(*go), "--cancel-label", label(c)]);
+            codes[0] = Some(*go);
+            codes[2] = Some(c);
+            false
         }
-        3 => {
-            cmd.args(["--yesnocancel", &text, "--yes-label", &buttons[0], "--no-label", &buttons[1], "--cancel-label", &buttons[2]]);
+        ([a, b], None) => {
+            cmd.args(["--yesno", &text, "--yes-label", label(*b), "--no-label", label(*a)]);
+            codes[0] = Some(*b);
+            codes[1] = Some(*a);
+            false
+        }
+        ([a, b], Some(c)) => {
+            cmd.args(["--yesnocancel", &text, "--yes-label", label(*b), "--no-label", label(*a), "--cancel-label", label(c)]);
+            codes[0] = Some(*b);
+            codes[1] = Some(*a);
+            codes[2] = Some(c);
+            false
         }
         _ => {
             cmd.args(["--menu", &text]);
-            for (i, b) in buttons.iter().enumerate() {
-                cmd.args([i.to_string(), b.clone()]);
+            for (i, b) in &shown {
+                cmd.args([i.to_string(), b.to_string()]);
             }
+            true
         }
-    }
-    let menu = buttons.len() > 3;
+    };
     let child = match cmd.stdout(std::process::Stdio::piped()).spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -65,17 +90,16 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
         if ours.is_none() {
             return;
         }
-        let code = out.status.code().unwrap_or(-1);
+        // Killed or crashed (no exit code): nothing to press.
+        let Some(code) = out.status.code() else { return };
         let index = if menu {
-            String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok()
+            String::from_utf8_lossy(&out.stdout).trim().parse::<usize>().ok()
         } else {
-            // kdialog: 0 first button, 1 second, 2 third (closing the dialog counts as the second
-            // or third: "No"/"Cancel", as with any dialog).
-            (0..3).contains(&code).then_some(code as u16)
+            codes.get(code as usize).copied().flatten()
         };
         if let Some(i) = index {
             log::info!("stand-in {id}: pressing button {i}");
-            let _ = net.send(NetCmd::Control(W::new(t::BLIND_PRESS).u32(id).u16(i).finish()));
+            let _ = net.send(NetCmd::Control(W::new(t::BLIND_PRESS).u32(id).u16(i as u16).finish()));
         }
     });
 }
