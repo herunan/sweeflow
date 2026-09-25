@@ -15,20 +15,22 @@ enum AppList {
                     "/System/Applications/Utilities", home + "/Applications"]
         var seen = Set<String>()
         var out: [App] = []
-        for dir in dirs {
-            let items = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
-            for item in items where item.hasSuffix(".app") {
-                let path = dir + "/" + item
-                guard let bundle = Bundle(path: path), let bid = bundle.bundleIdentifier,
-                      bid != Bundle.main.bundleIdentifier, seen.insert(bid).inserted else { continue }
-                // Skip background-only and menu-bar agents: nothing to show on Linux.
-                if bundle.object(forInfoDictionaryKey: "LSBackgroundOnly") as? Bool == true { continue }
-                if bundle.object(forInfoDictionaryKey: "LSUIElement") as? Bool == true { continue }
-                let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
-                    ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
-                    ?? String(item.dropLast(4))
-                out.append(App(bundleId: bid, name: name, iconPNG: png(NSWorkspace.shared.icon(forFile: path), size: 128)))
-            }
+        // Apps that live outside the Applications folders.
+        let extras = ["/System/Library/CoreServices/Finder.app"]
+        let paths = dirs.flatMap { dir in
+            ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".app") }.map { dir + "/" + $0 }
+        } + extras
+        for path in paths {
+            let item = (path as NSString).lastPathComponent
+            guard let bundle = Bundle(path: path), let bid = bundle.bundleIdentifier,
+                  bid != Bundle.main.bundleIdentifier, seen.insert(bid).inserted else { continue }
+            // Skip background-only and menu-bar agents: nothing to show on Linux.
+            if bundle.object(forInfoDictionaryKey: "LSBackgroundOnly") as? Bool == true { continue }
+            if bundle.object(forInfoDictionaryKey: "LSUIElement") as? Bool == true { continue }
+            let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+                ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
+                ?? String(item.dropLast(4))
+            out.append(App(bundleId: bid, name: name, iconPNG: png(NSWorkspace.shared.icon(forFile: path), size: 128)))
         }
         return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
