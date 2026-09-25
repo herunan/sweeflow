@@ -84,29 +84,6 @@ final class WindowTracker {
     private var fastUntil = DispatchTime.now()
     /// Diagnostics: popups' frames during their first moments (to see open/close animations).
     private var popupBorn: [UInt32: DispatchTime] = [:]
-    /// Popups that open with a zoom (a calendar app's event card grows from a dot at the click over
-    /// half a second, with a bounce): announced once they've stopped changing, at their final
-    /// size, rather than followed step by step. Frame and when it last changed.
-    private var growing: [UInt32: (frame: CGRect, since: DispatchTime)] = [:]
-
-    /// A new popup that is still animating open (started tiny, or changed in the last 60 ms).
-    private func stillOpening(_ p: TrackedWindow) -> Bool {
-        let now = DispatchTime.now()
-        if var g = growing[p.wid] {
-            if g.frame != p.frame {
-                g = (p.frame, now)
-                growing[p.wid] = g
-                return true
-            }
-            if now.uptimeNanoseconds - g.since.uptimeNanoseconds < 60_000_000 { return true }
-            growing[p.wid] = nil
-            return false
-        }
-        guard p.frame.width < 40 || p.frame.height < 40 else { return false }
-        growing[p.wid] = (p.frame, now)
-        pollFast()   // watch it closely until it settles
-        return true
-    }
 
     func stop() { timer?.cancel(); timer = nil }
 
@@ -200,7 +177,6 @@ final class WindowTracker {
         // dropdown must not be positioned relative to the app's main window).
         let owners = order.compactMap { seen[$0] }   // front-to-back: toplevels, then panels
         for var p in popups where p.kind == .popup {
-            if windows[p.wid] == nil, stillOpening(p) { continue }
             let near = owners.filter { $0.pid == p.pid && $0.frame.insetBy(dx: -40, dy: -40).intersects(p.frame) }
             // Prefer a panel (drawn above its app's windows), then the frontmost window.
             guard let parent = near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
@@ -211,7 +187,6 @@ final class WindowTracker {
         }
 
         let live = Set(seen.keys).union(popups.map(\.wid))
-        growing = growing.filter { live.contains($0.key) }
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         for (wid, old) in windows where seen[wid] == nil {
             if old.kind == .popup, let born = popupBorn.removeValue(forKey: wid) {
