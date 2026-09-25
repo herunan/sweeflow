@@ -449,6 +449,7 @@ final class Session {
             self?.queue.async {
                 guard let self else { return }
                 if let area, area.width > 0 {
+                    if area == self.vdArea { self.streamers.values.forEach { $0.checkScale() }; return }
                     self.vdArea = area
                     // Windows move onto the (new) virtual display: capture at its scale.
                     self.streamers.values.forEach { $0.checkScale() }
@@ -645,10 +646,12 @@ final class Session {
             self.control?.send(m)
         }
         tracker.start()
-        // Displays come and go (the virtual one, the lid): captures follow their display's scale.
+        // Displays come and go (the virtual one, the lid, a real monitor plugged in): macOS can
+        // rearrange them and move the virtual display, so look up where it is now, bring the
+        // windows back onto it, and capture at its scale.
         screensObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                                  object: nil, queue: nil) { [weak self] _ in
-            self?.queue.asyncAfter(deadline: .now() + 0.3) { self?.streamers.values.forEach { $0.checkScale() } }
+            self?.refreshVirtualDisplayArea(attempt: 0)
         }
     }
 
