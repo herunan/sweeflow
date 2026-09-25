@@ -39,6 +39,10 @@ final class WindowTracker {
     private(set) var blind: [UInt32: BlindWindow] = [:]
     var onBlindAdded: ((BlindWindow) -> Void)?
     var onBlindRemoved: ((BlindWindow) -> Void)?
+    /// macOS's prompt helpers (not apps, so never streamed): "downloaded from the internet"
+    /// checks, password and permission prompts, system alerts. Shown as stand-ins too.
+    static let promptOwners: Set<String> = ["CoreServicesUIAgent", "SecurityAgent", "UserNotificationCenter",
+                                            "universalAccessAuthWarn", "coreautha", "LocalAuthenticationRemoteService"]
     /// System UI that is unshareable but not a prompt for the user (the lock screen included).
     static let notBlind: Set<String> = ["Window Server", "Dock", "SystemUIServer", "Control Center", "Notification Center",
                                         "Spotlight", "loginwindow", "WindowManager", "Wallpaper", "TextInputMenuAgent"]
@@ -137,13 +141,13 @@ final class WindowTracker {
         for info in list {
             // Windows that refuse capture (security prompts, sign-in verifiers): can't be streamed, but
             // Linux can show a stand-in for them (see BlindWindows). Any app, system ones too.
-            if (info[kCGWindowSharingState as String] as? Int) == 0,
+            if let owner = info[kCGWindowOwnerName as String] as? String,
+               (info[kCGWindowSharingState as String] as? Int) == 0 || Self.promptOwners.contains(owner),
                let wid = info[kCGWindowNumber as String] as? UInt32,
                let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(),
                let layer = info[kCGWindowLayer as String] as? Int, (0..<1000).contains(layer),
                let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd),
                b.width >= 150, b.height >= 80,
-               let owner = info[kCGWindowOwnerName as String] as? String,
                !Self.notBlind.contains(owner) {
                 blindNow[wid] = BlindWindow(wid: wid, pid: pid, owner: owner, frame: b)
             }
