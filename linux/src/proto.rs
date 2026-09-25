@@ -19,6 +19,8 @@ pub mod t {
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;
+    pub const BLIND_SHOW: u8 = 0x1F;
+    pub const BLIND_GONE: u8 = 0x19;
     pub const SCREEN_LOCKED: u8 = 0x1D;
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
@@ -28,6 +30,7 @@ pub mod t {
     pub const MENU_REFRESH: u8 = 0x25;
     pub const RESTORE: u8 = 0x26;
     pub const LAUNCH_APP: u8 = 0x27;
+    pub const BLIND_PRESS: u8 = 0x29;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;

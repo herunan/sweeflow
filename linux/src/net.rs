@@ -59,6 +59,8 @@ pub enum UiEvent {
     Clipboard(std::collections::HashMap<String, Arc<Vec<u8>>>),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
+    /// A Mac window that can't be captured: show a stand-in (see blind.rs).
+    BlindShow { id: u32, app: String, title: String, texts: Vec<String>, buttons: Vec<String> },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
     RawFrame { wid: u32, w: u16, h: u16, px_per_pt: u8, capture_us: u64, bgra: Vec<u8> },
 }
@@ -85,6 +87,7 @@ impl UiEvent {
             UiEvent::DragBegan { .. } => "drag began",
             UiEvent::DragData(_) => "drag data",
             UiEvent::Corners { .. } => "corners",
+            UiEvent::BlindShow { .. } => "blind",
             UiEvent::RawFrame { .. } => "popup frame",
         }
     }
@@ -461,6 +464,18 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
                     notify("Your Mac is locked", "Mac windows are paused until you unlock it (Touch ID or password on the Mac).")
                 });
             }
+            return Ok(());
+        }
+        t::BLIND_SHOW => {
+            let id = r.u32()?;
+            let (app, title) = (r.str()?, r.str()?);
+            let texts = (0..r.u16()?).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
+            let buttons = (0..r.u16()?).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
+            log::info!("{app} window {id} can't be shown here: stand-in with {} button(s)", buttons.len());
+            UiEvent::BlindShow { id, app, title, texts, buttons }
+        }
+        t::BLIND_GONE => {
+            crate::blind::gone(r.u32()?);
             return Ok(());
         }
         t::PONG => return Ok(()),

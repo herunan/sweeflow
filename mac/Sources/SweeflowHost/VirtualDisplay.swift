@@ -28,26 +28,49 @@ final class VirtualDisplay {
         return CGRect(x: b.minX, y: b.minY + menuBar, width: b.width, height: b.height - menuBar)
     }
 
-    /// An earlier version gave this display the Linux wallpaper; put macOS's default back (and
-    /// delete the copies). The display's NSScreen appears a moment after it's created.
-    private func resetOldWallpaper(attempt: Int) {
+    /// A plain backdrop: black in dark mode, white in light mode. Mac windows tint their
+    /// sidebars and toolbars with what's behind them, so a neutral one keeps their colours
+    /// clean. Follows the Mac's appearance; only this invisible display is touched.
+    private var appearanceObserver: NSObjectProtocol?
+
+    private func applyBackdrop(attempt: Int) {
         guard let id = displayID else { return }
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
         }) else {
             if attempt < 20 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.resetOldWallpaper(attempt: attempt + 1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.applyBackdrop(attempt: attempt + 1) }
             }
             return
         }
+        let dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
-        if let current = NSWorkspace.shared.desktopImageURL(for: screen), current.path.hasPrefix(dir.path) {
-            try? NSWorkspace.shared.setDesktopImageURL(URL(fileURLWithPath: "/System/Library/CoreServices/DefaultDesktop.heic"), for: screen, options: [:])
-            log("virtual display wallpaper back to the default")
-        }
+        // Old copies of the Linux wallpaper (an earlier version), no longer used.
         for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         where f.lastPathComponent.hasPrefix("wallpaper-") {
             try? FileManager.default.removeItem(at: f)
+        }
+        let url = dir.appendingPathComponent(dark ? "backdrop-black.png" : "backdrop-white.png")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            let image = NSImage(size: NSSize(width: 16, height: 16))
+            image.lockFocus()
+            (dark ? NSColor.black : NSColor.white).setFill()
+            NSRect(x: 0, y: 0, width: 16, height: 16).fill()
+            image.unlockFocus()
+            if let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
+                try? rep.representation(using: .png, properties: [:])?.write(to: url)
+            }
+        }
+        if NSWorkspace.shared.desktopImageURL(for: screen) != url {
+            try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [
+                .imageScaling: NSImageScaling.scaleAxesIndependently.rawValue, .allowClipping: false,
+            ])
+            log("virtual display backdrop: \(dark ? "black" : "white")")
+        }
+        if appearanceObserver == nil {
+            appearanceObserver = DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main
+            ) { [weak self] _ in self?.applyBackdrop(attempt: 0) }
         }
     }
 
@@ -115,7 +138,7 @@ final class VirtualDisplay {
         display = vd
         size = points
         log("virtual display \(vd.displayID) created: \(w)x\(h) points")
-        resetOldWallpaper(attempt: 0)
+        applyBackdrop(attempt: 0)
     }
 }
 

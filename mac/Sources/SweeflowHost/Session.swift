@@ -31,6 +31,8 @@ final class Session {
     private var gesture: (wid: UInt32, frame: CGRect, until: DispatchTime, buttonDown: Bool)?
     private var gestureTimer: DispatchSourceTimer?
     private var sentButtons: [UInt32: [CGRect]] = [:]
+    /// Buttons of the uncapturable windows shown as stand-ins on Linux.
+    private var blindButtons: [UInt32: [AXUIElement]] = [:]
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
     private var started = false
@@ -298,6 +300,13 @@ final class Session {
                 // Items change state after use (checkmarks, enabled): resend shortly after.
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { self?.sendMenus(pid: pid) }
             }
+        case .blindPress:
+            let wid = try m.u32(), index = Int(try m.u16())
+            if wid == 1 { log("stand-in test: button \(index) chosen") }
+            if let b = blindButtons[wid], index < b.count {
+                let r = AXUIElementPerformAction(b[index], kAXPressAction as CFString)
+                log("uncapturable window \(wid): pressed button \(index) (\(r == .success ? "ok" : "failed"))")
+            }
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
             guard config.virtualDisplay else { return }
@@ -531,6 +540,16 @@ final class Session {
         queue.async { self.streamers.values.forEach { $0.setScreenLocked(on, placeholder: placeholder) } }
     }
 
+    func debugBlindTest() {
+        queue.async {
+            var m = MsgWriter(.blindShow)
+            m.u32(1); m.str("Sweeflow"); m.str("Stand-in test")
+            m.u16(1); m.str("This is how a Mac window that can't be captured (a security prompt) shows up here. Pick one — nothing happens on the Mac.")
+            m.u16(2); m.str("Allow"); m.str("Deny")
+            self.control?.send(m)
+        }
+    }
+
     func debugWindows() -> String {
         tracker.windows.values.sorted { $0.wid < $1.wid }.map {
             "\($0.wid) \($0.appName) kind=\($0.kind) parent=\($0.parent) layer=\($0.layer) frame=\($0.frame) rel=\($0.rel)"
@@ -618,6 +637,13 @@ final class Session {
         // Which window has focus changes with what the user does or with app switches, which
         // both start a burst of window checks.
         tracker.onBurstPoll = { [weak self] in self?.checkFocus() }
+        tracker.onBlindAdded = { [weak self] b in self?.blindAdded(b) }
+        tracker.onBlindRemoved = { [weak self] b in
+            guard let self else { return }
+            self.blindButtons[b.wid] = nil
+            var m = MsgWriter(.blindGone); m.u32(b.wid)
+            self.control?.send(m)
+        }
         tracker.start()
         // Displays come and go (the virtual one, the lid): captures follow their display's scale.
         screensObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -633,6 +659,27 @@ final class Session {
         tracker.burst(everyMs: click ? 8 : 33)
         cursor?.activity()
         if click { clipboard?.0.checkSoon() }
+    }
+
+    /// A window that refuses capture appeared: read its text and buttons (a moment later, once
+    /// it has drawn) and have Linux show a stand-in.
+    private func blindAdded(_ b: WindowTracker.BlindWindow) {
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            let content = BlindWindows.read(pid: b.pid, frame: b.frame)
+            self?.queue.async {
+                guard let self, self.tracker.blind[b.wid] != nil else { return }
+                let title = content?.title ?? ""
+                let texts = (content?.texts ?? []).filter { $0 != title && $0 != b.owner }
+                let buttons = content?.buttons ?? []
+                self.blindButtons[b.wid] = buttons.map(\.element)
+                var m = MsgWriter(.blindShow)
+                m.u32(b.wid); m.str(b.owner); m.str(title)
+                m.u16(UInt16(texts.count)); texts.forEach { m.str($0) }
+                m.u16(UInt16(buttons.count)); buttons.forEach { m.str($0.label) }
+                self.control?.send(m)
+                log("uncapturable window \(b.wid) (\(b.owner)): stand-in with \(buttons.count) buttons")
+            }
+        }
     }
 
     private var watchingLock = false

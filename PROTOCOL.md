@@ -36,7 +36,10 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x24 | C→S | MenuActivate | i32 pid, u16 n, n × u16 path — press that menu item (indices as in MenuTree) |
 | 0x1C | S→C | AppList | u16 n, n × (str bundleId, str name, bytes png128) — installed apps, for launchers |
 | 0x1D | S→C | ScreenLocked | u8 locked — while locked the host sends no frames (capture is blank) |
+| 0x1F | S→C | BlindShow | u32 id, str app, str title, u16 n × str text, u16 n × str button — a window that refuses capture (security prompt, sign-in verifier): shown as a native stand-in |
+| 0x19 | S→C | BlindGone | u32 id — that window closed |
 | 0x27 | C→S | LaunchApp | str bundleId — open (or reopen) the app on the Mac |
+| 0x29 | C→S | BlindPress | u32 id, u16 button — press that button of an uncapturable window |
 | 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
 | 0x25 | C→S | MenuRefresh | i32 pid — re-read and resend the app's menus |
 | 0x18 | S→C | ToggleMaximize | u32 wid — the app zoomed its window (title-bar double-click); client toggles maximised |

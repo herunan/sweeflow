@@ -56,6 +56,27 @@ final class DebugPort {
                 cfg.showsCursor = false
                 capture(SCContentFilter(display: d, including: [w]), cfg, to: p[2], reply: reply)
             }
+        case "axapp" where p.count == 2:
+            // An app's windows as the Accessibility API sees them (texts and buttons).
+            guard let pid = pid_t(p[1]) else { return reply("usage: axapp pid") }
+            DispatchQueue.global().async { reply(BlindWindows.describe(pid: pid).map { $0.debugDescription }.joined(separator: "\n")) }
+        case "axpress" where p.count >= 3:
+            // Press a button (by its label) in one of an app's windows: axpress pid Label words
+            guard let pid = pid_t(p[1]) else { return reply("usage: axpress pid label") }
+            let label = p[2...].joined(separator: " ")
+            DispatchQueue.global().async {
+                for c in BlindWindows.describe(pid: pid) {
+                    if let b = c.buttons.first(where: { $0.label == label }) {
+                        return reply(AXUIElementPerformAction(b.element, kAXPressAction as CFString) == .success ? "pressed" : "failed")
+                    }
+                }
+                reply("no such button")
+            }
+        case "blindtest":
+            // A pretend stand-in (id 1): shows the Linux dialog; its answer is only logged.
+            guard let s = session else { return reply("no session") }
+            s.debugBlindTest()
+            reply("sent")
         case "move", "click":
             guard p.count >= 4, let wid = UInt32(p[1]), let x = Double(p[2]), let y = Double(p[3]),
                   let s = session else { return reply("usage / no session") }

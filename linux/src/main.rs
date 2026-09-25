@@ -1,3 +1,4 @@
+mod blind;
 mod clipboard;
 mod config;
 mod decode;

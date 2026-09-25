@@ -34,6 +34,15 @@ final class WindowTracker {
     private var bundleCache: [pid_t: (String, String)] = [:]
     /// macOS's "being captured" badges (small windows it attaches to captured windows), by pid.
     private(set) var badges: [pid_t: [CGRect]] = [:]
+    struct BlindWindow { let wid: UInt32; let pid: pid_t; let owner: String; let frame: CGRect }
+    /// Windows that can't be captured, and callbacks as they come and go.
+    private(set) var blind: [UInt32: BlindWindow] = [:]
+    var onBlindAdded: ((BlindWindow) -> Void)?
+    var onBlindRemoved: ((BlindWindow) -> Void)?
+    /// System UI that is unshareable but not a prompt for the user (the lock screen included).
+    static let notBlind: Set<String> = ["Window Server", "Dock", "SystemUIServer", "Control Center", "Notification Center",
+                                        "Spotlight", "loginwindow", "WindowManager", "Wallpaper", "TextInputMenuAgent"]
+
     /// Whether a window is one of its app's real windows (in its Accessibility window list).
     /// Set by the session; transient popups (a calendar app's event card) aren't.
     var isAppWindow: ((UInt32, pid_t) -> Bool)?
@@ -123,8 +132,21 @@ final class WindowTracker {
         var frontToplevel: [pid_t: TrackedWindow] = [:]
         var popups: [TrackedWindow] = []
         var badges: [pid_t: [CGRect]] = [:]
+        var blindNow: [UInt32: BlindWindow] = [:]
 
         for info in list {
+            // Windows that refuse capture (security prompts, sign-in verifiers): can't be streamed, but
+            // Linux can show a stand-in for them (see BlindWindows). Any app, system ones too.
+            if (info[kCGWindowSharingState as String] as? Int) == 0,
+               let wid = info[kCGWindowNumber as String] as? UInt32,
+               let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(),
+               let layer = info[kCGWindowLayer as String] as? Int, (0..<1000).contains(layer),
+               let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd),
+               b.width >= 150, b.height >= 80,
+               let owner = info[kCGWindowOwnerName as String] as? String,
+               !Self.notBlind.contains(owner) {
+                blindNow[wid] = BlindWindow(wid: wid, pid: pid, owner: owner, frame: b)
+            }
             guard let wid = info[kCGWindowNumber as String] as? UInt32,
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                   let layer = info[kCGWindowLayer as String] as? Int,
@@ -236,6 +258,9 @@ final class WindowTracker {
         }
         zOrder = order
         self.badges = badges
+        for (wid, b) in blind where blindNow[wid] == nil { onBlindRemoved?(b) }
+        for (wid, b) in blindNow where blind[wid] == nil { onBlindAdded?(b) }
+        blind = blindNow
     }
 
     /// Where macOS's capture badge overlaps `wid`, relative to the window (points).

@@ -556,6 +556,7 @@ impl App {
                 self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)
             }
             UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles, qh),
+            UiEvent::BlindShow { id, app, title, texts, buttons } => crate::blind::show(id, &app, &title, &texts, &buttons, self.net.clone()),
         }
     }
 
