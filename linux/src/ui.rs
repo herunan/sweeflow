@@ -188,6 +188,9 @@ struct Win {
     /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
     raw_buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
     stale: bool,
+    /// Popup geometry changes wait a moment (see adopt_mac_size).
+    popup_wait: bool,
+    popup_settled: bool,
 }
 
 impl Win {
@@ -666,6 +669,8 @@ impl App {
                 pending_raw: None,
                 raw_buffers: Default::default(),
                 stale: false,
+                popup_wait: false,
+                popup_settled: false,
             },
         );
         if !is_popup {
@@ -753,6 +758,26 @@ impl App {
             Role::Toplevel(_) if w.floating => {
                 w.size = mac;
                 self.draw_base(wid, qh);
+            }
+            Role::Popup(_) if !w.popup_settled => {
+                // Wait: macOS animates popovers closing (shrinking toward their anchor); followed
+                // step by step, the popup would slide away before it disappears. A real change is
+                // still there a moment later.
+                if !w.popup_wait {
+                    w.popup_wait = true;
+                    let qh = qh.clone();
+                    let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(200)), move |_, _, app| {
+                        if let Some(w) = app.windows.get_mut(&wid) {
+                            w.popup_wait = false;
+                            w.popup_settled = true;
+                        }
+                        app.adopt_mac_size(wid, &qh);
+                        if let Some(w) = app.windows.get_mut(&wid) {
+                            w.popup_settled = false;
+                        }
+                        TimeoutAction::Drop
+                    });
+                }
             }
             Role::Popup(p) => {
                 let pos = XdgPositioner::new(&self.xdg).expect("positioner");
