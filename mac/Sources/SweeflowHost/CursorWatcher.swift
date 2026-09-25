@@ -1,7 +1,8 @@
 import AppKit
 
 /// Watches the system cursor image (I-beam, pointing hand, resize arrows...) and reports changes,
-/// so the client can draw the Mac's cursor shape locally with zero latency.
+/// so the client can draw the Mac's cursor shape locally with zero latency. Looked at only while
+/// the pointer is being used (and a moment after, for cursors that change after a hover delay).
 final class CursorWatcher {
     private var timer: Timer?
     private var lastHash: UInt64 = 0
@@ -13,16 +14,33 @@ final class CursorWatcher {
         self.onChange = onChange
     }
 
+    private var activeUntil = Date.distantPast
+
     func start() {
+        DispatchQueue.main.async { self.poll() }
+    }
+
+    /// The pointer moved or clicked: watch at 60 Hz until 0.3 s after the last activity.
+    func activity() {
         DispatchQueue.main.async {
-            let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.poll() }
+            self.activeUntil = Date().addingTimeInterval(0.3)
+            guard self.timer == nil else { return }
+            self.poll()
+            let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] t in
+                guard let self else { return }
+                self.poll()
+                if Date() > self.activeUntil {
+                    t.invalidate()
+                    self.timer = nil
+                }
+            }
             RunLoop.main.add(t, forMode: .common)
             self.timer = t
         }
     }
 
     func stop() {
-        DispatchQueue.main.async { self.timer?.invalidate(); self.timer = nil }
+        DispatchQueue.main.async { self.timer?.invalidate(); self.timer = nil; self.activeUntil = .distantPast }
     }
 
     private func poll() {

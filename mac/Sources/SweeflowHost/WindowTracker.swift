@@ -54,34 +54,52 @@ final class WindowTracker {
         self.allowed = allowed
     }
 
-    func start(interval: DispatchTimeInterval = .milliseconds(50)) {
+    /// Looks at the window list only when something may have changed: in short bursts after
+    /// the user does something (see `burst`) and on app events, with a slow fallback for what
+    /// happens by itself (a reminder popping up).
+    func start() {
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(5))
+        t.schedule(deadline: .now(), repeating: .seconds(1), leeway: .milliseconds(100))
         t.setEventHandler { [weak self] in self?.poll() }
         t.resume()
         timer = t
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didHideApplicationNotification,
+                     NSWorkspace.didUnhideApplicationNotification] {
+            nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.burst(everyMs: 20) }
+        }
     }
 
-    /// Clicks open and close menus and popovers: look closely for a moment (every 8 ms for
-    /// half a second), so one that closes vanishes on Linux almost at once.
-    func pollFast() {
-        fastUntil = .now() + 0.5
-        guard fastTimer == nil else { return }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(1))
-        t.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.poll()
-            if DispatchTime.now() > self.fastUntil {
-                self.fastTimer?.cancel()
-                self.fastTimer = nil
+    /// Checks closely for a moment (half a second): every 8 ms after a click or key (menus and
+    /// popovers open and close then), every 33 ms while the pointer moves.
+    func burst(everyMs interval: Int = 8) {
+        queue.async { [self] in
+            burstUntil = .now() + 0.5
+            if let current = burstInterval, current <= interval, burstTimer != nil { return }
+            burstTimer?.cancel()
+            burstInterval = interval
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now(), repeating: .milliseconds(interval), leeway: .milliseconds(1))
+            t.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.poll()
+                self.onBurstPoll?()
+                if DispatchTime.now() > self.burstUntil {
+                    self.burstTimer?.cancel()
+                    self.burstTimer = nil
+                    self.burstInterval = nil
+                }
             }
+            t.resume()
+            burstTimer = t
         }
-        t.resume()
-        fastTimer = t
     }
-    private var fastTimer: DispatchSourceTimer?
-    private var fastUntil = DispatchTime.now()
+    /// Also run during bursts (the session checks which window has focus).
+    var onBurstPoll: (() -> Void)?
+    private var burstTimer: DispatchSourceTimer?
+    private var burstInterval: Int?
+    private var burstUntil = DispatchTime.now()
     /// Popups' largest size so far, and those that have started their closing animation.
     private var popupMax: [UInt32: CGSize] = [:]
     private var closing: Set<UInt32> = []

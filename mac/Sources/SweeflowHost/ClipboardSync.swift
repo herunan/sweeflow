@@ -20,7 +20,8 @@ final class ClipboardSync {
     func start() {
         DispatchQueue.main.async {
             self.lastChange = NSPasteboard.general.changeCount
-            let t = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in self?.poll() }
+            // Copies happen after a click or key (see checkSoon); this only catches the rest.
+            let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.poll() }
             RunLoop.main.add(t, forMode: .common)
             self.timer = t
         }
@@ -28,6 +29,14 @@ final class ClipboardSync {
 
     func stop() {
         DispatchQueue.main.async { self.timer?.invalidate(); self.timer = nil }
+    }
+
+    /// Just after a click or key press (⌘C, a Copy menu item): look a little later, once the
+    /// app has had time to write the clipboard.
+    func checkSoon() {
+        for delay in [0.15, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.poll() }
+        }
     }
 
     private func poll() {

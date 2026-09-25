@@ -1,5 +1,5 @@
 import CoreGraphics
-import Foundation
+import AppKit
 
 /// The MacBook's own screen, turned down to near-black while streaming, so it can run with the lid
 /// slightly open (a closed lid locks the Mac, and a locked Mac can't be captured) without
@@ -21,35 +21,39 @@ enum BuiltInScreen {
         return ids.prefix(Int(n)).first { CGDisplayIsBuiltin($0) != 0 }
     }
 
-    private static var timer: Timer?
     private static var wasOnline = false
 
     /// Keeps the screen dark while streaming: now, and each time it comes back on (lid opened).
     /// Main thread.
-    static func startDimming() {
-        timer?.invalidate()
-        timer = nil
-        wasOnline = builtIn != nil
-        dim()
-        let t = Timer(timeInterval: 1, repeats: true) { _ in
+    /// Screens come and go (lid opened or closed): macOS says so; nothing runs in between.
+    private static var observer: NSObjectProtocol?
+    private static var dimming = false
+
+    private static func watchScreens() {
+        guard observer == nil else { return }
+        observer = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                          object: nil, queue: .main) { _ in
             let online = builtIn != nil
-            if online && !wasOnline { dim() }
+            if dimming {
+                if online && !wasOnline { dim() }
+            } else {
+                restore()   // brightness still owed from when the lid was closed
+            }
             wasOnline = online
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+    }
+
+    static func startDimming() {
+        dimming = true
+        wasOnline = builtIn != nil
+        dim()
+        watchScreens()
     }
 
     static func stopDimming() {
-        timer?.invalidate()
-        timer = nil
-        guard !restore() else { return }
-        // Lid still closed: put the brightness back once the screen is on again.
-        let t = Timer(timeInterval: 2, repeats: true) { t in
-            if restore() { t.invalidate(); if timer === t { timer = nil } }
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        dimming = false
+        restore()   // if the lid is closed, done when the screen comes back (watchScreens)
+        watchScreens()
     }
 
     private static func dim() {

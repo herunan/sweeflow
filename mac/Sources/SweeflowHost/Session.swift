@@ -24,7 +24,7 @@ final class Session {
     private var sentIcons: Set<String> = []
     private var raisedWid: UInt32 = 0
     private var lastFocused: UInt32 = 0
-    private var focusTimer: DispatchSourceTimer?
+    private var screensObserver: NSObjectProtocol?
     private var cursor: CursorWatcher?
     /// Watches a window right after a click in it, to catch the app starting a window drag
     /// (title bar) or zoom (double-click), which we hand over to the Linux window manager.
@@ -76,7 +76,7 @@ final class Session {
             DispatchQueue.main.async { host.sessionEnded() }
         }
         tracker.stop()
-        focusTimer?.cancel()
+        if let o = screensObserver { NotificationCenter.default.removeObserver(o) }
         cursor?.stop()
         gestureTimer?.cancel()
         input.releaseAll()
@@ -160,6 +160,7 @@ final class Session {
             st.active = wid == clientFocus
             streamers[ObjectIdentifier(s)] = st
             st.start()
+            queue.asyncAfter(deadline: .now() + 0.6) { st.checkScale() }
             if ScreenLock.isLocked { st.setScreenLocked(true) }
         case .clipboardSubscribe:
             clipboard?.0.stop()
@@ -317,13 +318,14 @@ final class Session {
             let (wid, p) = try pointerTarget(&m)
             // A drop from Linux is being replayed with the Mac's own pointer: don't pull it away.
             if let p, !DragBridge.replaying { ensureFront(wid, at: p); input.move(to: p) }
+            userDidSomething(click: false)
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
             if let p {
                 if pressed { ensureFront(wid, at: p) }
                 input.button(b, pressed: pressed, at: p)
-                tracker.pollFast()
+                userDidSomething(click: true)
                 if b == 0 {
                     watchGesture(wid, buttonDown: pressed)
                     watchDrag(wid, buttonDown: pressed)
@@ -333,9 +335,11 @@ final class Session {
             let (_, p) = try pointerTarget(&m)
             let dx = try m.f32(), dy = try m.f32(), unit = try m.u8(), phase = try m.u8()
             if let p { input.scroll(dx: dx, dy: dy, unit: unit, phase: phase, at: p) }
+            userDidSomething(click: false)
         case .key:
             let code = try m.u32(), v = try m.u8()   // 0 up, 1 down, 2 repeat
             input.key(evdev: code, pressed: v != 0, isRepeat: v == 2)
+            if v == 1 { userDidSomething(click: true) }
         case .releaseAll:
             input.releaseAll()
             setClientFocus(0)
@@ -437,6 +441,8 @@ final class Session {
                 guard let self else { return }
                 if let area, area.width > 0 {
                     self.vdArea = area
+                    // Windows move onto the (new) virtual display: capture at its scale.
+                    self.streamers.values.forEach { $0.checkScale() }
                     log("virtual display area \(area)")
                     for w in self.tracker.windows.values { self.placeOnVirtualDisplay(w) }
                 } else if attempt < 10 {
@@ -609,13 +615,24 @@ final class Session {
             }
         }
         tracker.isAppWindow = { [weak self] wid, pid in self?.control_.element(wid, pid: pid) != nil }
+        // Which window has focus changes with what the user does or with app switches, which
+        // both start a burst of window checks.
+        tracker.onBurstPoll = { [weak self] in self?.checkFocus() }
         tracker.start()
+        // Displays come and go (the virtual one, the lid): captures follow their display's scale.
+        screensObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                 object: nil, queue: nil) { [weak self] _ in
+            self?.queue.asyncAfter(deadline: .now() + 0.3) { self?.streamers.values.forEach { $0.checkScale() } }
+        }
+    }
 
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
-        t.setEventHandler { [weak self] in self?.checkFocus() }
-        t.resume()
-        focusTimer = t
+    /// What the user does is when windows, menus, the cursor and the clipboard change: check
+    /// those then (just in time) rather than on a timer. A click or key looks closely (menus
+    /// open and close), pointer movement less so.
+    private func userDidSomething(click: Bool) {
+        tracker.burst(everyMs: click ? 8 : 33)
+        cursor?.activity()
+        if click { clipboard?.0.checkSoon() }
     }
 
     private var watchingLock = false
@@ -672,7 +689,10 @@ final class Session {
 
     private func sendChanged(_ w: TrackedWindow) {
         placeOnVirtualDisplay(w)
-        for st in streamers.values where st.wid == w.wid { st.windowResized(to: w.frame.size) }
+        for st in streamers.values where st.wid == w.wid {
+            st.windowResized(to: w.frame.size)
+            st.checkScale()   // it may have moved to another display
+        }
         var m = MsgWriter(.windowChanged)
         m.u32(w.wid); m.str(w.title)
         m.f32(w.frame.width); m.f32(w.frame.height)

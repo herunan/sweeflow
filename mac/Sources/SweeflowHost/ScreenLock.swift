@@ -23,7 +23,7 @@ enum ScreenLock {
             dnc.addObserver(forName: Notification.Name(name), object: nil, queue: .main) { _ in set(value) }
         }
         // In case a notification is missed (e.g. across sleep).
-        let t = Timer(timeInterval: 2, repeats: true) { _ in set(currentlyLocked()) }
+        let t = Timer(timeInterval: 15, repeats: true) { _ in set(currentlyLocked()) }
         RunLoop.main.add(t, forMode: .common)
     }
 

@@ -48,7 +48,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var appIcon: CGImage?
     /// Pixels per point of the display the window is on (looked up from its position).
     var displayScale: (() -> CGFloat?)?
-    private var scaleCheckCountdown = 0
     /// Called when traffic lights drawn by the app itself were found in the pixels.
     var onDetectedButtons: (([CGRect]) -> Void)?
     private var detectCountdown = 0
@@ -115,11 +114,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.startCapture(win)
             }
         }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
-        t.setEventHandler { [weak self] in self?.tick() }
-        t.resume()
-        refineTimer = t
     }
 
     private func startCapture(_ win: SCWindow) {
@@ -157,7 +151,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     return
                 }
                 if let err { log("stream \(self.wid): startCapture failed: \(err)"); self.out.close() }
-                else { log("stream \(self.wid): capturing") }
+                else {
+                    log("stream \(self.wid): capturing")
+                    self.expectFirstFrame(from: s, win: win)
+                }
             }
         }
     }
@@ -361,6 +358,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             // Only the current capture's frames (a replaced one can still deliver a few).
             guard let self, !self.stopped, !self.showingPause, stream === self.stream else { return }
+            self.framesSinceStart += 1
             if lagUs > 0 { self.statCaptureLagSum += lagUs; self.statCaptureLagN += 1 }
             if !self.loggedAttachments {
                 self.loggedAttachments = true
@@ -418,7 +416,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 fillEdges(pb, ring: max(2, Int(self.scale)))
                 // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
                 // drops alpha, which would leave them darkened. Restore their real colour.
-                unpremultiply(pb)
+                // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
+                // the full pass is needed.
+                if hasTranslucency(pb, skip: Int(28 * self.scale)) { unpremultiply(pb) }
                 let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
                 if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", self.wid, ms)) }
             }
@@ -444,42 +444,79 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// When the window goes idle, re-encode the last frame a couple of times: the rate controller
     /// spends the spare bits refining it, so static content converges to near-lossless.
-    private func tick() {
-        // The window moved to a display with another scale (e.g. the virtual HiDPI display came
-        // or went): capture at that scale rather than padding with black or losing detail.
-        scaleCheckCountdown -= 1
-        if scaleCheckCountdown <= 0 {
-            scaleCheckCountdown = 5
-            if let want = displayScale?(), want > 0, abs(want - scale) > 0.01, let stream, !stopped {
-                log("stream \(wid): display scale \(scale) → \(want)")
-                scale = want
-                // A fresh capture, not a reconfigure: after a reconfigure ScreenCaptureKit sends
-                // nothing until the window's content changes, so a window sitting still (native
-                // apps don't redraw on moving display) would keep its old-scale picture.
-                if let win = scWindow {
-                    stream.stopCapture { _ in }
-                    self.stream = nil
-                    forceKeyframe = true
-                    startCapture(win)
-                }
+    /// A new capture normally starts with a frame, but not always (seen with a browser right after
+    /// the virtual display came back): if none has come within a second, start again (at most
+    /// three times). A one-off check, nothing keeps running.
+    private var framesSinceStart = 0
+    private var startRetries = 0
+
+    private func expectFirstFrame(from s: SCStream, win: SCWindow) {
+        framesSinceStart = 0
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, !self.stopped, self.stream === s, self.framesSinceStart == 0 else {
+                self?.startRetries = 0
+                return
+            }
+            guard self.startRetries < 3 else { log("stream \(self.wid): still no frame after 3 restarts"); return }
+            self.startRetries += 1
+            log("stream \(self.wid): no first frame, starting the capture again")
+            s.stopCapture { _ in }
+            self.stream = nil
+            self.forceKeyframe = true
+            self.startCapture(win)
+        }
+    }
+
+    /// The window moved, or the displays changed: capture at the scale of the display it's on
+    /// now (e.g. the virtual HiDPI display came or went), rather than padding with black or
+    /// losing detail.
+    func checkScale() {
+        queue.async { [weak self] in
+            guard let self, let want = self.displayScale?(), want > 0, abs(want - self.scale) > 0.01,
+                  let stream = self.stream, !self.stopped else { return }
+            log("stream \(self.wid): display scale \(self.scale) → \(want)")
+            self.scale = want
+            // A fresh capture, not a reconfigure: after a reconfigure ScreenCaptureKit sends
+            // nothing until the window's content changes, so a window sitting still (native apps
+            // don't redraw on moving display) would keep its old-scale picture.
+            if let win = self.scWindow {
+                stream.stopCapture { _ in }
+                self.stream = nil
+                self.forceKeyframe = true
+                self.startCapture(win)
             }
         }
-        let idleMs = (DispatchTime.now().uptimeNanoseconds - lastEncodeAt.uptimeNanoseconds) / 1_000_000
-        if refinementsLeft > 0, idleMs >= 120, pendingBuffer == nil, let b = lastBuffer {
-            refinementsLeft -= 1
-            pendingBuffer = b
-            pump()
+    }
+
+    /// When the window goes idle, re-encode the last frame a couple of times: the rate controller
+    /// spends the spare bits refining it, so static content converges to near-lossless. One
+    /// timer after each frame, not a running one.
+    private func scheduleRefine() {
+        refineTimer?.cancel()
+        guard refinementsLeft > 0, !lossless else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + .milliseconds(130))
+        t.setEventHandler { [weak self] in
+            guard let self, !self.stopped, self.refinementsLeft > 0, self.pendingBuffer == nil, let b = self.lastBuffer else { return }
+            self.refinementsLeft -= 1
+            self.pendingBuffer = b
+            self.pump()
         }
+        t.resume()
+        refineTimer = t
+    }
+
+    /// Stats every 5 s of streaming, written as frames go out.
+    private func logStatsIfDue() {
         let el = Double(DispatchTime.now().uptimeNanoseconds - statSince.uptimeNanoseconds) / 1e9
-        if el >= 5, statFrames > 0 {
-            let lat = statLatencyN > 0 ? Double(statLatencySum) / Double(statLatencyN) / 1000 : -1
-            let enc = statEncodeN > 0 ? Double(statEncodeSum) / Double(statEncodeN) / 1000 : -1
-            let lag = statCaptureLagN > 0 ? Double(statCaptureLagSum) / Double(statCaptureLagN) / 1000 : -1
-            log(String(format: "stream %u: %.1f fps, %.1f Mbit/s, capture→present %.1f ms (capture lag %.1f, encode %.1f, in flight %d)", wid,
-                       Double(statFrames) / el, Double(statBytes) * 8 / el / 1e6, lat, lag, enc, inFlight.count))
-            statFrames = 0; statBytes = 0; statLatencySum = 0; statLatencyN = 0; statSince = .now()
-            statEncodeSum = 0; statEncodeN = 0; statCaptureLagSum = 0; statCaptureLagN = 0
-        }
+        guard el >= 5, statFrames > 0 else { return }
+        let lat = statLatencyN > 0 ? Double(statLatencySum) / Double(statLatencyN) / 1000 : -1
+        let enc = statEncodeN > 0 ? Double(statEncodeSum) / Double(statEncodeN) / 1000 : -1
+        let lag = statCaptureLagN > 0 ? Double(statCaptureLagSum) / Double(statCaptureLagN) / 1000 : -1
+        log(String(format: "stream %u: %.1f fps, %.1f Mbit/s, capture→present %.1f ms (capture lag %.1f, encode %.1f, in flight %d)", wid,
+                   Double(statFrames) / el, Double(statBytes) * 8 / el / 1e6, lat, lag, enc, inFlight.count))
+        statFrames = 0; statBytes = 0; statLatencySum = 0; statLatencyN = 0; statSince = .now()
+        statEncodeSum = 0; statEncodeN = 0; statCaptureLagSum = 0; statCaptureLagN = 0
     }
 
     /// Sends the window's transparent corner tiles (ahead of the frame they belong to).
@@ -509,6 +546,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let enc = encoder else { return }
         lastBuffer = pb
         lastEncodeAt = .now()
+        scheduleRefine()
+        logStatsIfDue()
         let captureUs = hostMicros()
         var props: CFDictionary?
         if forceKeyframe {
@@ -524,8 +563,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                                         frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
             guard status == noErr, let sb else {
-                log("encode error \(status)")
-                self.queue.async { self.inFlight.removeAll { $0 == captureUs }; self.forceKeyframe = true }
+                // No frame and no error: the encoder dropped it (real-time mode) — the stream
+                // stays intact. A real error needs a fresh start (keyframe).
+                if status != noErr { log("encode error \(status)") }
+                self.queue.async {
+                    self.inFlight.removeAll { $0 == captureUs }
+                    if status != noErr { self.forceKeyframe = true }
+                }
                 return
             }
             let (data, key) = annexB(sb)
@@ -566,6 +610,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let captureUs = hostMicros()
         inFlight.append(captureUs)
         lastEncodeAt = .now()
+        scheduleRefine()
+        logStatsIfDue()
         var m = MsgWriter(.frame)
         m.u64(captureUs)
         m.u16(UInt16(w)); m.u16(UInt16(h))
@@ -628,9 +674,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // sRGB, so any other curve makes VideoToolbox shift every pixel's brightness.
             kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_sRGB,
             kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-            // A ceiling on how coarse any frame may get: the encoder otherwise starves flat
-            // areas, turning smooth UI gradients into blocks.
-            kVTCompressionPropertyKey_MaxAllowedFrameQP: 30,
         ]
         for (k, v) in props {
             let r = VTSessionSetProperty(s, key: k, value: v as CFTypeRef)
@@ -1074,4 +1117,22 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     }
     ctx.fillPath()
     return out
+}
+
+/// Whether any pixel away from the corners and edges is semi-transparent, looking at one pixel
+/// in 64 (every 8th in both directions).
+func hasTranslucency(_ pb: CVPixelBuffer, skip margin: Int) -> Bool {
+    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return true }
+    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return true }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+    guard w > 2 * margin, h > 2 * margin else { return true }
+    for y in Swift.stride(from: margin, to: h - margin, by: 8) {
+        let row = base + y * stride
+        for x in Swift.stride(from: margin, to: w - margin, by: 8) where row[x * 4 + 3] < 250 {
+            return true
+        }
+    }
+    return false
 }

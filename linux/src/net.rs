@@ -125,22 +125,50 @@ static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 /// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
 /// brief network blip doesn't make them flicker).
+/// Connection changes, for `watch_launcher_visibility`.
+static ONLINE_EVENTS: std::sync::OnceLock<std::sync::mpsc::Sender<bool>> = std::sync::OnceLock::new();
+
+fn set_online(online: bool) {
+    CONNECTED.store(online, std::sync::atomic::Ordering::SeqCst);
+    if let Some(tx) = ONLINE_EVENTS.get() {
+        let _ = tx.send(online);
+    }
+}
+
+/// Shows the Mac apps in the app menu while connected; hides them once the Mac has been gone
+/// for a grace period (a network blip doesn't make them flicker). Woken by connection changes.
 fn watch_launcher_visibility() {
-    use std::sync::atomic::Ordering;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if ONLINE_EVENTS.set(tx).is_err() {
+        return;
+    }
     let grace = std::time::Duration::from_secs(20);
-    let mut shown: Option<bool> = None;
-    let mut offline_since = std::time::Instant::now();
+    // Until the first connection, the grace period applies from start.
+    let mut online = CONNECTED.load(std::sync::atomic::Ordering::SeqCst);
+    crate::launchers::set_visible(true);
     loop {
-        let online = CONNECTED.load(Ordering::SeqCst);
         if online {
-            offline_since = std::time::Instant::now();
+            match rx.recv() {
+                Ok(o) => online = o,
+                Err(_) => return,
+            }
+            continue;
         }
-        let want = online || offline_since.elapsed() < grace;
-        if shown != Some(want) {
-            crate::launchers::set_visible(want);
-            shown = Some(want);
+        match rx.recv_timeout(grace) {
+            Ok(o) => online = o,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                crate::launchers::set_visible(false);
+                // Offline: wait for the Mac without a timeout.
+                match rx.recv() {
+                    Ok(o) => online = o,
+                    Err(_) => return,
+                }
+            }
+            Err(_) => return,
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        if online {
+            crate::launchers::set_visible(true);
+        }
     }
 }
 
@@ -232,10 +260,10 @@ async fn session(
     struct Online;
     impl Drop for Online {
         fn drop(&mut self) {
-            CONNECTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            set_online(false);
         }
     }
-    CONNECTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    set_online(true);
     let _online = Online;
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;

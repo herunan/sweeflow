@@ -20,18 +20,30 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         self.allowed = allowed
     }
 
+    /// The app list changes when apps launch or quit: refresh then (a slow timer covers the rest).
     func start() {
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: .seconds(3))
+        t.schedule(deadline: .now(), repeating: .seconds(30))
         t.setEventHandler { [weak self] in self?.refresh() }
         t.resume()
         timer = t
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            let o = nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                // A moment for the new app to show up in ScreenCaptureKit's list.
+                self?.queue.asyncAfter(deadline: .now() + 1) { self?.refresh() }
+            }
+            observers.append(o)
+        }
     }
+    private var observers: [NSObjectProtocol] = []
 
     func stop() {
         queue.async {
             self.stopped = true
             self.timer?.cancel()
+            self.observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+            self.observers.removeAll()
             self.stream?.stopCapture { _ in }
             self.stream = nil
         }
