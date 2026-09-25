@@ -5,11 +5,9 @@ mod launchers;
 mod lights;
 mod menus;
 mod net;
-mod positions;
 mod proto;
 mod setup;
 mod ui;
-mod wallpaper;
 
 use anyhow::Result;
 

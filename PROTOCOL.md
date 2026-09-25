@@ -37,7 +37,6 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x1C | S→C | AppList | u16 n, n × (str bundleId, str name, bytes png128) — installed apps, for launchers |
 | 0x1D | S→C | ScreenLocked | u8 locked — while locked the host sends no frames (capture is blank) |
 | 0x27 | C→S | LaunchApp | str bundleId — open (or reopen) the app on the Mac |
-| 0x28 | C→S | WindowPosition | u32 wid, f32 x, f32 y — where the window is on the Linux screen (logical px); the host puts it in the same place on the virtual display (same wallpaper behind it) |
 | 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
 | 0x25 | C→S | MenuRefresh | i32 pid — re-read and resend the app's menus |
 | 0x18 | S→C | ToggleMaximize | u32 wid — the app zoomed its window (title-bar double-click); client toggles maximised |
@@ -57,7 +56,6 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x49 | C→S | DragFetch | — send the dragged files (clipboard stream) |
 | 0x4A | S→C | DragData | u16 n, n × (str kind, str name, bytes data) — the dragged files (clipboard stream) |
 | 0x4B | C→S | DragDropLocal | u32 wid, f32 x, f32 y — a drag out of a Mac window was dropped on another Mac window: drop the dragged files there |
-| 0x4C | C→S | Wallpaper | str sha256, str ext, bytes image — the Linux wallpaper, set on the virtual display (macOS tints window materials with the wallpaper) (clipboard stream) |
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 

@@ -28,38 +28,26 @@ final class VirtualDisplay {
         return CGRect(x: b.minX, y: b.minY + menuBar, width: b.width, height: b.height - menuBar)
     }
 
-    /// Wallpaper for the virtual display (the Linux one), applied whenever the display exists.
-    /// Only this invisible display gets it; the Mac's own screens keep theirs.
-    private var wallpaper: URL?
-
-    func setWallpaper(_ url: URL) {
-        wallpaper = url
-        applyWallpaper(attempt: 0)
-    }
-
-    /// The display's NSScreen shows up a moment after it's created: retry for a few seconds.
-    private func applyWallpaper(attempt: Int) {
-        guard let url = wallpaper, let id = displayID else { return }
+    /// An earlier version gave this display the Linux wallpaper; put macOS's default back (and
+    /// delete the copies). The display's NSScreen appears a moment after it's created.
+    private func resetOldWallpaper(attempt: Int) {
+        guard let id = displayID else { return }
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
         }) else {
             if attempt < 20 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.applyWallpaper(attempt: attempt + 1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.resetOldWallpaper(attempt: attempt + 1) }
             }
             return
         }
-        if NSWorkspace.shared.desktopImageURL(for: screen) == url { return }
-        do {
-            // Fill the screen, cropping as needed (as Plasma's default "scaled and cropped").
-            try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [
-                .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
-                .allowClipping: true,
-            ])
-            log("virtual display wallpaper: \(url.lastPathComponent)")
-            // Windows re-tint with it, but don't send new frames by themselves.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { DebugPort.session?.refreshAll() }
-        } catch {
-            log("virtual display wallpaper failed: \(error)")
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
+        if let current = NSWorkspace.shared.desktopImageURL(for: screen), current.path.hasPrefix(dir.path) {
+            try? NSWorkspace.shared.setDesktopImageURL(URL(fileURLWithPath: "/System/Library/CoreServices/DefaultDesktop.heic"), for: screen, options: [:])
+            log("virtual display wallpaper back to the default")
+        }
+        for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        where f.lastPathComponent.hasPrefix("wallpaper-") {
+            try? FileManager.default.removeItem(at: f)
         }
     }
 
@@ -127,7 +115,7 @@ final class VirtualDisplay {
         display = vd
         size = points
         log("virtual display \(vd.displayID) created: \(w)x\(h) points")
-        applyWallpaper(attempt: 0)
+        resetOldWallpaper(attempt: 0)
     }
 }
 

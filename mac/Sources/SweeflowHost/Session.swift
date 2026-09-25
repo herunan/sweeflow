@@ -33,12 +33,6 @@ final class Session {
     private var sentButtons: [UInt32: [CGRect]] = [:]
     /// Usable area of the virtual display (global CG coords), once it is online.
     private var vdArea: CGRect?
-    /// The virtual display's full bounds (the area plus the menu bar above it).
-    private var vdBounds: CGRect?
-    /// Where windows sit on the Linux screen (points). Kept, and applied again whenever
-    /// windows get shuffled here (the virtual display coming back, a window reappearing).
-    private var linuxPositions: [UInt32: CGPoint] = [:]
-    private var positionsScheduled = false
     private var started = false
     /// Sizes the client shows windows at (from its resize requests).
     private var requestedSizes: [UInt32: CGSize] = [:]
@@ -147,7 +141,6 @@ final class Session {
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.visibleSize = requestedSizes[wid]
-            st.windowFrame = { [weak tracker] in tracker?.windows[wid]?.frame }
             st.displayScale = { [weak tracker] in
                 guard let f = tracker?.windows[wid]?.frame else { return nil }
                 return displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40)))
@@ -205,24 +198,6 @@ final class Session {
                         log("drag to Linux: \(items.map(\.name))")
                     }
                 }
-            }
-        case .wallpaper:
-            // The Linux wallpaper, for the virtual display (window materials are tinted with it).
-            let hash = try m.str(), ext = try m.str(), data = try m.bytes()
-            DispatchQueue.global(qos: .utility).async {
-                let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
-                let safeExt = ext.allSatisfy { $0.isLetter || $0.isNumber } ? ext : "png"
-                let url = dir.appendingPathComponent("wallpaper-\(hash.prefix(12)).\(safeExt)")
-                if !FileManager.default.fileExists(atPath: url.path) {
-                    // One file per wallpaper (macOS caches by path), old ones removed.
-                    for old in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-                    where old.lastPathComponent.hasPrefix("wallpaper-") {
-                        try? FileManager.default.removeItem(at: old)
-                    }
-                    try? data.write(to: url)
-                }
-                log("wallpaper from Linux: \(url.lastPathComponent) (\(data.count / 1024) KB)")
-                DispatchQueue.main.async { host.display.setWallpaper(url) }
             }
         case .dragDropLocal:
             // A drag out of one Mac window dropped on another (via Linux): drop the same files.
@@ -322,13 +297,6 @@ final class Session {
                 // Items change state after use (checkmarks, enabled): resend shortly after.
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { self?.sendMenus(pid: pid) }
             }
-        case .windowPosition:
-            // Where the window is on the Linux screen: put it in the same place here, so the
-            // wallpaper behind it (which tints its sidebar and toolbar) is the same patch.
-            let wid = try m.u32(), x = try m.f32(), y = try m.f32()
-            let scale = CGFloat(max(clientScale, 0.5))
-            linuxPositions[wid] = CGPoint(x: x / scale, y: y / scale)
-            scheduleLinuxPositions()
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
             guard config.virtualDisplay else { return }
@@ -464,65 +432,17 @@ final class Session {
     private func refreshVirtualDisplayArea(attempt: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 0.3 : 0.5)) { [weak self] in
             let area = host.display.usableBounds
-            let bounds = host.display.bounds
             self?.queue.async {
                 guard let self else { return }
                 if let area, area.width > 0 {
                     self.vdArea = area
-                    self.vdBounds = bounds
                     log("virtual display area \(area)")
                     for w in self.tracker.windows.values { self.placeOnVirtualDisplay(w) }
-                    self.scheduleLinuxPositions()
                 } else if attempt < 10 {
                     self.refreshVirtualDisplayArea(attempt: attempt + 1)
                 }
             }
         }
-    }
-
-    /// Windows to capture afresh once they've stopped moving (see WindowStreamer.refresh).
-    private var refreshAt: [UInt32: DispatchTime] = [:]
-
-    private func refreshSoon(_ wid: UInt32) {
-        let due = DispatchTime.now() + 0.5
-        refreshAt[wid] = due
-        queue.asyncAfter(deadline: due) { [weak self] in
-            guard let self, let at = self.refreshAt[wid], at <= .now() else { return }
-            self.refreshAt[wid] = nil
-            for st in self.streamers.values where st.wid == wid { st.refresh() }
-        }
-    }
-
-    /// All windows afresh (the wallpaper changed).
-    func refreshAll() {
-        queue.async { for w in self.tracker.windows.values where w.kind == .toplevel { self.refreshSoon(w.wid) } }
-    }
-
-    /// Coalesces the stream of moves during a drag.
-    private func scheduleLinuxPositions() {
-        guard !positionsScheduled else { return }
-        positionsScheduled = true
-        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.applyLinuxPositions() }
-    }
-
-    private func applyLinuxPositions() {
-        positionsScheduled = false
-        guard let area = vdArea, let bounds = vdBounds else { return }
-        for (wid, p) in linuxPositions {
-            guard let w = tracker.windows[wid], w.kind == .toplevel, minimized[wid] == nil else { continue }
-            // Same place relative to the screen; the Mac keeps windows below its menu bar and
-            // on the display.
-            var origin = CGPoint(x: bounds.minX + p.x, y: bounds.minY + p.y)
-            origin.x = min(max(origin.x, area.minX), max(area.minX, area.maxX - w.frame.width))
-            origin.y = min(max(origin.y, area.minY), max(area.minY, area.maxY - w.frame.height))
-            if abs(origin.x - w.frame.minX) > 1 || abs(origin.y - w.frame.minY) > 1 {
-                let ok = control_.setPosition(wid, pid: w.pid, origin)
-                if !ok { log("window \(wid): can't move it to \(origin)") }
-                else { refreshSoon(wid) }
-            }
-        }
-        // Forget windows that are gone.
-        linuxPositions = linuxPositions.filter { tracker.windows[$0.key] != nil }
     }
 
     /// Keeps a streamed window (or floating panel) fully on the virtual display: input is injected
@@ -666,7 +586,6 @@ final class Session {
         tracker.onAdded = { [weak self] w in
             self?.minimized[w.wid] = nil
             self?.placeOnVirtualDisplay(w)
-            if self?.linuxPositions[w.wid] != nil { self?.scheduleLinuxPositions() }
             self?.sendAdded(w)
         }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }

@@ -59,8 +59,6 @@ pub enum UiEvent {
     Clipboard(std::collections::HashMap<String, Arc<Vec<u8>>>),
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
-    /// Where KWin has a Mac window (from the positions script).
-    LinuxPosition { app_id: String, caption: String, x: i32, y: i32, minimized: bool },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
     RawFrame { wid: u32, w: u16, h: u16, px_per_pt: u8, capture_us: u64, bgra: Vec<u8> },
 }
@@ -87,7 +85,6 @@ impl UiEvent {
             UiEvent::DragBegan { .. } => "drag began",
             UiEvent::DragData(_) => "drag data",
             UiEvent::Corners { .. } => "corners",
-            UiEvent::LinuxPosition { .. } => "position",
             UiEvent::RawFrame { .. } => "popup frame",
         }
     }
@@ -301,50 +298,6 @@ async fn session(
         (Arc::new(tokio::sync::Mutex::new(ctx)), task)
     };
 
-    // The Linux wallpaper for the Mac's virtual display: macOS tints window materials
-    // (sidebars, toolbars) with the wallpaper under the window, so with ours (and the windows
-    // placed as they are here) they look as they would on this desktop. Sent again as soon as
-    // Plasma saves a change.
-    let wallpaper_task = {
-        let tx = clip_tx.clone();
-        tokio::spawn(async move {
-            let mut sent: Option<String> = None;
-            let mut changes = crate::wallpaper::changes();
-            loop {
-                let found = tokio::task::spawn_blocking(|| {
-                    crate::wallpaper::current(crate::wallpaper::screen_aspect()).and_then(|p| crate::wallpaper::load(&p).map(|l| (p, l)))
-                })
-                .await
-                .ok()
-                .flatten();
-                if let Some((path, (hash, data))) = found {
-                    if sent.as_deref() != Some(hash.as_str()) {
-                        let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "png".into());
-                        let msg = W::new(t::WALLPAPER).str(&hash).str(&ext).bytes(&data).finish();
-                        if tx.lock().await.write_all(&msg).await.is_ok() {
-                            log::info!("wallpaper sent to the Mac: {} ({} KB)", path.display(), data.len() / 1024);
-                            sent = Some(hash);
-                        }
-                    }
-                }
-                // Plasma saving its config (new wallpaper, light/dark switch) wakes this up; a
-                // slow check covers anything the watch misses.
-                tokio::select! {
-                    r = changes.changed() => {
-                        if r.is_err() {
-                            tokio::time::sleep(Duration::from_secs(600)).await;
-                        }
-                        // Let Plasma finish writing (it can save in several steps).
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                        changes.borrow_and_update();
-                        log::info!("Plasma settings saved: checking the wallpaper");
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(600)) => {}
-                }
-            }
-        })
-    };
-
     let mut video: HashMap<u32, (quinn::SendStream, tokio::task::JoinHandle<()>)> = HashMap::new();
     let render_node = cfg.render_node.clone();
     let result = loop {
@@ -399,7 +352,6 @@ async fn session(
     }
     audio.abort();
     clip_task.abort();
-    wallpaper_task.abort();
     conn.close(0u32.into(), b"bye");
     result
 }
