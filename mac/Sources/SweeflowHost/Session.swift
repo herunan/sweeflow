@@ -481,6 +481,24 @@ final class Session {
         }
     }
 
+    /// Windows to capture afresh once they've stopped moving (see WindowStreamer.refresh).
+    private var refreshAt: [UInt32: DispatchTime] = [:]
+
+    private func refreshSoon(_ wid: UInt32) {
+        let due = DispatchTime.now() + 0.5
+        refreshAt[wid] = due
+        queue.asyncAfter(deadline: due) { [weak self] in
+            guard let self, let at = self.refreshAt[wid], at <= .now() else { return }
+            self.refreshAt[wid] = nil
+            for st in self.streamers.values where st.wid == wid { st.refresh() }
+        }
+    }
+
+    /// All windows afresh (the wallpaper changed).
+    func refreshAll() {
+        queue.async { for w in self.tracker.windows.values where w.kind == .toplevel { self.refreshSoon(w.wid) } }
+    }
+
     /// Coalesces the stream of moves during a drag.
     private func scheduleLinuxPositions() {
         guard !positionsScheduled else { return }
@@ -501,6 +519,7 @@ final class Session {
             if abs(origin.x - w.frame.minX) > 1 || abs(origin.y - w.frame.minY) > 1 {
                 let ok = control_.setPosition(wid, pid: w.pid, origin)
                 if !ok { log("window \(wid): can't move it to \(origin)") }
+                else { refreshSoon(wid) }
             }
         }
         // Forget windows that are gone.

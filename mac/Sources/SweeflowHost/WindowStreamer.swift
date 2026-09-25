@@ -310,6 +310,19 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Starts a fresh capture: the window's look changed without its content changing (it moved
+    /// over another part of the wallpaper, or the wallpaper changed — macOS tints sidebars and
+    /// toolbars with it), and ScreenCaptureKit only sends frames when the content changes.
+    func refresh() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.showingPause, let win = self.scWindow, let stream = self.stream else { return }
+            stream.stopCapture { _ in }
+            self.stream = nil
+            self.forceKeyframe = true
+            self.startCapture(win)
+        }
+    }
+
     func requestKeyframe() {
         forceKeyframe = true
         if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b }

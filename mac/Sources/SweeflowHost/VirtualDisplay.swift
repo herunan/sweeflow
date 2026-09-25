@@ -56,6 +56,8 @@ final class VirtualDisplay {
                 .allowClipping: true,
             ])
             log("virtual display wallpaper: \(url.lastPathComponent)")
+            // Windows re-tint with it, but don't send new frames by themselves.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { DebugPort.session?.refreshAll() }
         } catch {
             log("virtual display wallpaper failed: \(error)")
         }
