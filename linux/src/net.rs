@@ -124,6 +124,8 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
 /// Local socket for `sweeflow launch <bundle id>` (used by the Mac app launchers).
 /// Launch requests made while the Mac is offline, delivered on (re)connect.
 static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+/// The Mac's lock state as last reported (kept across reconnects).
+static MAC_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
@@ -466,7 +468,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::SCREEN_LOCKED => {
             let locked = r.u8()? != 0;
             log::info!("Mac screen {}", if locked { "locked" } else { "unlocked" });
-            if locked {
+            // Once per lock, not on every reconnect while it stays locked (a sleeping Mac wakes
+            // briefly now and then), and not at all while streaming is switched off.
+            let was = MAC_LOCKED.swap(locked, std::sync::atomic::Ordering::SeqCst);
+            if locked && !was && crate::tray::streaming() {
                 std::thread::spawn(|| {
                     notify("Your Mac is locked", "Mac windows are paused until you unlock it (Touch ID or password on the Mac).")
                 });

@@ -107,6 +107,10 @@ pub fn allows_clipboard() -> bool {
     get(|s| s.enabled && s.clipboard, true)
 }
 
+pub fn streaming() -> bool {
+    get(|s| s.enabled, true)
+}
+
 pub fn allows_drag() -> bool {
     get(|s| s.enabled && s.drag_drop, true)
 }
