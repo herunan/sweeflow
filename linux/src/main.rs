@@ -2,6 +2,7 @@ mod blind;
 mod clipboard;
 mod config;
 mod decode;
+mod desktop;
 mod launchers;
 mod lights;
 mod menus;

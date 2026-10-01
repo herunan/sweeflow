@@ -57,6 +57,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             ("Shared Clipboard", c.clipboard, { (c: inout Config) in c.clipboard.toggle() }),
             ("Drag and Drop", c.dragDrop, { (c: inout Config) in c.dragDrop.toggle() }),
             ("Mac Apps in Linux Menu", c.launcherMenu, { (c: inout Config) in c.launcherMenu.toggle() }),
+            ("Mac Apps on Own Linux Desktop", c.ownDesktop, { (c: inout Config) in c.ownDesktop.toggle() }),
         ] as [(String, Bool, (inout Config) -> Void)] {
             let i = toggle(title, on, change)
             i.isEnabled = c.enabled

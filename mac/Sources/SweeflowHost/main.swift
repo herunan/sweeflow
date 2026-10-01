@@ -29,6 +29,8 @@ struct Config: Codable {
     var dragDrop = true
     /// The Mac Apps folder in the Linux app menu.
     var launcherMenu = true
+    /// Mac windows on a Linux desktop of their own.
+    var ownDesktop = true
     /// "sharp": Retina, 10-bit. "light": 1x, 8-bit, for slower networks.
     var quality = "sharp"
 
@@ -50,6 +52,7 @@ struct Config: Codable {
         dragDrop = try c.decodeIfPresent(Bool.self, forKey: .dragDrop) ?? d.dragDrop
         launcherMenu = try c.decodeIfPresent(Bool.self, forKey: .launcherMenu) ?? d.launcherMenu
         quality = try c.decodeIfPresent(String.self, forKey: .quality) ?? d.quality
+        ownDesktop = try c.decodeIfPresent(Bool.self, forKey: .ownDesktop) ?? d.ownDesktop
     }
 
     func allows(_ bundleId: String) -> Bool {

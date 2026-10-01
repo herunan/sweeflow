@@ -29,6 +29,13 @@ pub struct Settings {
     pub drag_drop: bool,
     pub launcher: bool,
     pub quality: String,
+    /// Mac windows on a desktop of their own (see desktop.rs).
+    #[serde(default = "yes")]
+    pub desktop: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Default)]
@@ -86,6 +93,12 @@ pub fn set_settings(json: &[u8]) {
     match serde_json::from_slice::<Settings>(json) {
         Ok(new) => {
             log::info!("settings: {new:?}");
+            let wanted = new.enabled && new.desktop;
+            // Acted on when it changes, and once per run (in case it changed while away).
+            static APPLIED: Mutex<Option<bool>> = Mutex::new(None);
+            if APPLIED.lock().unwrap().replace(wanted) != Some(wanted) {
+                crate::desktop::apply(wanted);
+            }
             STATE.lock().unwrap().settings = Some(new);
             refresh();
             crate::net::launcher_setting_changed();
@@ -220,12 +233,13 @@ impl ksni::Tray for Tray {
         items.push(MenuItem::Separator);
 
         type Toggle = (&'static str, fn(&Settings) -> bool, fn(&mut Settings));
-        let toggles: [Toggle; 5] = [
+        let toggles: [Toggle; 6] = [
             ("Mac sound on Linux", |s| s.sound, |s| s.sound = !s.sound),
             ("Dim Mac screen", |s| s.dim, |s| s.dim = !s.dim),
             ("Shared clipboard", |s| s.clipboard, |s| s.clipboard = !s.clipboard),
             ("Drag and drop", |s| s.drag_drop, |s| s.drag_drop = !s.drag_drop),
             ("Mac Apps in app menu", |s| s.launcher, |s| s.launcher = !s.launcher),
+            ("Mac apps on their own desktop", |s| s.desktop, |s| s.desktop = !s.desktop),
         ];
         for (label, get, flip) in toggles {
             items.push(
