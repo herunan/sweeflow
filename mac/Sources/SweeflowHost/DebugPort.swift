@@ -141,6 +141,13 @@ final class DebugPort {
             // Preview the locked look: pause on|off.
             session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")
             reply("ok")
+        case "blind":
+            // Uncapturable windows as the tracker has them, and what the window list says now.
+            guard let s = session else { return reply("no session") }
+            s.queue.async {
+                let r = s.debugBlind()
+                DispatchQueue.main.async { reply(r) }
+            }
         case "windows":
             guard let s = session else { return reply("no session") }
             s.queue.async {

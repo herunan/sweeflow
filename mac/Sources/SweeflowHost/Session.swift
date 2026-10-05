@@ -530,6 +530,15 @@ final class Session {
         return "ok \(p)"
     }
 
+    func debugBlind() -> String {
+        let tracked = tracker.blind.values.map { "tracked \($0.wid) \($0.owner) menu=\($0.menu) \($0.frame)" }
+        let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+        let raw = list.filter { ($0[kCGWindowSharingState as String] as? Int) == 0 || ($0[kCGWindowLayer as String] as? Int) == 101 }.map {
+            "list \($0[kCGWindowNumber as String] ?? 0) \($0[kCGWindowOwnerName as String] ?? "") pid \($0[kCGWindowOwnerPID as String] ?? 0) layer \($0[kCGWindowLayer as String] ?? 0) sharing \($0[kCGWindowSharingState as String] ?? -1)"
+        }
+        return (tracked + raw).joined(separator: "\n")
+    }
+
     func debugAX(_ wid: UInt32) -> String {
         guard let w = tracker.windows[wid] else { return "no window" }
         return "cg frame \(w.frame)\n" + control_.debugDescribe(wid, pid: w.pid)

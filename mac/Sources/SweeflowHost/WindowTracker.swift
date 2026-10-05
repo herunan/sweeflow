@@ -140,6 +140,7 @@ final class WindowTracker {
         var popups: [TrackedWindow] = []
         var badges: [pid_t: [CGRect]] = [:]
         var blindNow: [UInt32: BlindWindow] = [:]
+        var helperPopups: [(wid: UInt32, pid: pid_t, frame: CGRect, layer: Int)] = []
 
         for info in list {
             // Windows that refuse capture (security prompts, sign-in verifiers): can't be streamed, but
@@ -162,8 +163,17 @@ final class WindowTracker {
                   let layer = info[kCGWindowLayer as String] as? Int,
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: boundsDict),
-                  (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.01,
-                  let (bid, appName) = appInfo(pid), allowed(bid) else { continue }
+                  (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.01 else { continue }
+            guard let (bid, appName) = appInfo(pid), allowed(bid) else {
+                // A helper process's menu or popover (each System Settings page runs in a process
+                // of its own): attached below to the streamed window it opens over.
+                if (24..<1000).contains(layer), (info[kCGWindowSharingState as String] as? Int) != 0, pid != getpid(),
+                   let owner = info[kCGWindowOwnerName as String] as? String, !Self.notBlind.contains(owner),
+                   bounds.width >= 8, bounds.height >= 8 {
+                    helperPopups.append((wid, pid, bounds, layer))
+                }
+                continue
+            }
             // Windows macOS injects into a shared app — the purple "being captured" badge and the
             // live preview it pops up on hover — are not shareable (sharing state 0). Never
             // stream them; remember the badge (layer 0) so it can be erased from captures.
@@ -248,6 +258,11 @@ final class WindowTracker {
         // Each menu belongs to the frontmost window of its app that it touches (a panel's own
         // dropdown must not be positioned relative to the app's main window).
         let owners = order.compactMap { seen[$0] }   // front-to-back: toplevels, then panels
+        for h in helperPopups {
+            guard let parent = owners.first(where: { $0.frame.insetBy(dx: -40, dy: -40).intersects(h.frame) }) else { continue }
+            popups.append(TrackedWindow(wid: h.wid, pid: parent.pid, bundleId: parent.bundleId, appName: parent.appName, title: "",
+                                        frame: h.frame, layer: h.layer, parent: 0, kind: .popup))
+        }
         for var p in popups where p.kind == .popup {
             // Closing: macOS shrinks popovers (a calendar app's event card) toward where they opened.
             // Shrinking in both directions at once only happens then, so it's gone from now on
