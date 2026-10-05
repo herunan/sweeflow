@@ -149,7 +149,11 @@ final class Session {
         case .subscribe:
             let wid = try m.u32()
             guard let win = tracker.windows[wid] else { log("subscribe to unknown window \(wid)"); s.close(); return }
-            let scale = settings.config.quality == "light" ? 1 : captureScale > 0 ? captureScale : backingScale(of: win.frame)
+            log("stream \(wid): subscribed")
+            // A new window is about to move onto the virtual display (see placeOnVirtualDisplay):
+            // capture at its scale from the start, not at wherever it opened and then again.
+            let vdScale = vdArea.flatMap { win.kind == .popup ? nil : displayScale(at: CGPoint(x: $0.midX, y: $0.midY)) }
+            let scale = settings.config.quality == "light" ? 1 : captureScale > 0 ? captureScale : vdScale ?? backingScale(of: win.frame)
             let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, lossless: win.kind == .popup,
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
@@ -264,19 +268,21 @@ final class Session {
             guard let win = tracker.windows[wid] else { return }
             requestedSizes[wid] = CGSize(width: w, height: h)
             for st in streamers.values where st.wid == wid { st.visibleSize = CGSize(width: w, height: h) }
-            control_.setSize(wid, pid: win.pid, CGSize(width: w, height: h))
+            // Capture at the new size as soon as the app has resized (not on the next slow look).
+            ax { $0.setSize(wid, pid: win.pid, CGSize(width: w, height: h)) }
         case .launchApp:
             let bid = try m.str()
             log("launching \(bid)")
             // `open -b` also reopens a running app that has no windows (like clicking its Dock icon).
             DispatchQueue.global().async { _ = try? run("/usr/bin/open", ["-b", bid]) }
+            // Its window can take a few seconds to appear (a cold launch): look out for it.
+            tracker.burst(everyMs: 50, for: 5)
         case .restore:
             // Restored from the Linux taskbar: bring the Mac window back; the tracker then
             // re-announces it and the client resubscribes to its video.
             let wid = try m.u32()
             if let w = minimized.removeValue(forKey: wid) {
-                control_.unminimize(wid, pid: w.pid)
-                control_.focus(wid, pid: w.pid)
+                ax(burstFor: 1) { $0.unminimize(wid, pid: w.pid); $0.focus(wid, pid: w.pid) }
             }
         case .menuRefresh:
             sendMenus(pid: pid_t(try m.i32()))
@@ -287,6 +293,7 @@ final class Session {
             for _ in 0..<n { path.append(Int(try m.u16())) }
             menuQueue.async { [weak self] in
                 let ok = MenuReader.press(pid: pid, path: path)
+                self?.tracker.burst(everyMs: 16, for: 1)
                 log("menu \(path) in \(pid): \(ok ? "pressed" : "not found")")
                 // Items change state after use (checkmarks, enabled): resend shortly after.
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { self?.sendMenus(pid: pid) }
@@ -316,10 +323,11 @@ final class Session {
             setClientFocus(wid)
             guard let win = tracker.windows[wid] else { return }
             raise(win)
-            control_.focus(wid, pid: win.pid)
+            ax { $0.focus(wid, pid: win.pid) }
         case .close:
             let wid = try m.u32()
-            if let win = tracker.windows[wid] { control_.close(wid, pid: win.pid) }
+            // The window takes a moment to go after its close button is pressed: watch for it.
+            if let win = tracker.windows[wid] { ax(burstFor: 2) { $0.close(wid, pid: win.pid) } }
 
         case .pointerMove:
             let (wid, p) = try pointerTarget(&m)
@@ -428,13 +436,12 @@ final class Session {
             // The app started dragging its window: end the drag on the Mac, put the window back,
             // and let KWin move the Linux window instead (the button is still held there).
             input.button(0, pressed: false, at: input.lastPoint)
-            control_.setPosition(g.wid, pid: win.pid, g.frame.origin)
+            ax { $0.setPosition(g.wid, pid: win.pid, g.frame.origin) }
             log("window \(g.wid): title-bar drag → handing move to Linux")
             var m = MsgWriter(.moveStarted); m.u32(g.wid); control?.send(m)
         } else if now.size != g.frame.size && !g.buttonDown {
             // Double-click zoom: undo it on the Mac and maximise the Linux window instead.
-            control_.setPosition(g.wid, pid: win.pid, g.frame.origin)
-            control_.setSize(g.wid, pid: win.pid, g.frame.size)
+            ax { $0.setPosition(g.wid, pid: win.pid, g.frame.origin); $0.setSize(g.wid, pid: win.pid, g.frame.size) }
             log("window \(g.wid): zoom → toggling maximise on Linux")
             var m = MsgWriter(.toggleMaximize); m.u32(g.wid); control?.send(m)
         }
@@ -472,7 +479,7 @@ final class Session {
         origin.x = min(max(origin.x, area.minX), max(area.minX, area.maxX - w.frame.width))
         origin.y = min(max(origin.y, area.minY), max(area.minY, area.maxY - w.frame.height))
         if w.kind == .toplevel { origin = uncovered(w, at: origin, in: area) }
-        if origin != w.frame.origin { control_.setPosition(w.wid, pid: w.pid, origin) }
+        if origin != w.frame.origin { ax { $0.setPosition(w.wid, pid: w.pid, origin) } }
     }
 
     /// Nobody sees the virtual display, but macOS still works out which windows are hidden
@@ -514,6 +521,22 @@ final class Session {
             justMoved[w.wid] = (CGRect(origin: best, size: frame.size), now)
         }
         return best
+    }
+
+    /// Accessibility actions wait on the app (Finder can take a second to close a window): run
+    /// them off the session's queue so frames, input and window checks carry on meanwhile, then
+    /// look for the change they make straight away.
+    private let axQueue = DispatchQueue(label: "sweeflow.ax", qos: .userInteractive)
+
+    private func ax(burstFor seconds: Double = 0.5, _ action: @escaping (WindowControl) -> Void) {
+        let control = control_
+        axQueue.async { [weak self] in
+            let t0 = Date()
+            action(control)
+            let ms = Date().timeIntervalSince(t0) * 1000
+            if ms > 100 { log(String(format: "accessibility action took %.0f ms", ms)) }
+            self?.tracker.burst(everyMs: 16, for: seconds)
+        }
     }
 
     // MARK: debug hooks (DebugPort)
@@ -651,7 +674,7 @@ final class Session {
     }
 
     private func raise(_ win: TrackedWindow) {
-        control_.focus(win.wid, pid: win.pid)
+        ax { $0.focus(win.wid, pid: win.pid) }
         raisedWid = win.wid
     }
 
@@ -659,6 +682,8 @@ final class Session {
 
     private func startTracking() {
         tracker.onAdded = { [weak self] w in
+            WindowStreamer.prefetch(w.wid)
+            self?.goneWindows.remove(w.wid)
             self?.minimized[w.wid] = nil
             self?.placeOnVirtualDisplay(w)
             self?.sendAdded(w)
@@ -669,6 +694,19 @@ final class Session {
             let wid = w.wid
             if self.minimized[wid] != nil { return }
             guard w.kind == .toplevel else { self.windowGone(wid); return }
+            // Closed: its Accessibility element is gone already, so say so straight away.
+            // (It can take macOS a moment to invalidate it: look again shortly.)
+            let control = self.control_
+            for delay in [0.0, 0.12, 0.3] {
+                self.axQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    let exists = control.exists(wid, pid: w.pid)
+                    self?.queue.async { [weak self] in
+                        guard let self, !exists, self.tracker.windows[wid] == nil, self.minimized[wid] == nil,
+                              !self.goneWindows.contains(wid) else { return }
+                        self.windowGone(wid)
+                    }
+                }
+            }
             // A minimising window leaves the screen before the minimise animation finishes and
             // AX reports it minimised, so decide a moment later.
             self.queue.asyncAfter(deadline: .now() + 0.7) { [weak self] in
@@ -866,7 +904,11 @@ final class Session {
         }
     }
 
+    /// Windows already reported gone (several checks can conclude it).
+    private var goneWindows: Set<UInt32> = []
+
     private func windowGone(_ wid: UInt32) {
+        guard goneWindows.insert(wid).inserted else { return }
         control_.forget(wid)
         sentButtons[wid] = nil
         var m = MsgWriter(.windowRemoved); m.u32(wid); control?.send(m)

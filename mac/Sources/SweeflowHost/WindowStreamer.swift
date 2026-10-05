@@ -99,7 +99,30 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: lifecycle
 
+    /// Windows looked up ahead of a subscription (see `prefetch`): the window list takes
+    /// ScreenCaptureKit a few hundred milliseconds, which would otherwise delay a new window.
+    private static var prefetched: [UInt32: (window: SCWindow, at: Date)] = [:]
+    private static let prefetchLock = NSLock()
+
+    /// Looks up a window that's about to be subscribed to (it just appeared).
+    static func prefetch(_ wid: UInt32) {
+        let t0 = Date()
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            guard let w = content?.windows.first(where: { $0.windowID == wid }) else { return }
+            prefetchLock.withLock { prefetched[wid] = (w, Date()) }
+            log(String(format: "window %u: looked up for capture in %.0f ms", wid, Date().timeIntervalSince(t0) * 1000))
+        }
+    }
+
     func start() {
+        let cached = Self.prefetchLock.withLock { Self.prefetched.removeValue(forKey: wid) }
+        if let cached, Date().timeIntervalSince(cached.at) < 5 {
+            queue.async { [weak self] in
+                guard let self, !self.stopped else { return }
+                self.startCapture(cached.window)
+            }
+            return
+        }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, err in
             guard let self else { return }
             self.queue.async {
@@ -141,6 +164,20 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             out.close(); return
         }
         stream = s
+        // Starting a capture takes ScreenCaptureKit ~0.4 s; a still of the window takes a fraction
+        // of that, so a new window shows straight away and goes live when the capture starts.
+        if !sentStill {
+            sentStill = true
+            let t0 = Date()
+            SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
+                log(String(format: "stream %u: still taken in %.0f ms", self?.wid ?? 0, Date().timeIntervalSince(t0) * 1000))
+                guard let self, let sb, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+                self.queue.async {
+                    guard !self.stopped, !self.showingPause, self.stream === s, self.framesSinceStart == 0, !ScreenLock.isLocked else { return }
+                    self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
+                }
+            }
+        }
         s.startCapture { [weak self] err in
             guard let self else { return }
             self.queue.async {
@@ -365,75 +402,84 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             // Only the current capture's frames (a replaced one can still deliver a few).
             guard let self, !self.stopped, !self.showingPause, stream === self.stream else { return }
-            self.framesSinceStart += 1
-            self.stopRetries = 0
-            if lagUs > 0 { self.statCaptureLagSum += lagUs; self.statCaptureLagN += 1 }
-            if !self.loggedAttachments {
-                self.loggedAttachments = true
-                let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
-                log("stream \(self.wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
-            }
-            if let r = contentRect {
-                let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
-                let cw = r.width * scaleFactor, ch = r.height * scaleFactor
-                if abs(cw - bw) > 2 || abs(ch - bh) > 2 {
-                    self.mismatchLogs += 1
-                    if self.mismatchLogs <= 5 {
-                        log(String(format: "stream %u: content %.0fx%.0f (rect %@ contentScale %.2f scaleFactor %.1f) in buffer %.0fx%.0f, pointSize %@",
-                                   self.wid, cw, ch, NSStringFromRect(r), contentScale, scaleFactor, bw, bh, NSStringFromSize(self.pointSize)))
-                    }
-                }
-            }
-            if !self.lossless {
-                // Apps that hide the standard buttons and draw their own: find them in the pixels
-                // (a few times a second until found).
-                if !self.buttons.contains(where: { $0.width > 0 }), self.onDetectedButtons != nil {
-                    self.detectCountdown -= 1
-                    if self.detectCountdown <= 0 {
-                        self.detectCountdown = 20
-                        if let found = detectTrafficLights(pb, scale: self.scale) {
-                            log("stream \(self.wid): found app-drawn traffic lights at \(found.map { "\(Int($0.minX)),\(Int($0.minY))" })")
-                            self.buttons = found
-                            self.onDetectedButtons?(found)
-                        }
-                    }
-                }
-                // Order matters: erase the capture badge first (it overlaps the top-left
-                // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
-                if let dark = eraseCaptureBadge(pb, buttons: self.buttons, badge: self.badgeRect(), scale: self.scale) { self.darkTitleBar = dark }
-                let t0 = DispatchTime.now().uptimeNanoseconds
-                // A few radius measurements per window (not every frame) feed the shared vote.
-                self.measureCountdown -= 1
-                if self.radiusSamples < 5, self.measureCountdown <= 0 {
-                    self.measureCountdown = 15
-                    if let r = measureCornerRadius(pb, scale: self.scale) {
-                        self.radiusSamples += 1
-                        let pt = Int((CGFloat(r) / self.scale).rounded())
-                        WindowStreamer.radiusVotes[pt, default: 0] += 1
-                        log("stream \(self.wid): corner radius sample \(pt)pt → consensus \(WindowStreamer.consensusRadiusPt)pt")
-                    }
-                }
-                let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * self.scale).rounded())
-                let visiblePx = self.visibleSize.map { CGSize(width: $0.width * self.scale, height: $0.height * self.scale) }
-                if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: self.scale, visible: visiblePx),
-                   hash != self.cornersHash {
-                    self.cornersHash = hash
-                    self.pendingCorners = (t, tiles)
-                }
-                fillCorners(pb, radiusPx: Int(28 * self.scale))
-                fillEdges(pb, ring: max(2, Int(self.scale)))
-                // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
-                // drops alpha, which would leave them darkened. Restore their real colour.
-                // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
-                // the full pass is needed.
-                if hasTranslucency(pb, skip: Int(28 * self.scale)) { unpremultiply(pb) }
-                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
-                if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", self.wid, ms)) }
-            }
-            self.pendingBuffer = pb
-            self.refinementsLeft = 2
-            self.pump()
+            self.process(pb, contentRect: contentRect, contentScale: contentScale, scaleFactor: scaleFactor, lagUs: lagUs)
         }
+    }
+
+    /// A captured frame (from the stream, or the still that stands in until it starts), on
+    /// `queue`: prepared and handed to the encoder.
+    private func process(_ pb: CVPixelBuffer, contentRect: CGRect?, contentScale: CGFloat, scaleFactor: CGFloat, lagUs: UInt64,
+                         still: Bool = false) {
+        if !still {
+            framesSinceStart += 1
+            stopRetries = 0
+        }
+        if lagUs > 0 { statCaptureLagSum += lagUs; statCaptureLagN += 1 }
+        if !loggedAttachments {
+            loggedAttachments = true
+            let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
+            log("stream \(wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
+        }
+        if let r = contentRect {
+            let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
+            let cw = r.width * scaleFactor, ch = r.height * scaleFactor
+            if abs(cw - bw) > 2 || abs(ch - bh) > 2 {
+                mismatchLogs += 1
+                if mismatchLogs <= 5 {
+                    log(String(format: "stream %u: content %.0fx%.0f (rect %@ contentScale %.2f scaleFactor %.1f) in buffer %.0fx%.0f, pointSize %@",
+                               wid, cw, ch, NSStringFromRect(r), contentScale, scaleFactor, bw, bh, NSStringFromSize(pointSize)))
+                }
+            }
+        }
+        if !lossless {
+            // Apps that hide the standard buttons and draw their own: find them in the pixels
+            // (a few times a second until found).
+            if !buttons.contains(where: { $0.width > 0 }), onDetectedButtons != nil {
+                detectCountdown -= 1
+                if detectCountdown <= 0 {
+                    detectCountdown = 20
+                    if let found = detectTrafficLights(pb, scale: scale) {
+                        log("stream \(wid): found app-drawn traffic lights at \(found.map { "\(Int($0.minX)),\(Int($0.minY))" })")
+                        buttons = found
+                        onDetectedButtons?(found)
+                    }
+                }
+            }
+            // Order matters: erase the capture badge first (it overlaps the top-left
+            // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
+            if let dark = eraseCaptureBadge(pb, buttons: buttons, badge: badgeRect(), scale: scale) { darkTitleBar = dark }
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            // A few radius measurements per window (not every frame) feed the shared vote.
+            measureCountdown -= 1
+            if radiusSamples < 5, measureCountdown <= 0 {
+                measureCountdown = 15
+                if let r = measureCornerRadius(pb, scale: scale) {
+                    radiusSamples += 1
+                    let pt = Int((CGFloat(r) / scale).rounded())
+                    WindowStreamer.radiusVotes[pt, default: 0] += 1
+                    log("stream \(wid): corner radius sample \(pt)pt → consensus \(WindowStreamer.consensusRadiusPt)pt")
+                }
+            }
+            let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded())
+            let visiblePx = visibleSize.map { CGSize(width: $0.width * scale, height: $0.height * scale) }
+            if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale, visible: visiblePx),
+               hash != cornersHash {
+                cornersHash = hash
+                pendingCorners = (t, tiles)
+            }
+            fillCorners(pb, radiusPx: Int(28 * scale))
+            fillEdges(pb, ring: max(2, Int(scale)))
+            // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
+            // drops alpha, which would leave them darkened. Restore their real colour.
+            // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
+            // the full pass is needed.
+            if hasTranslucency(pb, skip: Int(28 * scale)) { unpremultiply(pb) }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", wid, ms)) }
+        }
+        pendingBuffer = pb
+        refinementsLeft = 2
+        pump()
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -485,6 +531,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// the virtual display came back): if none has come within a second, start again (at most
     /// three times). A one-off check, nothing keeps running.
     private var framesSinceStart = 0
+    /// A still was sent ahead of the first capture (once per window).
+    private var sentStill = false
     private var startRetries = 0
 
     private func expectFirstFrame(from s: SCStream, win: SCWindow) {

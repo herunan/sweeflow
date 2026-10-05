@@ -89,9 +89,9 @@ final class WindowTracker {
 
     /// Checks closely for a moment (half a second): every 8 ms after a click or key (menus and
     /// popovers open and close then), every 33 ms while the pointer moves.
-    func burst(everyMs interval: Int = 8) {
+    func burst(everyMs interval: Int = 8, for seconds: Double = 0.5) {
         queue.async { [self] in
-            burstUntil = .now() + 0.5
+            burstUntil = max(burstUntil, .now() + seconds)
             if let current = burstInterval, current <= interval, burstTimer != nil { return }
             burstTimer?.cancel()
             burstInterval = interval
@@ -217,12 +217,13 @@ final class WindowTracker {
         // Untitled floating windows over one of their app's windows belong to it: a search
         // field's suggestions, an event's hover card (a calendar app). Shown attached, like menus.
         // Titled ones (a reminder, an inspector) stay windows of their own.
-        // An app's overlay inside its own window (System Settings' search suggestions): listed
-        // as a window, but with no window buttons, and lying wholly within a bigger window of the
-        // app. Shown attached to that window, like a popover.
+        // An app's overlay opening from inside its own window (System Settings' search
+        // suggestions, which can hang off the bottom): listed as a window, but with no window
+        // buttons, starting within a bigger window of the app. Shown attached to it, like a popover.
         for (wid, w) in seen where w.kind == .toplevel {
+            let corner = CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)
             let host = seen.values.contains {
-                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && $0.frame.contains(w.frame)
+                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && $0.frame.contains(corner)
                     && $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
             }
             guard host else { continue }

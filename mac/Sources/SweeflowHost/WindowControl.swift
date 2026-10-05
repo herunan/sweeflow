@@ -3,25 +3,41 @@ import ApplicationServices
 import CPrivate
 
 /// Moves, resizes, raises and closes real Mac windows through the Accessibility API.
+/// Used from the session's queue and its Accessibility queue (the cache is locked).
 final class WindowControl {
     private var cache: [UInt32: AXUIElement] = [:]
+    private let lock = NSLock()
 
     func element(_ wid: UInt32, pid: pid_t) -> AXUIElement? {
-        if let e = cache[wid] { return e }
+        if let e = lock.withLock({ cache[wid] }) { return e }
         let app = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
               let wins = value as? [AXUIElement] else { return nil }
-        for w in wins {
-            var id: CGWindowID = 0
-            if _AXUIElementGetWindow(w, &id) == .success {
-                cache[id] = w
+        return lock.withLock {
+            for w in wins {
+                var id: CGWindowID = 0
+                if _AXUIElementGetWindow(w, &id) == .success {
+                    cache[id] = w
+                }
             }
+            return cache[wid]
         }
-        return cache[wid]
     }
 
-    func forget(_ wid: UInt32) { cache[wid] = nil }
+    /// Whether the window still exists for Accessibility: a closed one's element goes invalid
+    /// at once, while a minimising one stays valid.
+    func exists(_ wid: UInt32, pid: pid_t) -> Bool {
+        guard let e = element(wid, pid: pid) else { return false }
+        var role: CFTypeRef?
+        if AXUIElementCopyAttributeValue(e, kAXRoleAttribute as CFString, &role) == .invalidUIElement {
+            forget(wid)
+            return false
+        }
+        return true
+    }
+
+    func forget(_ wid: UInt32) { lock.withLock { cache[wid] = nil } }
 
     @discardableResult
     func setSize(_ wid: UInt32, pid: pid_t, _ size: CGSize) -> Bool {

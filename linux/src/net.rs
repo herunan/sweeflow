@@ -346,8 +346,11 @@ async fn session(
                     NetCmd::Subscribe(wid) => {
                         // A window minimised on the Mac loses its capture; its task has ended.
                         if video.get(&wid).is_some_and(|(_, task)| !task.is_finished()) { continue; }
+                        let t0 = std::time::Instant::now();
                         let (mut tx, rx) = conn.open_bi().await?;
+                        let opened = t0.elapsed();
                         tx.write_all(&W::new(t::SUBSCRIBE).u32(wid).finish()).await?;
+                        log::info!("window {wid}: video stream opened in {opened:?}, subscribed in {:?}", t0.elapsed());
                         let task = tokio::spawn(video_task(wid, rx, ui.clone(), render_node.clone()));
                         video.insert(wid, (tx, task));
                     }
