@@ -3,6 +3,7 @@ mod clipboard;
 mod config;
 mod decode;
 mod desktop;
+mod frames;
 mod launchers;
 mod lights;
 mod menus;

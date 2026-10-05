@@ -138,6 +138,7 @@ final class Session {
             cursor = cw
             sendAppList()
             sendSettings()
+            openDatagrams()
             if !watchingLock {
                 watchingLock = true
                 ScreenLock.onChange { [weak self] in self?.queue.async { self?.sendLockState() } }
@@ -177,6 +178,9 @@ final class Session {
                 self.control?.send(m)
             }
             st.active = wid == clientFocus
+            if let flow = datagrams {
+                st.sendDatagram = { d in flow.send(content: d, completion: .idempotent) }
+            }
             streamers[ObjectIdentifier(s)] = st
             st.start()
             queue.asyncAfter(deadline: .now() + 0.6) { st.checkScale() }
@@ -799,6 +803,24 @@ final class Session {
     }
 
     private var watchingLock = false
+
+    /// The connection's QUIC datagram flow (for video), opened on hello.
+    private var datagrams: NWConnection?
+
+    private func openDatagrams() {
+        guard datagrams == nil, settings.config.videoDatagrams else { return }
+        let opts = NWProtocolQUIC.Options()
+        opts.isDatagram = true
+        guard let flow = group.extract(connectionTo: nil, using: opts) else { return log("datagrams: unavailable, video on streams") }
+        flow.stateUpdateHandler = { [weak self] state in
+            guard case .failed = state, let self else { return }
+            log("datagrams: \(state), video on streams")
+            self.datagrams = nil
+            self.streamers.values.forEach { $0.sendDatagram = nil }
+        }
+        flow.start(queue: queue)
+        datagrams = flow
+    }
 
     // MARK: settings
 

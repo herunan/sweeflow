@@ -13,6 +13,7 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::frames::Encoded;
 use crate::{
     config::Config,
     decode::{Decoder, GpuFrame},
@@ -110,6 +111,7 @@ pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEv
 
 pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let _ = NET_TX.set(tx.clone());
     listen_local(tx.clone());
     std::thread::Builder::new()
         .name("net".into())
@@ -119,6 +121,18 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
         })
         .unwrap();
     tx
+}
+
+/// Each window's decoder input, for frames arriving as datagrams.
+static FRAME_SINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, std::sync::mpsc::Sender<Encoded>>>> =
+    std::sync::LazyLock::new(Default::default);
+/// For decoders to ask the Mac for a keyframe (after a lost frame or a decode error).
+static NET_TX: std::sync::OnceLock<mpsc::UnboundedSender<NetCmd>> = std::sync::OnceLock::new();
+
+fn request_keyframe(wid: u32) {
+    if let Some(tx) = NET_TX.get() {
+        let _ = tx.send(NetCmd::Video(wid, W::new(t::REQUEST_KEYFRAME).finish()));
+    }
 }
 
 /// Local socket for `sweeflow launch <bundle id>` (used by the Mac app launchers).
@@ -292,6 +306,25 @@ async fn session(
         anyhow::Ok(())
     });
 
+    // Delta video frames, as QUIC datagrams: put back together, then to their window's decoder.
+    let datagram_task = {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut r = crate::frames::Reassembler::default();
+            while let Ok(d) = conn.read_datagram().await {
+                match r.push(&d, std::time::Instant::now()) {
+                    Some((wid, Ok(f))) => {
+                        if let Some(tx) = FRAME_SINKS.lock().unwrap().get(&wid) {
+                            let _ = tx.send(f);
+                        }
+                    }
+                    Some((wid, Err(e))) => log::warn!("window {wid}: bad datagram frame: {e}"),
+                    None => {}
+                }
+            }
+        })
+    };
+
     // Mac app audio → PipeWire.
     let audio = {
         let (mut atx, arx) = conn.open_bi().await?;
@@ -392,6 +425,7 @@ async fn session(
     }
     audio.abort();
     clip_task.abort();
+    datagram_task.abort();
     conn.close(0u32.into(), b"bye");
     result
 }
@@ -511,24 +545,21 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     ui.send(ev).map_err(|_| anyhow::anyhow!("ui gone"))
 }
 
-struct Encoded {
-    capture_us: u64,
-    w: u16,
-    h: u16,
-    key: bool,
-    lossless: bool,
-    dark: bool,
-    /// Pixels per point of this frame (2 for Retina captures).
-    px_per_pt: u8,
-    full_range: bool,
-    data: Vec<u8>,
-}
 
 /// Receives encoded frames for one window and decodes them on a dedicated thread, so a slow
 /// decode never stalls the network reader.
 async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: String) {
     // Unbounded is fine: the host never has more than a couple of frames in flight.
     let (ftx, frx) = std::sync::mpsc::channel::<Encoded>();
+    // Frames also arrive as datagrams (see the session's datagram task).
+    FRAME_SINKS.lock().unwrap().insert(wid, ftx.clone());
+    struct Unregister(u32);
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            FRAME_SINKS.lock().unwrap().remove(&self.0);
+        }
+    }
+    let _unregister = Unregister(wid);
     let ui2 = ui.clone();
     std::thread::Builder::new()
         .name(format!("decode-{wid}"))
@@ -536,7 +567,24 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
             // Created on the first HEVC frame; popups only ever send lossless frames.
             let mut dec: Option<Decoder> = None;
             let mut waiting_for_key = true;
-            while let Ok(f) = frx.recv() {
+            let mut order = crate::frames::Orderer::default();
+            let mut reported_lost = 0;
+            let mut last_report = std::time::Instant::now();
+            loop {
+                let ready = match frx.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Ok(f) => order.push(f, std::time::Instant::now()),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => order.tick(std::time::Instant::now()),
+                    Err(_) => break,
+                };
+                if ready.request_key {
+                    request_keyframe(wid);
+                }
+                if order.lost != reported_lost && last_report.elapsed().as_secs() >= 10 {
+                    log::info!("window {wid}: {} frame(s) lost in transit so far", order.lost);
+                    reported_lost = order.lost;
+                    last_report = std::time::Instant::now();
+                }
+                for f in ready.frames {
                 if f.lossless {
                     let expected = f.w as usize * f.h as usize * 4;
                     match lz4_flex::decompress(&f.data, expected) {
@@ -577,7 +625,9 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                     Err(e) => {
                         log::warn!("window {wid}: decode error {e:#}; waiting for keyframe");
                         waiting_for_key = true;
+                        request_keyframe(wid);
                     }
+                }
                 }
             }
         })
@@ -616,24 +666,7 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
         if ty != t::FRAME {
             continue;
         }
-        let parsed = (|| -> Result<_> {
-            let mut r = R::new(&body);
-            let capture_us = r.u64()?;
-            let w = r.u16()?;
-            let h = r.u16()?;
-            let flags = r.u8()?;
-            Ok(Encoded {
-                capture_us,
-                w,
-                h,
-                key: flags & 1 != 0,
-                lossless: flags & 2 != 0,
-                dark: flags & 4 != 0,
-                px_per_pt: flags >> 4,
-                full_range: flags & 8 != 0,
-                data: r.bytes()?.to_vec(),
-            })
-        })();
+        let parsed = crate::frames::parse_frame(&body);
         match parsed {
             Ok(f) => {
                 if ftx.send(f).is_err() {

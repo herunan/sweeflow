@@ -85,6 +85,8 @@ final class Server {
         quic.initialMaxData = 64 << 20
         quic.initialMaxStreamDataBidirectionalLocal = 16 << 20
         quic.initialMaxStreamDataBidirectionalRemote = 16 << 20
+        // Video goes as datagrams (a lost packet drops its frame instead of stalling the rest).
+        quic.maxDatagramFrameSize = 65535
         let sec = quic.securityProtocolOptions
         sec_protocol_options_set_local_identity(sec, identity.secIdentity)
         sec_protocol_options_set_peer_authentication_required(sec, true)

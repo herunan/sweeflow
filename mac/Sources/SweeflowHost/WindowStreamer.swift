@@ -25,6 +25,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoderSize: (Int32, Int32) = (0, 0)
 
     private var inFlight: [UInt64] = []
+    /// Sends one QUIC datagram (set by the session): delta frames go this way, so a lost packet
+    /// costs that frame rather than stalling the stream behind it.
+    var sendDatagram: ((Data) -> Void)?
+    /// Numbers HEVC frames, so the client can order them across the stream and datagrams and
+    /// notice a lost one.
+    private var frameSeq: UInt32 = 0
     // Enough for 100–120 fps over a ~25 ms pipeline; more only queues frames in the encoder.
     private let maxInFlight = 3
     private var pendingBuffer: CVPixelBuffer?   // newest capture not yet encoded (throttled)
@@ -525,6 +531,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Encodes the pending capture if flow control allows.
     private func pump() {
+        // A frame lost on the way (datagrams) is never acknowledged: don't wait for it forever.
+        let now = hostMicros()
+        inFlight.removeAll { now > $0 && now - $0 > 300_000 }
         guard !stopped, !paused, inFlight.count < maxInFlight, let pb = pendingBuffer else { return }
         pendingBuffer = nil
         if lossless { sendLossless(pb) } else { encode(pb) }
@@ -734,7 +743,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         m.u16(UInt16(w)); m.u16(UInt16(h))
         m.u8((key ? 1 : 0) | (darkTitleBar ? 4 : 0) | (fullRange ? 8 : 0) | (UInt8(min(15, max(1, scale.rounded()))) << 4))
         m.bytes(data)
-        out.send(m)
+        frameSeq &+= 1
+        m.u32(frameSeq)
+        // Keyframes (big, and everything after depends on them) stay on the reliable stream.
+        if !key, let send = sendDatagram {
+            for d in Datagrams.split(m.framed, wid: wid, seq: frameSeq) { send(d) }
+        } else {
+            out.send(m)
+        }
         statFrames += 1
         statBytes += data.count
     }

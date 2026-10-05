@@ -29,6 +29,8 @@ struct Config: Codable {
     var dragDrop = true
     /// The Mac Apps folder in the Linux app menu.
     var launcherMenu = true
+    /// Delta video frames as QUIC datagrams (off: everything on the windows' streams).
+    var videoDatagrams = true
     /// Mac windows on a Linux desktop of their own.
     var ownDesktop = true
     /// "sharp": Retina, 10-bit. "light": 1x, 8-bit, for slower networks.
@@ -53,6 +55,7 @@ struct Config: Codable {
         launcherMenu = try c.decodeIfPresent(Bool.self, forKey: .launcherMenu) ?? d.launcherMenu
         quality = try c.decodeIfPresent(String.self, forKey: .quality) ?? d.quality
         ownDesktop = try c.decodeIfPresent(Bool.self, forKey: .ownDesktop) ?? d.ownDesktop
+        videoDatagrams = try c.decodeIfPresent(Bool.self, forKey: .videoDatagrams) ?? d.videoDatagrams
     }
 
     func allows(_ bundleId: String) -> Bool {

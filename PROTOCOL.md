@@ -87,3 +87,15 @@ Closing a video stream unsubscribes.
 |------|-----|------|---------|
 | 0x60 | C→S | AudioSubscribe | — (on a new bidirectional stream) |
 | 0x61 | S→C | Audio | bytes pcm — 48 kHz stereo s16le, the streamed apps' audio mixed |
+
+## Video datagrams
+
+Delta (non-key) HEVC frames go as QUIC datagrams instead of on the window's stream, so a lost
+packet costs that frame rather than stalling the frames behind it. Keyframes, lossless (popup)
+frames and corners stay on the stream. A FRAME message's body ends with a `u32` sequence number
+(HEVC frames only); the frame message, framed exactly as on the stream, is cut into datagrams of
+at most 1100 payload bytes, each with a 12-byte header: `u32 window id, u32 sequence, u16 piece
+index, u16 piece count` (little-endian). The client reassembles, orders by sequence, gives up on a
+missing frame after 40 ms and sends REQUEST_KEYFRAME (0x52) on the window's stream. The host
+forgets unacknowledged frames after 300 ms. `videoDatagrams: false` in the host's config.json
+turns this off.
