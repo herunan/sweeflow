@@ -5,7 +5,6 @@
 
 use std::{
     collections::HashMap,
-    hash::{Hash, Hasher},
     io::Read,
     path::PathBuf,
     sync::Arc,
@@ -43,16 +42,6 @@ pub fn decode(body: &[u8]) -> Result<Vec<ClipItem>> {
     let mut r = R::new(body);
     let n = r.u16()?;
     (0..n).map(|_| Ok(ClipItem { kind: r.str()?, name: r.str()?, data: r.bytes()?.to_vec() })).collect()
-}
-
-pub fn fingerprint(items: &[ClipItem]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for it in items {
-        it.kind.hash(&mut h);
-        it.name.hash(&mut h);
-        it.data.hash(&mut h);
-    }
-    h.finish()
 }
 
 /// What we offer on the Linux clipboard (or a drag) for items from the Mac: MIME type → bytes.
@@ -273,4 +262,32 @@ pub fn drop_items(data: Vec<(String, Vec<u8>)>) -> Vec<ClipItem> {
         return vec![ClipItem { kind: TEXT.into(), name: String::new(), data: text }];
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_items_survive_the_wire() {
+        let items = vec![
+            ClipItem { kind: "text/plain;charset=utf-8".into(), name: String::new(), data: "héllo".as_bytes().to_vec() },
+            ClipItem { kind: "file".into(), name: "a b.pdf".into(), data: vec![0, 1, 2, 255] },
+        ];
+        let msg = encode(&items);
+        // encode() frames the message (u32 length, type); decode() takes the body.
+        let (ty, body) = (msg[4], &msg[5..]);
+        assert_eq!(ty, crate::proto::t::CLIPBOARD);
+        let back = decode(body).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].data, "héllo".as_bytes());
+        assert_eq!(back[1].name, "a b.pdf");
+        assert_eq!(back[1].data, vec![0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn a_truncated_clipboard_message_is_an_error() {
+        let msg = encode(&[ClipItem { kind: "file".into(), name: "x".into(), data: vec![1; 100] }]);
+        assert!(decode(&msg[5..msg.len() - 10]).is_err());
+    }
 }

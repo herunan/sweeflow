@@ -81,6 +81,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // Stats
     private var statFrames = 0, statBytes = 0, statLatencySum: UInt64 = 0, statLatencyN = 0
+    /// Every capture→present time this period (for percentiles).
+    private var statLatencies: [UInt64] = []
     private var statEncodeSum: UInt64 = 0, statEncodeN = 0, statCaptureLagSum: UInt64 = 0, statCaptureLagN = 0
     private var statSince = DispatchTime.now()
 
@@ -361,7 +363,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         if let i = inFlight.firstIndex(of: captureUs) {
             inFlight.removeSubrange(...i)
             let now = hostMicros()
-            if now > captureUs { statLatencySum += now - captureUs; statLatencyN += 1 }
+            if now > captureUs {
+                statLatencySum += now - captureUs; statLatencyN += 1
+                statLatencies.append(now - captureUs)
+            }
         }
         pump()
     }
@@ -606,8 +611,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let lat = statLatencyN > 0 ? Double(statLatencySum) / Double(statLatencyN) / 1000 : -1
         let enc = statEncodeN > 0 ? Double(statEncodeSum) / Double(statEncodeN) / 1000 : -1
         let lag = statCaptureLagN > 0 ? Double(statCaptureLagSum) / Double(statCaptureLagN) / 1000 : -1
-        log(String(format: "stream %u: %.1f fps, %.1f Mbit/s, capture→present %.1f ms (capture lag %.1f, encode %.1f, in flight %d)", wid,
-                   Double(statFrames) / el, Double(statBytes) * 8 / el / 1e6, lat, lag, enc, inFlight.count))
+        let sorted = statLatencies.sorted()
+        func pct(_ p: Double) -> Double { sorted.isEmpty ? -1 : Double(sorted[min(sorted.count - 1, Int(Double(sorted.count) * p))]) / 1000 }
+        log(String(format: "stream %u: %.1f fps, %.1f Mbit/s, capture→present %.1f ms (p50 %.1f, p95 %.1f, max %.1f; capture lag %.1f, encode %.1f, in flight %d)", wid,
+                   Double(statFrames) / el, Double(statBytes) * 8 / el / 1e6, lat, pct(0.5), pct(0.95), pct(1), lag, enc, inFlight.count))
+        statLatencies.removeAll(keepingCapacity: true)
         statFrames = 0; statBytes = 0; statLatencySum = 0; statLatencyN = 0; statSince = .now()
         statEncodeSum = 0; statEncodeN = 0; statCaptureLagSum = 0; statCaptureLagN = 0
     }

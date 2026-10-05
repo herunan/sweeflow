@@ -46,16 +46,19 @@ final class Settings {
     /// A change from the client: only the fields it sent.
     func apply(wire data: Data) {
         guard let w = try? JSONDecoder().decode(Wire.self, from: data) else { return log("bad settings from client") }
-        update { c in
-            if let v = w.enabled { c.enabled = v }
-            if let v = w.exclude { c.excludeApps = v }
-            if let v = w.sound { c.soundOnLinux = v }
-            if let v = w.dim { c.dimMacScreenWhileStreaming = v }
-            if let v = w.clipboard { c.clipboard = v }
-            if let v = w.dragDrop { c.dragDrop = v }
-            if let v = w.launcher { c.launcherMenu = v }
-            if let v = w.quality, ["sharp", "light"].contains(v) { c.quality = v }
-            if let v = w.desktop { c.ownDesktop = v }
-        }
+        update { Self.merge(w, into: &$0) }
+    }
+
+    /// Applies the fields the client sent; anything absent or invalid stays as it is.
+    static func merge(_ w: Wire, into c: inout Config) {
+        if let v = w.enabled { c.enabled = v }
+        if let v = w.exclude { c.excludeApps = v }
+        if let v = w.sound { c.soundOnLinux = v }
+        if let v = w.dim { c.dimMacScreenWhileStreaming = v }
+        if let v = w.clipboard { c.clipboard = v }
+        if let v = w.dragDrop { c.dragDrop = v }
+        if let v = w.launcher { c.launcherMenu = v }
+        if let v = w.quality, ["sharp", "light"].contains(v) { c.quality = v }
+        if let v = w.desktop { c.ownDesktop = v }
     }
 }

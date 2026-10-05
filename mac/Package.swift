@@ -21,5 +21,11 @@ let package = Package(
                 .linkedFramework("Accelerate"),
             ]
         ),
+        // `swift test` (needs Xcode): the host's pure logic.
+        .testTarget(
+            name: "SweeflowHostTests",
+            dependencies: ["SweeflowHost"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

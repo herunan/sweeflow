@@ -503,7 +503,7 @@ impl App {
                 }
             }
             UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png, qh),
-            UiEvent::Focused(_) => {}
+            UiEvent::Focused => {}
             UiEvent::WindowButtons(wid, rects) => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.buttons = rects;

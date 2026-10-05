@@ -94,12 +94,7 @@ fn write_rule(desktop: Option<&str>) -> Result<()> {
         Command::new("kwriteconfig6").args(["--file", "kwinrulesrc", "--group", group, "--key", key, value]).status()
     };
     let read = Command::new("kreadconfig6").args(["--file", "kwinrulesrc", "--group", "General", "--key", "rules"]).output()?;
-    let mut rules: Vec<String> = String::from_utf8_lossy(&read.stdout)
-        .trim()
-        .split(',')
-        .filter(|r| !r.is_empty() && *r != RULE)
-        .map(String::from)
-        .collect();
+    let mut rules = other_rules(&String::from_utf8_lossy(&read.stdout));
     match desktop {
         Some(id) => {
             for (k, v) in [
@@ -127,6 +122,11 @@ fn write_rule(desktop: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// kwinrulesrc's rule list without ours (it's added back when switched on).
+fn other_rules(list: &str) -> Vec<String> {
+    list.trim().split(',').filter(|r| !r.is_empty() && *r != RULE).map(String::from).collect()
+}
+
 fn run_script(js: &str) -> Result<()> {
     let path = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -148,4 +148,16 @@ fn run_script(js: &str) -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
     conn.call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "unloadScript", &("sweeflow-desktop",))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_peoples_rules_are_kept() {
+        assert_eq!(other_rules("abc,sweeflow,def\n"), ["abc", "def"]);
+        assert_eq!(other_rules(""), Vec::<String>::new());
+        assert_eq!(other_rules("sweeflow"), Vec::<String>::new());
+    }
 }

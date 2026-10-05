@@ -42,7 +42,7 @@ pub enum UiEvent {
     WindowRemoved(u32),
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
-    Focused(u32),
+    Focused,
     /// Close / minimise / zoom button rects (x, y, w, h) in window points.
     WindowButtons(u32, [[f32; 4]; 3]),
     MoveStarted(u32),
@@ -76,7 +76,7 @@ impl UiEvent {
             UiEvent::WindowRemoved(_) => "window removed",
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
-            UiEvent::Focused(_) => "focused",
+            UiEvent::Focused => "focused",
             UiEvent::WindowButtons(..) => "window buttons",
             UiEvent::MoveStarted(_) => "move started",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
@@ -433,7 +433,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::WINDOW_REMOVED => UiEvent::WindowRemoved(r.u32()?),
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
-        t::FOCUSED => UiEvent::Focused(r.u32()?),
+        t::FOCUSED => {
+            r.u32()?;
+            UiEvent::Focused
+        }
         t::WINDOW_BUTTONS => {
             let wid = r.u32()?;
             let mut rects = [[0f32; 4]; 3];

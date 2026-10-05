@@ -498,27 +498,13 @@ final class Session {
             .filter { $0.wid != w.wid && $0.kind != .popup }
             .map { o -> TrackedWindow in var o = o; if let m = justMoved[o.wid] { o.frame = m.frame }; return o }
             .filter { area.intersects($0.frame) }
-        let frame = CGRect(origin: origin, size: w.frame.size)
-        func overlap(_ a: CGRect, _ b: CGRect) -> CGFloat { let i = a.intersection(b); return i.isNull ? 0 : i.width * i.height }
-        let size = frame.width * frame.height
-        let covered = others.contains { o in
-            let overlay = o.pid == w.pid && o.frame.contains(w.frame) && o.frame.width * o.frame.height > size
-            return !overlay && overlap(frame, o.frame) > size * 0.85
-        }
-        guard covered, frame.width < area.width, frame.height < area.height else { return origin }
-        var best = origin, bestOverlap = CGFloat.infinity
-        for y in stride(from: area.minY, through: area.maxY - frame.height, by: 90) {
-            for x in stride(from: area.minX, through: area.maxX - frame.width, by: 120) {
-                let r = CGRect(x: x, y: y, width: frame.width, height: frame.height)
-                let o = others.reduce(0) { $0 + overlap(r, $1.frame) }
-                if o < bestOverlap { best = r.origin; bestOverlap = o }
-                if o == 0 { break }
-            }
-            if bestOverlap == 0 { break }
-        }
+            // An app's own overlay inside its window (a search panel) doesn't count.
+            .filter { o in !(o.pid == w.pid && o.frame.contains(w.frame) && o.frame.width * o.frame.height > w.frame.width * w.frame.height) }
+            .map(\.frame)
+        let best = Placement.uncovered(CGRect(origin: origin, size: w.frame.size), others: others, in: area)
         if best != origin {
             log("window \(w.wid) (\(w.appName)): moved out from under another window")
-            justMoved[w.wid] = (CGRect(origin: best, size: frame.size), now)
+            justMoved[w.wid] = (CGRect(origin: best, size: w.frame.size), now)
         }
         return best
     }
@@ -551,6 +537,12 @@ final class Session {
             input.button(right ? 1 : 0, pressed: false, at: p)
         }
         return "ok \(p)"
+    }
+
+    func debugClose(_ wid: UInt32) -> String {
+        guard let w = tracker.windows[wid] else { return "no window \(wid)" }
+        ax(burstFor: 2) { $0.close(wid, pid: w.pid) }
+        return "ok"
     }
 
     func debugBlind() -> String {

@@ -288,3 +288,27 @@ impl ksni::Tray for Tray {
         items
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_parse_as_the_mac_sends_them() {
+        let json = br#"{"enabled":true,"exclude":["com.apple.finder"],"sound":false,"dim":true,"clipboard":true,"dragDrop":false,"launcher":true,"quality":"light","desktop":false}"#;
+        let s: Settings = serde_json::from_slice(json).unwrap();
+        assert!(s.enabled && !s.sound && !s.drag_drop && !s.desktop);
+        assert_eq!(s.exclude, ["com.apple.finder"]);
+        assert_eq!(s.quality, "light");
+        // And back, in the Mac's field names.
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"dragDrop\":false"));
+    }
+
+    #[test]
+    fn an_older_mac_without_the_desktop_setting_means_on() {
+        let json = br#"{"enabled":true,"exclude":[],"sound":true,"dim":true,"clipboard":true,"dragDrop":true,"launcher":true,"quality":"sharp"}"#;
+        let s: Settings = serde_json::from_slice(json).unwrap();
+        assert!(s.desktop);
+    }
+}

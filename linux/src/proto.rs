@@ -39,6 +39,7 @@ pub mod t {
     pub const KEY: u8 = 0x33;
     pub const RELEASE_ALL: u8 = 0x34;
     pub const CLIPBOARD: u8 = 0x40;
+    #[allow(dead_code)] // part of the protocol; this client measures RTT from QUIC instead
     pub const PING: u8 = 0x41;
     pub const CLIPBOARD_SUBSCRIBE: u8 = 0x43;
     pub const DROP_FILES: u8 = 0x46;
@@ -138,4 +139,25 @@ pub async fn read_msg(rx: &mut quinn::RecvStream) -> Result<Option<(u8, Vec<u8>)
     rx.read_exact(&mut buf).await?;
     let ty = buf.remove(0);
     Ok(Some((ty, buf)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_and_reader_agree() {
+        let m = W::new(t::BLIND_SHOW).u32(7).str("Größe").u16(2).f32(1.5).u64(u64::MAX).bytes(&[9, 8]).u8(1).finish();
+        assert_eq!(u32::from_le_bytes(m[..4].try_into().unwrap()) as usize, m.len() - 4);
+        assert_eq!(m[4], t::BLIND_SHOW);
+        let mut r = R::new(&m[5..]);
+        assert_eq!(r.u32().unwrap(), 7);
+        assert_eq!(r.str().unwrap(), "Größe");
+        assert_eq!(r.u16().unwrap(), 2);
+        assert_eq!(r.f32().unwrap(), 1.5);
+        assert_eq!(r.u64().unwrap(), u64::MAX);
+        assert_eq!(r.bytes().unwrap(), &[9, 8]);
+        assert_eq!(r.u8().unwrap(), 1);
+        assert!(r.u8().is_err(), "reading past the end fails");
+    }
 }
