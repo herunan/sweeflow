@@ -557,7 +557,10 @@ impl App {
                 self.present_raw(wid, w, h, px_per_pt, capture_us, bgra, qh)
             }
             UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles, qh),
-            UiEvent::BlindShow { id, app, title, texts, buttons } => crate::blind::show(id, &app, &title, &texts, &buttons, self.net.clone()),
+            UiEvent::BlindShow { id, app, buttons, menu: true, .. } => crate::blind::show_menu(id, &app, &buttons, self.net.clone()),
+            UiEvent::BlindShow { id, app, title, texts, buttons, menu: false } => {
+                crate::blind::show(id, &app, &title, &texts, &buttons, self.net.clone())
+            }
         }
     }
 
@@ -1426,6 +1429,7 @@ fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64
 
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
+const KEY_SPACE: u32 = 57;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
@@ -1455,6 +1459,17 @@ fn switch_windows(reverse: bool) {
     std::thread::spawn(move || {
         let _ = std::process::Command::new("qdbus6")
             .args(["org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
+
+/// Cmd+Space: Linux's search (KRunner), not the Mac's Spotlight, wherever the focus is.
+fn open_search() {
+    std::thread::spawn(|| {
+        let _ = std::process::Command::new("qdbus6")
+            .args(["org.kde.krunner", "/App", "org.kde.krunner.App.toggleDisplay"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -1777,6 +1792,11 @@ impl KeyboardHandler for App {
         if e.raw_code == KEY_TAB && self.meta_down > 0 {
             // Cmd+Tab switches between *all* desktop windows, like it does everywhere else.
             switch_windows(self.shift_down > 0);
+            self.swallowed.push(e.raw_code);
+            return;
+        }
+        if e.raw_code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
+            open_search();
             self.swallowed.push(e.raw_code);
             return;
         }

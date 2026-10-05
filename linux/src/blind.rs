@@ -104,6 +104,35 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
     });
 }
 
+/// An uncapturable Mac menu (a pop-up button's): its items as a pick-list. Cancelling closes
+/// the menu on the Mac.
+pub fn show_menu(id: u32, app: &str, items: &[String], net: UnboundedSender<NetCmd>) {
+    let mut cmd = Command::new("kdialog");
+    cmd.args(["--title", app, "--menu", "Choose:"]);
+    for (i, item) in items.iter().enumerate() {
+        cmd.args([i.to_string(), item.clone()]);
+    }
+    let child = match cmd.stdout(std::process::Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => return log::warn!("stand-in menu: {e}"),
+    };
+    let pid = child.id();
+    DIALOGS.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, pid);
+    std::thread::spawn(move || {
+        let Ok(out) = child.wait_with_output() else { return };
+        let ours = DIALOGS.lock().unwrap().as_mut().and_then(|m| (m.get(&id) == Some(&pid)).then(|| m.remove(&id))).flatten();
+        if ours.is_none() {
+            return;
+        }
+        // Killed (no exit code): nothing to do. Otherwise a choice, or cancelled (0xFFFF).
+        let Some(code) = out.status.code() else { return };
+        let index = if code == 0 { String::from_utf8_lossy(&out.stdout).trim().parse::<u16>().ok() } else { None };
+        let index = index.unwrap_or(0xFFFF);
+        log::info!("stand-in menu {id}: {}", if index == 0xFFFF { "cancelled".to_string() } else { format!("item {index}") });
+        let _ = net.send(NetCmd::Control(W::new(t::BLIND_PRESS).u32(id).u16(index).finish()));
+    });
+}
+
 /// The Mac window went away: close its dialog.
 pub fn gone(id: u32) {
     if let Some(pid) = DIALOGS.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) {

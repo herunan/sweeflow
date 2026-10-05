@@ -34,7 +34,7 @@ final class WindowTracker {
     private var bundleCache: [pid_t: (String, String)] = [:]
     /// macOS's "being captured" badges (small windows it attaches to captured windows), by pid.
     private(set) var badges: [pid_t: [CGRect]] = [:]
-    struct BlindWindow { let wid: UInt32; let pid: pid_t; let owner: String; let frame: CGRect }
+    struct BlindWindow { let wid: UInt32; let pid: pid_t; let owner: String; let frame: CGRect; var menu = false }
     /// Windows that can't be captured, and callbacks as they come and go.
     private(set) var blind: [UInt32: BlindWindow] = [:]
     var onBlindAdded: ((BlindWindow) -> Void)?
@@ -50,6 +50,9 @@ final class WindowTracker {
     /// Whether a window is one of its app's real windows (in its Accessibility window list).
     /// Set by the session; transient popups (a calendar app's event card) aren't.
     var isAppWindow: ((UInt32, pid_t) -> Bool)?
+    /// Whether a window lacks working window buttons (all zero-size): set by the session.
+    var hasNoButtons: ((UInt32, pid_t) -> Bool)?
+    private var noButtonsSeen: [UInt32: Bool] = [:]
     /// Untitled windows' answers, looked at for their first second (the list can lag a new
     /// window), then kept.
     private var appWindowSeen: [UInt32: (isApp: Bool, first: DispatchTime)] = [:]
@@ -147,9 +150,12 @@ final class WindowTracker {
                let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(),
                let layer = info[kCGWindowLayer as String] as? Int, (0..<1000).contains(layer),
                let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd),
-               b.width >= 150, b.height >= 80,
                !Self.notBlind.contains(owner) {
-                blindNow[wid] = BlindWindow(wid: wid, pid: pid, owner: owner, frame: b)
+                // An open pop-up menu (layer 101) is small; anything else that small is no dialog.
+                let menu = layer == 101 && (info[kCGWindowSharingState as String] as? Int) == 0
+                if menu ? (b.width >= 30 && b.height >= 16) : (b.width >= 150 && b.height >= 80) {
+                    blindNow[wid] = BlindWindow(wid: wid, pid: pid, owner: owner, frame: b, menu: menu)
+                }
             }
             guard let wid = info[kCGWindowNumber as String] as? UInt32,
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t,
@@ -201,6 +207,27 @@ final class WindowTracker {
         // Untitled floating windows over one of their app's windows belong to it: a search
         // field's suggestions, an event's hover card (a calendar app). Shown attached, like menus.
         // Titled ones (a reminder, an inspector) stay windows of their own.
+        // An app's overlay inside its own window (System Settings' search suggestions): listed
+        // as a window, but with no window buttons, and lying wholly within a bigger window of the
+        // app. Shown attached to that window, like a popover.
+        for (wid, w) in seen where w.kind == .toplevel {
+            let host = seen.values.contains {
+                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && $0.frame.contains(w.frame)
+                    && $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
+            }
+            guard host else { continue }
+            let none = noButtonsSeen[wid] ?? (hasNoButtons?(wid, w.pid) ?? false)
+            noButtonsSeen[wid] = none
+            guard none else { continue }
+            var p = w
+            p.kind = .popup
+            popups.append(p)
+            seen[wid] = nil
+            order.removeAll { $0 == wid }
+            if frontToplevel[w.pid]?.wid == wid {
+                frontToplevel[w.pid] = order.lazy.compactMap { seen[$0] }.first { $0.pid == w.pid }
+            }
+        }
         let appWindows = Array(seen.values)
         for i in popups.indices where popups[i].kind == .dialog && popups[i].title.isEmpty {
             let p = popups[i]
@@ -245,6 +272,7 @@ final class WindowTracker {
         popupMax = popupMax.filter { live.contains($0.key) }
         closing = closing.filter { id in popups.contains { $0.wid == id } }
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
+        noButtonsSeen = noButtonsSeen.filter { live.contains($0.key) }
         for (wid, old) in windows where seen[wid] == nil {
 
             windows[wid] = nil

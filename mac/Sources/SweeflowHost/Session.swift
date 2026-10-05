@@ -296,7 +296,10 @@ final class Session {
         case .blindPress:
             let wid = try m.u32(), index = Int(try m.u16())
             if wid == 1 { log("stand-in test: button \(index) chosen") }
-            if let b = blindButtons[wid], index < b.count {
+            if index == 0xFFFF, let menu = blindMenus[wid] {
+                // Cancelled on Linux: close the menu on the Mac too.
+                AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+            } else if let b = blindButtons[wid], index < b.count {
                 let r = AXUIElementPerformAction(b[index], kAXPressAction as CFString)
                 log("uncapturable window \(wid): pressed button \(index) (\(r == .success ? "ok" : "failed"))")
             }
@@ -461,7 +464,6 @@ final class Session {
     /// at its real position on the Mac, so any part off-screen there can't be clicked.
     private func placeOnVirtualDisplay(_ w: TrackedWindow) {
         guard w.kind != .popup, let area = vdArea else { return }
-        if area.contains(w.frame) { return }
         var origin = w.frame.origin
         if w.kind == .toplevel && !area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)) {
             origin = area.origin   // not on the display at all yet: top-left
@@ -469,7 +471,49 @@ final class Session {
         // Clamp so the whole window is visible (as far as it fits).
         origin.x = min(max(origin.x, area.minX), max(area.minX, area.maxX - w.frame.width))
         origin.y = min(max(origin.y, area.minY), max(area.minY, area.maxY - w.frame.height))
+        if w.kind == .toplevel { origin = uncovered(w, at: origin, in: area) }
         if origin != w.frame.origin { control_.setPosition(w.wid, pid: w.pid, origin) }
+    }
+
+    /// Nobody sees the virtual display, but macOS still works out which windows are hidden
+    /// behind others, and apps (Chromium/Electron ones especially) all but stop drawing those:
+    /// hovering one on Linux then lags while the Mac wakes it. So windows mostly under another
+    /// move to where they overlap the rest least. An app's own overlay inside its window (a
+    /// search panel) stays where it is.
+    /// Where windows were just moved (the tracker sees it on its next look), so several moved
+    /// at once don't all pick the same free spot.
+    private var justMoved: [UInt32: (frame: CGRect, at: DispatchTime)] = [:]
+
+    private func uncovered(_ w: TrackedWindow, at origin: CGPoint, in area: CGRect) -> CGPoint {
+        let now = DispatchTime.now()
+        justMoved = justMoved.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 1_500_000_000 }
+        let others = tracker.windows.values
+            .filter { $0.wid != w.wid && $0.kind != .popup }
+            .map { o -> TrackedWindow in var o = o; if let m = justMoved[o.wid] { o.frame = m.frame }; return o }
+            .filter { area.intersects($0.frame) }
+        let frame = CGRect(origin: origin, size: w.frame.size)
+        func overlap(_ a: CGRect, _ b: CGRect) -> CGFloat { let i = a.intersection(b); return i.isNull ? 0 : i.width * i.height }
+        let size = frame.width * frame.height
+        let covered = others.contains { o in
+            let overlay = o.pid == w.pid && o.frame.contains(w.frame) && o.frame.width * o.frame.height > size
+            return !overlay && overlap(frame, o.frame) > size * 0.85
+        }
+        guard covered, frame.width < area.width, frame.height < area.height else { return origin }
+        var best = origin, bestOverlap = CGFloat.infinity
+        for y in stride(from: area.minY, through: area.maxY - frame.height, by: 90) {
+            for x in stride(from: area.minX, through: area.maxX - frame.width, by: 120) {
+                let r = CGRect(x: x, y: y, width: frame.width, height: frame.height)
+                let o = others.reduce(0) { $0 + overlap(r, $1.frame) }
+                if o < bestOverlap { best = r.origin; bestOverlap = o }
+                if o == 0 { break }
+            }
+            if bestOverlap == 0 { break }
+        }
+        if best != origin {
+            log("window \(w.wid) (\(w.appName)): moved out from under another window")
+            justMoved[w.wid] = (CGRect(origin: best, size: frame.size), now)
+        }
+        return best
     }
 
     // MARK: debug hooks (DebugPort)
@@ -630,6 +674,10 @@ final class Session {
             }
         }
         tracker.isAppWindow = { [weak self] wid, pid in self?.control_.element(wid, pid: pid) != nil }
+        tracker.hasNoButtons = { [weak self] wid, pid in
+            guard let self, self.control_.element(wid, pid: pid) != nil else { return false }
+            return self.control_.buttonRects(wid, pid: pid).allSatisfy { $0.width == 0 }
+        }
         // Which window has focus changes with what the user does or with app switches, which
         // both start a burst of window checks.
         tracker.onBurstPoll = { [weak self] in self?.checkFocus() }
@@ -637,6 +685,7 @@ final class Session {
         tracker.onBlindRemoved = { [weak self] b in
             guard let self else { return }
             self.blindButtons[b.wid] = nil
+            self.blindMenus[b.wid] = nil
             var m = MsgWriter(.blindGone); m.u32(b.wid)
             self.control?.send(m)
         }
@@ -661,7 +710,11 @@ final class Session {
 
     /// A window that refuses capture appeared: read its text and buttons (a moment later, once
     /// it has drawn) and have Linux show a stand-in.
+    /// Open menus shown as stand-ins, to close them when the choice is cancelled on Linux.
+    private var blindMenus: [UInt32: AXUIElement] = [:]
+
     private func blindAdded(_ b: WindowTracker.BlindWindow) {
+        if b.menu { return blindMenuAdded(b) }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) { [weak self] in
             let content = BlindWindows.read(pid: b.pid, frame: b.frame)
             self?.queue.async {
@@ -676,6 +729,32 @@ final class Session {
                 m.u16(UInt16(buttons.count)); buttons.forEach { m.str($0.label) }
                 self.control?.send(m)
                 log("uncapturable window \(b.wid) (\(b.owner)): stand-in with \(buttons.count) buttons")
+            }
+        }
+    }
+
+    /// A menu that can't be captured (System Settings' pages run in helper processes that
+    /// refuse capture): its items as a pick-list on Linux.
+    private func blindMenuAdded(_ b: WindowTracker.BlindWindow) {
+        log("uncapturable menu \(b.wid) (\(b.owner)): reading its items")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let t0 = Date()
+            let read = BlindWindows.readMenu(pid: b.pid)
+            log(String(format: "uncapturable menu %u: read in %.2fs", b.wid, Date().timeIntervalSince(t0)))
+            self?.queue.async {
+                guard let self, self.tracker.blind[b.wid] != nil, settings.config.enabled else { return }
+                guard let read, !read.items.isEmpty else {
+                    return log("uncapturable menu \(b.wid) (\(b.owner)): no items readable (\(read == nil ? "no menu found" : "empty"))")
+                }
+                self.blindButtons[b.wid] = read.items.map(\.element)
+                self.blindMenus[b.wid] = read.menu
+                var m = MsgWriter(.blindShow)
+                m.u32(b.wid); m.str(b.owner); m.str("")
+                m.u16(0)
+                m.u16(UInt16(read.items.count)); read.items.forEach { m.str($0.label) }
+                m.u8(1)   // a menu
+                self.control?.send(m)
+                log("uncapturable menu \(b.wid) (\(b.owner)): stand-in with \(read.items.count) items")
             }
         }
     }

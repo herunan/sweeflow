@@ -31,6 +31,29 @@ enum BlindWindows {
         return read(match)
     }
 
+    /// The open menu of `pid` (a pop-up button's, a context menu): its items, and the menu
+    /// itself (to close it). A tick goes in front of the chosen item.
+    static func readMenu(pid: pid_t) -> (items: [(label: String, element: AXUIElement)], menu: AXUIElement)? {
+        let app = AXUIElementCreateApplication(pid)
+        func find(_ e: AXUIElement, _ depth: Int) -> AXUIElement? {
+            guard depth < 16 else { return nil }
+            if attr(e, kAXRoleAttribute) as? String == kAXMenuRole { return e }
+            for child in (attr(e, kAXChildrenAttribute) as? [AXUIElement]) ?? [] {
+                if let m = find(child, depth + 1) { return m }
+            }
+            return nil
+        }
+        let roots = [app] + ((attr(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [])
+        guard let menu = roots.lazy.compactMap({ find($0, 0) }).first else { return nil }
+        let items: [(label: String, element: AXUIElement)] = ((attr(menu, kAXChildrenAttribute) as? [AXUIElement]) ?? []).compactMap { e in
+            guard let title = attr(e, kAXTitleAttribute) as? String, !title.isEmpty,
+                  attr(e, kAXEnabledAttribute) as? Bool ?? true else { return nil }
+            let mark = attr(e, kAXMenuItemMarkCharAttribute) as? String ?? ""
+            return (mark.isEmpty ? title : "✓ " + title, e)
+        }
+        return (items, menu)
+    }
+
     /// Every window of `pid`, read through Accessibility.
     static func describe(pid: pid_t) -> [Content] {
         let app = AXUIElementCreateApplication(pid)
