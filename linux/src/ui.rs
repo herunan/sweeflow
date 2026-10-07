@@ -569,10 +569,13 @@ impl App {
         log::info!("window {wid} added: {} kind {} parent {} {}x{} at {},{}",
                    info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
         if let Some(w) = self.windows.get_mut(&wid) {
-            // Re-announced after a reconnect: keep the native window, restart the video.
+            // Re-announced after a reconnect: keep the native window, restart the video, and make
+            // sure the Mac window still has this window's size.
             w.stale = false;
             w.info = info;
+            w.requested = None;
             let _ = self.net.send(NetCmd::Subscribe(wid));
+            self.adopt_mac_size(wid, qh);
             return;
         }
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
@@ -803,6 +806,17 @@ impl App {
                 w.requested = Some((size, Instant::now()));
                 log::info!("window {wid}: {}x{} on the Mac, {}x{} here: asking again", mac.0, mac.1, size.0, size.1);
                 let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                // If the Mac doesn't follow (and so reports no change), look again later. Only
+                // when far off: an app that snaps to its own steps (Terminal's character cells)
+                // is left alone.
+                let far = mac.0.abs_diff(size.0) > 40 || mac.1.abs_diff(size.1) > 40;
+                if far {
+                    let qh = qh.clone();
+                    let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
+                        app.adopt_mac_size(wid, &qh);
+                        TimeoutAction::Drop
+                    });
+                }
             }
         }
     }
@@ -1556,6 +1570,12 @@ impl WindowHandler for App {
             w.size = size;
             w.requested = Some((size, Instant::now()));
             let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+            // Check it took (a Mac window that can't follow reports no change).
+            let qh2 = qh.clone();
+            let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
+                app.adopt_mac_size(wid, &qh2);
+                TimeoutAction::Drop
+            });
         }
         if cfg.decoration_mode != DecorationMode::Server && first {
             log::debug!("compositor declined server-side decorations");

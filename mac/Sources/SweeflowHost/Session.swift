@@ -272,8 +272,7 @@ final class Session {
             guard let win = tracker.windows[wid] else { return }
             requestedSizes[wid] = CGSize(width: w, height: h)
             for st in streamers.values where st.wid == wid { st.visibleSize = CGSize(width: w, height: h) }
-            // Capture at the new size as soon as the app has resized (not on the next slow look).
-            ax { $0.setSize(wid, pid: win.pid, CGSize(width: w, height: h)) }
+            resize(win, to: CGSize(width: w, height: h))
         case .launchApp:
             let bid = try m.str()
             log("launching \(bid)")
@@ -464,10 +463,32 @@ final class Session {
                     self.streamers.values.forEach { $0.checkScale() }
                     log("virtual display area \(area)")
                     for w in self.tracker.windows.values { self.placeOnVirtualDisplay(w) }
+                    // Sizes asked for before the display was known may have been cut short.
+                    for w in self.tracker.windows.values where w.kind == .toplevel {
+                        if let want = self.requestedSizes[w.wid], abs(want.width - w.frame.width) > 2 || abs(want.height - w.frame.height) > 2 {
+                            self.resize(w, to: want)
+                        }
+                    }
                 } else if attempt < 10 {
                     self.refreshVirtualDisplayArea(attempt: attempt + 1)
                 }
             }
+        }
+    }
+
+    /// Gives a window the size it has on Linux. macOS won't let a window grow past the bottom or
+    /// right of its screen, so one placed low (see placeOnVirtualDisplay) is moved up/left first.
+    private func resize(_ win: TrackedWindow, to size: CGSize) {
+        var origin = win.frame.origin
+        if let area = vdArea, win.kind == .toplevel {
+            origin.x = max(area.minX, min(origin.x, area.maxX - size.width))
+            origin.y = max(area.minY, min(origin.y, area.maxY - size.height))
+        }
+        let moved = origin != win.frame.origin
+        // Capture at the new size as soon as the app has resized (not on the next slow look).
+        ax {
+            if moved { $0.setPosition(win.wid, pid: win.pid, origin) }
+            $0.setSize(win.wid, pid: win.pid, size)
         }
     }
 
