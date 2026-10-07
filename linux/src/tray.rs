@@ -46,6 +46,8 @@ struct State {
     settings: Option<Settings>,
     /// (bundle id, name) of the Mac's apps.
     apps: Vec<(String, String)>,
+    /// "Stream Mac apps" was ticked while the Mac was unreachable: switch it on when it's back.
+    resume_wanted: bool,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -99,7 +101,16 @@ pub fn set_settings(json: &[u8]) {
             if APPLIED.lock().unwrap().replace(wanted) != Some(wanted) {
                 crate::desktop::apply(wanted);
             }
-            STATE.lock().unwrap().settings = Some(new);
+            let resume = {
+                let mut s = STATE.lock().unwrap();
+                let resume = std::mem::take(&mut s.resume_wanted) && !new.enabled;
+                s.settings = Some(new);
+                resume
+            };
+            if resume {
+                log::info!("the Mac is back: switching streaming on, as asked");
+                change(|s| s.enabled = true);
+            }
             refresh();
             crate::net::launcher_setting_changed();
         }
@@ -193,14 +204,33 @@ impl ksni::Tray for Tray {
                 ..Default::default()
             }
             .into(),
-            CheckmarkItem {
-                label: "Stream Mac apps".into(),
-                enabled: known,
-                checked: on,
-                activate: Box::new(|_| change(|s| s.enabled = !s.enabled)),
-                ..Default::default()
-            }
-            .into(),
+            if known {
+                CheckmarkItem {
+                    label: "Stream Mac apps".into(),
+                    checked: on,
+                    activate: Box::new(|_| change(|s| s.enabled = !s.enabled)),
+                    ..Default::default()
+                }
+                .into()
+            } else {
+                // The Mac can't be reached (asleep, most likely): remember the wish, try to wake
+                // it, and switch streaming on once it's back.
+                CheckmarkItem {
+                    label: "Stream Mac apps (when the Mac is back)".into(),
+                    checked: state.resume_wanted,
+                    activate: Box::new(|_| {
+                        let mut s = STATE.lock().unwrap();
+                        s.resume_wanted = !s.resume_wanted;
+                        let wanted = s.resume_wanted;
+                        drop(s);
+                        if wanted {
+                            std::thread::spawn(crate::wake::wake);
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            },
             MenuItem::Separator,
         ];
 

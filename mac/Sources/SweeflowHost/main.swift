@@ -136,6 +136,7 @@ final class HostState {
             log("no client for a while: removing virtual display, allowing sleep")
             self.display.remove()
             self.wake.release()
+            self.wake.releaseReachable()
             self.setMuted(false)
         }
         teardown = work
@@ -147,7 +148,14 @@ final class HostState {
     func apply() {
         guard sessions > 0 else { return }
         let c = settings.config
-        if c.enabled { wake.hold() } else { wake.release(); display.remove() }
+        if c.enabled {
+            wake.releaseReachable()
+            wake.hold()
+        } else {
+            wake.release()
+            wake.holdReachable()
+            display.remove()
+        }
         let dim = c.enabled && c.dimMacScreenWhileStreaming
         if dim != dimmed {
             dimmed = dim

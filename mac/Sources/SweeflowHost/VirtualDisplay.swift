@@ -170,6 +170,25 @@ final class Wakefulness {
         }
     }
 
+    /// Streaming is switched off but Linux is still connected: no idle sleep, so Linux can switch
+    /// it back on (a sleeping Mac drops off the network). The screen may still turn off, and
+    /// closing the lid still sleeps it.
+    private var reachable: IOPMAssertionID?
+
+    func holdReachable() {
+        guard reachable == nil else { return }
+        var id = IOPMAssertionID(0)
+        if IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                       "Sweeflow: Linux is connected (streaming off)" as CFString, &id) == kIOReturnSuccess {
+            reachable = id
+        }
+    }
+
+    func releaseReachable() {
+        if let id = reachable { IOPMAssertionRelease(id) }
+        reachable = nil
+    }
+
     /// Restores normal lid-close sleep (e.g. after a crash left it disabled).
     static func resetLidSleep() { _ = Wakefulness().setLidSleep(disabled: false) }
 

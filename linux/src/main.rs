@@ -12,6 +12,7 @@ mod proto;
 mod setup;
 mod tray;
 mod ui;
+mod wake;
 
 use anyhow::Result;
 

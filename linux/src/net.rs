@@ -272,12 +272,14 @@ async fn session(
     ui: &UiTx,
     cmds: &mut mpsc::UnboundedReceiver<NetCmd>,
 ) -> Result<()> {
-    let addr: SocketAddr = tokio::net::lookup_host(&cfg.host)
-        .await?
-        .next()
-        .context("host did not resolve")?;
+    // The Mac's name can resolve to IPv6 addresses first; IPv4 is what the local network (and a
+    // VPN's local-network exception) reliably carries.
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.host).await?.collect();
+    let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
     let conn = endpoint.connect(addr, "sweeflow")?.await.context("connect")?;
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
+    let ip = addr.ip();
+    std::thread::spawn(move || crate::wake::remember(ip));
     struct Online;
     impl Drop for Online {
         fn drop(&mut self) {
