@@ -1362,6 +1362,11 @@ impl App {
         self.update_lights(wid, qh);
     }
 
+    /// Whether the pointer is over the traffic lights we draw (see lights_pointer_at).
+    fn over_lights(&self, wid: u32) -> bool {
+        self.windows.get(&wid).is_some_and(|w| w.lights_hover)
+    }
+
     /// Which traffic light (0 close, 1 minimise, 2 zoom) is under (x, y), if any.
     fn button_at(&self, wid: u32, x: f64, y: f64) -> Option<usize> {
         let w = self.windows.get(&wid)?;
@@ -1651,7 +1656,9 @@ impl PointerHandler for App {
                         d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
                     }
                     self.lights_pointer(wid, e.position.0, e.position.1, qh);
-                    self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
+                    if !self.over_lights(wid) {
+                        self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
+                    }
                 }
                 PointerEventKind::Leave { .. } => {
                     if self.pointer_focus == Some(wid) {
@@ -1672,6 +1679,11 @@ impl PointerHandler for App {
                     self.lights_pointer_at(wid, e.position.0, e.position.1, Some(time), qh);
                     if self.windows.get(&wid).is_some_and(|w| w.lights_pressed.is_some()) {
                         continue; // dragging off a traffic light: not for the Mac
+                    }
+                    if self.over_lights(wid) {
+                        // Drawn and handled here. On the Mac, resting on the green button opens
+                        // its tiling menu, which then takes every click until it's dismissed.
+                        continue;
                     }
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
