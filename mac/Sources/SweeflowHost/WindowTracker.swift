@@ -124,12 +124,13 @@ final class WindowTracker {
 
     /// A window over more than one display (a drag's image layer, which covers the whole
     /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
-    /// Linux desktop and take the pointer.
+    /// Linux desktop and take the pointer. It covers whole displays; a real window that merely
+    /// straddles two (a video-call app's meeting window, left across a display edge) is no drag layer.
     static func spansDisplays(_ r: CGRect) -> Bool {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
         var n: UInt32 = 0
-        guard CGGetDisplaysWithRect(r, 8, &ids, &n) == .success else { return false }
-        return n > 1
+        guard CGGetDisplaysWithRect(r, 8, &ids, &n) == .success, n > 1 else { return false }
+        return ids.prefix(Int(n)).contains { r.contains(CGDisplayBounds($0)) }
     }
 
     /// Processes known to have no app bundle (system helpers owning windows): not asked again.
