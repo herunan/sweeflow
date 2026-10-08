@@ -61,9 +61,21 @@ struct Config: Codable {
     func allows(_ bundleId: String) -> Bool {
         if bundleId == Bundle.main.bundleIdentifier || excludeApps.contains(bundleId) { return false }
         if !apps.isEmpty { return apps.contains(bundleId) }
-        // Regular apps only: menu-bar utilities and background agents have no real windows.
-        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
-            .contains { $0.activationPolicy == .regular }
+        return Self.isRegularApp(bundleId)
+    }
+
+    /// Regular apps only: menu-bar utilities and background agents have no real windows.
+    /// Asking LaunchServices is a round trip to launchservicesd, and the window list is checked
+    /// up to every 8 ms while you work: remember the answer for a few seconds.
+    private static var regular: [String: (Bool, Date)] = [:]
+    private static let regularLock = NSLock()
+
+    static func isRegularApp(_ bundleId: String) -> Bool {
+        let now = Date()
+        if let (yes, at) = regularLock.withLock({ regular[bundleId] }), now.timeIntervalSince(at) < 10 { return yes }
+        let yes = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).contains { $0.activationPolicy == .regular }
+        regularLock.withLock { regular[bundleId] = (yes, now) }
+        return yes
     }
 
     private static let url = Identity.dir.appendingPathComponent("config.json")

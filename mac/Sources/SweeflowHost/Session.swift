@@ -217,8 +217,8 @@ final class Session {
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
             guard settings.config.dragDrop, let win = tracker.windows[wid] else { return }
             let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
-            if win.kind == .toplevel { raise(win) }
-            DispatchQueue.main.async {
+            // The drop lands on whatever is in front at that point: the target first.
+            raiseThen(win) {
                 let files = self.drag.draggedFiles
                 log("drag between Mac windows: \(files.map(\.lastPathComponent)) → \(wid)")
                 self.drag.drop(files.map { .file($0) }, at: point)
@@ -230,7 +230,6 @@ final class Session {
             for _ in 0..<n { items.append((try m.str(), try m.str(), try m.bytes())) }
             guard settings.config.dragDrop, let win = tracker.windows[wid] else { return }
             let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
-            if win.kind == .toplevel { raise(win) }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let dir = FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent("Library/Caches/sweeflow/drops/\(Int(Date().timeIntervalSince1970 * 1000))")
@@ -249,7 +248,7 @@ final class Session {
                     }
                 }
                 log("drop from Linux: \(objects) at \(point)")
-                DispatchQueue.main.async { self?.drag.drop(objects, at: point) }
+                self?.queue.async { self?.raiseThen(win) { self?.drag.drop(objects, at: point) } }
             }
         case .clipboard:
             let n = Int(try m.u16())
@@ -690,6 +689,18 @@ final class Session {
         control?.send(m)
     }
 
+    /// Brings a window to the front, then (on the main thread) does what needs it there.
+    private func raiseThen(_ win: TrackedWindow, _ then: @escaping () -> Void) {
+        guard win.kind == .toplevel else { return DispatchQueue.main.async(execute: then) }
+        let control = control_
+        raisedWid = win.wid
+        axQueue.async {
+            control.focus(win.wid, pid: win.pid)
+            // A moment for the window server to restack before the drop is replayed.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: then)
+        }
+    }
+
     /// The latest raise asked for: raises still queued behind a slow one are skipped (only the
     /// window last pointed at matters).
     private var raiseGeneration = 0
@@ -958,7 +969,13 @@ final class Session {
         var m = MsgWriter(.windowRemoved); m.u32(wid); control?.send(m)
     }
 
+    private var lastFocusCheck = DispatchTime(uptimeNanoseconds: 0)
+
     private func checkFocus() {
+        // An Accessibility round trip to the frontmost app: not on every 8 ms look.
+        let now = DispatchTime.now()
+        guard now.uptimeNanoseconds - lastFocusCheck.uptimeNanoseconds > 50_000_000 else { return }
+        lastFocusCheck = now
         guard let wid = control_.focusedWindowID(), wid != lastFocused, tracker.windows[wid] != nil else { return }
         lastFocused = wid
         var m = MsgWriter(.focused); m.u32(wid); control?.send(m)

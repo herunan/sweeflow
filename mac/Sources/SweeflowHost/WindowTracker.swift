@@ -132,9 +132,16 @@ final class WindowTracker {
         return n > 1
     }
 
+    /// Processes known to have no app bundle (system helpers owning windows): not asked again.
+    private var noBundle: Set<pid_t> = []
+
     private func appInfo(_ pid: pid_t) -> (String, String)? {
         if let c = bundleCache[pid] { return c }
-        guard let app = NSRunningApplication(processIdentifier: pid), let bid = app.bundleIdentifier else { return nil }
+        if noBundle.contains(pid) { return nil }
+        guard let app = NSRunningApplication(processIdentifier: pid), let bid = app.bundleIdentifier else {
+            noBundle.insert(pid)
+            return nil
+        }
         let info = (bid, app.localizedName ?? bid)
         bundleCache[pid] = info
         return info
