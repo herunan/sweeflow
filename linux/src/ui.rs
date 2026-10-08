@@ -158,7 +158,7 @@ struct Win {
     color: Option<WpColorRepresentationSurfaceV1>,
     /// Range last declared to the compositor (None until the first frame).
     color_full_range: Option<bool>,
-    _inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     configured: bool,
     /// Logical size of the window as configured by the compositor.
     size: (u32, u32),
@@ -658,7 +658,7 @@ impl App {
                 video_viewport,
                 color,
                 color_full_range: None,
-                _inhibitor: inhibitor,
+                inhibitor,
                 configured: false,
                 size,
                 requested: None,
@@ -740,6 +740,11 @@ impl App {
             l.viewport.destroy();
             l.sub.destroy();
             l.surface.destroy();
+        }
+        // Dropping the proxy sends nothing: without an explicit destroy KWin keeps the inhibitor,
+        // and a window re-created right away (video-call apps do this) gets a protocol error that kills us.
+        if let Some(i) = w.inhibitor {
+            i.destroy();
         }
         w.video_viewport.destroy();
         w.video_sub.destroy();
