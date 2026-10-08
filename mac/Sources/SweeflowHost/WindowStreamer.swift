@@ -174,7 +174,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = s
         // Starting a capture takes ScreenCaptureKit ~0.4 s; a still of the window takes a fraction
         // of that, so a new window shows straight away and goes live when the capture starts.
-        if !sentStill {
+        // Not for popups: macOS fades them in, so a still catches one half-drawn and holds it
+        // until the capture starts (it pops). Popups' captures start fast enough.
+        if !sentStill && !lossless {
             sentStill = true
             let t0 = Date()
             SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
