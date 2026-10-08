@@ -162,6 +162,11 @@ struct Win {
     configured: bool,
     /// Logical size of the window as configured by the compositor.
     size: (u32, u32),
+    /// Smallest size the Mac app turned out to accept (declared to the compositor, so tiling
+    /// gives the window at least that instead of cutting it off).
+    min_size: (u32, u32),
+    /// The Mac reached the size last asked for (so a later difference is the app's own doing).
+    followed: bool,
     /// Last size we asked the Mac for, and when (to ignore stale Mac-side sizes mid-resize).
     requested: Option<((u32, u32), Instant)>,
     floating: bool,
@@ -608,7 +613,7 @@ impl App {
             // Floating panels (kind 2: reminders, palettes) are ordinary, independent windows
             // here too: own taskbar entry, tiled like the rest.
             if info.kind != 2 {
-                window.set_min_size(Some((100, 60)));
+                window.set_min_size(Some(MIN_SIZE));
             }
             window.commit();
             let s = window.wl_surface().clone();
@@ -646,6 +651,7 @@ impl App {
         self.surfaces.insert(base.id(), wid);
         self.surfaces.insert(video.id(), wid);
         let size = (info.w.max(1.0) as u32, info.h.max(1.0) as u32);
+        let info_kind = info.kind;
         let is_popup = matches!(role, Role::Popup(_));
         self.windows.insert(
             wid,
@@ -660,6 +666,8 @@ impl App {
                 color_full_range: None,
                 inhibitor,
                 configured: false,
+                followed: false,
+                min_size: if info_kind == 2 { (1, 1) } else { MIN_SIZE },
                 size,
                 requested: None,
                 floating: true,
@@ -759,11 +767,34 @@ impl App {
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let mac = (w.info.w.round() as u32, w.info.h.round() as u32);
         if mac == w.size || !w.configured {
+            w.followed |= mac == w.size;
             return;
         }
         if let Some((_, at)) = w.requested {
             let wait = if matches!(w.role, Role::Toplevel(_)) && !w.floating { 3000 } else { 1500 };
             if at.elapsed() < Duration::from_millis(wait) {
+                return;
+            }
+        }
+        // Asked for this size and the app stayed bigger: that's as small as it goes (a video-call app's
+        // meeting window). Declare it as the minimum, so the tiling makes room for the whole
+        // window instead of cutting its bottom off.
+        if let Role::Toplevel(win) = &w.role {
+            let size = w.size;
+            let refused = !w.followed && w.requested.is_some_and(|(r, _)| r == size);
+            let min = (
+                if mac.0 > size.0 + 40 { mac.0.max(w.min_size.0) } else { w.min_size.0 },
+                if mac.1 > size.1 + 40 { mac.1.max(w.min_size.1) } else { w.min_size.1 },
+            );
+            if refused && min != w.min_size {
+                log::info!("window {wid}: the Mac keeps it {}x{} (asked {}x{}): minimum size {}x{}",
+                           mac.0, mac.1, size.0, size.1, min.0, min.1);
+                w.min_size = min;
+                win.set_min_size(Some(min));
+                // Drawn at that size, the tiling lays the window out again (the tiling redoes
+                // its layout when a window's size changes) and gives it the room.
+                w.size = (size.0.max(min.0), size.1.max(min.1));
+                self.draw_base(wid, qh);
                 return;
             }
         }
@@ -804,11 +835,12 @@ impl App {
                 self.draw_base(wid, qh);
             }
             Role::Toplevel(_) => {
+                let size = w.size;
                 // Tiled here, but the app resized itself on the Mac (a browser does, e.g. on opening
                 // a tab): ask again for the size it has here. At most every few seconds, so an
                 // app that can't be that small (Terminal snaps to character cells) isn't nagged.
-                let size = w.size;
                 w.requested = Some((size, Instant::now()));
+            w.followed = false;
                 log::info!("window {wid}: {}x{} on the Mac, {}x{} here: asking again", mac.0, mac.1, size.0, size.1);
                 let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
                 // If the Mac doesn't follow (and so reports no change), look again later. Only
@@ -1451,6 +1483,8 @@ fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64
     }
 }
 
+/// Smallest a Mac window gets here, unless its app is known to need more.
+const MIN_SIZE: (u32, u32) = (100, 60);
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
 const KEY_SPACE: u32 = 57;
@@ -1579,6 +1613,7 @@ impl WindowHandler for App {
         if size != w.size || (first && size != (w.info.w as u32, w.info.h as u32)) {
             w.size = size;
             w.requested = Some((size, Instant::now()));
+            w.followed = false;
             let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
             // Check it took (a Mac window that can't follow reports no change).
             let qh2 = qh.clone();
