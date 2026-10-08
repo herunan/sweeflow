@@ -98,6 +98,13 @@ setvbuf(stderr, nil, _IOLBF, 0)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
+// `SweeflowHost --pair`: ask the running Sweeflow to open pairing, then quit.
+if CommandLine.arguments.contains("--pair") {
+    DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.pair"), object: nil,
+                                                                 userInfo: nil, deliverImmediately: true)
+    exit(0)
+}
+
 let settings = Settings(Config.load())
 
 if !CGPreflightScreenCaptureAccess() {
@@ -210,5 +217,12 @@ do { try server.start(port: settings.config.port) } catch { log("listen failed: 
 let debugPort = DebugPort()
 if settings.config.debugPort != 0 { debugPort.start(port: settings.config.debugPort) }
 let statusMenu = StatusMenu()
+
+// Nothing paired yet (a fresh install): pairing is the first thing to do.
+if Identity.pairedClients().isEmpty { PairingWindow.shared.show() }
+// Opens pairing from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
+DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.pair"), object: nil, queue: .main) { _ in
+    PairingWindow.shared.show()
+}
 
 app.run()

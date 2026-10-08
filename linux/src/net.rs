@@ -274,9 +274,24 @@ async fn session(
 ) -> Result<()> {
     // The Mac's name can resolve to IPv6 addresses first; IPv4 is what the local network (and a
     // VPN's local-network exception) reliably carries.
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.host).await?.collect();
-    let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
-    let conn = endpoint.connect(addr, "sweeflow")?.await.context("connect")?;
+    let saved = async {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.host).await?.collect();
+        let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
+        anyhow::Ok((addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?))
+    };
+    let (addr, conn) = match saved.await {
+        Ok(c) => c,
+        Err(e) => {
+            // The Mac may have a new address: look for it on the network by its certificate.
+            let fp = cfg.host_fingerprint.clone();
+            let Some(addr) = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?
+            else {
+                return Err(e);
+            };
+            log::info!("{} not reachable ({e:#}); found the Mac at {addr}", cfg.host);
+            (addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?)
+        }
+    };
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
     let ip = addr.ip();
     std::thread::spawn(move || crate::wake::remember(ip));
@@ -740,10 +755,19 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
 
 // --- TLS -----------------------------------------------------------------------------------
 
-#[derive(Debug)]
+/// Decides whether a Mac's certificate (its SHA-256) is the one we want: the paired Mac's
+/// fingerprint when streaming, the code the person typed when pairing.
+pub type HostCheck = Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>;
+
 struct PinnedHost {
-    fingerprint: Vec<u8>,
+    check: HostCheck,
     provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl std::fmt::Debug for PinnedHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinnedHost")
+    }
 }
 
 impl ServerCertVerifier for PinnedHost {
@@ -756,14 +780,8 @@ impl ServerCertVerifier for PinnedHost {
         _: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let got = Sha256::digest(end.as_ref());
-        if got.as_slice() == self.fingerprint.as_slice() {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(format!(
-                "host certificate {} does not match the paired Mac; re-run `sweeflow pair`",
-                hex::encode(got)
-            )))
-        }
+        (self.check)(got.as_slice()).map_err(rustls::Error::General)?;
+        Ok(ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
         &self,
@@ -787,17 +805,27 @@ impl ServerCertVerifier for PinnedHost {
 }
 
 fn make_endpoint(cfg: &Config) -> Result<quinn::Endpoint> {
+    let want = hex::decode(&cfg.host_fingerprint).context("bad host fingerprint in config")?;
+    let check: HostCheck = Arc::new(move |got: &[u8]| {
+        if got == want.as_slice() {
+            Ok(())
+        } else {
+            Err(format!("host certificate {} does not match the paired Mac; pair it again", hex::encode(got)))
+        }
+    });
+    client_endpoint(check, b"sweeflow/1")
+}
+
+/// A QUIC client endpoint with our client certificate, accepting the Mac `check` approves.
+pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let (cert, key) = cfg.client_identity()?;
+    let (cert, key) = crate::config::client_identity()?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedHost {
-            fingerprint: hex::decode(&cfg.host_fingerprint).context("bad host fingerprint in config")?,
-            provider,
-        }))
+        .with_custom_certificate_verifier(Arc::new(PinnedHost { check, provider }))
         .with_client_auth_cert(vec![cert], PrivateKeyDer::Pkcs8(key.into()))?;
-    tls.alpn_protocols = vec![b"sweeflow/1".to_vec()];
+    tls.alpn_protocols = vec![alpn.to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));

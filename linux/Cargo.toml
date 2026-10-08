@@ -13,6 +13,7 @@ hex = "0.4.3"
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
 log = "0.4.34"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "std"] }
+mdns-sd = "0.21.5"
 png = "0.18.1"
 quinn = "0.11"
 rcgen = "0.14.10"

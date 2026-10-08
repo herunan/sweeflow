@@ -72,6 +72,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         quality.submenu = q
         quality.isEnabled = c.enabled
         menu.addItem(quality)
+        menu.addItem(.separator())
+
+        menu.addItem(ClosureMenuItem(title: "Pair with Linux…") { PairingWindow.shared.show() })
+        let paired = Identity.pairedClients()
+        let pairedItem = NSMenuItem(title: "Paired Computers", action: nil, keyEquivalent: "")
+        let ps = NSMenu()
+        for p in paired {
+            let label = p.name.isEmpty ? "Linux \(PairingCode.of(fingerprint: p.fingerprint))" : p.name
+            ps.addItem(ClosureMenuItem(title: "Forget \(label)") { Identity.removeClient(p.fingerprint) })
+        }
+        pairedItem.submenu = ps
+        pairedItem.isEnabled = !paired.isEmpty
+        menu.addItem(pairedItem)
     }
 
     private func toggle(_ title: String, _ on: Bool, _ change: @escaping (inout Config) -> Void) -> NSMenuItem {

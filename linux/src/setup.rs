@@ -87,13 +87,9 @@ pub fn setup(target: &str) -> Result<()> {
         bail!("could not read the Mac's certificate fingerprint (is Sweeflow running? see ~/Library/Logs/sweeflow.log on the Mac)");
     }
 
-    let cfg = Config {
-        host: format!("{host}:44120"),
-        host_fingerprint: host_fp,
-        scale: Config::load().map(|c| c.scale).unwrap_or(1.0),
-        capture_scale: Config::load().map(|c| c.capture_scale).unwrap_or(0.0),
-        render_node: config::default_render_node(),
-    };
+    let mut cfg = Config::load_or_default()?;
+    let name = host.trim_end_matches(".local").to_string();
+    cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp });
     cfg.save()?;
     println!("==> paired. Config written to {}", Config::path().display());
     println!();

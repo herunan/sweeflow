@@ -11,6 +11,8 @@ enum Msg: UInt8 {
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55
     case audioSubscribe = 0x60, audio = 0x61
+    // Pairing listener only (see Pairing.swift).
+    case pairRequest = 0x70, pairResult = 0x71
 }
 
 let protocolVersion: UInt16 = 1

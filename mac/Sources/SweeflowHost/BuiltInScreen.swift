@@ -28,13 +28,35 @@ enum BuiltInScreen {
     /// Screens come and go (lid opened or closed): macOS says so; nothing runs in between.
     private static var observer: NSObjectProtocol?
     private static var dimming = false
+    /// Lit up for a moment (Sweeflow showing something there, like pairing), even while streaming.
+    private static var paused = false
+
+    /// The built-in screen, for Sweeflow's own windows: the one a person at the Mac looks at.
+    static var screen: NSScreen? {
+        NSScreen.screens.first { s in
+            (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID).map { CGDisplayIsBuiltin($0) != 0 } ?? false
+        }
+    }
+
+    /// Brightens the screen until `resume()`, so a window shown there can be seen. Main thread.
+    static func pause() {
+        guard !paused else { return }
+        paused = true
+        restore()
+    }
+
+    static func resume() {
+        guard paused else { return }
+        paused = false
+        if dimming { dim() }
+    }
 
     private static func watchScreens() {
         guard observer == nil else { return }
         observer = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                           object: nil, queue: .main) { _ in
             let online = builtIn != nil
-            if dimming {
+            if dimming && !paused {
                 if online && !wasOnline { dim() }
             } else {
                 restore()   // brightness still owed from when the lid was closed
@@ -46,7 +68,7 @@ enum BuiltInScreen {
     static func startDimming() {
         dimming = true
         wasOnline = builtIn != nil
-        dim()
+        if !paused { dim() }
         watchScreens()
     }
 

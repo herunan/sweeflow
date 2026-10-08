@@ -8,6 +8,7 @@ mod launchers;
 mod lights;
 mod menus;
 mod net;
+mod pair;
 mod proto;
 mod setup;
 mod tray;
@@ -21,7 +22,9 @@ sweeflow — stream Mac app windows into your Linux desktop
 
 USAGE:
     sweeflow                 connect to the paired Mac and show its windows
-    sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it
+    sweeflow pair            pair with a Mac on this network (it shows a code to type here)
+    sweeflow pair --text     the same, in the terminal
+    sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it (development)
     sweeflow launch BUNDLEID open a Mac app (what the Mac app launchers run)
     sweeflow install         install this binary and start it with your desktop (systemd user service)
     sweeflow status          show configuration and pairing info
@@ -54,6 +57,7 @@ fn main() -> Result<()> {
             let _lock = single_instance()?;
             ui::run(config::Config::load()?)
         }
+        Some("pair") => pair::run_text(),
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
         Some("launch") => launchers::launch(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),

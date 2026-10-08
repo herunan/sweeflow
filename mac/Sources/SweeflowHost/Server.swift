@@ -105,6 +105,8 @@ final class Server {
         let params = NWParameters(quic: quic)
         params.serviceClass = .interactiveVideo
         let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+        // Findable on the network by name, so Linux keeps finding the Mac when its address changes.
+        l.service = NWListener.Service(name: macName, type: streamServiceType, domain: nil, txtRecord: serviceTXT())
         l.stateUpdateHandler = { log("listener: \($0)") }
         l.newConnectionGroupHandler = { [weak self] group in self?.accept(group) }
         l.start(queue: queue)
@@ -185,13 +187,38 @@ struct Identity {
         let fp = SHA256.hash(data: SecCertificateCopyData(leaf!) as Data).map { String(format: "%02x", $0) }.joined()
         try fp.write(to: dir.appendingPathComponent("fingerprint"), atomically: true, encoding: .utf8)
 
-        let clients = dir.appendingPathComponent("clients")
         return Identity(secIdentity: sec_identity_create(secIdent)!, fingerprint: fp, authorizedClients: {
             // Re-read on every handshake so pairing a new client needs no restart.
-            let text = (try? String(contentsOf: clients, encoding: .utf8)) ?? ""
-            return Set(text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-                .filter { !$0.isEmpty && !$0.hasPrefix("#") })
+            Set(pairedClients().map(\.fingerprint))
         })
+    }
+
+    static let clientsFile = dir.appendingPathComponent("clients")
+
+    /// Paired clients, one per line: `<sha256 hex> [name]` (older lines have no name).
+    static func pairedClients() -> [(fingerprint: String, name: String)] {
+        let text = (try? String(contentsOf: clientsFile, encoding: .utf8)) ?? ""
+        return text.split(whereSeparator: \.isNewline).compactMap { line in
+            let l = line.trimmingCharacters(in: .whitespaces)
+            guard !l.isEmpty, !l.hasPrefix("#") else { return nil }
+            let parts = l.split(separator: " ", maxSplits: 1)
+            return (parts[0].lowercased(), parts.count > 1 ? String(parts[1]) : "")
+        }
+    }
+
+    static func addClient(_ fingerprint: String, name: String) {
+        var all = pairedClients().filter { $0.fingerprint != fingerprint.lowercased() }
+        all.append((fingerprint.lowercased(), name))
+        writeClients(all)
+    }
+
+    static func removeClient(_ fingerprint: String) {
+        writeClients(pairedClients().filter { $0.fingerprint != fingerprint })
+    }
+
+    private static func writeClients(_ all: [(fingerprint: String, name: String)]) {
+        let text = all.map { $0.name.isEmpty ? $0.fingerprint : "\($0.fingerprint) \($0.name)" }.joined(separator: "\n") + "\n"
+        try? text.write(to: clientsFile, atomically: true, encoding: .utf8)
     }
 }
 
