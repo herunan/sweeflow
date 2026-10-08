@@ -782,9 +782,11 @@ impl App {
         if let Role::Toplevel(win) = &w.role {
             let size = w.size;
             let refused = !w.followed && w.requested.is_some_and(|(r, _)| r == size);
+            // Any real overshoot counts: even a few points cut off a toolbar. (Apps that snap to
+            // their own steps, like Terminal's character cells, end up smaller, not bigger.)
             let min = (
-                if mac.0 > size.0 + 40 { mac.0.max(w.min_size.0) } else { w.min_size.0 },
-                if mac.1 > size.1 + 40 { mac.1.max(w.min_size.1) } else { w.min_size.1 },
+                if mac.0 > size.0 + 4 { mac.0.max(w.min_size.0) } else { w.min_size.0 },
+                if mac.1 > size.1 + 4 { mac.1.max(w.min_size.1) } else { w.min_size.1 },
             );
             if refused && min != w.min_size {
                 log::info!("window {wid}: the Mac keeps it {}x{} (asked {}x{}): minimum size {}x{}",
@@ -1687,6 +1689,7 @@ impl PointerHandler for App {
             let (x, y) = (e.position.0 as f32, e.position.1 as f32);
             match e.kind {
                 PointerEventKind::Enter { serial } => {
+                    log::debug!("pointer entered {wid} at {x:.0},{y:.0}");
                     self.pointer_focus = Some(wid);
                     self.enter_serial = serial;
                     if self.cursor_surface.is_some() {
@@ -1701,6 +1704,7 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Leave { .. } => {
+                    log::debug!("pointer left {wid}");
                     if self.pointer_focus == Some(wid) {
                         self.pointer_focus = None;
                     }
@@ -1836,6 +1840,7 @@ impl KeyboardHandler for App {
         _: &[Keysym],
     ) {
         if let Some(wid) = self.wid_for(surface) {
+            log::debug!("keyboard focus → {wid}: focusing it on the Mac");
             self.kb_focus = Some(wid);
             self.send(W::new(t::FOCUS).u32(wid).finish());
             self.update_lights(wid, qh);
@@ -1845,6 +1850,7 @@ impl KeyboardHandler for App {
 
     fn leave(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {
         let was = self.kb_focus.take();
+        log::debug!("keyboard focus left {was:?}");
         if let Some(wid) = was {
             self.update_lights(wid, qh);
         }
