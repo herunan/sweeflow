@@ -40,6 +40,10 @@ final class DragBridge: NSObject, NSDraggingSource {
     // MARK: Linux → Mac
 
     /// Drops `items` at `point` (global CG coordinates, top-left origin). Main thread only.
+    /// Pace of a replayed drop (seconds): quick, but slow enough that apps see the drag enter
+    /// before the release. Tunable from the debug port while finding the edge.
+    static var timing = (press: 0.02, afterPress: 0.06, step: 0.012, rests: 2, rest: 0.03)
+
     func drop(_ items: [Item], at point: CGPoint) {
         guard !items.isEmpty else { return }
         pending = items
@@ -63,20 +67,20 @@ final class DragBridge: NSObject, NSDraggingSource {
         func post(_ type: CGEventType, _ at: CGPoint) {
             CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: .left)?.post(tap: .cghidEventTap)
         }
-        let path: [CGVector] = [.init(dx: 2, dy: 0), .init(dx: 5, dy: 1), .init(dx: 9, dy: 2), .init(dx: 12, dy: 3), .init(dx: 10, dy: 2),
-                                .init(dx: 7, dy: 1), .init(dx: 4, dy: 1), .init(dx: 2, dy: 0), .init(dx: 1, dy: 0), .init(dx: 0, dy: 0)]
+        let path: [CGVector] = [.init(dx: 2, dy: 0), .init(dx: 6, dy: 1), .init(dx: 10, dy: 2), .init(dx: 12, dy: 3),
+                                .init(dx: 8, dy: 2), .init(dx: 4, dy: 1), .init(dx: 1, dy: 0), .init(dx: 0, dy: 0)]
         post(.mouseMoved, point)
-        var t = 0.05
+        var t = Self.timing.press
         DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseDown, point) }
-        t += 0.1
+        t += Self.timing.afterPress
         for v in path {
             DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseDragged, CGPoint(x: point.x + v.dx, y: point.y + v.dy)) }
-            t += 0.016
+            t += Self.timing.step
         }
-        // Rest on the target (spring-loaded folders, drop highlights), then release.
-        for _ in 0..<4 {
+        // Rest on the target a moment (drop highlights), then release.
+        for _ in 0..<Self.timing.rests {
             DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseDragged, point) }
-            t += 0.04
+            t += Self.timing.rest
         }
         Self.replay(for: t + 0.1)
         DispatchQueue.main.asyncAfter(deadline: .now() + t) { post(.leftMouseUp, point) }
@@ -105,6 +109,10 @@ final class DragBridge: NSObject, NSDraggingSource {
         // The drop target is whatever is under the pointer: get out of its way.
         panel?.ignoresMouseEvents = true
         panel?.alphaValue = 0
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        log("drop replay: ended at \(screenPoint) with operation \(operation.rawValue)")
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -148,5 +156,8 @@ private final class DragStartView: NSView {
     }
     required init?(coder: NSCoder) { nil }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { bridge?.beginDrag(from: self, event: event) }
+    override func mouseDown(with event: NSEvent) {
+        log("drop replay: press received")
+        bridge?.beginDrag(from: self, event: event)
+    }
 }

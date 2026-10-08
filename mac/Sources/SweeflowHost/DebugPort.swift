@@ -141,6 +141,17 @@ final class DebugPort {
             // Preview the locked look: pause on|off.
             session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")
             reply("ok")
+        case "droptiming" where p.count == 6:
+            // droptiming press afterPress step rests rest
+            DragBridge.timing = (Double(p[1]) ?? 0.03, Double(p[2]) ?? 0.08, Double(p[3]) ?? 0.016, Int(p[4]) ?? 2, Double(p[5]) ?? 0.04)
+            reply("ok \(DragBridge.timing)")
+        case "drop" where p.count == 5:
+            // Replays a file drop like a Mac→Mac drag would: drop <wid> <x> <y> <path>
+            guard let s = session, let wid = UInt32(p[1]), let x = Double(p[2]), let y = Double(p[3]) else { return reply("usage") }
+            s.queue.async {
+                let r = s.debugDrop(wid, x: x, y: y, file: URL(fileURLWithPath: p[4]))
+                DispatchQueue.main.async { reply(r) }
+            }
         case "close" where p.count == 2:
             guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
             s.queue.async {

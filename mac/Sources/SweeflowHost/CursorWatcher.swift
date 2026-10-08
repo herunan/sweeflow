@@ -44,7 +44,9 @@ final class CursorWatcher {
     }
 
     private func poll() {
-        guard let cursor = NSCursor.currentSystem else { return }
+        // A drop being replayed (DragBridge) shows the Mac's drag cursor: not for Linux, where
+        // the drop already happened.
+        guard !DragBridge.replaying, let cursor = NSCursor.currentSystem else { return }
         let image = cursor.image
         let size = image.size
         guard size.width > 0, size.height > 0 else { return }

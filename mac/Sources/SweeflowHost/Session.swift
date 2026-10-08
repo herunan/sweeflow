@@ -563,6 +563,13 @@ final class Session {
         return "ok \(p)"
     }
 
+    func debugDrop(_ wid: UInt32, x: Double, y: Double, file: URL) -> String {
+        guard let win = tracker.windows[wid] else { return "no window \(wid)" }
+        let point = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
+        raiseThen(win) { self.drag.drop([.file(file)], at: point) }
+        return "dropping at \(point)"
+    }
+
     func debugClose(_ wid: UInt32) -> String {
         guard let w = tracker.windows[wid] else { return "no window \(wid)" }
         ax(burstFor: 2) { $0.close(wid, pid: w.pid) }

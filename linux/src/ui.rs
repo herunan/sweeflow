@@ -1926,7 +1926,7 @@ impl DataDeviceHandler for App {
         // Files, images, links or text dragged onto a Mac window (not our own drag coming back).
         let mimes = offer.with_mime_types(|m| m.to_vec());
         let accept = crate::clipboard::drop_mime(&mimes);
-        log::debug!("drag entered with {mimes:?}");
+        log::info!("drag entered {:?} (surface {:?}, ours: {}) with {mimes:?}", self.wid_for(surface), surface.id(), self.drag_source.is_some());
         match self.wid_for(surface) {
             // A drag out of a Mac window landing on another one: the Mac drops its own files.
             Some(wid) if self.drag_source.is_some() => {
@@ -1951,6 +1951,7 @@ impl DataDeviceHandler for App {
     }
 
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        log::info!("drag left {:?}", self.dnd_target.map(|t| t.0));
         self.dnd_target = None;
     }
 
@@ -1963,8 +1964,10 @@ impl DataDeviceHandler for App {
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {}
 
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
-        let (Some((wid, x, y)), Some(offer)) = (self.dnd_target.take(), self.dnd_device.as_ref().and_then(|d| d.data().drag_offer()))
-        else {
+        let target = self.dnd_target.take();
+        let offer = self.dnd_device.as_ref().and_then(|d| d.data().drag_offer());
+        log::info!("drop performed on {:?} (offer: {}, ours: {})", target.map(|t| t.0), offer.is_some(), self.drag_source.is_some());
+        let (Some((wid, x, y)), Some(offer)) = (target, offer) else {
             return;
         };
         if !crate::tray::allows_drag() {
