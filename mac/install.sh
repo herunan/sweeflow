@@ -56,24 +56,7 @@ fi
 echo "==> bundling $APP"
 launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
 pkill -x SweeflowHost 2>/dev/null || true
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/SweeflowHost"
-cat > "$APP/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-  <key>CFBundleName</key><string>Sweeflow</string>
-  <key>CFBundleDisplayName</key><string>Sweeflow</string>
-  <key>CFBundleExecutable</key><string>SweeflowHost</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>15.0</string>
-  <key>LSUIElement</key><true/>
-  <key>NSScreenCaptureUsageDescription</key><string>Sweeflow streams your app windows to your Linux desktop.</string>
-</dict></plist>
-EOF
+./bundle.sh "$BIN" "$APP" 0.1 1
 codesign --force --timestamp=none --options runtime --keychain "$KEYCHAIN" -s "$SIGN_NAME" \
     -i "$BUNDLE_ID" "$APP"
 

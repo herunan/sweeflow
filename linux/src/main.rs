@@ -4,6 +4,7 @@ mod config;
 mod decode;
 mod desktop;
 mod frames;
+mod installer;
 mod launchers;
 mod lights;
 mod menus;
@@ -14,6 +15,7 @@ mod setup;
 mod tray;
 mod ui;
 mod wake;
+mod wizard;
 
 use anyhow::Result;
 
@@ -48,6 +50,24 @@ unsafe extern "C" {
     fn libc_flock(fd: i32, op: i32) -> i32;
 }
 
+/// The config once a Mac is paired. Nothing paired yet (a fresh install): open the "Add a Mac"
+/// window once, and wait (rather than exit, which systemd would answer by starting us again).
+fn wait_for_a_mac() -> Result<config::Config> {
+    let mut asked = false;
+    loop {
+        let cfg = config::Config::load_or_default()?;
+        if !cfg.host.is_empty() {
+            return Ok(cfg);
+        }
+        if !asked {
+            log::info!("no Mac paired yet: opening the pairing window");
+            tray::open_wizard();
+            asked = true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zbus=warn,tracing=warn")).init();
     ffmpeg_next::init()?;
@@ -55,9 +75,10 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         None | Some("run") => {
             let _lock = single_instance()?;
-            ui::run(config::Config::load()?)
+            ui::run(wait_for_a_mac()?)
         }
-        Some("pair") => pair::run_text(),
+        Some("pair") if args.get(1).is_some_and(|a| a == "--text") => pair::run_text(),
+        Some("pair") => wizard::run(),
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
         Some("launch") => launchers::launch(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),

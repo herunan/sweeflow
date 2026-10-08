@@ -198,22 +198,7 @@ final class PairingWindow: NSObject, NSWindowDelegate {
         Pairing.shared.open()
         if window == nil { build() }
         status.stringValue = "Waiting for Linux…"
-        BuiltInScreen.pause()
-        NSApp.activate()
-        place()
-        window?.makeKeyAndOrderFront(nil)
-    }
-
-    /// On the screen a person at the Mac sees: the built-in one, else any but Sweeflow's own
-    /// virtual display (nobody sees that, and Sweeflow's windows aren't streamed).
-    private func place() {
-        guard let w = window else { return }
-        let virtual = host.display.displayID
-        let screen = BuiltInScreen.screen ?? NSScreen.screens.first {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) != virtual
-        } ?? NSScreen.main
-        guard let f = screen?.visibleFrame else { return w.center() }
-        w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
+        presentToPerson(window!)
     }
 
     /// Asks the person at the Mac to allow a computer, on the pairing window.

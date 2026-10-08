@@ -154,11 +154,13 @@ impl Config {
         true
     }
 
-    /// Adds (or updates) a paired Mac and makes it the active one.
-    pub fn add_mac(&mut self, m: PairedMac) {
+    /// Adds (or updates) a paired Mac; `activate` makes it the one to stream from.
+    pub fn add_mac(&mut self, m: PairedMac, activate: bool) {
         self.macs.retain(|o| o.fingerprint != m.fingerprint);
         self.macs.push(m.clone());
-        self.set_active(&m);
+        if activate || self.host_fingerprint == m.fingerprint {
+            self.set_active(&m);
+        }
     }
 
     /// Forgets a Mac. If it was the active one, another paired Mac (if any) takes over.
@@ -270,7 +272,7 @@ mod tests {
     #[test]
     fn several_macs_round_trip_and_switch() {
         let mut c = Config::parse(&format!("host = \"MAC1.local:44120\"\nhost_fingerprint = \"{FP_A}\"\n")).unwrap();
-        c.add_mac(PairedMac { name: "Air".into(), service: "Air".into(), host: "air.local:44120".into(), fingerprint: FP_B.into() });
+        c.add_mac(PairedMac { name: "Air".into(), service: "Air".into(), host: "air.local:44120".into(), fingerprint: FP_B.into() }, true);
         assert_eq!(c.host_fingerprint, FP_B);
         let again = Config::parse(&c.render()).unwrap();
         assert_eq!(again.macs, c.macs);

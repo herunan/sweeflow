@@ -234,6 +234,9 @@ impl ksni::Tray for Tray {
             MenuItem::Separator,
         ];
 
+        items.push(macs_menu());
+        items.push(MenuItem::Separator);
+
         let exclude = s.as_ref().map(|s| s.exclude.clone()).unwrap_or_default();
         let apps: Vec<MenuItem<Self>> = state
             .apps
@@ -317,6 +320,99 @@ impl ksni::Tray for Tray {
         );
         items
     }
+}
+
+/// "Mac ▸": which paired Mac to stream from, adding one, forgetting one.
+fn macs_menu() -> MenuItem<Tray> {
+    let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+    let mut sub: Vec<MenuItem<Tray>> = Vec::new();
+    if !cfg.macs.is_empty() {
+        let fps: Vec<String> = cfg.macs.iter().map(|m| m.fingerprint.clone()).collect();
+        sub.push(
+            RadioGroup {
+                selected: fps.iter().position(|f| *f == cfg.host_fingerprint).unwrap_or(0),
+                select: Box::new(move |_, i| {
+                    let Some(fp) = fps.get(i).cloned() else { return };
+                    switch_to(&fp);
+                }),
+                options: cfg.macs.iter().map(|m| RadioItem { label: m.name.replace('_', "__"), ..Default::default() }).collect(),
+            }
+            .into(),
+        );
+        sub.push(MenuItem::Separator);
+    }
+    sub.push(
+        StandardItem {
+            label: "Add a Mac…".into(),
+            icon_name: "list-add".into(),
+            activate: Box::new(|_| open_wizard()),
+            ..Default::default()
+        }
+        .into(),
+    );
+    if !cfg.macs.is_empty() {
+        let forget: Vec<MenuItem<Tray>> = cfg
+            .macs
+            .iter()
+            .map(|m| {
+                let fp = m.fingerprint.clone();
+                StandardItem {
+                    label: m.name.replace('_', "__"),
+                    activate: Box::new(move |_| forget(&fp)),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect();
+        sub.push(SubMenu { label: "Forget".into(), submenu: forget, ..Default::default() }.into());
+    }
+    SubMenu { label: "Mac".into(), icon_name: "computer-laptop".into(), submenu: sub, ..Default::default() }.into()
+}
+
+pub fn open_wizard() {
+    match std::env::current_exe() {
+        Ok(me) => {
+            if let Err(e) = std::process::Command::new(me).arg("pair").spawn() {
+                log::warn!("couldn't open the pairing window: {e}");
+            }
+        }
+        Err(e) => log::warn!("couldn't open the pairing window: {e}"),
+    }
+}
+
+/// Streams from another paired Mac: saved, then the client restarts into it (which drops every
+/// window of the old one cleanly).
+fn switch_to(fingerprint: &str) {
+    let mut cfg = match crate::config::Config::load_or_default() {
+        Ok(c) => c,
+        Err(e) => return log::warn!("config: {e:#}"),
+    };
+    if cfg.host_fingerprint == fingerprint || !cfg.activate(fingerprint) {
+        return;
+    }
+    if let Err(e) = cfg.save() {
+        return log::warn!("saving config: {e:#}");
+    }
+    log::info!("switching to {}", cfg.host);
+    restart();
+}
+
+fn forget(fingerprint: &str) {
+    let Ok(mut cfg) = crate::config::Config::load_or_default() else { return };
+    let was_active = cfg.host_fingerprint == fingerprint;
+    cfg.forget(fingerprint);
+    if let Err(e) = cfg.save() {
+        return log::warn!("saving config: {e:#}");
+    }
+    refresh();
+    if was_active {
+        restart();
+    }
+}
+
+fn restart() {
+    // Through systemd (it runs us); a plain exit would also do, but slower (RestartSec).
+    let _ = std::process::Command::new("systemctl").args(["--user", "restart", "sweeflow"]).spawn();
 }
 
 #[cfg(test)]

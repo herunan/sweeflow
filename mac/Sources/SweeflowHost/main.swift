@@ -105,6 +105,27 @@ if CommandLine.arguments.contains("--pair") {
     exit(0)
 }
 
+// Opened by hand (Finder, Launchpad): the copy macOS keeps running is the one that serves Linux.
+// Make sure that one exists (the login item), ask it to show its window, and step aside. If
+// macOS wants the login item approved first, carry on here; the setup window explains.
+if !LoginItem.underLaunchd {
+    if LoginItem.devInstall || LoginItem.service.status == .enabled || LoginItem.enable() {
+        DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.show"), object: nil,
+                                                                     userInfo: nil, deliverImmediately: true)
+        exit(0)
+    }
+}
+
+// Started by the bundled login item, stderr goes nowhere: keep a log where the dev setup does.
+if ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] != LoginItem.devAgentLabel {
+    let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/sweeflow.log")
+    if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil) }
+    if let h = try? FileHandle(forWritingTo: logURL) {
+        h.seekToEndOfFile()
+        dup2(h.fileDescriptor, STDERR_FILENO)
+    }
+}
+
 let settings = Settings(Config.load())
 
 if !CGPreflightScreenCaptureAccess() {
@@ -218,11 +239,15 @@ let debugPort = DebugPort()
 if settings.config.debugPort != 0 { debugPort.start(port: settings.config.debugPort) }
 let statusMenu = StatusMenu()
 
-// Nothing paired yet (a fresh install): pairing is the first thing to do.
-if Identity.pairedClients().isEmpty { PairingWindow.shared.show() }
+// Something still to set up (a fresh install): the setup window says what.
+if !Onboarding.complete { Onboarding.shared.show() }
 // Opens pairing from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
 DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.pair"), object: nil, queue: .main) { _ in
     PairingWindow.shared.show()
+}
+// Sweeflow opened again by hand while running (see above): show the setup window.
+DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.show"), object: nil, queue: .main) { _ in
+    Onboarding.shared.show()
 }
 
 app.run()

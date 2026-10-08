@@ -23,6 +23,8 @@ use crate::{
 pub const STREAM_SERVICE: &str = "_sweeflow._udp.local.";
 /// Advertised only while the Mac is in pairing mode.
 pub const PAIR_SERVICE: &str = "_sweeflow-pair._udp.local.";
+/// Where the Mac's pairing listener is (for a Mac typed in by address).
+pub const PAIR_PORT: u16 = 44121;
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -240,7 +242,8 @@ pub fn run_text() -> Result<()> {
         Outcome::Paired(p) => {
             let mut cfg = crate::config::Config::load_or_default()?;
             println!("Paired with {} ({}).", p.name, p.host);
-            cfg.add_mac(p);
+            let first = cfg.host.is_empty();
+            cfg.add_mac(p, first);
             cfg.save()?;
             Ok(())
         }

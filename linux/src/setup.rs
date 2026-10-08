@@ -89,7 +89,7 @@ pub fn setup(target: &str) -> Result<()> {
 
     let mut cfg = Config::load_or_default()?;
     let name = host.trim_end_matches(".local").to_string();
-    cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp });
+    cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp }, true);
     cfg.save()?;
     println!("==> paired. Config written to {}", Config::path().display());
     println!();
@@ -98,6 +98,26 @@ pub fn setup(target: &str) -> Result<()> {
     println!("  • Accessibility");
     println!("Then run `sweeflow` here.");
     Ok(())
+}
+
+/// Starts the client for the active Mac: restarts it if it runs as a service already, else
+/// installs it (so it also starts with the desktop from now on).
+pub fn start_client() -> Result<()> {
+    let installed = Command::new("systemctl")
+        .args(["--user", "cat", "sweeflow.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if installed {
+        let ok = Command::new("systemctl").args(["--user", "restart", "sweeflow.service"]).status()?.success();
+        if !ok {
+            bail!("couldn't restart sweeflow (see `journalctl --user -u sweeflow`)");
+        }
+        Ok(())
+    } else {
+        install()
+    }
 }
 
 /// Installs this binary to ~/.local/bin and a systemd user service that runs it with the

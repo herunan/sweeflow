@@ -75,6 +75,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(ClosureMenuItem(title: "Pair with Linux…") { PairingWindow.shared.show() })
+        menu.addItem(ClosureMenuItem(title: "Setup…") { Onboarding.shared.show() })
         let paired = Identity.pairedClients()
         let pairedItem = NSMenuItem(title: "Paired Computers", action: nil, keyEquivalent: "")
         let ps = NSMenu()
