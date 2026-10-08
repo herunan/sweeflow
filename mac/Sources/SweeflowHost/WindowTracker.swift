@@ -122,6 +122,16 @@ final class WindowTracker {
 
     func stop() { timer?.cancel(); timer = nil }
 
+    /// A window over more than one display (a drag's image layer, which covers the whole
+    /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
+    /// Linux desktop and take the pointer.
+    static func spansDisplays(_ r: CGRect) -> Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8)
+        var n: UInt32 = 0
+        guard CGGetDisplaysWithRect(r, 8, &ids, &n) == .success else { return false }
+        return n > 1
+    }
+
     private func appInfo(_ pid: pid_t) -> (String, String)? {
         if let c = bundleCache[pid] { return c }
         guard let app = NSRunningApplication(processIdentifier: pid), let bid = app.bundleIdentifier else { return nil }
@@ -168,6 +178,7 @@ final class WindowTracker {
                 // A helper process's menu or popover (each System Settings page runs in a process
                 // of its own): attached below to the streamed window it opens over.
                 if (24..<1000).contains(layer), (info[kCGWindowSharingState as String] as? Int) != 0, pid != getpid(),
+                   !Self.spansDisplays(bounds),
                    let owner = info[kCGWindowOwnerName as String] as? String, !Self.notBlind.contains(owner),
                    bounds.width >= 8, bounds.height >= 8 {
                     helperPopups.append((wid, pid, bounds, layer))
@@ -185,6 +196,7 @@ final class WindowTracker {
             var w = TrackedWindow(wid: wid, pid: pid, bundleId: bid, appName: appName, title: title,
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
             if layer == 0, title.isEmpty, !looksLikeAppWindow(wid, pid: pid) {
+                if Self.spansDisplays(bounds) { continue }   // a drag image layer, see spansDisplays
                 // Not a real window of the app but a transient one drawn at window level (a calendar app's
                 // event card): shown attached to the app window it sits on, like a popover.
                 w.kind = .popup
@@ -194,7 +206,7 @@ final class WindowTracker {
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
                 order.append(wid)
-            } else if layer < 1000, bounds.width >= 4, bounds.height >= 4 {
+            } else if layer < 1000, bounds.width >= 4, bounds.height >= 4, !Self.spansDisplays(bounds) {
                 // Below the menu-bar level (24) are floating panels, utility and modal panel
                 // windows (reminders, palettes, inspectors): real windows of their own, attached
                 // to the app. Above are menus, popovers and tooltips.

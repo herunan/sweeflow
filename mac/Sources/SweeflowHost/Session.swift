@@ -690,8 +690,17 @@ final class Session {
         control?.send(m)
     }
 
+    /// The latest raise asked for: raises still queued behind a slow one are skipped (only the
+    /// window last pointed at matters).
+    private var raiseGeneration = 0
+    private let raiseLock = NSLock()
+
     private func raise(_ win: TrackedWindow) {
-        ax { $0.focus(win.wid, pid: win.pid) }
+        let gen = raiseLock.withLock { raiseGeneration += 1; return raiseGeneration }
+        ax { [weak self] control in
+            guard let self, self.raiseLock.withLock({ self.raiseGeneration == gen }) else { return }
+            control.focus(win.wid, pid: win.pid)
+        }
         raisedWid = win.wid
     }
 

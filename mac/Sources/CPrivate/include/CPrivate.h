@@ -36,3 +36,8 @@ AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *outWindow);
 - (instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
 - (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
 @end
+
+// Brings `pid`'s window `wid` to the front at once, the way window switchers (AltTab, yabai) do:
+// SkyLight's _SLPSSetFrontProcessWithOptions, looked up at runtime. NSRunningApplication's
+// activate waits up to a second for the current app to yield. Returns false if unavailable.
+bool MFSetFrontWindow(pid_t pid, uint32_t wid);

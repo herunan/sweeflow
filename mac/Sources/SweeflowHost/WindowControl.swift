@@ -70,11 +70,16 @@ final class WindowControl {
 
     /// Brings the window to the front and makes its app active so it receives keystrokes.
     func focus(_ wid: UInt32, pid: pid_t) {
+        // Front process and window at once (NSRunningApplication.activate waits up to a second
+        // for the current app to yield, and every raise queued behind it).
+        let fronted = MFSetFrontWindow(pid, wid)
         if let e = element(wid, pid: pid) {
             AXUIElementPerformAction(e, kAXRaiseAction as CFString)
             AXUIElementSetAttributeValue(e, kAXMainAttribute as CFString, kCFBooleanTrue)
         }
-        NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+        if !fronted && NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+        }
     }
 
     func close(_ wid: UInt32, pid: pid_t) {
