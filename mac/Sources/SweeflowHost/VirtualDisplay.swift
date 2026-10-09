@@ -18,14 +18,18 @@ final class VirtualDisplay {
         return b.isEmpty ? nil : b
     }
 
-    /// Area below the display's menu bar, in global CG coordinates.
+    /// The display's area clear of the menu bar and the Dock, in global CG coordinates. (The
+    /// Dock sits on this display when it's the leftmost or rightmost one and the Dock is on that
+    /// side: a window under it can't be clicked there.)
     var usableBounds: CGRect? {
         guard let id = displayID, let b = bounds else { return nil }
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
         }) else { return b }
-        let menuBar = screen.frame.maxY - screen.visibleFrame.maxY
-        return CGRect(x: b.minX, y: b.minY + menuBar, width: b.width, height: b.height - menuBar)
+        let f = screen.frame, v = screen.visibleFrame
+        // NSScreen is bottom-left based; inset the CG bounds by the same margins.
+        let left = v.minX - f.minX, right = f.maxX - v.maxX, top = f.maxY - v.maxY, bottom = v.minY - f.minY
+        return CGRect(x: b.minX + left, y: b.minY + top, width: b.width - left - right, height: b.height - top - bottom)
     }
 
     /// A plain backdrop: black in dark mode, white in light mode. Mac windows tint their

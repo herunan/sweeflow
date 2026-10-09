@@ -339,6 +339,7 @@ final class Session {
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
+            log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")")
             if let p {
                 if pressed { ensureFront(wid, at: p) }
                 input.button(b, pressed: pressed, at: p)
@@ -369,9 +370,17 @@ final class Session {
     /// Reads `u32 wid, f32 x, f32 y` and converts to a global Mac point.
     private func pointerTarget(_ m: inout MsgReader) throws -> (UInt32, CGPoint?) {
         let wid = try m.u32(), x = try m.f32(), y = try m.f32()
-        guard let win = tracker.windows[wid] else { return (wid, nil) }
-        return (wid, CGPoint(x: win.frame.minX + x, y: win.frame.minY + y))
+        if let win = tracker.windows[wid] { return (wid, CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)) }
+        // Just gone on the Mac but still shown on Linux a moment longer (a tooltip vanishes as
+        // the button under it is pressed): act where it was, on whatever is there now.
+        if let gone = recentlyGone[wid], DispatchTime.now().uptimeNanoseconds - gone.at.uptimeNanoseconds < 2_000_000_000 {
+            return (gone.parent, CGPoint(x: gone.frame.minX + x, y: gone.frame.minY + y))
+        }
+        return (wid, nil)
     }
+
+    /// Where windows that just went away were (see pointerTarget).
+    private var recentlyGone: [UInt32: (frame: CGRect, parent: UInt32, at: DispatchTime)] = [:]
 
     /// Windows overlap on the Mac, so the one under the pointer must be on top before we
     /// inject events at its location.
@@ -736,6 +745,9 @@ final class Session {
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
         tracker.onRemoved = { [weak self] w in
             guard let self else { return }
+            let now = DispatchTime.now()
+            self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
+            self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
             let wid = w.wid
             if self.minimized[wid] != nil { return }
             guard w.kind == .toplevel else { self.windowGone(wid); return }
