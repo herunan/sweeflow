@@ -81,7 +81,10 @@ final class Server {
     func start(port: UInt16) throws {
         let quic = NWProtocolQUIC.Options(alpn: ["sweeflow/1"])
         quic.idleTimeout = 15_000
-        quic.initialMaxStreamsBidirectional = 64
+        // Cumulative, not concurrent: Network.framework doesn't raise it as streams close, and
+        // each window and popup opens one (a video-call app's tooltips churn through dozens). At 64 the
+        // client's next stream blocked, and with it every click.
+        quic.initialMaxStreamsBidirectional = 1_000_000
         quic.initialMaxData = 64 << 20
         quic.initialMaxStreamDataBidirectionalLocal = 16 << 20
         quic.initialMaxStreamDataBidirectionalRemote = 16 << 20

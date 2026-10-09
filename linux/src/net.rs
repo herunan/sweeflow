@@ -397,7 +397,15 @@ async fn session(
                         // A window minimised on the Mac loses its capture; its task has ended.
                         if video.get(&wid).is_some_and(|(_, task)| !task.is_finished()) { continue; }
                         let t0 = std::time::Instant::now();
-                        let (mut tx, rx) = conn.open_bi().await?;
+                        // Opening waits for the Mac to allow another stream: never let that hold
+                        // up input and acknowledgements queued behind it.
+                        let (mut tx, rx) = match tokio::time::timeout(Duration::from_secs(2), conn.open_bi()).await {
+                            Ok(r) => r?,
+                            Err(_) => {
+                                log::warn!("window {wid}: the Mac allows no more streams on this connection; reconnecting");
+                                anyhow::bail!("out of QUIC streams");
+                            }
+                        };
                         let opened = t0.elapsed();
                         tx.write_all(&W::new(t::SUBSCRIBE).u32(wid).finish()).await?;
                         log::info!("window {wid}: video stream opened in {opened:?}, subscribed in {:?}", t0.elapsed());
