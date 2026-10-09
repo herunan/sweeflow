@@ -352,15 +352,22 @@ final class WindowTracker {
 
     /// Returns true when `wid` is the topmost window covering `point` (global coords),
     /// i.e. a click there would land on it.
+    /// Whether `wid` is what's in front at `point` — or only its own app's menu, tooltip or
+    /// popover is (raising the window then would dismiss that menu: a raise counts as a click).
     func isFrontmost(_ wid: UInt32, at point: CGPoint) -> Bool {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return false }
+        let pid = windows[wid]?.pid
         for info in list {
             guard let layer = info[kCGWindowLayer as String] as? Int, layer < 1000,
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: boundsDict), bounds.contains(point),
                   (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.01 else { continue }
-            return (info[kCGWindowNumber as String] as? UInt32) == wid
+            let number = info[kCGWindowNumber as String] as? UInt32
+            if number == wid { return true }
+            let owner = info[kCGWindowOwnerPID as String] as? pid_t
+            let isOwnPopup = owner != nil && owner == pid && (layer > 0 || number.flatMap { windows[$0]?.kind } != .toplevel)
+            return isOwnPopup
         }
         return false
     }
