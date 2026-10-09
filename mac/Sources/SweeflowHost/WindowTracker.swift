@@ -291,6 +291,7 @@ final class WindowTracker {
             if closing.contains(p.wid) { continue }
             let big = popupMax[p.wid] ?? p.frame.size
             if p.frame.width < big.width * 0.9 && p.frame.height < big.height * 0.9 {
+                log("popup \(p.wid) (\(p.appName)) shrank from \(big) to \(p.frame.size): taken as closing")
                 closing.insert(p.wid)
                 continue
             }
@@ -366,6 +367,9 @@ final class WindowTracker {
             let number = info[kCGWindowNumber as String] as? UInt32
             if number == wid { return true }
             let owner = info[kCGWindowOwnerPID as String] as? pid_t
+            // Other apps' windows above the normal level (the Dock keeps a transparent one over
+            // the whole display) stay on top whatever we raise: they don't count.
+            if layer > 0 && owner != pid { continue }
             let isOwnPopup = owner != nil && owner == pid && (layer > 0 || number.flatMap { windows[$0]?.kind } != .toplevel)
             return isOwnPopup
         }

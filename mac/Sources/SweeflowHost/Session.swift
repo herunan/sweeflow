@@ -714,6 +714,7 @@ final class Session {
     private let raiseLock = NSLock()
 
     private func raise(_ win: TrackedWindow) {
+        log("raising \(win.wid) (\(win.appName))")
         let gen = raiseLock.withLock { raiseGeneration += 1; return raiseGeneration }
         ax { [weak self] control in
             guard let self, self.raiseLock.withLock({ self.raiseGeneration == gen }) else { return }
