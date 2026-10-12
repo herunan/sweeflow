@@ -9,7 +9,13 @@ final class WindowControl {
     private let lock = NSLock()
 
     func element(_ wid: UInt32, pid: pid_t) -> AXUIElement? {
-        if let e = lock.withLock({ cache[wid] }) { return e }
+        if let e = lock.withLock({ cache[wid] }) {
+            // Window numbers get reused (a video-call app closes and reopens its meeting window under the
+            // same one): a cached element of a window that's gone is no longer that window.
+            var id: CGWindowID = 0
+            if _AXUIElementGetWindow(e, &id) == .success, id == wid { return e }
+            forget(wid)
+        }
         let app = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
@@ -83,11 +89,14 @@ final class WindowControl {
     }
 
     func close(_ wid: UInt32, pid: pid_t) {
-        guard let e = element(wid, pid: pid) else { return }
+        guard let e = element(wid, pid: pid) else { log("close \(wid): no accessibility element"); return }
         var button: CFTypeRef?
-        if AXUIElementCopyAttributeValue(e, kAXCloseButtonAttribute as CFString, &button) == .success, let b = button {
-            AXUIElementPerformAction(b as! AXUIElement, kAXPressAction as CFString)
+        guard AXUIElementCopyAttributeValue(e, kAXCloseButtonAttribute as CFString, &button) == .success, let b = button else {
+            log("close \(wid): window has no close button")
+            return
         }
+        let err = AXUIElementPerformAction(b as! AXUIElement, kAXPressAction as CFString)
+        if err != .success { log("close \(wid): pressing the close button failed (\(err.rawValue))") }
     }
 
     /// Frames of the close / minimise / zoom buttons relative to the window origin, in points

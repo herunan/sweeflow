@@ -330,6 +330,7 @@ final class Session {
             let wid = try m.u32()
             // The window takes a moment to go after its close button is pressed: watch for it.
             if let win = tracker.windows[wid] { ax(burstFor: 2) { $0.close(wid, pid: win.pid) } }
+            log("close \(wid)")
 
         case .pointerMove:
             let (wid, p) = try pointerTarget(&m)
