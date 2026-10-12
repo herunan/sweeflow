@@ -165,6 +165,12 @@ struct Win {
     /// Smallest size the Mac app turned out to accept (declared to the compositor, so tiling
     /// gives the window at least that instead of cutting it off).
     min_size: (u32, u32),
+    /// Largest size the Mac app turned out to accept (it stayed smaller than asked: a video-call app's
+    /// meeting window, a window wider than the Mac's display).
+    max_size: Option<(u32, u32)>,
+    /// A first refusal (size asked, size the Mac kept), not acted on yet: the Mac may just be
+    /// lagging behind a drag. Only the same refusal twice in a row declares a limit.
+    refusal: Option<((u32, u32), (u32, u32))>,
     /// The Mac reached the size last asked for (so a later difference is the app's own doing).
     followed: bool,
     /// Last size we asked the Mac for, and when (to ignore stale Mac-side sizes mid-resize).
@@ -495,6 +501,10 @@ impl App {
                     win.info.h = h;
                     win.info.rel_x = rel_x;
                     win.info.rel_y = rel_y;
+                    self.clip_input(wid, qh);
+                    if let Some(w) = self.windows.get(&wid) {
+                        w.base().commit();
+                    }
                     self.adopt_mac_size(wid, qh);
                 }
             }
@@ -668,6 +678,8 @@ impl App {
                 configured: false,
                 followed: false,
                 min_size: if info_kind == 2 { (1, 1) } else { MIN_SIZE },
+                max_size: None,
+                refusal: None,
                 size,
                 requested: None,
                 floating: true,
@@ -781,7 +793,30 @@ impl App {
         // window instead of cutting its bottom off.
         if let Role::Toplevel(win) = &w.role {
             let size = w.size;
-            let refused = !w.followed && w.requested.is_some_and(|(r, _)| r == size);
+            // The app went below a minimum we declared: it can go smaller after all (the limit
+            // came from a moment the Mac was behind).
+            let default_min = if w.info.kind == 2 { (1, 1) } else { MIN_SIZE };
+            if w.min_size != default_min && (mac.0 + 4 < w.min_size.0 || mac.1 + 4 < w.min_size.1) {
+                log::info!("window {wid}: the Mac made it {}x{}: minimum size {}x{} dropped",
+                           mac.0, mac.1, w.min_size.0, w.min_size.1);
+                w.min_size = default_min;
+                win.set_min_size(Some(default_min));
+            }
+            let mut refused = !w.followed && w.requested.is_some_and(|(r, _)| r == size);
+            // Seen once, ask once more and look again: during a drag (or right after a
+            // reconnect) the Mac lags, and a limit declared from that sticks and wrecks the
+            // tiling. A real refusal comes back the same.
+            if refused && w.refusal != Some((size, mac)) {
+                w.refusal = Some((size, mac));
+                w.requested = Some((size, Instant::now()));
+                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                let qh = qh.clone();
+                let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
+                    app.adopt_mac_size(wid, &qh);
+                    TimeoutAction::Drop
+                });
+                refused = false;
+            }
             // Any real overshoot counts: even a few points cut off a toolbar. (Apps that snap to
             // their own steps, like Terminal's character cells, end up smaller, not bigger.)
             let min = (
@@ -798,6 +833,25 @@ impl App {
                 w.size = (size.0.max(min.0), size.1.max(min.1));
                 self.draw_base(wid, qh);
                 return;
+            }
+            // The other way round: asked for more and the app stayed far smaller. Asking again
+            // won't help, so declare its size as the maximum and shrink to it, instead of
+            // keeping an empty window that size around it.
+            let far_smaller = mac.0 + 40 < size.0 || mac.1 + 40 < size.1;
+            if refused && far_smaller && w.max_size != Some((mac.0.max(w.min_size.0), mac.1.max(w.min_size.1))) {
+                let max = (mac.0.max(w.min_size.0), mac.1.max(w.min_size.1));
+                log::info!("window {wid}: the Mac keeps it {}x{} (asked {}x{}): maximum size {}x{}",
+                           mac.0, mac.1, size.0, size.1, max.0, max.1);
+                w.max_size = Some(max);
+                win.set_max_size(Some(max));
+                w.size = (size.0.min(max.0), size.1.min(max.1));
+                self.draw_base(wid, qh);
+                return;
+            }
+            // The app grew past a maximum we declared: it can go bigger after all.
+            if w.max_size.is_some_and(|m| mac.0 > m.0 || mac.1 > m.1) {
+                w.max_size = None;
+                win.set_max_size(None);
             }
         }
         match &w.role {
@@ -872,7 +926,26 @@ impl App {
         base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        base.commit();
+        self.clip_input(wid, _qh);
+        if let Some(w) = self.windows.get(&wid) {
+            w.base().commit();
+        }
+    }
+
+    /// Clicks land on the window only where the Mac window is. A window bigger here than on
+    /// the Mac (tiled wider than the app goes) is transparent around it, and must not swallow
+    /// the clicks meant for what shows through. Takes effect on the base surface's next commit.
+    fn clip_input(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        if !matches!(w.role, Role::Toplevel(_)) {
+            return;
+        }
+        let mac = (w.info.w.round().max(1.0) as i32, w.info.h.round().max(1.0) as i32);
+        let base = w.base();
+        let region = self.compositor.wl_compositor().create_region(qh, ());
+        region.add(0, 0, mac.0.min(w.size.0 as i32), mac.1.min(w.size.1 as i32));
+        base.set_input_region(Some(&region));
+        region.destroy();
     }
 
     fn present(&mut self, wid: u32, frame: GpuFrame, qh: &QueueHandle<Self>) {
