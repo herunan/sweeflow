@@ -1,4 +1,4 @@
-// One setting: icon, name and a switch. Clicking anywhere on the row flips it.
+// One setting: icon, name, a short description and a switch. Clicking anywhere on the row flips it.
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
@@ -8,15 +8,12 @@ PlasmaComponents3.ItemDelegate {
     id: row
     property string iconName
     property string label
-    property string tip
+    property string hint
     property bool on
     signal flipped(bool value)
 
     Layout.fillWidth: true
     onClicked: flipped(!on)
-    PlasmaComponents3.ToolTip.text: tip
-    PlasmaComponents3.ToolTip.visible: hovered && tip !== ""
-    PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
 
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing
@@ -25,7 +22,19 @@ PlasmaComponents3.ItemDelegate {
             Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
             Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
         }
-        PlasmaComponents3.Label { text: row.label; elide: Text.ElideRight; Layout.fillWidth: true }
+        ColumnLayout {
+            spacing: 0
+            Layout.fillWidth: true
+            PlasmaComponents3.Label { text: row.label; elide: Text.ElideRight; Layout.fillWidth: true }
+            PlasmaComponents3.Label {
+                visible: row.hint !== ""
+                text: row.hint
+                font: Kirigami.Theme.smallFont
+                opacity: 0.6
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+            }
+        }
         PlasmaComponents3.Switch {
             checked: row.on
             onToggled: {

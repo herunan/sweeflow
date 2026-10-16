@@ -95,7 +95,7 @@ PlasmoidItem {
 
     fullRepresentation: PlasmaExtras.Representation {
         Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 22
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 27
         collapseMarginsHint: true
 
         header: PlasmaExtras.PlasmoidHeading {
@@ -223,13 +223,15 @@ PlasmoidItem {
                         Layout.fillWidth: true
                         enabled: root.streaming
                         onClicked: { root.act("display"); root.expanded = false; }
-                        PlasmaComponents3.ToolTip.text: "The whole Mac screen in a window: find dialogs and windows that aren't showing here"
-                        PlasmaComponents3.ToolTip.visible: hovered
-                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                         contentItem: RowLayout {
                             spacing: Kirigami.Units.largeSpacing
                             Kirigami.Icon { source: "monitor-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium }
-                            PlasmaComponents3.Label { text: "Show Mac display"; Layout.fillWidth: true }
+                            ColumnLayout {
+                                spacing: 0
+                                Layout.fillWidth: true
+                                PlasmaComponents3.Label { text: "Show Mac display"; Layout.fillWidth: true }
+                                PlasmaComponents3.Label { text: "The whole Mac screen in a window"; font: Kirigami.Theme.smallFont; opacity: 0.6; Layout.fillWidth: true; elide: Text.ElideRight }
+                            }
                         }
                     }
 
@@ -237,19 +239,19 @@ PlasmoidItem {
 
                     Repeater {
                         model: [
-                            { key: "sound", icon: "audio-volume-high-symbolic", label: "Play Mac sound" },
-                            { key: "clipboard", icon: "edit-paste-symbolic", label: "Clipboard" },
-                            { key: "dragDrop", icon: "transform-move-symbolic", label: "Drag and drop files" },
-                            { key: "dim", icon: "brightness-low-symbolic", label: "Dim Mac screen" },
-                            { key: "desktop", icon: "virtual-desktops-symbolic", label: "Own desktop" },
-                            { key: "launcher", icon: "application-menu-symbolic", label: "Mac apps in Linux menu" },
-                            { key: "sharp", icon: "view-preview-symbolic", label: "High quality", tip: "Turn off for slower connections" },
+                            { key: "sound", icon: "audio-volume-high-symbolic", label: "Play Mac sound", hint: "Mac audio plays on Linux" },
+                            { key: "clipboard", icon: "edit-paste-symbolic", label: "Shared clipboard", hint: "Copy on one, paste on the other" },
+                            { key: "dragDrop", icon: "transform-move-symbolic", label: "Drag and drop files", hint: "Between Mac windows and Linux" },
+                            { key: "dim", icon: "brightness-low-symbolic", label: "Dim Mac screen", hint: "While its apps are streaming" },
+                            { key: "desktop", icon: "virtual-desktops-symbolic", label: "Own desktop", hint: "Mac apps open on a desktop of their own" },
+                            { key: "launcher", icon: "application-menu-symbolic", label: "Mac apps in Linux menu", hint: "Listed alongside your Linux apps" },
+                            { key: "sharp", icon: "view-preview-symbolic", label: "High quality", hint: "Turn off for slower connections" },
                         ]
                         delegate: ToggleRow {
                             required property var modelData
                             iconName: modelData.icon
                             label: modelData.label
-                            tip: modelData.tip || ""
+                            hint: modelData.hint
                             on: !!root.settings && (modelData.key === "sharp" ? root.settings.quality !== "light" : !!root.settings[modelData.key])
                             enabled: root.streaming
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
@@ -261,6 +263,7 @@ PlasmoidItem {
                     ToggleRow {
                         iconName: "system-run-symbolic"
                         label: "Open at login"
+                        hint: "Start Sweeflow when you log in"
                         on: !!root.st.openAtLogin
                         onFlipped: (v) => root.act("login", v ? "on" : "off")
                     }
