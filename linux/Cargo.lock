@@ -2913,37 +2913,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
-name = "sweeflow"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop 0.14.4",
- "calloop-wayland-source 0.4.1",
- "env_logger",
- "ffmpeg-next",
- "hex",
- "ksni",
- "log",
- "lz4_flex",
- "mdns-sd",
- "png",
- "quinn",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "slint",
- "smithay-client-toolkit 0.21.1",
- "tokio",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-plasma",
- "zbus",
- "zvariant",
-]
-
-[[package]]
 name = "mdns-sd"
 version = "0.21.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4903,6 +4872,37 @@ dependencies = [
  "skrifa",
  "yazi",
  "zeno",
+]
+
+[[package]]
+name = "sweeflow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop 0.14.4",
+ "calloop-wayland-source 0.4.1",
+ "env_logger",
+ "ffmpeg-next",
+ "hex",
+ "ksni",
+ "log",
+ "lz4_flex",
+ "mdns-sd",
+ "png",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "slint",
+ "smithay-client-toolkit 0.21.1",
+ "tokio",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-plasma",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]

@@ -311,8 +311,11 @@ impl ksni::Tray for Tray {
                 label: "Quit sweeflow".into(),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|_| {
-                    // Through systemd, which would otherwise start it again.
-                    let _ = std::process::Command::new("systemctl").args(["--user", "stop", "sweeflow"]).spawn();
+                    // Through systemd, which would otherwise start it again (under the service, this
+                    // stop is what ends us). Started any other way (KRunner, a terminal), the stop
+                    // is a no-op, so exit ourselves.
+                    let _ = std::process::Command::new("systemctl").args(["--user", "stop", "sweeflow"]).status();
+                    std::process::exit(0);
                 }),
                 ..Default::default()
             }
