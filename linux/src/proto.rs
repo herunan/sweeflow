@@ -33,6 +33,8 @@ pub mod t {
     pub const LAUNCH_APP: u8 = 0x27;
     pub const SET_SETTINGS: u8 = 0x28;
     pub const BLIND_PRESS: u8 = 0x29;
+    /// u8 on: open (or close) the "Mac display" view, which arrives as window DISPLAY_WID.
+    pub const SHOW_DISPLAY: u8 = 0x2A;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;

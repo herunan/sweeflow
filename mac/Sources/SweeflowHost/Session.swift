@@ -149,6 +149,21 @@ final class Session {
 
         case .subscribe:
             let wid = try m.u32()
+            if wid == displayViewWid {
+                guard let dv = displayView else { s.close(); return }
+                log("stream \(wid): subscribed (Mac display)")
+                // At 1 pixel per point: it's for looking around, and a 2x ultrawide is a lot of pixels.
+                let st = WindowStreamer(wid: wid, pointSize: dv.bounds.size, scale: 1, lossless: false,
+                                        out: s, queue: queue, displayID: dv.id)
+                st.active = wid == clientFocus
+                if let flow = datagrams {
+                    st.sendDatagram = { d in flow.send(content: d, completion: .idempotent) }
+                }
+                streamers[ObjectIdentifier(s)] = st
+                st.start()
+                if ScreenLock.isLocked { st.setScreenLocked(true) }
+                return
+            }
             guard let win = tracker.windows[wid] else { log("subscribe to unknown window \(wid)"); s.close(); return }
             log("stream \(wid): subscribed")
             // A new window is about to move onto the virtual display (see placeOnVirtualDisplay):
@@ -326,8 +341,11 @@ final class Session {
             guard let win = tracker.windows[wid] else { return }
             raise(win)
             ax { $0.focus(wid, pid: win.pid) }
+        case .showDisplay:
+            if try m.u8() != 0 { openDisplayView() } else { closeDisplayView() }
         case .close:
             let wid = try m.u32()
+            if wid == displayViewWid { closeDisplayView(); return }
             // The window takes a moment to go after its close button is pressed: watch for it.
             if let win = tracker.windows[wid] { ax(burstFor: 2) { $0.close(wid, pid: win.pid) } }
             log("close \(wid)")
@@ -368,9 +386,42 @@ final class Session {
         }
     }
 
+    /// The display shown as a window ("Show Mac display"), while it's open.
+    private var displayView: (id: CGDirectDisplayID, bounds: CGRect)?
+
+    /// Announces the whole virtual display (or, without one, the main display) as a window.
+    private func openDisplayView() {
+        DispatchQueue.main.async { [weak self] in
+            let id = host.display.displayID ?? CGMainDisplayID()
+            let b = CGDisplayBounds(id)
+            self?.queue.async {
+                guard let self else { return }
+                self.displayView = (id, b)
+                log("display view: display \(id) at \(b)")
+                var m = MsgWriter(.windowAdded)
+                m.u32(displayViewWid); m.i32(0)
+                m.str("dev.sweeflow.display"); m.str("Mac display"); m.str(macName)
+                m.f32(b.width); m.f32(b.height)
+                m.u32(0); m.f32(Float(0)); m.f32(Float(0))
+                m.u8(3)
+                self.control?.send(m)
+            }
+        }
+    }
+
+    private func closeDisplayView() {
+        guard displayView != nil else { return }
+        displayView = nil
+        for st in streamers.values where st.wid == displayViewWid { st.stop() }
+        var m = MsgWriter(.windowRemoved); m.u32(displayViewWid); control?.send(m)
+        log("display view closed")
+    }
+
     /// Reads `u32 wid, f32 x, f32 y` and converts to a global Mac point.
     private func pointerTarget(_ m: inout MsgReader) throws -> (UInt32, CGPoint?) {
         let wid = try m.u32(), x = try m.f32(), y = try m.f32()
+        // The display view: points on the display, whatever window is there.
+        if wid == displayViewWid, let dv = displayView { return (wid, CGPoint(x: dv.bounds.minX + x, y: dv.bounds.minY + y)) }
         if let win = tracker.windows[wid] { return (wid, CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)) }
         // Just gone on the Mac but still shown on Linux a moment longer (a tooltip vanishes as
         // the button under it is pressed): act where it was, on whatever is there now.

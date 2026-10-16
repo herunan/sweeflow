@@ -202,6 +202,10 @@ struct Win {
     /// Popup geometry changes wait a moment (see adopt_mac_size).
     popup_wait: bool,
     popup_settled: bool,
+    /// The "Mac display" view (kind 3): letterboxed and scaled to fit, never resized on the Mac.
+    display: bool,
+    /// Display view only: logical px per Mac point, and where the picture starts (logical px).
+    fit: (f64, f64, f64),
 }
 
 impl Win {
@@ -616,6 +620,17 @@ impl App {
             (Role::Popup(popup), s)
         } else {
             let surface = self.compositor.create_surface(qh);
+            if info.kind == 3 {
+                // The Mac display: an ordinary window with a KDE frame (the picture has no title
+                // bar of its own), on the Mac desktop with the rest (app id "sweeflow-…").
+                let window = self.xdg.create_window(surface, WindowDecorations::RequestServer, qh);
+                window.set_title(format!("Mac display — {}", info.title));
+                window.set_app_id("sweeflow-display");
+                window.set_min_size(Some((320, 160)));
+                window.commit();
+                let s = window.wl_surface().clone();
+                (Role::Toplevel(window), s)
+            } else {
             // The Mac window brings its own title bar and traffic lights; no KDE frame around it.
             let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, qh);
             window.set_title(display_title(&info.app_name, &info.title));
@@ -628,6 +643,7 @@ impl App {
             window.commit();
             let s = window.wl_surface().clone();
             (Role::Toplevel(window), s)
+            }
         };
 
         let viewporter = self.viewporter.get().expect("wp_viewporter");
@@ -651,7 +667,7 @@ impl App {
         };
 
         let appmenu = match (&role, &self.appmenu_mgr, &self.menus) {
-            (Role::Toplevel(_), Some(mgr), Some(menus)) => {
+            (Role::Toplevel(_), Some(mgr), Some(menus)) if info.kind != 3 => {
                 let am = mgr.create(&base, qh, ());
                 am.set_address(menus.service(), Menus::object_path(info.pid));
                 Some(am)
@@ -660,7 +676,13 @@ impl App {
         };
         self.surfaces.insert(base.id(), wid);
         self.surfaces.insert(video.id(), wid);
-        let size = (info.w.max(1.0) as u32, info.h.max(1.0) as u32);
+        let display = info.kind == 3;
+        // The display opens at a comfortable fraction of its size (it's as big as the screen).
+        let size = if display {
+            ((info.w * 0.6).max(320.0) as u32, (info.h * 0.6).max(160.0) as u32)
+        } else {
+            (info.w.max(1.0) as u32, info.h.max(1.0) as u32)
+        };
         let info_kind = info.kind;
         let is_popup = matches!(role, Role::Popup(_));
         self.windows.insert(
@@ -677,7 +699,7 @@ impl App {
                 inhibitor,
                 configured: false,
                 followed: false,
-                min_size: if info_kind == 2 { (1, 1) } else { MIN_SIZE },
+                min_size: if info_kind == 2 || info_kind == 3 { (1, 1) } else { MIN_SIZE },
                 max_size: None,
                 refusal: None,
                 size,
@@ -698,6 +720,8 @@ impl App {
                 raw_buffers: Default::default(),
                 stale: false,
                 popup_wait: false,
+                display,
+                fit: (1.0, 0.0, 0.0),
                 popup_settled: false,
             },
         );
@@ -777,6 +801,9 @@ impl App {
     /// is floating and we are not in the middle of our own resize.
     fn adopt_mac_size(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.display {
+            return; // scaled to fit, whatever its size
+        }
         let mac = (w.info.w.round() as u32, w.info.h.round() as u32);
         if mac == w.size || !w.configured {
             w.followed |= mac == w.size;
@@ -921,8 +948,9 @@ impl App {
             t.xdg_surface().set_window_geometry(0, 0, bw as i32, bh as i32);
         }
         let base = w.base();
-        // Transparent: the window's rounded corners must show the desktop behind them.
-        let fill = &self.clear;
+        // Transparent: the window's rounded corners must show the desktop behind them. The
+        // display view is letterboxed: dark bars.
+        let fill = if w.display { &self.background } else { &self.clear };
         base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -937,7 +965,7 @@ impl App {
     /// the clicks meant for what shows through. Takes effect on the base surface's next commit.
     fn clip_input(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get(&wid) else { return };
-        if !matches!(w.role, Role::Toplevel(_)) {
+        if !matches!(w.role, Role::Toplevel(_)) || w.display {
             return;
         }
         let mac = (w.info.w.round().max(1.0) as i32, w.info.h.round().max(1.0) as i32);
@@ -998,6 +1026,21 @@ impl App {
             wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
             qh,
         );
+
+        if w.display {
+            // Scaled to fit, centred.
+            let (k, ox, oy) = w.fit;
+            let (dw, dh) = ((w.info.w as f64 * k).round().max(1.0) as i32, (w.info.h as f64 * k).round().max(1.0) as i32);
+            w.video_sub.set_position(ox.round() as i32, oy.round() as i32);
+            w.video_viewport.set_source(0.0, 0.0, frame.width as f64, frame.height as f64);
+            w.video_viewport.set_destination(dw, dh);
+            w.video.attach(Some(&buffer), 0, 0);
+            w.video.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
+            w.video.commit();
+            w.base().commit(); // the subsurface position applies with the parent's commit
+            self.in_use.insert(buffer.id(), frame);
+            return;
+        }
 
         // Map the frame to the window's size in points (the frame may be 2x Retina pixels; the
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
@@ -1368,10 +1411,23 @@ impl App {
     }
 
     /// Resize edge under (x, y) for windows without a KDE frame.
+    /// Window position (logical px) → Mac window points. The same, except in the display view,
+    /// whose picture is scaled and letterboxed.
+    fn to_mac(&self, wid: u32, x: f64, y: f64) -> (f32, f32) {
+        match self.windows.get(&wid) {
+            Some(w) if w.display => {
+                let (k, ox, oy) = w.fit;
+                (((x - ox) / k).clamp(0.0, w.info.w as f64 - 1.0) as f32, ((y - oy) / k).clamp(0.0, w.info.h as f64 - 1.0) as f32)
+            }
+            _ => (x as f32, y as f32),
+        }
+    }
+
     fn edge_at(&self, wid: u32, x: f64, y: f64) -> Option<xdg_toplevel::ResizeEdge> {
         use xdg_toplevel::ResizeEdge as E;
         let w = self.windows.get(&wid)?;
-        if !matches!(w.role, Role::Toplevel(_)) || w.maximized {
+        // The display view has a KDE frame to resize by.
+        if !matches!(w.role, Role::Toplevel(_)) || w.maximized || w.display {
             return None;
         }
         const EDGE: f64 = 5.0;
@@ -1685,7 +1741,12 @@ impl WindowHandler for App {
         };
         let first = !w.configured;
         w.configured = true;
-        if size != w.size || (first && size != (w.info.w as u32, w.info.h as u32)) {
+        if w.display {
+            // Never resized on the Mac: the picture is scaled into whatever size it's given.
+            w.size = size;
+            let k = (size.0 as f64 / w.info.w.max(1.0) as f64).min(size.1 as f64 / w.info.h.max(1.0) as f64);
+            w.fit = (k, (size.0 as f64 - w.info.w as f64 * k) / 2.0, (size.1 as f64 - w.info.h as f64 * k) / 2.0);
+        } else if size != w.size || (first && size != (w.info.w as u32, w.info.h as u32)) {
             w.size = size;
             w.requested = Some((size, Instant::now()));
             w.followed = false;
@@ -1759,7 +1820,7 @@ impl PointerHandler for App {
     fn pointer_frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for e in events {
             let Some(wid) = self.wid_for(&e.surface) else { continue };
-            let (x, y) = (e.position.0 as f32, e.position.1 as f32);
+            let (x, y) = self.to_mac(wid, e.position.0, e.position.1);
             match e.kind {
                 PointerEventKind::Enter { serial } => {
                     log::debug!("pointer entered {wid} at {x:.0},{y:.0}");

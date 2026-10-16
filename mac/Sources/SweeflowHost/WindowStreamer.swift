@@ -96,8 +96,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// so their rounded corners and translucency survive. They are small and short-lived.
     let lossless: Bool
 
-    init(wid: UInt32, pointSize: CGSize, scale: CGFloat, lossless: Bool, out: MsgStream, queue: DispatchQueue) {
+    /// Set for the "Mac display" view: captures this whole display instead of a window, with
+    /// none of the window treatment (corners, traffic lights, capture badge).
+    let displayID: CGDirectDisplayID?
+    private var scDisplay: SCDisplay?
+
+    init(wid: UInt32, pointSize: CGSize, scale: CGFloat, lossless: Bool, out: MsgStream, queue: DispatchQueue,
+         displayID: CGDirectDisplayID? = nil) {
         self.wid = wid
+        self.displayID = displayID
         self.lossless = lossless
         self.pointSize = pointSize
         self.scale = scale
@@ -123,6 +130,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func start() {
+        if displayID != nil { return startDisplay() }
         let cached = Self.prefetchLock.withLock { Self.prefetched.removeValue(forKey: wid) }
         if let cached, Date().timeIntervalSince(cached.at) < 5 {
             queue.async { [weak self] in
@@ -147,9 +155,37 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    private func startCapture(_ win: SCWindow) {
+    /// The display view: look the display up, then capture it.
+    private func startDisplay() {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, err in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.stopped, self.stream == nil else { return }
+                guard let d = content?.displays.first(where: { $0.displayID == self.displayID }) else {
+                    // No list at all: the capture service isn't back yet (see resumeAfterStop).
+                    if content == nil { self.resumeAfterStop() } else { log("stream \(self.wid): display not found (\(String(describing: err)))"); self.out.close() }
+                    return
+                }
+                self.scDisplay = d
+                self.startCapture(nil, display: d)
+            }
+        }
+    }
+
+    /// Starts again from the same window or display (after a stop, or a capture that never
+    /// delivered a frame).
+    private func restartCapture() {
+        if let d = scDisplay { startCapture(nil, display: d) } else if let w = scWindow { startCapture(w) }
+    }
+
+    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil) {
         scWindow = win
-        let filter = SCContentFilter(desktopIndependentWindow: win)
+        let filter: SCContentFilter
+        if let display {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+        } else if let win {
+            filter = SCContentFilter(desktopIndependentWindow: win)
+        } else { return }
         applySize(to: config)
         // BGRA with alpha so the rounded window corners can be filled in (see fillCorners);
         // the encoder converts to 4:2:0 in hardware.
@@ -162,7 +198,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // A shared window's capture otherwise gets its menus/popups composited in (scaled and
         // misplaced); we stream those as their own windows.
         config.includeChildWindows = false
-        config.shouldBeOpaque = false
+        config.shouldBeOpaque = display != nil
         config.capturesAudio = false
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         do {
@@ -204,7 +240,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 else {
                     log("stream \(self.wid): capturing")
-                    self.expectFirstFrame(from: s, win: win)
+                    self.expectFirstFrame(from: s)
                 }
             }
         }
@@ -343,10 +379,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 guard let b = self.colourBeforeLock else {
                     self.pendingBuffer = nil
                     // Only a placeholder was shown: a fresh capture starts with a real frame.
-                    if let win = self.scWindow, let stream = self.stream {
+                    if let stream = self.stream {
                         stream.stopCapture { _ in }
                         self.stream = nil
-                        self.startCapture(win)
+                        self.restartCapture()
                     }
                     return
                 }
@@ -444,7 +480,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
-        if !lossless {
+        if !lossless && displayID == nil {
             // Apps that hide the standard buttons and draw their own: find them in the pixels
             // (a few times a second until found).
             if !buttons.contains(where: { $0.width > 0 }), onDetectedButtons != nil {
@@ -511,6 +547,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func resumeAfterStop() {
         guard stopRetries < 5 else { log("stream \(wid): giving up after repeated stops"); out.close(); return }
         stopRetries += 1
+        if displayID != nil {
+            queue.asyncAfter(deadline: .now() + Double(stopRetries)) { [weak self] in
+                self?.forceKeyframe = true
+                self?.startDisplay()
+            }
+            return
+        }
         queue.asyncAfter(deadline: .now() + Double(stopRetries)) { [weak self] in
             SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, _ in
                 guard let self else { return }
@@ -551,7 +594,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var sentStill = false
     private var startRetries = 0
 
-    private func expectFirstFrame(from s: SCStream, win: SCWindow) {
+    private func expectFirstFrame(from s: SCStream) {
+        let win = scWindow
         framesSinceStart = 0
         queue.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, !self.stopped, self.stream === s, self.framesSinceStart == 0 else {
@@ -564,6 +608,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             s.stopCapture { _ in }
             self.stream = nil
             self.forceKeyframe = true
+            guard let win else { return self.restartCapture() }
             // A fresh look-up: the window as ScreenCaptureKit saw it when it first appeared (an
             // app still opening it) can stay frameless however often it's restarted.
             SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, _ in

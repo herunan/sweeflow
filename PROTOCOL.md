@@ -42,6 +42,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x27 | C→S | LaunchApp | str bundleId — open (or reopen) the app on the Mac |
 | 0x28 | C→S | SetSettings | bytes JSON, same shape as Settings (any subset of the fields) — the host saves it and answers with Settings |
 | 0x29 | C→S | BlindPress | u32 id, u16 button — press that button of an uncapturable window |
+| 0x2A | C→S | ShowDisplay | u8 on — open (1) or close (0) the "Mac display" view: the host announces the whole virtual display as window 0xFFFFFF00 (WindowAdded kind 3), captured as a display; pointer events for it are display-relative points. The client scales it to fit and never sends Resize for it; Close on it closes the view |
 | 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
 | 0x25 | C→S | MenuRefresh | i32 pid — re-read and resend the app's menus |
 | 0x18 | S→C | ToggleMaximize | u32 wid — the app zoomed its window (title-bar double-click); client toggles maximised |
@@ -64,7 +65,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 
-`kind`: 0 = normal toplevel, 1 = popup/menu (child of `parent`), 2 = sheet/dialog.
+`kind`: 0 = normal toplevel, 1 = popup/menu (child of `parent`), 2 = sheet/dialog, 3 = the Mac display view.
 
 ## Video streams
 

@@ -219,6 +219,20 @@ PlasmoidItem {
                         }
                     }
 
+                    PlasmaComponents3.ItemDelegate {
+                        Layout.fillWidth: true
+                        enabled: root.streaming
+                        onClicked: { root.act("display"); root.expanded = false; }
+                        PlasmaComponents3.ToolTip.text: "The whole Mac screen in a window: find dialogs and windows that aren't showing here"
+                        PlasmaComponents3.ToolTip.visible: hovered
+                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                        contentItem: RowLayout {
+                            spacing: Kirigami.Units.largeSpacing
+                            Kirigami.Icon { source: "monitor-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium }
+                            PlasmaComponents3.Label { text: "Show Mac display"; Layout.fillWidth: true }
+                        }
+                    }
+
                     Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
 
                     Repeater {

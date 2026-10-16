@@ -32,7 +32,8 @@ impl Iface {
         crate::tray::rename(&fingerprint, &name);
     }
 
-    /// One of: wake, pair, switch <fingerprint>, forget <fingerprint>, launch <bundle id>,
+    /// One of: wake, pair, display (show the Mac's display in a window), switch <fingerprint>,
+    /// forget <fingerprint>, launch <bundle id>,
     /// login on|off (open at login), quit.
     #[zbus(name = "Do")]
     fn act(&self, action: String, arg: String) {
