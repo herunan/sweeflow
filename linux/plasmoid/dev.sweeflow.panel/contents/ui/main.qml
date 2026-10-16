@@ -212,7 +212,8 @@ PlasmoidItem {
                             PlasmaComponents3.Label {
                                 readonly property int total: (root.st.apps || []).length
                                 readonly property int hidden: root.settings ? root.settings.exclude.length : 0
-                                text: hidden ? (total - hidden) + " of " + total : "All " + total
+                                readonly property int running: (root.st.apps || []).filter(a => a.state > 0).length
+                                text: (running ? running + " running · " : "") + (hidden ? (total - hidden) + " of " + total : "All " + total)
                                 opacity: 0.6
                             }
                             Kirigami.Icon { source: "go-next-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.small; Layout.preferredHeight: Kirigami.Units.iconSizes.small }
@@ -338,7 +339,7 @@ PlasmoidItem {
                 PlasmaComponents3.Label {
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
-                    text: "Click to open on the Mac · switch off to keep it there"
+                    text: "Click to open · ⏻ quits · switch off to keep it on the Mac"
                     font: Kirigami.Theme.smallFont
                     opacity: 0.7
                 }
@@ -361,7 +362,25 @@ PlasmoidItem {
                                     Layout.preferredWidth: Kirigami.Units.iconSizes.medium
                                     Layout.preferredHeight: Kirigami.Units.iconSizes.medium
                                 }
-                                PlasmaComponents3.Label { text: appRow.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true }
+                                ColumnLayout {
+                                    spacing: 0
+                                    Layout.fillWidth: true
+                                    PlasmaComponents3.Label { text: appRow.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true }
+                                    PlasmaComponents3.Label {
+                                        visible: appRow.modelData.state > 0
+                                        text: ["", "Running, no window", "Minimised", "Open"][appRow.modelData.state] || ""
+                                        font: Kirigami.Theme.smallFont
+                                        color: appRow.modelData.state === 3 ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.textColor
+                                        opacity: appRow.modelData.state === 3 ? 0.9 : 0.6
+                                    }
+                                }
+                                PlasmaComponents3.ToolButton {
+                                    visible: appRow.modelData.state > 0
+                                    icon.name: "application-exit"
+                                    onClicked: root.act("quit-app", appRow.modelData.id)
+                                    PlasmaComponents3.ToolTip.text: "Quit " + appRow.modelData.name
+                                    PlasmaComponents3.ToolTip.visible: hovered
+                                }
                                 PlasmaComponents3.Switch {
                                     checked: appRow.shown
                                     onToggled: {

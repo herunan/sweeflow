@@ -558,6 +558,15 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             crate::tray::set_settings(r.bytes()?);
             return Ok(());
         }
+        t::RUNNING_APPS => {
+            let n = r.u16()?;
+            let mut running = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                running.push((r.str()?, r.u8()?));
+            }
+            crate::tray::set_running(running);
+            return Ok(());
+        }
         t::BLIND_GONE => {
             crate::blind::gone(r.u32()?);
             return Ok(());

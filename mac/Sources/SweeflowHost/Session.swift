@@ -92,6 +92,7 @@ final class Session {
         if let o = settingsObserver { NotificationCenter.default.removeObserver(o) }
         cursor?.stop()
         gestureTimer?.cancel()
+        runningTimer?.cancel()
         input.releaseAll()
         streamers.values.forEach { $0.stop() }
         streamers.removeAll()
@@ -138,6 +139,7 @@ final class Session {
             cursor = cw
             sendAppList()
             sendSettings()
+            watchRunningApps()
             openDatagrams()
             if !watchingLock {
                 watchingLock = true
@@ -341,6 +343,13 @@ final class Session {
             guard let win = tracker.windows[wid] else { return }
             raise(win)
             ax { $0.focus(wid, pid: win.pid) }
+        case .quitApp:
+            // As ⌘Q: the app may still ask about unsaved changes (on the Mac, via a stand-in).
+            let bid = try m.str()
+            log("quitting \(bid)")
+            DispatchQueue.main.async {
+                NSRunningApplication.runningApplications(withBundleIdentifier: bid).forEach { $0.terminate() }
+            }
         case .showDisplay:
             if try m.u8() != 0 { openDisplayView() } else { closeDisplayView() }
         case .close:
@@ -383,6 +392,46 @@ final class Session {
 
         default:
             log("unhandled message \(m.type)")
+        }
+    }
+
+    /// Which apps are running and how (RunningApps): looked at every second, sent on change.
+    private var runningTimer: DispatchSourceTimer?
+    private var lastRunning: [String: UInt8] = [:]
+
+    private func watchRunningApps() {
+        runningTimer?.cancel()
+        lastRunning = [:]
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 0.3, repeating: 1.0)
+        t.setEventHandler { [weak self] in self?.sendRunningApps() }
+        t.resume()
+        runningTimer = t
+    }
+
+    /// 3 = has a window showing here, 2 = only minimised ones, 1 = running with no window.
+    private func sendRunningApps() {
+        DispatchQueue.main.async { [weak self] in
+            let own = Bundle.main.bundleIdentifier
+            let bids = NSWorkspace.shared.runningApplications
+                .filter { $0.activationPolicy == .regular }
+                .compactMap(\.bundleIdentifier)
+                .filter { $0 != own }
+            self?.queue.async {
+                guard let self else { return }
+                var now: [String: UInt8] = [:]
+                for bid in bids {
+                    let open = self.tracker.windows.values.contains { $0.bundleId == bid && $0.kind != .popup }
+                    let mini = self.minimized.values.contains { $0.bundleId == bid }
+                    now[bid] = open ? 3 : mini ? 2 : 1
+                }
+                guard now != self.lastRunning else { return }
+                self.lastRunning = now
+                var m = MsgWriter(.runningApps)
+                m.u16(UInt16(now.count))
+                for (bid, state) in now.sorted(by: { $0.key < $1.key }) { m.str(bid); m.u8(state) }
+                self.control?.send(m)
+            }
         }
     }
 

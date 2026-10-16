@@ -46,6 +46,8 @@ struct State {
     settings: Option<Settings>,
     /// (bundle id, name) of the Mac's apps.
     apps: Vec<(String, String)>,
+    /// Running Mac apps: 3 = a window shown here, 2 = only minimised ones, 1 = no window.
+    running: std::collections::HashMap<String, u8>,
     /// "Stream Mac apps" was ticked while the Mac was unreachable: switch it on when it's back.
     resume_wanted: bool,
     /// The settings as last seen from the Mac, shown (read-only) while it's away.
@@ -102,6 +104,7 @@ pub fn connected(mac: Option<String>) {
     let mut s = STATE.lock().unwrap();
     if mac.is_none() {
         s.settings = None;
+        s.running.clear();
     }
     s.mac = mac;
     drop(s);
@@ -137,6 +140,11 @@ pub fn set_settings(json: &[u8]) {
         }
         Err(e) => log::warn!("bad settings from the Mac: {e}"),
     }
+}
+
+pub fn set_running(running: Vec<(String, u8)>) {
+    STATE.lock().unwrap().running = running.into_iter().collect();
+    refresh();
 }
 
 pub fn set_apps(apps: Vec<(String, String)>) {
@@ -438,8 +446,17 @@ pub fn panel_state() -> serde_json::Value {
         .map(|m| m.name.clone())
         .or_else(|| state.mac.clone())
         .unwrap_or_default();
-    let mut apps: Vec<_> = state.apps.iter().map(|(b, n)| crate::panel::app(b, n)).collect();
-    apps.sort_by_key(|a| a["name"].as_str().unwrap_or_default().to_lowercase());
+    let mut apps: Vec<_> = state
+        .apps
+        .iter()
+        .map(|(b, n)| {
+            let mut a = crate::panel::app(b, n);
+            a["state"] = state.running.get(b).copied().unwrap_or(0).into();
+            a
+        })
+        .collect();
+    // Running ones first, then by name.
+    apps.sort_by_key(|a| (a["state"].as_u64() == Some(0), a["name"].as_str().unwrap_or_default().to_lowercase()));
     serde_json::json!({
         "connected": state.settings.is_some(),
         "paired": !cfg.host.is_empty(),
@@ -499,6 +516,11 @@ pub fn panel_do(action: &str, arg: &str) {
             refresh();
         }
         "gather" => crate::desktop::gather(),
+        "quit-app" => {
+            if let Some(net) = NET.get() {
+                let _ = net.send(NetCmd::Control(W::new(t::QUIT_APP).str(arg).finish()));
+            }
+        }
         "display" => {
             if let Some(net) = NET.get() {
                 let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(1).finish()));

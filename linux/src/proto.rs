@@ -35,6 +35,10 @@ pub mod t {
     pub const BLIND_PRESS: u8 = 0x29;
     /// u8 on: open (or close) the "Mac display" view, which arrives as window DISPLAY_WID.
     pub const SHOW_DISPLAY: u8 = 0x2A;
+    /// str bundle id: quit the app (as ⌘Q).
+    pub const QUIT_APP: u8 = 0x2B;
+    /// u16 n × (str bundle id, u8 state 3 shown / 2 minimised / 1 no window): running Mac apps.
+    pub const RUNNING_APPS: u8 = 0x2C;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;
