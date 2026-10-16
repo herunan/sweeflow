@@ -498,6 +498,7 @@ pub fn panel_do(action: &str, arg: &str) {
             let _ = std::process::Command::new("systemctl").args(["--user", verb, "sweeflow"]).status();
             refresh();
         }
+        "gather" => crate::desktop::gather(),
         "display" => {
             if let Some(net) = NET.get() {
                 let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(1).finish()));

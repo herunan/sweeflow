@@ -255,6 +255,10 @@ PlasmoidItem {
                             on: !!root.settings && (modelData.key === "sharp" ? root.settings.quality !== "light" : !!root.settings[modelData.key])
                             enabled: root.streaming
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
+                            actionText: modelData.key === "desktop" ? "Gather" : ""
+                            actionIcon: "view-refresh-symbolic"
+                            actionTip: "Bring every Mac window back to the Mac desktop"
+                            onExtraClicked: root.act("gather")
                         }
                     }
 

@@ -140,6 +140,20 @@ fn save(id: &str, adopted: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// "Gather" in the tray: set the Mac desktop up again and bring every Mac window back to it,
+/// whatever happened to it meanwhile.
+pub fn gather() {
+    if !crate::tray::wants_own_desktop() {
+        return;
+    }
+    std::thread::spawn(|| {
+        log::info!("gathering Mac windows onto the Mac desktop");
+        if let Err(e) = enable() {
+            log::warn!("Mac desktop: {e:#}");
+        }
+    });
+}
+
 /// A Mac window is opening: make sure the desktop the rule sends it to still exists (it may
 /// have been removed by hand), at most every few seconds.
 pub fn check() {
