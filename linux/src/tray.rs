@@ -52,6 +52,8 @@ struct State {
     resume_wanted: bool,
     /// The settings as last seen from the Mac, shown (read-only) while it's away.
     last: Option<Settings>,
+    /// Where Mac apps show up (task manager, Mac Dock, Global Menu), as last looked at.
+    placement: crate::placement::Placement,
 }
 
 static STATE: LazyLock<Mutex<State>> =
@@ -68,6 +70,7 @@ pub fn start(net: UnboundedSender<NetCmd>) {
         .name("tray".into())
         .spawn(move || {
             let panel = crate::panel::Panel::new().map_err(|e| log::warn!("tray widget's D-Bus service: {e}")).ok();
+            refresh_placement();
             // With the KDE widget installed, it is the tray icon; the plain one is for elsewhere.
             let handle: Option<Handle<Tray>> = if widget_installed() {
                 None
@@ -466,6 +469,7 @@ pub fn panel_state() -> serde_json::Value {
         "apps": apps,
         "macs": macs,
         "openAtLogin": open_at_login(),
+        "placement": state.placement,
     })
 }
 
@@ -516,6 +520,22 @@ pub fn panel_do(action: &str, arg: &str) {
             refresh();
         }
         "gather" => crate::desktop::gather(),
+        "placement" => refresh_placement(),
+        "taskbar" | "dock" | "global-menu" => {
+            let (action, arg) = (action.to_string(), arg.to_string());
+            std::thread::spawn(move || {
+                let r = match (action.as_str(), arg.as_str()) {
+                    ("taskbar", a) => crate::placement::set_taskbar(a == "on"),
+                    ("dock", "off") => crate::placement::remove_dock(),
+                    ("dock", a) => crate::placement::add_dock(a == "own"),
+                    (_, a) => crate::placement::set_global_menu(a == "on"),
+                };
+                if let Err(e) = r {
+                    log::warn!("{action} {arg}: {e:#}");
+                }
+                refresh_placement();
+            });
+        }
         "quit-app" => {
             if let Some(net) = NET.get() {
                 let _ = net.send(NetCmd::Control(W::new(t::QUIT_APP).str(arg).finish()));
@@ -529,6 +549,21 @@ pub fn panel_do(action: &str, arg: &str) {
         "quit" => quit(),
         _ => log::warn!("unknown tray widget action {action}"),
     }
+}
+
+/// Looks again at where Mac apps show up (off the calling thread), and tells the widget.
+pub fn refresh_placement() {
+    std::thread::spawn(|| {
+        // Plasma applies some changes (a new panel) a moment later.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let p = crate::placement::query();
+        let mut s = STATE.lock().unwrap();
+        if s.placement != p {
+            s.placement = p;
+            drop(s);
+            refresh();
+        }
+    });
 }
 
 /// Starts with the session: the user service is enabled.

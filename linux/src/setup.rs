@@ -208,10 +208,18 @@ fn append_tar(out: &mut Vec<u8>, path: &str, data: &[u8], mode: u32) {
 }
 
 const LOGO: &str = include_str!("../../assets/sweeflow.svg");
-const WIDGET_METADATA: &str = include_str!("../plasmoid/dev.sweeflow.panel/metadata.json");
-const WIDGET_QML: &str = include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/main.qml");
-const WIDGET_TOGGLE_ROW: &str = include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/ToggleRow.qml");
-const WIDGET_MAC_ROW: &str = include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/MacRow.qml");
+/// The Plasma widgets' files (published path inside ~/.local/share/plasma/plasmoids, contents),
+/// built in so the binary installs them.
+const WIDGET_FILES: &[(&str, &str)] = &[
+    ("dev.sweeflow.panel/metadata.json", include_str!("../plasmoid/dev.sweeflow.panel/metadata.json")),
+    ("dev.sweeflow.panel/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/main.qml")),
+    ("dev.sweeflow.panel/contents/ui/ToggleRow.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/ToggleRow.qml")),
+    ("dev.sweeflow.panel/contents/ui/MacRow.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/MacRow.qml")),
+    ("dev.sweeflow.panel/contents/icons/sweeflow.svg", LOGO),
+    ("dev.sweeflow.dock/metadata.json", include_str!("../plasmoid/dev.sweeflow.dock/metadata.json")),
+    ("dev.sweeflow.dock/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.dock/contents/ui/main.qml")),
+    ("dev.sweeflow.dock/contents/config/main.xml", include_str!("../plasmoid/dev.sweeflow.dock/contents/config/main.xml")),
+];
 
 /// The logo (icon theme name "sweeflow"), and on Plasma the tray widget (linux/plasmoid), added
 /// to every system tray. Plasma keeps its own copy of the panel config, so the tray is changed
@@ -234,14 +242,12 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") {
         return Ok(());
     }
-    let widget = home.join(".local/share/plasma/plasmoids/dev.sweeflow.panel");
-    std::fs::create_dir_all(widget.join("contents/ui"))?;
-    std::fs::create_dir_all(widget.join("contents/icons"))?;
-    std::fs::write(widget.join("metadata.json"), WIDGET_METADATA)?;
-    std::fs::write(widget.join("contents/ui/main.qml"), WIDGET_QML)?;
-    std::fs::write(widget.join("contents/ui/ToggleRow.qml"), WIDGET_TOGGLE_ROW)?;
-    std::fs::write(widget.join("contents/ui/MacRow.qml"), WIDGET_MAC_ROW)?;
-    std::fs::write(widget.join("contents/icons/sweeflow.svg"), LOGO)?;
+    let plasmoids = home.join(".local/share/plasma/plasmoids");
+    for (path, contents) in WIDGET_FILES {
+        let file = plasmoids.join(path);
+        std::fs::create_dir_all(file.parent().context("widget path")?)?;
+        std::fs::write(file, contents)?;
+    }
     let script = r#"panels().forEach(function(p){ p.widgets("org.kde.plasma.systemtray").forEach(function(w){
         w.currentConfigGroup = ["General"];
         ["extraItems","knownItems"].forEach(function(k){ var v = w.readConfig(k, []); if (typeof v === "string") v = v.split(",");

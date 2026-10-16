@@ -42,7 +42,8 @@ impl Iface {
     /// One of: wake, pair, display (show the Mac's display in a window), gather (Mac windows
     /// back onto the Mac desktop), switch <fingerprint>,
     /// forget <fingerprint>, launch <bundle id>, quit-app <bundle id>,
-    /// login on|off (open at login), quit.
+    /// login on|off (open at login), taskbar on|off, dock own|panel|off, global-menu on|off,
+    /// placement (look again at those), quit.
     #[zbus(name = "Do")]
     fn act(&self, action: String, arg: String) {
         crate::tray::panel_do(&action, &arg);

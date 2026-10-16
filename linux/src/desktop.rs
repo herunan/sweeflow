@@ -215,14 +215,10 @@ fn disable() -> Result<()> {
 
 /// Adds (with a desktop id) or removes our rule in kwinrulesrc, keeping everyone else's.
 fn write_rule(desktop: Option<&str>) -> Result<()> {
-    let set = |group: &str, key: &str, value: &str| {
-        Command::new("kwriteconfig6").args(["--file", "kwinrulesrc", "--group", group, "--key", key, value]).status()
-    };
-    let read = Command::new("kreadconfig6").args(["--file", "kwinrulesrc", "--group", "General", "--key", "rules"]).output()?;
-    let mut rules = other_rules(&String::from_utf8_lossy(&read.stdout));
     match desktop {
-        Some(id) => {
-            for (k, v) in [
+        Some(id) => set_rule(
+            RULE,
+            Some(&[
                 ("Description", "Mac apps on their own desktop (sweeflow)"),
                 // Not the Mac display view: it opens wherever you are.
                 ("wmclass", "^sweeflow-(?!display$)"),
@@ -231,15 +227,29 @@ fn write_rule(desktop: Option<&str>) -> Result<()> {
                 ("desktops", id),
                 // Apply initially: placed there when opened, free to move afterwards.
                 ("desktopsrule", "3"),
-            ] {
-                set(RULE, k, v)?;
-            }
-            rules.push(RULE.into());
+            ]),
+        ),
+        None => set_rule(RULE, None),
+    }
+}
+
+/// Writes (Some) or removes (None) one of our KWin rules, keeping everyone else's, and has
+/// KWin reload them.
+pub fn set_rule(name: &str, entries: Option<&[(&str, &str)]>) -> Result<()> {
+    let set = |group: &str, key: &str, value: &str| {
+        Command::new("kwriteconfig6").args(["--file", "kwinrulesrc", "--group", group, "--key", key, value]).status()
+    };
+    let read = Command::new("kreadconfig6").args(["--file", "kwinrulesrc", "--group", "General", "--key", "rules"]).output()?;
+    let mut rules = other_rules(&String::from_utf8_lossy(&read.stdout), name);
+    if let Some(entries) = entries {
+        for (k, v) in entries {
+            set(name, k, v)?;
         }
-        None => {
-            for k in ["Description", "wmclass", "wmclassmatch", "wmclasscomplete", "desktops", "desktopsrule"] {
-                Command::new("kwriteconfig6").args(["--file", "kwinrulesrc", "--group", RULE, "--key", k, "--delete"]).status()?;
-            }
+        rules.push(name.into());
+    } else {
+        // kwriteconfig6 can't drop a whole group: delete the keys we write.
+        for k in ["Description", "wmclass", "wmclassmatch", "wmclasscomplete", "desktops", "desktopsrule", "skiptaskbar", "skiptaskbarrule"] {
+            Command::new("kwriteconfig6").args(["--file", "kwinrulesrc", "--group", name, "--key", k, "--delete"]).status()?;
         }
     }
     set("General", "rules", &rules.join(","))?;
@@ -248,9 +258,17 @@ fn write_rule(desktop: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// kwinrulesrc's rule list without ours (it's added back when switched on).
-fn other_rules(list: &str) -> Vec<String> {
-    list.trim().split(',').filter(|r| !r.is_empty() && *r != RULE).map(String::from).collect()
+/// Whether one of our KWin rules is in place.
+pub fn has_rule(name: &str) -> bool {
+    Command::new("kreadconfig6")
+        .args(["--file", "kwinrulesrc", "--group", "General", "--key", "rules"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim().split(',').any(|r| r == name))
+}
+
+/// kwinrulesrc's rule list without `name` (it's added back when switched on).
+fn other_rules(list: &str, name: &str) -> Vec<String> {
+    list.trim().split(',').filter(|r| !r.is_empty() && *r != name).map(String::from).collect()
 }
 
 fn run_script(js: &str) -> Result<()> {
@@ -282,8 +300,9 @@ mod tests {
 
     #[test]
     fn other_peoples_rules_are_kept() {
-        assert_eq!(other_rules("abc,sweeflow,def\n"), ["abc", "def"]);
-        assert_eq!(other_rules(""), Vec::<String>::new());
-        assert_eq!(other_rules("sweeflow"), Vec::<String>::new());
+        assert_eq!(other_rules("abc,sweeflow,def\n", RULE), ["abc", "def"]);
+        assert_eq!(other_rules("", RULE), Vec::<String>::new());
+        assert_eq!(other_rules("sweeflow", RULE), Vec::<String>::new());
+        assert_eq!(other_rules("sweeflow,sweeflow-taskbar", "sweeflow-taskbar"), ["sweeflow"]);
     }
 }

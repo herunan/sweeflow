@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "dev.sweeflow.dock",
+        "Name": "Mac Dock",
+        "Description": "Your Mac's apps, like its Dock: open, minimised or running",
+        "Icon": "sweeflow",
+        "Category": "Windows and Tasks",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

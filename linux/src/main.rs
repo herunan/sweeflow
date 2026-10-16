@@ -11,6 +11,7 @@ mod menus;
 mod net;
 mod pair;
 mod panel;
+mod placement;
 mod proto;
 mod setup;
 mod tray;
