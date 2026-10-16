@@ -26,6 +26,13 @@ impl Iface {
         crate::tray::panel_set(&json);
     }
 
+    /// The answer of desktop.rs's KWin script: the desktop to use ("" for none) and, when it's
+    /// one of the user's own empty desktops being reused, its name.
+    #[zbus(name = "DesktopFound")]
+    fn desktop_found(&self, id: String, adopted_name: String) {
+        crate::desktop::found(id, adopted_name);
+    }
+
     /// Renames a linked Mac (here only: it's what this computer calls it).
     #[zbus(name = "Rename")]
     fn rename(&self, fingerprint: String, name: String) {

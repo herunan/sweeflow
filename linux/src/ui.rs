@@ -677,6 +677,9 @@ impl App {
         self.surfaces.insert(base.id(), wid);
         self.surfaces.insert(video.id(), wid);
         let display = info.kind == 3;
+        if matches!(role, Role::Toplevel(_)) {
+            crate::desktop::check();
+        }
         // The display opens at a comfortable fraction of its size (it's as big as the screen).
         let size = if display {
             ((info.w * 0.6).max(320.0) as u32, (info.h * 0.6).max(160.0) as u32)

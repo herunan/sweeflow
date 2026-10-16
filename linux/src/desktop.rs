@@ -1,8 +1,14 @@
 //! Mac windows on a virtual desktop of their own ("Mac"), apart from the Linux ones: a KWin
-//! rule places each new Mac window there (initially, so one can still be moved elsewhere).
-//! Switched off, the rule and the desktop go again.
+//! rule places each new Mac window there (initially, so one can still be moved elsewhere). An
+//! existing empty desktop is reused rather than adding one. Switched off, the rule goes, and
+//! the desktop goes too (or, if it was the user's, gets its old name back).
 
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::Command,
+    sync::{Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use zbus::blocking::Connection;
@@ -33,30 +39,89 @@ fn desktops(conn: &Connection) -> Result<Vec<(u32, String, String)>> {
     Ok(Vec::<(u32, String, String)>::try_from(v)?)
 }
 
-/// The id of the desktop we made, kept so we only ever remove that one.
+/// The id of the desktop in use, kept so we only ever remove that one. A second line, when
+/// present, is the name an empty desktop of the user's had before we took it over: it gets that
+/// name back (instead of being removed) when switched off.
 fn id_file() -> std::path::PathBuf {
     crate::config::dir().join("mac-desktop")
 }
 
+fn stored() -> (String, Option<String>) {
+    let text = fs::read_to_string(id_file()).unwrap_or_default();
+    let mut lines = text.lines();
+    let id = lines.next().unwrap_or_default().trim().to_string();
+    (id, lines.next().map(|n| n.to_string()).filter(|n| !n.is_empty()))
+}
+
+/// The reply from the look-up script (see `find`), via panel.rs.
+static FOUND: Mutex<Option<(String, String)>> = Mutex::new(None);
+static FOUND_CV: Condvar = Condvar::new();
+
+pub fn found(id: String, adopted_name: String) {
+    *FOUND.lock().unwrap() = Some((id, adopted_name));
+    FOUND_CV.notify_all();
+}
+
+/// Asks KWin for the desktop to use: ours if it's still there, else one called Mac, else the
+/// last desktop with no windows on it (the user's spare). None: make one.
+fn find(ours: &str) -> Result<Option<(String, Option<String>)>> {
+    *FOUND.lock().unwrap() = None;
+    let js = format!(
+        "let d = workspace.desktops.find(d => d.id == '{ours}') || workspace.desktops.find(d => d.name == '{NAME}');\n\
+         let adopted = '';\n\
+         if (!d) {{\n\
+           const used = new Set();\n\
+           for (const w of workspace.windowList())\n\
+             if (w.normalWindow && !w.skipTaskbar && !w.onAllDesktops) for (const x of w.desktops) used.add(x.id);\n\
+           const empty = workspace.desktops.filter(x => !used.has(x.id));\n\
+           if (empty.length) {{ d = empty[empty.length - 1]; adopted = d.name; }}\n\
+         }}\n\
+         callDBus('dev.sweeflow.Client', '/dev/sweeflow/Panel', 'dev.sweeflow.Panel', 'DesktopFound', d ? d.id : '', adopted);"
+    );
+    run_script(&js)?;
+    let guard = FOUND.lock().unwrap();
+    let (guard, _) = FOUND_CV.wait_timeout_while(guard, Duration::from_secs(3), |f| f.is_none()).unwrap();
+    let (id, adopted) = guard.clone().context("KWin didn't answer the desktop look-up")?;
+    Ok((!id.is_empty()).then(|| (id, (!adopted.is_empty()).then_some(adopted))))
+}
+
 fn enable() -> Result<()> {
     let conn = Connection::session()?;
-    let ours = fs::read_to_string(id_file()).unwrap_or_default();
-    let mut list = desktops(&conn)?;
-    if !list.iter().any(|(_, id, _)| *id == ours) {
-        conn.call_method(
-            Some("org.kde.KWin"),
-            "/VirtualDesktopManager",
-            Some("org.kde.KWin.VirtualDesktopManager"),
-            "createDesktop",
-            &(list.len() as u32, NAME),
-        )?;
-        list = desktops(&conn)?;
-        let (_, id, _) = list.iter().rev().find(|(_, _, n)| n == NAME).context("desktop not created")?;
-        fs::create_dir_all(crate::config::dir())?;
-        fs::write(id_file(), id)?;
-        log::info!("created the {NAME} desktop");
-    }
-    let id = fs::read_to_string(id_file())?;
+    let (ours, adopted_before) = stored();
+    let id = match find(&ours)? {
+        Some((id, _)) if id == ours => id,
+        Some((id, adopted)) => {
+            // The user's own: called Mac already, or an empty one taken over and renamed.
+            let adopted = adopted.filter(|n| n != NAME);
+            if adopted.is_some() {
+                conn.call_method(
+                    Some("org.kde.KWin"),
+                    "/VirtualDesktopManager",
+                    Some("org.kde.KWin.VirtualDesktopManager"),
+                    "setDesktopName",
+                    &(id.as_str(), NAME),
+                )?;
+            }
+            log::info!("using the existing desktop {} for Mac apps", adopted.as_deref().unwrap_or(NAME));
+            save(&id, adopted.as_deref().or(adopted_before.as_deref().filter(|_| id == ours)))?;
+            id
+        }
+        None => {
+            let list = desktops(&conn)?;
+            conn.call_method(
+                Some("org.kde.KWin"),
+                "/VirtualDesktopManager",
+                Some("org.kde.KWin.VirtualDesktopManager"),
+                "createDesktop",
+                &(list.len() as u32, NAME),
+            )?;
+            let list = desktops(&conn)?;
+            let (_, id, _) = list.iter().rev().find(|(_, _, n)| n == NAME).context("desktop not created")?;
+            save(id, None)?;
+            log::info!("created the {NAME} desktop");
+            id.clone()
+        }
+    };
     write_rule(Some(&id))?;
     // Windows already open move there too: now, and again shortly for any that were opening
     // while the rule went in (right after connecting, they all are).
@@ -65,24 +130,70 @@ fn enable() -> Result<()> {
          if (d) for (const w of workspace.windowList()) if (w.resourceClass.startsWith('sweeflow-')) w.desktops = [d];"
     );
     run_script(&js)?;
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(3));
     run_script(&js)
+}
+
+fn save(id: &str, adopted: Option<&str>) -> Result<()> {
+    fs::create_dir_all(crate::config::dir())?;
+    fs::write(id_file(), format!("{id}\n{}", adopted.unwrap_or_default()))?;
+    Ok(())
+}
+
+/// A Mac window is opening: make sure the desktop the rule sends it to still exists (it may
+/// have been removed by hand), at most every few seconds.
+pub fn check() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) || !crate::tray::wants_own_desktop() {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    std::thread::spawn(|| {
+        let (ours, _) = stored();
+        let gone = Connection::session()
+            .and_then(|c| Ok(desktops(&c).map(|l| !l.iter().any(|(_, id, _)| *id == ours)).unwrap_or(false)))
+            .unwrap_or(false);
+        if gone {
+            log::info!("the Mac desktop is gone: setting it up again");
+            if let Err(e) = enable() {
+                log::warn!("Mac desktop: {e:#}");
+            }
+        }
+    });
 }
 
 fn disable() -> Result<()> {
     write_rule(None)?;
-    let Ok(id) = fs::read_to_string(id_file()) else { return Ok(()) };
+    let (id, adopted) = stored();
+    if id.is_empty() {
+        return Ok(());
+    }
     let conn = Connection::session()?;
     if desktops(&conn)?.iter().any(|(_, d, _)| *d == id) {
-        // Any windows on it move to a neighbouring desktop.
-        conn.call_method(
-            Some("org.kde.KWin"),
-            "/VirtualDesktopManager",
-            Some("org.kde.KWin.VirtualDesktopManager"),
-            "removeDesktop",
-            &(id.as_str(),),
-        )?;
-        log::info!("removed the {NAME} desktop");
+        if let Some(name) = &adopted {
+            // The user's own desktop: give it its name back, windows and all.
+            conn.call_method(
+                Some("org.kde.KWin"),
+                "/VirtualDesktopManager",
+                Some("org.kde.KWin.VirtualDesktopManager"),
+                "setDesktopName",
+                &(id.as_str(), name.as_str()),
+            )?;
+            log::info!("gave the desktop its name {name} back");
+        } else {
+            // Any windows on it move to a neighbouring desktop.
+            conn.call_method(
+                Some("org.kde.KWin"),
+                "/VirtualDesktopManager",
+                Some("org.kde.KWin.VirtualDesktopManager"),
+                "removeDesktop",
+                &(id.as_str(),),
+            )?;
+            log::info!("removed the {NAME} desktop");
+        }
     }
     let _ = fs::remove_file(id_file());
     Ok(())

@@ -112,7 +112,9 @@ pub fn set_settings(json: &[u8]) {
     match serde_json::from_slice::<Settings>(json) {
         Ok(new) => {
             log::info!("settings: {new:?}");
-            let wanted = new.enabled && new.desktop;
+            // Not tied to streaming being on: pausing would take the desktop away (and back
+            // under a new id), and windows opening meanwhile landed on the shared desktop.
+            let wanted = new.desktop;
             // Acted on when it changes, and once per run (in case it changed while away).
             static APPLIED: Mutex<Option<bool>> = Mutex::new(None);
             if APPLIED.lock().unwrap().replace(wanted) != Some(wanted) {
@@ -148,6 +150,10 @@ fn get<T>(f: impl FnOnce(&Settings) -> T, unknown: T) -> T {
 
 pub fn allows_clipboard() -> bool {
     get(|s| s.enabled && s.clipboard, true)
+}
+
+pub fn wants_own_desktop() -> bool {
+    get(|s| s.desktop, false)
 }
 
 pub fn streaming() -> bool {
