@@ -242,6 +242,13 @@ PlasmoidItem {
 
                     Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
 
+                    Kirigami.Heading {
+                        level: 5
+                        text: "Streaming"
+                        opacity: 0.7
+                        Layout.leftMargin: Kirigami.Units.largeSpacing
+                        Layout.bottomMargin: Kirigami.Units.smallSpacing
+                    }
                     Repeater {
                         model: [
                             { key: "sound", icon: "audio-volume-high-symbolic", label: "Play Mac sound", hint: "Mac audio plays on Linux" },
@@ -260,22 +267,21 @@ PlasmoidItem {
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
                         }
                     }
-
                     ToggleRow {
-                        visible: !!root.placement.plasma
-                        iconName: "application-menu-symbolic"
-                        label: "Global Menu"
-                        hint: "The Mac apps' menus at the top of the screen"
-                        on: !!root.placement.globalMenu
-                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
+                        iconName: "system-run-symbolic"
+                        label: "Open at login"
+                        hint: "Start Sweeflow when you log in"
+                        on: !!root.st.openAtLogin
+                        onFlipped: (v) => root.act("login", v ? "on" : "off")
                     }
+
 
                     Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
 
-                    // Where Mac apps appear (the KDE ones only on Plasma).
+                    // Mac apps: where they show up (the KDE ones only on Plasma).
                     Kirigami.Heading {
                         level: 5
-                        text: "Where Mac apps appear"
+                        text: "Mac apps"
                         opacity: 0.7
                         Layout.leftMargin: Kirigami.Units.largeSpacing
                         Layout.bottomMargin: Kirigami.Units.smallSpacing
@@ -310,22 +316,20 @@ PlasmoidItem {
                         onFlipped: (v) => root.act("dock", v ? "own" : "off")
                     }
                     ToggleRow {
+                        visible: !!root.placement.plasma
+                        iconName: "application-menu-symbolic"
+                        label: "Global Menu"
+                        hint: "The Mac apps' menus at the top of the screen"
+                        on: !!root.placement.globalMenu
+                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
+                    }
+                    ToggleRow {
                         iconName: "view-app-grid-symbolic"
                         label: "Mac apps in Linux menu"
                         hint: "Listed alongside your Linux apps"
                         on: !!root.settings && root.settings.launcher
                         enabled: !!root.settings
                         onFlipped: (v) => root.set({ launcher: v })
-                    }
-
-                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
-
-                    ToggleRow {
-                        iconName: "system-run-symbolic"
-                        label: "Open at login"
-                        hint: "Start Sweeflow when you log in"
-                        on: !!root.st.openAtLogin
-                        onFlipped: (v) => root.act("login", v ? "on" : "off")
                     }
                 }
             }
