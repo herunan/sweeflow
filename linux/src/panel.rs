@@ -26,7 +26,14 @@ impl Iface {
         crate::tray::panel_set(&json);
     }
 
-    /// One of: wake, pair, switch <fingerprint>, forget <fingerprint>, launch <bundle id>, quit.
+    /// Renames a linked Mac (here only: it's what this computer calls it).
+    #[zbus(name = "Rename")]
+    fn rename(&self, fingerprint: String, name: String) {
+        crate::tray::rename(&fingerprint, &name);
+    }
+
+    /// One of: wake, pair, switch <fingerprint>, forget <fingerprint>, launch <bundle id>,
+    /// login on|off (open at login), quit.
     #[zbus(name = "Do")]
     fn act(&self, action: String, arg: String) {
         crate::tray::panel_do(&action, &arg);

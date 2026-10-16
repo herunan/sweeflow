@@ -60,6 +60,7 @@ PlasmoidItem {
     }
     function set(changes) { call("Set", [JSON.stringify(changes)]); }
     function act(action, arg) { call("Do", [action, arg || ""]); }
+    function rename(fingerprint, name) { call("Rename", [fingerprint, name]); }
 
     P5Support.DataSource {
         id: shell
@@ -94,7 +95,7 @@ PlasmoidItem {
 
     fullRepresentation: PlasmaExtras.Representation {
         Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 25
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 22
         collapseMarginsHint: true
 
         header: PlasmaExtras.PlasmoidHeading {
@@ -153,7 +154,7 @@ PlasmoidItem {
                 PlasmaComponents3.Button {
                     visible: root.running && !root.st.paired
                     icon.name: "list-add"
-                    text: "Add a Mac…"
+                    text: "Link a Mac…"
                     onClicked: root.act("pair")
                 }
             }
@@ -165,39 +166,10 @@ PlasmoidItem {
             RowLayout {
                 anchors.fill: parent
                 PlasmaComponents3.ToolButton {
-                    id: macsButton
                     icon.name: "computer-laptop"
-                    text: (root.st.macs || []).length > 1 ? "Macs" : "Mac"
-                    onClicked: macsMenu.open()
-                    PlasmaComponents3.Menu {
-                        id: macsMenu
-                        y: -height
-                        Repeater {
-                            model: root.st.macs || []
-                            PlasmaComponents3.MenuItem {
-                                required property var modelData
-                                text: modelData.name
-                                checkable: true
-                                checked: modelData.active
-                                onTriggered: root.act("switch", modelData.fingerprint)
-                            }
-                        }
-                        PlasmaComponents3.MenuSeparator {}
-                        PlasmaComponents3.MenuItem {
-                            icon.name: "list-add"
-                            text: "Add a Mac…"
-                            onTriggered: root.act("pair")
-                        }
-                        Repeater {
-                            model: root.st.macs || []
-                            PlasmaComponents3.MenuItem {
-                                required property var modelData
-                                icon.name: "edit-delete-remove"
-                                text: "Forget " + modelData.name
-                                onTriggered: root.act("forget", modelData.fingerprint)
-                            }
-                        }
-                    }
+                    text: "Linked Macs"
+                    enabled: stack.visible
+                    onClicked: { stack.pop(null); stack.push(macsPage); }
                 }
                 Item { Layout.fillWidth: true }
                 PlasmaComponents3.ToolButton {
@@ -229,49 +201,93 @@ PlasmoidItem {
                     spacing: 0
                     enabled: !!root.settings
 
-                    Repeater {
-                        model: [
-                            { key: "sound", icon: "audio-volume-high-symbolic", label: "Mac sound here", hint: "Play the Mac's audio on this PC" },
-                            { key: "clipboard", icon: "edit-paste-symbolic", label: "Shared clipboard", hint: "Copy on one, paste on the other" },
-                            { key: "dragDrop", icon: "transform-move-symbolic", label: "Drag and drop", hint: "Drag files between Mac windows and this PC" },
-                            { key: "dim", icon: "brightness-low-symbolic", label: "Dim the Mac's screen", hint: "While its apps are streaming here" },
-                            { key: "desktop", icon: "virtual-desktops-symbolic", label: "Own desktop", hint: "Mac apps open on a desktop of their own" },
-                            { key: "launcher", icon: "view-app-grid-symbolic", label: "In the app launcher", hint: "List Mac apps alongside this PC's" },
-                            { key: "light", icon: "network-wireless-symbolic", label: "Lighter picture", hint: "Less data, for slower networks" },
-                        ]
-                        delegate: ToggleRow {
-                            required property var modelData
-                            iconName: modelData.icon
-                            label: modelData.label
-                            hint: modelData.hint
-                            on: !!root.settings && (modelData.key === "light" ? root.settings.quality === "light" : !!root.settings[modelData.key])
-                            enabled: root.streaming
-                            onFlipped: (v) => root.set(modelData.key === "light" ? { quality: v ? "light" : "sharp" } : { [modelData.key]: v })
-                        }
-                    }
-
-                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
-
                     PlasmaComponents3.ItemDelegate {
                         Layout.fillWidth: true
                         enabled: root.streaming
                         onClicked: stack.push(appsPage)
                         contentItem: RowLayout {
                             spacing: Kirigami.Units.largeSpacing
-                            Kirigami.Icon { source: "view-list-icons-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium }
-                            ColumnLayout {
-                                spacing: 0
-                                Layout.fillWidth: true
-                                PlasmaComponents3.Label { text: "Apps"; Layout.fillWidth: true }
-                                PlasmaComponents3.Label {
-                                    readonly property int total: (root.st.apps || []).length
-                                    readonly property int hidden: root.settings ? root.settings.exclude.length : 0
-                                    text: hidden ? (total - hidden) + " of " + total + " shown here" : "All " + total + " shown here"
-                                    font: Kirigami.Theme.smallFont
-                                    opacity: 0.7
-                                }
+                            Kirigami.Icon { source: "view-app-grid-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium }
+                            PlasmaComponents3.Label { text: "Apps"; Layout.fillWidth: true }
+                            PlasmaComponents3.Label {
+                                readonly property int total: (root.st.apps || []).length
+                                readonly property int hidden: root.settings ? root.settings.exclude.length : 0
+                                text: hidden ? (total - hidden) + " of " + total : "All " + total
+                                opacity: 0.6
                             }
                             Kirigami.Icon { source: "go-next-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.small; Layout.preferredHeight: Kirigami.Units.iconSizes.small }
+                        }
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
+
+                    Repeater {
+                        model: [
+                            { key: "sound", icon: "audio-volume-high-symbolic", label: "Play Mac sound" },
+                            { key: "clipboard", icon: "edit-paste-symbolic", label: "Clipboard" },
+                            { key: "dragDrop", icon: "transform-move-symbolic", label: "Drag and drop files" },
+                            { key: "dim", icon: "brightness-low-symbolic", label: "Dim Mac screen" },
+                            { key: "desktop", icon: "virtual-desktops-symbolic", label: "Own desktop" },
+                            { key: "launcher", icon: "application-menu-symbolic", label: "Mac apps in Linux menu" },
+                            { key: "sharp", icon: "view-preview-symbolic", label: "High quality", tip: "Turn off for slower connections" },
+                        ]
+                        delegate: ToggleRow {
+                            required property var modelData
+                            iconName: modelData.icon
+                            label: modelData.label
+                            tip: modelData.tip || ""
+                            on: !!root.settings && (modelData.key === "sharp" ? root.settings.quality !== "light" : !!root.settings[modelData.key])
+                            enabled: root.streaming
+                            onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
+                        }
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
+
+                    ToggleRow {
+                        iconName: "system-run-symbolic"
+                        label: "Open at login"
+                        on: !!root.st.openAtLogin
+                        onFlipped: (v) => root.act("login", v ? "on" : "off")
+                    }
+                }
+            }
+        }
+
+        Component {
+            id: macsPage
+            ColumnLayout {
+                spacing: Kirigami.Units.smallSpacing
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.margins: Kirigami.Units.smallSpacing
+                    PlasmaComponents3.ToolButton {
+                        icon.name: "go-previous-symbolic"
+                        onClicked: stack.pop()
+                        PlasmaComponents3.ToolTip.text: "Back"
+                        PlasmaComponents3.ToolTip.visible: hovered
+                    }
+                    Kirigami.Heading { level: 4; text: "Linked Macs"; Layout.fillWidth: true }
+                    PlasmaComponents3.ToolButton {
+                        icon.name: "list-add"
+                        text: "Link a Mac…"
+                        onClicked: root.act("pair")
+                    }
+                }
+                PlasmaComponents3.ScrollView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    ListView {
+                        clip: true
+                        model: root.st.macs || []
+                        delegate: MacRow {
+                            required property var modelData
+                            width: ListView.view.width
+                            name: modelData.name
+                            active: modelData.active
+                            onActivated: root.act("switch", modelData.fingerprint)
+                            onRenamed: (n) => root.rename(modelData.fingerprint, n)
+                            onForgotten: root.act("forget", modelData.fingerprint)
                         }
                     }
                 }

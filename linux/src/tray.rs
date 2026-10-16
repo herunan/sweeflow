@@ -424,10 +424,13 @@ pub fn panel_state() -> serde_json::Value {
         .iter()
         .map(|m| serde_json::json!({ "name": m.name, "fingerprint": m.fingerprint, "active": m.fingerprint == cfg.host_fingerprint }))
         .collect();
-    let mac_name = state
-        .mac
-        .clone()
-        .or_else(|| cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint).map(|m| m.name.clone()))
+    // The name given here (renamable) over the one the Mac reports.
+    let mac_name = cfg
+        .macs
+        .iter()
+        .find(|m| m.fingerprint == cfg.host_fingerprint)
+        .map(|m| m.name.clone())
+        .or_else(|| state.mac.clone())
         .unwrap_or_default();
     let mut apps: Vec<_> = state.apps.iter().map(|(b, n)| crate::panel::app(b, n)).collect();
     apps.sort_by_key(|a| a["name"].as_str().unwrap_or_default().to_lowercase());
@@ -439,6 +442,7 @@ pub fn panel_state() -> serde_json::Value {
         "resumeWanted": state.resume_wanted,
         "apps": apps,
         "macs": macs,
+        "openAtLogin": open_at_login(),
     })
 }
 
@@ -483,9 +487,36 @@ pub fn panel_do(action: &str, arg: &str) {
                 log::warn!("launch {arg}: {e:#}");
             }
         }
+        "login" => {
+            let verb = if arg == "on" { "enable" } else { "disable" };
+            let _ = std::process::Command::new("systemctl").args(["--user", verb, "sweeflow"]).status();
+            refresh();
+        }
         "quit" => quit(),
         _ => log::warn!("unknown tray widget action {action}"),
     }
+}
+
+/// Starts with the session: the user service is enabled.
+fn open_at_login() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "--quiet", "sweeflow"])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+pub fn rename(fingerprint: &str, name: &str) {
+    let name = name.trim();
+    let Ok(mut cfg) = crate::config::Config::load_or_default() else { return };
+    let Some(m) = cfg.macs.iter_mut().find(|m| m.fingerprint == fingerprint) else { return };
+    if name.is_empty() || m.name == name {
+        return;
+    }
+    m.name = name.to_string();
+    if let Err(e) = cfg.save() {
+        return log::warn!("saving config: {e:#}");
+    }
+    refresh();
 }
 
 pub fn open_wizard() {
