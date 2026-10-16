@@ -218,7 +218,6 @@ const WIDGET_FILES: &[(&str, &str)] = &[
     ("dev.sweeflow.panel/contents/icons/sweeflow.svg", LOGO),
     ("dev.sweeflow.dock/metadata.json", include_str!("../plasmoid/dev.sweeflow.dock/metadata.json")),
     ("dev.sweeflow.dock/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.dock/contents/ui/main.qml")),
-    ("dev.sweeflow.dock/contents/config/main.xml", include_str!("../plasmoid/dev.sweeflow.dock/contents/config/main.xml")),
 ];
 
 /// The logo (icon theme name "sweeflow"), and on Plasma the tray widget (linux/plasmoid), added

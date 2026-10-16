@@ -1,5 +1,5 @@
-// The Mac Dock: the Mac's running (and pinned) apps as a row of icons, with the Dock's dot for
-// running ones. Hovering shows live previews of the app's windows here (as the task manager
+// The Mac Dock: the Mac's pinned and running apps as a row of icons. Under each: nothing when
+// not running, a dot when running without a window here, a bar when it has one. Hovering shows live previews of the app's windows here (as the task manager
 // does); clicking brings its window up, or opens the app. Reads the client over D-Bus, like the
 // tray widget (src/panel.rs), and the windows from Plasma's task manager model.
 
@@ -53,12 +53,9 @@ PlasmoidItem {
         filterMinimized: false
     }
 
-    readonly property var pinned: Plasmoid.configuration.pinned || []
-    function setPinned(id, on) {
-        const p = pinned.filter(b => b !== id);
-        if (on) p.push(id);
-        Plasmoid.configuration.pinned = p;
-    }
+    // Pins are Sweeflow's (shared with the tray's Apps page).
+    readonly property var pinned: root.st.pinned || []
+    function setPinned(id, on) { root.act(on ? "pin" : "unpin", id); }
 
     // Pinned (in their order), then the other running apps by name.
     readonly property var items: {
@@ -210,21 +207,24 @@ PlasmoidItem {
                     scale: cellArea.pressed ? 0.9 : 1
                     Behavior on scale { NumberAnimation { duration: Kirigami.Units.shortDuration } }
                 }
-                // The Dock's dot: running.
+                // Running: a dot; a window open here (or minimised): a bar.
                 Rectangle {
                     visible: cellArea.modelData.state > 0
                     readonly property real size: Math.max(4, grid.cell * 0.07)
-                    width: size
-                    height: size
+                    readonly property bool windows: cellArea.modelData.state >= 2 || wins.count > 0
+                    width: root.vertical ? size : (windows ? grid.cell * 0.32 : size)
+                    height: root.vertical ? (windows ? grid.cell * 0.32 : size) : size
                     radius: size / 2
+                    Behavior on width { NumberAnimation { duration: Kirigami.Units.shortDuration } }
+                    Behavior on height { NumberAnimation { duration: Kirigami.Units.shortDuration } }
                     anchors.horizontalCenter: root.vertical ? undefined : parent.horizontalCenter
                     anchors.bottom: root.vertical ? undefined : parent.bottom
                     anchors.bottomMargin: 1
                     anchors.verticalCenter: root.vertical ? parent.verticalCenter : undefined
                     anchors.left: root.vertical ? parent.left : undefined
                     anchors.leftMargin: 1
-                    color: Kirigami.Theme.textColor
-                    opacity: 0.8
+                    color: windows ? Kirigami.Theme.highlightColor : Kirigami.Theme.textColor
+                    opacity: windows ? 1 : 0.7
                 }
 
                 PlasmaComponents3.Menu {

@@ -176,7 +176,7 @@ PlasmoidItem {
                 Item { Layout.fillWidth: true }
                 PlasmaComponents3.ToolButton {
                     icon.name: "application-exit"
-                    text: "Quit"
+                    text: "Quit Sweeflow"
                     onClicked: root.act("quit")
                 }
             }
@@ -392,7 +392,7 @@ PlasmoidItem {
                 PlasmaComponents3.Label {
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
-                    text: "Click to open · switch off to keep it on the Mac"
+                    text: "Click to open · switch off to keep an app on the Mac"
                     font: Kirigami.Theme.smallFont
                     opacity: 0.7
                 }
@@ -402,21 +402,21 @@ PlasmoidItem {
                     ListView {
                         id: appList
                         clip: true
-                        // Running first (the client sorts them so), each group under a heading.
+                        // Pinned, running, the rest (the client sorts them so), each under a heading.
                         model: (root.st.apps || []).filter(a => a.name.toLowerCase().includes(search.text.toLowerCase()))
                         delegate: ColumnLayout {
                             id: appRow
                             required property var modelData
                             required property int index
                             readonly property bool shown: !!root.settings && !root.settings.exclude.includes(modelData.id)
-                            readonly property bool firstOfGroup: index === 0
-                                || (appList.model[index - 1].state > 0) !== (modelData.state > 0)
+                            function group(a) { return a.pinned ? "Pinned" : a.state > 0 ? "Running" : "Not running"; }
+                            readonly property bool firstOfGroup: index === 0 || group(appList.model[index - 1]) !== group(modelData)
                             width: ListView.view.width
                             spacing: 0
                             Kirigami.Heading {
                                 visible: appRow.firstOfGroup
                                 level: 5
-                                text: appRow.modelData.state > 0 ? "Running" : "Not running"
+                                text: appRow.group(appRow.modelData)
                                 opacity: 0.7
                                 Layout.leftMargin: Kirigami.Units.largeSpacing
                                 Layout.topMargin: appRow.index === 0 ? 0 : Kirigami.Units.largeSpacing
@@ -437,8 +437,8 @@ PlasmoidItem {
                                     Layout.fillWidth: true
                                     PlasmaComponents3.Label { text: appRow.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true }
                                     PlasmaComponents3.Label {
-                                        visible: appRow.modelData.state > 0
-                                        text: ["", "Running, no window", "Minimised", "Open"][appRow.modelData.state] || ""
+                                        visible: appRow.modelData.state > 0 || appRow.modelData.pinned
+                                        text: ["Not running", "Running, no window", "Minimised", "Open"][appRow.modelData.state] || ""
                                         font: Kirigami.Theme.smallFont
                                         color: appRow.modelData.state === 3 ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.textColor
                                         opacity: appRow.modelData.state === 3 ? 0.9 : 0.6
@@ -446,10 +446,21 @@ PlasmoidItem {
                                 }
                                 PlasmaComponents3.ToolButton {
                                     visible: appRow.modelData.state > 0
-                                    icon.name: "application-exit"
+                                    text: "Quit"
                                     onClicked: root.act("quit-app", appRow.modelData.id)
-                                    PlasmaComponents3.ToolTip.text: "Quit " + appRow.modelData.name
+                                    PlasmaComponents3.ToolTip.text: "Quit " + appRow.modelData.name + " on the Mac"
                                     PlasmaComponents3.ToolTip.visible: hovered
+                                    PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                }
+                                PlasmaComponents3.ToolButton {
+                                    icon.name: appRow.modelData.pinned ? "window-unpin" : "window-pin"
+                                    checkable: false
+                                    checked: appRow.modelData.pinned
+                                    opacity: appRow.modelData.pinned || hovered ? 1 : 0.35
+                                    onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
+                                    PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin" : "Pin (first here and kept in the Mac Dock)"
+                                    PlasmaComponents3.ToolTip.visible: hovered
+                                    PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                 }
                                 PlasmaComponents3.Switch {
                                     checked: appRow.shown

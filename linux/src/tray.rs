@@ -52,12 +52,14 @@ struct State {
     resume_wanted: bool,
     /// The settings as last seen from the Mac, shown (read-only) while it's away.
     last: Option<Settings>,
+    /// Pinned Mac apps (bundle ids, in order): first in the tray's Apps page, kept in the Dock.
+    pinned: Vec<String>,
     /// Where Mac apps show up (task manager, Mac Dock, Global Menu), as last looked at.
     placement: crate::placement::Placement,
 }
 
 static STATE: LazyLock<Mutex<State>> =
-    LazyLock::new(|| Mutex::new(State { last: load_last(), ..Default::default() }));
+    LazyLock::new(|| Mutex::new(State { last: load_last(), pinned: load_pinned(), ..Default::default() }));
 /// Wakes the tray's thread to redraw (its blocking handle can't be used from async code).
 static REFRESH: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 static NET: OnceLock<UnboundedSender<NetCmd>> = OnceLock::new();
@@ -418,6 +420,18 @@ pub fn widget_installed() -> bool {
         .is_some_and(|h| h.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists())
 }
 
+fn pinned_file() -> std::path::PathBuf {
+    crate::config::dir().join("pinned")
+}
+
+fn load_pinned() -> Vec<String> {
+    std::fs::read_to_string(pinned_file()).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+fn save_pinned(pinned: &[String]) {
+    let _ = std::fs::write(pinned_file(), pinned.join("\n"));
+}
+
 fn last_file() -> std::path::PathBuf {
     crate::config::dir().join("last-settings.json")
 }
@@ -455,11 +469,13 @@ pub fn panel_state() -> serde_json::Value {
         .map(|(b, n)| {
             let mut a = crate::panel::app(b, n);
             a["state"] = state.running.get(b).copied().unwrap_or(0).into();
+            a["pinned"] = state.pinned.contains(b).into();
             a
         })
         .collect();
-    // Running ones first, then by name.
-    apps.sort_by_key(|a| (a["state"].as_u64() == Some(0), a["name"].as_str().unwrap_or_default().to_lowercase()));
+    // Pinned (in their order), then running, then the rest; by name within each.
+    let pin_pos = |a: &serde_json::Value| state.pinned.iter().position(|p| a["id"] == **p).unwrap_or(usize::MAX);
+    apps.sort_by_key(|a| (pin_pos(a), a["state"].as_u64() == Some(0), a["name"].as_str().unwrap_or_default().to_lowercase()));
     serde_json::json!({
         "connected": state.settings.is_some(),
         "paired": !cfg.host.is_empty(),
@@ -470,6 +486,7 @@ pub fn panel_state() -> serde_json::Value {
         "macs": macs,
         "openAtLogin": open_at_login(),
         "placement": state.placement,
+        "pinned": state.pinned,
     })
 }
 
@@ -520,6 +537,16 @@ pub fn panel_do(action: &str, arg: &str) {
             refresh();
         }
         "gather" => crate::desktop::gather(),
+        "pin" | "unpin" => {
+            let mut s = STATE.lock().unwrap();
+            s.pinned.retain(|b| b != arg);
+            if action == "pin" {
+                s.pinned.push(arg.to_string());
+            }
+            save_pinned(&s.pinned);
+            drop(s);
+            refresh();
+        }
         "placement" => refresh_placement(),
         "taskbar" | "dock" | "global-menu" => {
             let (action, arg) = (action.to_string(), arg.to_string());
