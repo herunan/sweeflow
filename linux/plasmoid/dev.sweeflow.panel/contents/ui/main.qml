@@ -261,6 +261,15 @@ PlasmoidItem {
                         }
                     }
 
+                    ToggleRow {
+                        visible: !!root.placement.plasma
+                        iconName: "application-menu-symbolic"
+                        label: "Global Menu"
+                        hint: "Mac app menus at the top (you can change this)"
+                        on: !!root.placement.globalMenu
+                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
+                    }
+
                     Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
 
                     // Where Mac apps appear (the KDE ones only on Plasma).
@@ -273,8 +282,8 @@ PlasmoidItem {
                     }
                     ToggleRow {
                         iconName: "virtual-desktops-symbolic"
-                        label: "Own desktop"
-                        hint: "Mac apps open on a desktop of their own"
+                        label: "Mac windows in own desktop"
+                        hint: "A desktop just for Mac windows"
                         on: !!root.settings && root.settings.desktop
                         enabled: !!root.settings
                         onFlipped: (v) => root.set({ desktop: v })
@@ -286,26 +295,19 @@ PlasmoidItem {
                     ToggleRow {
                         visible: !!root.placement.plasma
                         iconName: "window-symbolic"
-                        label: "Task manager"
-                        hint: "Mac windows listed with your Linux apps"
+                        label: "Mac apps in Task Manager"
+                        hint: "Listed with your Linux apps"
                         on: !!root.placement.taskbar
                         onFlipped: (v) => root.act("taskbar", v ? "on" : "off")
                     }
                     ToggleRow {
                         visible: !!root.placement.plasma
-                        iconName: root.logo
+                        iconName: Qt.resolvedUrl("../icons/dock.svg")
+                        iconIsMask: true
                         label: "Mac Dock"
-                        hint: "A dock of Mac apps, with window previews"
+                        hint: "At the bottom, hidden until needed (you can change this)"
                         on: !!root.placement.dock
                         onFlipped: (v) => root.act("dock", v ? "own" : "off")
-                    }
-                    ToggleRow {
-                        visible: !!root.placement.plasma
-                        iconName: "application-menu-symbolic"
-                        label: "Global Menu"
-                        hint: "The Mac apps' menus at the top of the screen"
-                        on: !!root.placement.globalMenu
-                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
                     }
                     ToggleRow {
                         iconName: "view-app-grid-symbolic"

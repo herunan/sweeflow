@@ -7,6 +7,8 @@ import org.kde.kirigami as Kirigami
 PlasmaComponents3.ItemDelegate {
     id: row
     property string iconName
+    /// The icon is a single-colour drawing to be shown in the theme's text colour.
+    property bool iconIsMask: false
     property string label
     property string hint
     property bool on
@@ -24,6 +26,8 @@ PlasmaComponents3.ItemDelegate {
         spacing: Kirigami.Units.largeSpacing
         Kirigami.Icon {
             source: row.iconName
+            isMask: row.iconIsMask
+            color: Kirigami.Theme.textColor
             Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
             Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
         }
