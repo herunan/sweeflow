@@ -265,7 +265,7 @@ PlasmoidItem {
                         visible: !!root.placement.plasma
                         iconName: "application-menu-symbolic"
                         label: "Global Menu"
-                        hint: "Mac app menus at the top (you can change this)"
+                        hint: "The Mac apps' menus at the top of the screen"
                         on: !!root.placement.globalMenu
                         onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
                     }
@@ -305,7 +305,7 @@ PlasmoidItem {
                         iconName: Qt.resolvedUrl("../icons/dock.svg")
                         iconIsMask: true
                         label: "Mac Dock"
-                        hint: "At the bottom, hidden until needed (you can change this)"
+                        hint: "A dock of Mac apps, with window previews"
                         on: !!root.placement.dock
                         onFlipped: (v) => root.act("dock", v ? "own" : "off")
                     }
