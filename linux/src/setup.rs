@@ -220,6 +220,17 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     let icons = home.join(".local/share/icons/hicolor/scalable/apps");
     std::fs::create_dir_all(&icons)?;
     std::fs::write(icons.join("sweeflow.svg"), LOGO)?;
+    // Hidden: only so desktops can match Sweeflow's own windows (the wizard, app id
+    // "sweeflow") to their icon. Not a launcher: the client runs as a service.
+    let apps = home.join(".local/share/applications");
+    std::fs::create_dir_all(&apps)?;
+    std::fs::write(
+        apps.join("sweeflow.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Sweeflow\nComment=Add a Mac\nExec={} pair\nIcon=sweeflow\nNoDisplay=true\n",
+            home.join(".local/bin/sweeflow").display()
+        ),
+    )?;
     if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") {
         return Ok(());
     }

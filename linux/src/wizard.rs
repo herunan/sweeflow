@@ -53,6 +53,7 @@ slint::slint! {
 
     export component Wizard inherits Window {
         title: "Add a Mac — Sweeflow";
+        icon: @image-url("../../assets/sweeflow.svg");
         // A fixed size: a dialog, which tiling window managers leave floating.
         width: 540px;
         height: 460px;
@@ -77,7 +78,12 @@ slint::slint! {
 
             if page == 0: VerticalLayout {
                 spacing: 14px;
-                Title { text: "Add a Mac"; }
+                HorizontalLayout {
+                    spacing: 14px;
+                    alignment: start;
+                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; }
+                    Title { text: "Add a Mac"; vertical-alignment: center; }
+                }
                 Body {
                     text: installer-url != ""
                         ? "1.  On your Mac, open this address in Safari and install Sweeflow from it:"
@@ -156,7 +162,12 @@ slint::slint! {
 
             if page == 4: VerticalLayout {
                 spacing: 16px;
-                Title { text: "Paired with " + mac-name; }
+                HorizontalLayout {
+                    spacing: 14px;
+                    alignment: start;
+                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; }
+                    Title { text: "Paired with " + mac-name; vertical-alignment: center; }
+                }
                 Body {
                     text: streaming-mac-set
                         ? "You can switch between your Macs from the Sweeflow icon in the system tray."
@@ -183,6 +194,9 @@ thread_local! {
 }
 
 pub fn run() -> Result<()> {
+    // Matches sweeflow.desktop (written by `sweeflow install`), which gives KDE the logo for
+    // the title bar and taskbar.
+    let _ = slint::set_xdg_app_id("sweeflow");
     let ui = Wizard::new()?;
     let model = Rc::new(VecModel::<MacRow>::default());
     ui.set_macs(ModelRc::from(model.clone()));
