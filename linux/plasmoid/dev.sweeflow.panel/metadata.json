@@ -1,0 +1,14 @@
+{
+    "KPlugin": {
+        "Id": "dev.sweeflow.panel",
+        "Name": "Sweeflow",
+        "Description": "Mac apps on this desktop",
+        "Icon": "sweeflow",
+        "Category": "System Information",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "ApplicationStatus"
+}

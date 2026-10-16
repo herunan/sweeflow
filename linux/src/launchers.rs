@@ -15,6 +15,11 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
 }
 
+/// Where a Mac app's icon is saved (as PNG).
+pub fn icon_path(bundle_id: &str) -> PathBuf {
+    data_dir().join(format!("sweeflow/icons/{bundle_id}.png"))
+}
+
 /// Keeps ~/.local/share/applications/sweeflow-*.desktop in sync with the Mac's installed apps.
 pub fn sync(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
     let apps_dir = data_dir().join("applications");
@@ -29,7 +34,7 @@ pub fn sync(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
         if bid.is_empty() || bid.contains('/') {
             continue;
         }
-        let icon = icon_dir.join(format!("{bid}.png"));
+        let icon = icon_path(bid);
         if !png.is_empty() && fs::read(&icon).ok().as_deref() != Some(png.as_slice()) {
             fs::write(&icon, png)?;
         }

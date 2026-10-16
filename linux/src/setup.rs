@@ -159,6 +159,7 @@ pub fn install() -> Result<()> {
         bail!("could not enable the sweeflow service");
     }
     run(&["restart", "sweeflow.service"])?;
+    install_icon_and_widget(&home)?;
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
     Ok(())
@@ -204,4 +205,39 @@ fn append_tar(out: &mut Vec<u8>, path: &str, data: &[u8], mode: u32) {
     out.extend_from_slice(data);
     let pad = (512 - data.len() % 512) % 512;
     out.extend(std::iter::repeat_n(0u8, pad));
+}
+
+const LOGO: &str = include_str!("../../assets/sweeflow.svg");
+const WIDGET_METADATA: &str = include_str!("../plasmoid/dev.sweeflow.panel/metadata.json");
+const WIDGET_QML: &str = include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/main.qml");
+
+/// The logo (icon theme name "sweeflow"), and on Plasma the tray widget (linux/plasmoid), added
+/// to every system tray. Plasma keeps its own copy of the panel config, so the tray is changed
+/// through its scripting interface rather than the file.
+fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
+    let icons = home.join(".local/share/icons/hicolor/scalable/apps");
+    std::fs::create_dir_all(&icons)?;
+    std::fs::write(icons.join("sweeflow.svg"), LOGO)?;
+    if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") {
+        return Ok(());
+    }
+    let widget = home.join(".local/share/plasma/plasmoids/dev.sweeflow.panel");
+    std::fs::create_dir_all(widget.join("contents/ui"))?;
+    std::fs::create_dir_all(widget.join("contents/icons"))?;
+    std::fs::write(widget.join("metadata.json"), WIDGET_METADATA)?;
+    std::fs::write(widget.join("contents/ui/main.qml"), WIDGET_QML)?;
+    std::fs::write(widget.join("contents/icons/sweeflow.svg"), LOGO)?;
+    let script = r#"panels().forEach(function(p){ p.widgets("org.kde.plasma.systemtray").forEach(function(w){
+        w.currentConfigGroup = ["General"];
+        ["extraItems","knownItems"].forEach(function(k){ var v = w.readConfig(k, []); if (typeof v === "string") v = v.split(",");
+            if (v.indexOf("dev.sweeflow.panel") < 0) { v.push("dev.sweeflow.panel"); w.writeConfig(k, v); } });
+        w.reloadConfig(); }); });"#;
+    let ok = std::process::Command::new("qdbus6")
+        .args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        println!("    (couldn't add the Sweeflow widget to the system tray: add it from the tray's settings)");
+    }
+    Ok(())
 }

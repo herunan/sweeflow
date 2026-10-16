@@ -10,6 +10,7 @@ mod lights;
 mod menus;
 mod net;
 mod pair;
+mod panel;
 mod proto;
 mod setup;
 mod tray;

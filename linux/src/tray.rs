@@ -48,9 +48,12 @@ struct State {
     apps: Vec<(String, String)>,
     /// "Stream Mac apps" was ticked while the Mac was unreachable: switch it on when it's back.
     resume_wanted: bool,
+    /// The settings as last seen from the Mac, shown (read-only) while it's away.
+    last: Option<Settings>,
 }
 
-static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
+static STATE: LazyLock<Mutex<State>> =
+    LazyLock::new(|| Mutex::new(State { last: load_last(), ..Default::default() }));
 /// Wakes the tray's thread to redraw (its blocking handle can't be used from async code).
 static REFRESH: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 static NET: OnceLock<UnboundedSender<NetCmd>> = OnceLock::new();
@@ -62,14 +65,28 @@ pub fn start(net: UnboundedSender<NetCmd>) {
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            let handle: Handle<Tray> = match Tray.spawn() {
-                Ok(h) => h,
-                Err(e) => return log::warn!("tray icon: {e}"),
+            let panel = crate::panel::Panel::new().map_err(|e| log::warn!("tray widget's D-Bus service: {e}")).ok();
+            // With the KDE widget installed, it is the tray icon; the plain one is for elsewhere.
+            let handle: Option<Handle<Tray>> = if widget_installed() {
+                None
+            } else {
+                match Tray.spawn() {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        log::warn!("tray icon: {e}");
+                        None
+                    }
+                }
             };
             while rx.recv().is_ok() {
                 // Several changes at once: one redraw.
                 while rx.try_recv().is_ok() {}
-                handle.update(|_| {});
+                if let Some(h) = &handle {
+                    h.update(|_| {});
+                }
+                if let Some(p) = &panel {
+                    p.changed();
+                }
             }
         })
         .unwrap();
@@ -104,6 +121,8 @@ pub fn set_settings(json: &[u8]) {
             let resume = {
                 let mut s = STATE.lock().unwrap();
                 let resume = std::mem::take(&mut s.resume_wanted) && !new.enabled;
+                save_last(&new);
+                s.last = Some(new.clone());
                 s.settings = Some(new);
                 resume
             };
@@ -311,11 +330,7 @@ impl ksni::Tray for Tray {
                 label: "Quit sweeflow".into(),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|_| {
-                    // Through systemd, which would otherwise start it again (under the service, this
-                    // stop is what ends us). Started any other way (KRunner, a terminal), the stop
-                    // is a no-op, so exit ourselves.
-                    let _ = std::process::Command::new("systemctl").args(["--user", "stop", "sweeflow"]).status();
-                    std::process::exit(0);
+                    quit();
                 }),
                 ..Default::default()
             }
@@ -370,6 +385,107 @@ fn macs_menu() -> MenuItem<Tray> {
         sub.push(SubMenu { label: "Forget".into(), submenu: forget, ..Default::default() }.into());
     }
     SubMenu { label: "Mac".into(), icon_name: "computer-laptop".into(), submenu: sub, ..Default::default() }.into()
+}
+
+fn quit() {
+    // Through systemd, which would otherwise start it again (under the service, this stop is what
+    // ends us). Started any other way (KRunner, a terminal), the stop is a no-op, so exit ourselves.
+    let _ = std::process::Command::new("systemctl").args(["--user", "stop", "sweeflow"]).status();
+    std::process::exit(0);
+}
+
+/// The KDE tray widget (linux/plasmoid), installed by `sweeflow install` on Plasma.
+pub fn widget_installed() -> bool {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|h| h.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists())
+}
+
+fn last_file() -> std::path::PathBuf {
+    crate::config::dir().join("last-settings.json")
+}
+
+fn load_last() -> Option<Settings> {
+    serde_json::from_slice(&std::fs::read(last_file()).ok()?).ok()
+}
+
+fn save_last(s: &Settings) {
+    if let Ok(json) = serde_json::to_vec(s) {
+        let _ = std::fs::write(last_file(), json);
+    }
+}
+
+/// Everything the tray widget shows.
+pub fn panel_state() -> serde_json::Value {
+    let state = STATE.lock().unwrap();
+    let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+    let macs: Vec<_> = cfg
+        .macs
+        .iter()
+        .map(|m| serde_json::json!({ "name": m.name, "fingerprint": m.fingerprint, "active": m.fingerprint == cfg.host_fingerprint }))
+        .collect();
+    let mac_name = state
+        .mac
+        .clone()
+        .or_else(|| cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint).map(|m| m.name.clone()))
+        .unwrap_or_default();
+    let mut apps: Vec<_> = state.apps.iter().map(|(b, n)| crate::panel::app(b, n)).collect();
+    apps.sort_by_key(|a| a["name"].as_str().unwrap_or_default().to_lowercase());
+    serde_json::json!({
+        "connected": state.settings.is_some(),
+        "paired": !cfg.host.is_empty(),
+        "mac": mac_name,
+        "settings": state.settings.as_ref().or(state.last.as_ref()),
+        "resumeWanted": state.resume_wanted,
+        "apps": apps,
+        "macs": macs,
+    })
+}
+
+/// A change from the tray widget: only the fields it sent.
+pub fn panel_set(json: &str) {
+    let Ok(serde_json::Value::Object(changes)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return log::warn!("bad settings from the tray widget: {json}");
+    };
+    if STATE.lock().unwrap().settings.is_none() {
+        // The Mac is away: only streaming on/off can be asked for, and is done when it's back.
+        if let Some(on) = changes.get("enabled").and_then(|v| v.as_bool()) {
+            STATE.lock().unwrap().resume_wanted = on;
+            if on {
+                std::thread::spawn(crate::wake::wake);
+            }
+            refresh();
+        }
+        return;
+    }
+    change(move |s| {
+        let Ok(serde_json::Value::Object(mut now)) = serde_json::to_value(&*s) else { return };
+        now.extend(changes);
+        match serde_json::from_value(serde_json::Value::Object(now)) {
+            Ok(new) => *s = new,
+            Err(e) => log::warn!("bad settings from the tray widget: {e}"),
+        }
+    });
+    refresh();
+}
+
+/// An action from the tray widget.
+pub fn panel_do(action: &str, arg: &str) {
+    match action {
+        "wake" => {
+            std::thread::spawn(crate::wake::wake);
+        }
+        "pair" => open_wizard(),
+        "switch" => switch_to(arg),
+        "forget" => forget(arg),
+        "launch" => {
+            if let Err(e) = crate::launchers::launch(arg) {
+                log::warn!("launch {arg}: {e:#}");
+            }
+        }
+        "quit" => quit(),
+        _ => log::warn!("unknown tray widget action {action}"),
+    }
 }
 
 pub fn open_wizard() {
