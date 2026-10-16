@@ -127,7 +127,7 @@ fn enable() -> Result<()> {
     // while the rule went in (right after connecting, they all are).
     let js = format!(
         "const d = workspace.desktops.find(d => d.id == '{id}');\n\
-         if (d) for (const w of workspace.windowList()) if (w.resourceClass.startsWith('sweeflow-')) w.desktops = [d];"
+         if (d) for (const w of workspace.windowList()) if (w.resourceClass.startsWith('sweeflow-') && w.resourceClass != 'sweeflow-display') w.desktops = [d];"
     );
     run_script(&js)?;
     std::thread::sleep(Duration::from_secs(3));
@@ -224,7 +224,8 @@ fn write_rule(desktop: Option<&str>) -> Result<()> {
         Some(id) => {
             for (k, v) in [
                 ("Description", "Mac apps on their own desktop (sweeflow)"),
-                ("wmclass", "^sweeflow-"),
+                // Not the Mac display view: it opens wherever you are.
+                ("wmclass", "^sweeflow-(?!display$)"),
                 ("wmclassmatch", "3"),
                 ("wmclasscomplete", "false"),
                 ("desktops", id),
