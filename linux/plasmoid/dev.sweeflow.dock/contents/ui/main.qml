@@ -8,6 +8,7 @@ import QtQuick.Layouts
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents3
+import org.kde.plasma.extras as PlasmaExtras
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.workspace.dbus as DBus
 import org.kde.taskmanager as TaskManager
@@ -122,7 +123,7 @@ PlasmoidItem {
                 function activate(i) { tasks.requestActivate(wins.mapToSource(wins.index(i, 0))); }
 
                 onClicked: (mouse) => {
-                    if (mouse.button === Qt.RightButton) { menu.popup(); return; }
+                    if (mouse.button === Qt.RightButton) { menu.openRelative(); return; }
                     // Its window comes up (one already active goes down, as in the task manager);
                     // no window here: open the app on the Mac.
                     if (wins.count === 0) { root.act("launch", modelData.id); return; }
@@ -227,26 +228,32 @@ PlasmoidItem {
                     opacity: windows ? 1 : 0.7
                 }
 
-                PlasmaComponents3.Menu {
+                // A native menu in a window of its own: one drawn inside the panel gets clipped
+                // by the panel's edge.
+                PlasmaExtras.Menu {
                     id: menu
-                    PlasmaComponents3.MenuItem { text: cellArea.modelData.name; enabled: false }
-                    PlasmaComponents3.MenuSeparator {}
-                    PlasmaComponents3.MenuItem {
-                        icon.name: "window-new"
+                    visualParent: cellArea
+                    placement: Plasmoid.location === PlasmaCore.Types.TopEdge ? PlasmaExtras.Menu.BottomPosedLeftAlignedPopup
+                             : Plasmoid.location === PlasmaCore.Types.LeftEdge ? PlasmaExtras.Menu.RightPosedTopAlignedPopup
+                             : Plasmoid.location === PlasmaCore.Types.RightEdge ? PlasmaExtras.Menu.LeftPosedTopAlignedPopup
+                             : PlasmaExtras.Menu.TopPosedLeftAlignedPopup
+                    PlasmaExtras.MenuItem { text: cellArea.modelData.name; section: true }
+                    PlasmaExtras.MenuItem {
+                        icon: "window-new"
                         text: "Open"
-                        onTriggered: root.act("launch", cellArea.modelData.id)
+                        onClicked: root.act("launch", cellArea.modelData.id)
                     }
-                    PlasmaComponents3.MenuItem {
-                        icon.name: cellArea.isPinned ? "window-unpin" : "window-pin"
+                    PlasmaExtras.MenuItem {
+                        icon: cellArea.isPinned ? "window-unpin" : "window-pin"
                         text: cellArea.isPinned ? "Remove from Dock" : "Keep in Dock"
-                        onTriggered: root.setPinned(cellArea.modelData.id, !cellArea.isPinned)
+                        onClicked: root.setPinned(cellArea.modelData.id, !cellArea.isPinned)
                     }
-                    PlasmaComponents3.MenuSeparator { visible: cellArea.modelData.state > 0 }
-                    PlasmaComponents3.MenuItem {
+                    PlasmaExtras.MenuItem { separator: true; visible: cellArea.modelData.state > 0 }
+                    PlasmaExtras.MenuItem {
                         visible: cellArea.modelData.state > 0
-                        icon.name: "application-exit"
+                        icon: "application-exit"
                         text: "Quit"
-                        onTriggered: root.act("quit-app", cellArea.modelData.id)
+                        onClicked: root.act("quit-app", cellArea.modelData.id)
                     }
                 }
             }
