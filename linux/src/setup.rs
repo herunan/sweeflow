@@ -210,6 +210,7 @@ fn append_tar(out: &mut Vec<u8>, path: &str, data: &[u8], mode: u32) {
 const LOGO: &str = include_str!("../../assets/sweeflow.svg");
 const WIDGET_METADATA: &str = include_str!("../plasmoid/dev.sweeflow.panel/metadata.json");
 const WIDGET_QML: &str = include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/main.qml");
+const WIDGET_TOGGLE_ROW: &str = include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/ToggleRow.qml");
 
 /// The logo (icon theme name "sweeflow"), and on Plasma the tray widget (linux/plasmoid), added
 /// to every system tray. Plasma keeps its own copy of the panel config, so the tray is changed
@@ -226,6 +227,7 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(widget.join("contents/icons"))?;
     std::fs::write(widget.join("metadata.json"), WIDGET_METADATA)?;
     std::fs::write(widget.join("contents/ui/main.qml"), WIDGET_QML)?;
+    std::fs::write(widget.join("contents/ui/ToggleRow.qml"), WIDGET_TOGGLE_ROW)?;
     std::fs::write(widget.join("contents/icons/sweeflow.svg"), LOGO)?;
     let script = r#"panels().forEach(function(p){ p.widgets("org.kde.plasma.systemtray").forEach(function(w){
         w.currentConfigGroup = ["General"];

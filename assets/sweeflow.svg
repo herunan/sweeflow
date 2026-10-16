@@ -1,26 +1,21 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="skin" x1="0.15" y1="0.05" x2="0.85" y2="1">
-      <stop offset="0" stop-color="#ffd447"/>
-      <stop offset="0.38" stop-color="#ff7b3d"/>
-      <stop offset="0.72" stop-color="#f5345a"/>
-      <stop offset="1" stop-color="#cc1f5c"/>
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.1" stop-color="#ffb23e"/>
+      <stop offset="0.5" stop-color="#ff5a4e"/>
+      <stop offset="0.95" stop-color="#d81b60"/>
     </linearGradient>
-    <linearGradient id="t1" x1="1" y1="0" x2="0" y2="0"><stop offset="0.3" stop-color="#ffa63d"/><stop offset="1" stop-color="#ffa63d" stop-opacity="0.12"/></linearGradient>
-    <linearGradient id="t2" x1="1" y1="0" x2="0" y2="0"><stop offset="0.3" stop-color="#ff5a45"/><stop offset="1" stop-color="#ff5a45" stop-opacity="0.12"/></linearGradient>
-    <linearGradient id="t3" x1="1" y1="0" x2="0" y2="0"><stop offset="0.3" stop-color="#e8285e"/><stop offset="1" stop-color="#e8285e" stop-opacity="0.12"/></linearGradient>
-    <linearGradient id="leaf" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#25a656"/><stop offset="1" stop-color="#8ee86a"/></linearGradient>
-    <clipPath id="body"><path id="apple" d="M76 38 C68 29 48 28 40 44 C30 62 38 98 54 111 C62 117 70 115 76 111 C82 115 90 117 98 111 C114 98 122 62 112 44 C104 28 84 29 76 38 Z"/></clipPath>
+    <linearGradient id="leaf" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#1fa45a"/>
+      <stop offset="1" stop-color="#6fdc6f"/>
+    </linearGradient>
+    <!-- two flowing gaps cut the apple into three bands -->
+    <mask id="cuts">
+      <rect width="128" height="128" fill="#fff"/>
+      <path d="M10 68 C34 56 50 76 74 62 S110 44 124 46" fill="none" stroke="#000" stroke-width="5" stroke-linecap="round"/>
+      <path d="M10 92 C34 80 50 100 74 86 S110 68 124 70" fill="none" stroke="#000" stroke-width="5" stroke-linecap="round"/>
+    </mask>
   </defs>
-  <!-- ribbons streaming out behind -->
-  <path d="M62 56 C44 46 30 64 8 55" fill="none" stroke="url(#t1)" stroke-width="12" stroke-linecap="round"/>
-  <path d="M58 78 C40 68 26 88 4 79" fill="none" stroke="url(#t2)" stroke-width="12" stroke-linecap="round"/>
-  <path d="M64 98 C48 90 36 108 16 100" fill="none" stroke="url(#t3)" stroke-width="12" stroke-linecap="round"/>
-  <!-- apple -->
-  <use href="#apple" fill="url(#skin)"/>
-  <!-- shine -->
-  <path d="M96 52 C102 58 104 66 103 74" fill="none" stroke="#fff" stroke-opacity="0.6" stroke-width="6" stroke-linecap="round"/>
-  <!-- stem + leaf -->
-  <path d="M76 39 C76 30 78 22 82 16" fill="none" stroke="#6b3f22" stroke-width="5.5" stroke-linecap="round"/>
-  <path d="M82 25 C88 10 106 7 116 12 C112 25 96 32 82 25 Z" fill="url(#leaf)"/>
+  <path mask="url(#cuts)" fill="url(#skin)" d="M64 40 C57 32 39 31 30 46 C19 65 26 99 42 112 C50 118 57 116 64 112 C71 116 78 118 86 112 C102 99 109 65 98 46 C89 31 71 32 64 40 Z"/>
+  <path fill="url(#leaf)" d="M66 33 C66 19 78 9 94 9 C94 24 82 34 66 33 Z"/>
 </svg>

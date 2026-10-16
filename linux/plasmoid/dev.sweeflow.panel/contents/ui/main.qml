@@ -2,6 +2,7 @@
 // the same layout as the Mac's menu-bar panel (StatusPanel.swift).
 
 import QtQuick
+import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
@@ -53,7 +54,8 @@ PlasmoidItem {
     function call(member, args) {
         DBus.SessionBus.asyncCall({
             service: root.service, path: root.objectPath, iface: root.ifaceName,
-            member: member, arguments: args, signature: args.map(() => "s").join(""),
+            // No signature: given one, Plasma drops plain JS strings and sends no arguments.
+            member: member, arguments: args,
         });
     }
     function set(changes) { call("Set", [JSON.stringify(changes)]); }
@@ -92,7 +94,7 @@ PlasmoidItem {
 
     fullRepresentation: PlasmaExtras.Representation {
         Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 30
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 25
         collapseMarginsHint: true
 
         header: PlasmaExtras.PlasmoidHeading {
@@ -206,130 +208,132 @@ PlasmoidItem {
             }
         }
 
-        ColumnLayout {
+        // Main page: switches. "Apps ›" springs out a second page with the full list.
+        QQC2.StackView {
+            id: stack
             anchors.fill: parent
-            anchors.margins: Kirigami.Units.largeSpacing
-            spacing: Kirigami.Units.largeSpacing
             visible: root.running && !!root.st.paired
-            enabled: !!root.settings
+            initialItem: mainPage
+        }
+        Connections {
+            target: root
+            function onExpandedChanged() { if (!root.expanded) stack.pop(null); }
+        }
 
-            // Feature tiles: lit when on. Greyed while the Mac is away (the last known state).
-            GridLayout {
-                Layout.fillWidth: true
-                columns: 3
-                uniformCellWidths: true
-                columnSpacing: Kirigami.Units.smallSpacing
-                rowSpacing: Kirigami.Units.smallSpacing
-                Repeater {
-                    model: [
-                        { key: "sound", icon: "audio-volume-high-symbolic", label: "Sound", tip: "Play the Mac's sound on this PC" },
-                        { key: "clipboard", icon: "edit-paste-symbolic", label: "Clipboard", tip: "Copy on one, paste on the other" },
-                        { key: "dragDrop", icon: "transform-move-symbolic", label: "Drag & Drop", tip: "Drag files between Mac windows and this PC" },
-                        { key: "dim", icon: "brightness-low-symbolic", label: "Dim Mac", tip: "Dim the Mac's own screen while streaming" },
-                        { key: "desktop", icon: "virtual-desktops-symbolic", label: "Own Desktop", tip: "Put Mac apps on a desktop of their own" },
-                        { key: "launcher", icon: "view-app-grid-symbolic", label: "In Launcher", tip: "List Mac apps in the app launcher" },
-                    ]
-                    PlasmaComponents3.ToolButton {
-                        required property var modelData
-                        Layout.fillWidth: true
-                        Layout.preferredWidth: 1
-                        Layout.preferredHeight: Kirigami.Units.gridUnit * 4
-                        display: PlasmaComponents3.AbstractButton.TextUnderIcon
-                        icon.name: modelData.icon
-                        icon.width: Kirigami.Units.iconSizes.medium
-                        icon.height: Kirigami.Units.iconSizes.medium
-                        text: modelData.label
-                        checked: !!root.settings && !!root.settings[modelData.key]
-                        enabled: root.streaming
-                        onClicked: root.set({ [modelData.key]: !checked })
-                        PlasmaComponents3.ToolTip.text: modelData.tip
-                        PlasmaComponents3.ToolTip.visible: hovered
-                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
-                    }
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                enabled: root.streaming
-                PlasmaComponents3.Label { text: "Picture"; Layout.fillWidth: true }
-                Repeater {
-                    model: [
-                        { value: "sharp", label: "Sharp", tip: "Best picture" },
-                        { value: "light", label: "Light", tip: "Less data, for slower networks" },
-                    ]
-                    PlasmaComponents3.ToolButton {
-                        required property var modelData
-                        text: modelData.label
-                        checked: !!root.settings && root.settings.quality === modelData.value
-                        onClicked: root.set({ quality: modelData.value })
-                        PlasmaComponents3.ToolTip.text: modelData.tip
-                        PlasmaComponents3.ToolTip.visible: hovered
-                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
-                    }
-                }
-            }
-
-            Kirigami.Separator { Layout.fillWidth: true }
-
-            RowLayout {
-                Layout.fillWidth: true
-                ColumnLayout {
-                    spacing: 0
-                    Layout.fillWidth: true
-                    Kirigami.Heading { level: 4; text: "Apps" }
-                    PlasmaComponents3.Label {
-                        text: "Click to open · switch off to keep on the Mac"
-                        font: Kirigami.Theme.smallFont
-                        opacity: 0.7
-                        wrapMode: Text.WordWrap
-                        Layout.fillWidth: true
-                    }
-                }
-                PlasmaExtras.SearchField {
-                    id: search
-                    Layout.preferredWidth: Kirigami.Units.gridUnit * 10
-                }
-            }
-
+        Component {
+            id: mainPage
             PlasmaComponents3.ScrollView {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                ListView {
-                    id: appList
-                    clip: true
-                    model: (root.st.apps || []).filter(a => a.name.toLowerCase().includes(search.text.toLowerCase()))
-                    delegate: PlasmaComponents3.ItemDelegate {
-                        required property var modelData
-                        readonly property bool shown: !!root.settings && !root.settings.exclude.includes(modelData.id)
-                        width: ListView.view.width
+                contentWidth: availableWidth
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 0
+                    enabled: !!root.settings
+
+                    Repeater {
+                        model: [
+                            { key: "sound", icon: "audio-volume-high-symbolic", label: "Mac sound here", hint: "Play the Mac's audio on this PC" },
+                            { key: "clipboard", icon: "edit-paste-symbolic", label: "Shared clipboard", hint: "Copy on one, paste on the other" },
+                            { key: "dragDrop", icon: "transform-move-symbolic", label: "Drag and drop", hint: "Drag files between Mac windows and this PC" },
+                            { key: "dim", icon: "brightness-low-symbolic", label: "Dim the Mac's screen", hint: "While its apps are streaming here" },
+                            { key: "desktop", icon: "virtual-desktops-symbolic", label: "Own desktop", hint: "Mac apps open on a desktop of their own" },
+                            { key: "launcher", icon: "view-app-grid-symbolic", label: "In the app launcher", hint: "List Mac apps alongside this PC's" },
+                            { key: "light", icon: "network-wireless-symbolic", label: "Lighter picture", hint: "Less data, for slower networks" },
+                        ]
+                        delegate: ToggleRow {
+                            required property var modelData
+                            iconName: modelData.icon
+                            label: modelData.label
+                            hint: modelData.hint
+                            on: !!root.settings && (modelData.key === "light" ? root.settings.quality === "light" : !!root.settings[modelData.key])
+                            enabled: root.streaming
+                            onFlipped: (v) => root.set(modelData.key === "light" ? { quality: v ? "light" : "sharp" } : { [modelData.key]: v })
+                        }
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
+
+                    PlasmaComponents3.ItemDelegate {
+                        Layout.fillWidth: true
                         enabled: root.streaming
-                        onClicked: root.act("launch", modelData.id)
-                        PlasmaComponents3.ToolTip.text: "Open " + modelData.name + " on the Mac"
-                        PlasmaComponents3.ToolTip.visible: hovered
-                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                        onClicked: stack.push(appsPage)
                         contentItem: RowLayout {
                             spacing: Kirigami.Units.largeSpacing
-                            Kirigami.Icon {
-                                source: modelData.icon || "application-x-executable"
-                                Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
-                                Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
-                            }
-                            PlasmaComponents3.Label {
-                                text: modelData.name
-                                elide: Text.ElideRight
+                            Kirigami.Icon { source: "view-list-icons-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium }
+                            ColumnLayout {
+                                spacing: 0
                                 Layout.fillWidth: true
-                            }
-                            PlasmaComponents3.Switch {
-                                checked: shown
-                                onToggled: {
-                                    const exclude = root.settings.exclude.filter(b => b !== modelData.id);
-                                    if (!checked) exclude.push(modelData.id);
-                                    root.set({ exclude: exclude });
-                                    checked = Qt.binding(() => shown);
+                                PlasmaComponents3.Label { text: "Apps"; Layout.fillWidth: true }
+                                PlasmaComponents3.Label {
+                                    readonly property int total: (root.st.apps || []).length
+                                    readonly property int hidden: root.settings ? root.settings.exclude.length : 0
+                                    text: hidden ? (total - hidden) + " of " + total + " shown here" : "All " + total + " shown here"
+                                    font: Kirigami.Theme.smallFont
+                                    opacity: 0.7
                                 }
-                                PlasmaComponents3.ToolTip.text: shown ? "Shown here" : "Stays on the Mac"
-                                PlasmaComponents3.ToolTip.visible: hovered
+                            }
+                            Kirigami.Icon { source: "go-next-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.small; Layout.preferredHeight: Kirigami.Units.iconSizes.small }
+                        }
+                    }
+                }
+            }
+        }
+
+        Component {
+            id: appsPage
+            ColumnLayout {
+                spacing: Kirigami.Units.smallSpacing
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.margins: Kirigami.Units.smallSpacing
+                    PlasmaComponents3.ToolButton {
+                        icon.name: "go-previous-symbolic"
+                        onClicked: stack.pop()
+                        PlasmaComponents3.ToolTip.text: "Back"
+                        PlasmaComponents3.ToolTip.visible: hovered
+                    }
+                    Kirigami.Heading { level: 4; text: "Apps" }
+                    PlasmaExtras.SearchField {
+                        id: search
+                        Layout.fillWidth: true
+                        Component.onCompleted: forceActiveFocus()
+                    }
+                }
+                PlasmaComponents3.Label {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: Kirigami.Units.largeSpacing
+                    text: "Click to open on the Mac · switch off to keep it there"
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                }
+                PlasmaComponents3.ScrollView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    ListView {
+                        clip: true
+                        model: (root.st.apps || []).filter(a => a.name.toLowerCase().includes(search.text.toLowerCase()))
+                        delegate: PlasmaComponents3.ItemDelegate {
+                            id: appRow
+                            required property var modelData
+                            readonly property bool shown: !!root.settings && !root.settings.exclude.includes(modelData.id)
+                            width: ListView.view.width
+                            onClicked: root.act("launch", modelData.id)
+                            contentItem: RowLayout {
+                                spacing: Kirigami.Units.largeSpacing
+                                Kirigami.Icon {
+                                    source: appRow.modelData.icon || "application-x-executable"
+                                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                                }
+                                PlasmaComponents3.Label { text: appRow.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true }
+                                PlasmaComponents3.Switch {
+                                    checked: appRow.shown
+                                    onToggled: {
+                                        const exclude = root.settings.exclude.filter(b => b !== appRow.modelData.id);
+                                        if (!checked) exclude.push(appRow.modelData.id);
+                                        root.set({ exclude: exclude });
+                                        checked = Qt.binding(() => appRow.shown);
+                                    }
+                                }
                             }
                         }
                     }
