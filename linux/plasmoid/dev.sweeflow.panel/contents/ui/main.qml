@@ -339,7 +339,7 @@ PlasmoidItem {
                 PlasmaComponents3.Label {
                     Layout.fillWidth: true
                     Layout.leftMargin: Kirigami.Units.largeSpacing
-                    text: "Click to open · ⏻ quits · switch off to keep it on the Mac"
+                    text: "Click to open · switch off to keep it on the Mac"
                     font: Kirigami.Theme.smallFont
                     opacity: 0.7
                 }
@@ -347,14 +347,31 @@ PlasmoidItem {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     ListView {
+                        id: appList
                         clip: true
+                        // Running first (the client sorts them so), each group under a heading.
                         model: (root.st.apps || []).filter(a => a.name.toLowerCase().includes(search.text.toLowerCase()))
-                        delegate: PlasmaComponents3.ItemDelegate {
+                        delegate: ColumnLayout {
                             id: appRow
                             required property var modelData
+                            required property int index
                             readonly property bool shown: !!root.settings && !root.settings.exclude.includes(modelData.id)
+                            readonly property bool firstOfGroup: index === 0
+                                || (appList.model[index - 1].state > 0) !== (modelData.state > 0)
                             width: ListView.view.width
-                            onClicked: root.act("launch", modelData.id)
+                            spacing: 0
+                            Kirigami.Heading {
+                                visible: appRow.firstOfGroup
+                                level: 5
+                                text: appRow.modelData.state > 0 ? "Running" : "Not running"
+                                opacity: 0.7
+                                Layout.leftMargin: Kirigami.Units.largeSpacing
+                                Layout.topMargin: appRow.index === 0 ? 0 : Kirigami.Units.largeSpacing
+                                Layout.bottomMargin: Kirigami.Units.smallSpacing
+                            }
+                        PlasmaComponents3.ItemDelegate {
+                            Layout.fillWidth: true
+                            onClicked: root.act("launch", appRow.modelData.id)
                             contentItem: RowLayout {
                                 spacing: Kirigami.Units.largeSpacing
                                 Kirigami.Icon {
@@ -391,6 +408,7 @@ PlasmoidItem {
                                     }
                                 }
                             }
+                        }
                         }
                     }
                 }
