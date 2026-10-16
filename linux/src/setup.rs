@@ -122,6 +122,13 @@ pub fn start_client() -> Result<()> {
 
 /// Installs this binary to ~/.local/bin and a systemd user service that runs it with the
 /// desktop session (restarting it if it ever exits).
+/// `sweeflow install` has put the user service in place.
+pub fn service_installed() -> bool {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|h| h.join(".config/systemd/user/sweeflow.service").exists())
+}
+
 pub fn install() -> Result<()> {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
     let bin_dir = home.join(".local/bin");

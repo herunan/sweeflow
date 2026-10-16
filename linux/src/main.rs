@@ -76,6 +76,16 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("run") => {
+            // Started by hand (a terminal, KRunner) while installed as a service: start the
+            // service instead, so there's one copy and Quit / restarts behave. (Not by
+            // INVOCATION_ID: KDE runs launched apps as services of their own, which have one too.)
+            let in_service = std::fs::read_to_string("/proc/self/cgroup").is_ok_and(|c| c.contains("/sweeflow.service"));
+            if !in_service && setup::service_installed() {
+                eprintln!("sweeflow runs as a user service: starting it (systemctl --user start sweeflow)");
+                let ok = std::process::Command::new("systemctl").args(["--user", "start", "sweeflow"]).status()?.success();
+                anyhow::ensure!(ok, "couldn't start the sweeflow service");
+                return Ok(());
+            }
             let _lock = single_instance()?;
             ui::run(wait_for_a_mac()?)
         }
