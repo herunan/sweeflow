@@ -1771,8 +1771,16 @@ impl WindowHandler for App {
         w.configured = true;
         if w.display {
             // Never resized on the Mac: the picture is scaled into whatever size it's given.
-            w.size = size;
             let k = (size.0 as f64 / w.info.w.max(1.0) as f64).min(size.1 as f64 / w.info.h.max(1.0) as f64);
+            // Floating, it keeps the display's proportions: xdg-shell lets a window take less
+            // than it's offered, so it settles on the largest size of that shape (and KWin
+            // follows while it's dragged). Tiled or maximised, it must fill its space: dark bars.
+            let size = if w.floating {
+                ((w.info.w as f64 * k).round().max(1.0) as u32, (w.info.h as f64 * k).round().max(1.0) as u32)
+            } else {
+                size
+            };
+            w.size = size;
             w.fit = (k, (size.0 as f64 - w.info.w as f64 * k) / 2.0, (size.1 as f64 - w.info.h as f64 * k) / 2.0);
         } else if size != w.size || (first && size != (w.info.w as u32, w.info.h as u32)) {
             w.size = size;
