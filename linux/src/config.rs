@@ -155,7 +155,11 @@ impl Config {
     }
 
     /// Adds (or updates) a paired Mac; `activate` makes it the one to stream from.
-    pub fn add_mac(&mut self, m: PairedMac, activate: bool) {
+    /// Pairing again with a Mac it knows keeps the name given to it here (see tray::rename).
+    pub fn add_mac(&mut self, mut m: PairedMac, activate: bool) {
+        if let Some(old) = self.macs.iter().find(|o| o.fingerprint == m.fingerprint) {
+            m.name = old.name.clone();
+        }
         self.macs.retain(|o| o.fingerprint != m.fingerprint);
         self.macs.push(m.clone());
         if activate || self.host_fingerprint == m.fingerprint {

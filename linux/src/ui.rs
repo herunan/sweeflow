@@ -202,6 +202,8 @@ struct Win {
     /// Popup geometry changes wait a moment (see adopt_mac_size).
     popup_wait: bool,
     popup_settled: bool,
+    /// A "did the Mac follow?" look (adopt_mac_size) is scheduled.
+    check_pending: bool,
     /// The "Mac display" view (kind 3): letterboxed and scaled to fit, never resized on the Mac.
     display: bool,
     /// Display view only: logical px per Mac point, and where the picture starts (logical px).
@@ -723,6 +725,7 @@ impl App {
                 raw_buffers: Default::default(),
                 stale: false,
                 popup_wait: false,
+                check_pending: false,
                 display,
                 fit: (1.0, 0.0, 0.0),
                 popup_settled: false,
@@ -802,6 +805,36 @@ impl App {
 
     /// The Mac changed the window size itself (app-initiated resize). Follow it if the window
     /// is floating and we are not in the middle of our own resize.
+    /// Looks whether the Mac followed the size asked for, once things have settled: one look
+    /// per window, put off while sizes keep coming. (A tiling drag resizes every window many
+    /// times a second; a look per size piled up, and looks landing mid-drag re-asked sizes and
+    /// declared false limits, which made the tiling script lay everything out again.)
+    fn schedule_check(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        if let Some(w) = self.windows.get_mut(&wid) {
+            Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+        }
+    }
+
+    /// schedule_check for when the window is already borrowed.
+    fn arm_check(lh: &LoopHandle<'static, App>, pending: &mut bool, wid: u32, qh: &QueueHandle<Self>) {
+        if *pending {
+            return;
+        }
+        *pending = true;
+        let qh = qh.clone();
+        let _ = lh.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
+            let Some(w) = app.windows.get_mut(&wid) else { return TimeoutAction::Drop };
+            w.check_pending = false;
+            if w.requested.is_some_and(|(_, at)| at.elapsed() < Duration::from_millis(3000)) {
+                // Still being resized: look later.
+                app.schedule_check(wid, &qh);
+            } else {
+                app.adopt_mac_size(wid, &qh);
+            }
+            TimeoutAction::Drop
+        });
+    }
+
     fn adopt_mac_size(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get_mut(&wid) else { return };
         if w.display {
@@ -840,11 +873,7 @@ impl App {
                 w.refusal = Some((size, mac));
                 w.requested = Some((size, Instant::now()));
                 let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
-                let qh = qh.clone();
-                let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
-                    app.adopt_mac_size(wid, &qh);
-                    TimeoutAction::Drop
-                });
+                Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
                 refused = false;
             }
             // Any real overshoot counts: even a few points cut off a toolbar. (Apps that snap to
@@ -934,11 +963,7 @@ impl App {
                 // is left alone.
                 let far = mac.0.abs_diff(size.0) > 40 || mac.1.abs_diff(size.1) > 40;
                 if far {
-                    let qh = qh.clone();
-                    let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
-                        app.adopt_mac_size(wid, &qh);
-                        TimeoutAction::Drop
-                    });
+                    Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
                 }
             }
         }
@@ -1755,11 +1780,7 @@ impl WindowHandler for App {
             w.followed = false;
             let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
             // Check it took (a Mac window that can't follow reports no change).
-            let qh2 = qh.clone();
-            let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(3200)), move |_, _, app| {
-                app.adopt_mac_size(wid, &qh2);
-                TimeoutAction::Drop
-            });
+            Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
         }
         if cfg.decoration_mode != DecorationMode::Server && first {
             log::debug!("compositor declined server-side decorations");

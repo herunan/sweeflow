@@ -545,10 +545,37 @@ final class Session {
             origin.y = max(area.minY, min(origin.y, area.maxY - size.height))
         }
         let moved = origin != win.frame.origin
-        // Capture at the new size as soon as the app has resized (not on the next slow look).
-        ax {
-            if moved { $0.setPosition(win.wid, pid: win.pid, origin) }
-            $0.setSize(win.wid, pid: win.pid, size)
+        resizeTargets[win.wid] = (win.pid, moved ? origin : nil, size)
+        applyResize(win.wid)
+    }
+
+    /// The latest size (and position) asked for each window. A tiling drag lays out every
+    /// window again many times a second, and an Accessibility resize takes 100–500 ms: applied
+    /// one by one, the stale sizes queued up for seconds. Now one resize per window runs at a
+    /// time and the next takes only the newest target; each app has its own queue, so a slow
+    /// app (Electron) doesn't hold the others up.
+    private var resizeTargets: [UInt32: (pid: pid_t, origin: CGPoint?, size: CGSize)] = [:]
+    private var resizing: Set<UInt32> = []
+    private var appAXQueues: [pid_t: DispatchQueue] = [:]
+
+    private func applyResize(_ wid: UInt32) {
+        guard !resizing.contains(wid), let t = resizeTargets.removeValue(forKey: wid) else { return }
+        resizing.insert(wid)
+        let q = appAXQueues[t.pid] ?? DispatchQueue(label: "sweeflow.ax.\(t.pid)", qos: .userInteractive)
+        appAXQueues[t.pid] = q
+        let control = control_
+        q.async { [weak self] in
+            let t0 = Date()
+            if let o = t.origin { control.setPosition(wid, pid: t.pid, o) }
+            control.setSize(wid, pid: t.pid, t.size)
+            let ms = Date().timeIntervalSince(t0) * 1000
+            if ms > 100 { log(String(format: "resize of %u took %.0f ms", wid, ms)) }
+            // Capture at the new size as soon as the app has resized (not on the next slow look).
+            self?.tracker.burst(everyMs: 16, for: 0.5)
+            self?.queue.async {
+                self?.resizing.remove(wid)
+                self?.applyResize(wid)
+            }
         }
     }
 

@@ -550,7 +550,8 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             let buttons = (0..r.u16()?).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
             // Newer hosts say whether it's a menu.
             let menu = r.u8().unwrap_or(0) == 1;
-            log::info!("{app} {} {id} can't be shown here: stand-in with {} item(s)", if menu { "menu" } else { "window" }, buttons.len());
+            log::info!("{app} {} {id} can't be shown here: stand-in with {} item(s): {title:?} {texts:?} {buttons:?}",
+                       if menu { "menu" } else { "window" }, buttons.len());
             UiEvent::BlindShow { id, app, title, texts, buttons, menu }
         }
         t::SETTINGS => {
