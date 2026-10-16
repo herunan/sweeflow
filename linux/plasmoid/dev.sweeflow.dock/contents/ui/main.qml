@@ -1,6 +1,7 @@
-// The Mac Dock: the Mac's apps as a row of icons for any panel, with the Dock's dots (solid:
-// a window is open; ring: only minimised ones; faint: running with no window). Pinned apps stay
-// when not running. Reads the client over D-Bus, like the tray widget (src/panel.rs).
+// The Mac Dock: the Mac's running (and pinned) apps as a row of icons, with the Dock's dot for
+// running ones. Hovering shows live previews of the app's windows here (as the task manager
+// does); clicking brings its window up, or opens the app. Reads the client over D-Bus, like the
+// tray widget (src/panel.rs), and the windows from Plasma's task manager model.
 
 import QtQuick
 import QtQuick.Layouts
@@ -9,6 +10,9 @@ import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.components as PlasmaComponents3
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.workspace.dbus as DBus
+import org.kde.taskmanager as TaskManager
+import org.kde.pipewire as PipeWire
+import org.kde.kitemmodels as KItemModels
 
 PlasmoidItem {
     id: root
@@ -37,6 +41,16 @@ PlasmoidItem {
     function act(action, arg) {
         DBus.SessionBus.asyncCall({ service: root.service, path: root.objectPath, iface: root.ifaceName,
                                     member: "Do", arguments: [action, arg || ""] });
+    }
+
+    // Every window, to find each Mac app's (app id "sweeflow-<bundle id>").
+    TaskManager.TasksModel {
+        id: tasks
+        groupMode: TaskManager.TasksModel.GroupDisabled
+        filterByVirtualDesktop: false
+        filterByScreen: false
+        filterByActivity: false
+        filterMinimized: false
     }
 
     readonly property var pinned: Plasmoid.configuration.pinned || []
@@ -99,15 +113,85 @@ PlasmoidItem {
                 Layout.preferredHeight: grid.cell
                 hoverEnabled: true
                 acceptedButtons: Qt.LeftButton | Qt.RightButton
+
+                // This app's windows here.
+                KItemModels.KSortFilterProxyModel {
+                    id: wins
+                    sourceModel: tasks
+                    filterRowCallback: (row, parent) =>
+                        String(tasks.data(tasks.index(row, 0), TaskManager.AbstractTasksModel.AppId)).replace(/\.desktop$/, "")
+                            === "sweeflow-" + cellArea.modelData.id
+                }
+                function activate(i) { tasks.requestActivate(wins.mapToSource(wins.index(i, 0))); }
+
                 onClicked: (mouse) => {
-                    if (mouse.button === Qt.RightButton) menu.popup();
-                    else root.act("launch", modelData.id);
+                    if (mouse.button === Qt.RightButton) { menu.popup(); return; }
+                    // Its window comes up (one already active goes down, as in the task manager);
+                    // no window here: open the app on the Mac.
+                    if (wins.count === 0) { root.act("launch", modelData.id); return; }
+                    const first = wins.index(0, 0);
+                    if (wins.count === 1 && wins.data(first, TaskManager.AbstractTasksModel.IsActive))
+                        tasks.requestToggleMinimized(wins.mapToSource(first));
+                    else
+                        activate(0);
                 }
 
                 PlasmaCore.ToolTipArea {
                     anchors.fill: parent
-                    mainText: cellArea.modelData.name
-                    subText: ["Not running", "Running, no window", "Minimised", "Open"][cellArea.modelData.state] || ""
+                    interactive: wins.count > 0
+                    mainText: wins.count > 0 ? "" : cellArea.modelData.name
+                    subText: wins.count > 0 ? "" : (cellArea.modelData.state > 0 ? "No window open" : "Not running")
+                    mainItem: wins.count > 0 ? previews : null
+                    ColumnLayout {
+                        id: previews
+                        visible: false
+                        spacing: Kirigami.Units.smallSpacing
+                        PlasmaComponents3.Label { text: cellArea.modelData.name; font.bold: true }
+                        RowLayout {
+                            spacing: Kirigami.Units.smallSpacing
+                            Repeater {
+                                model: wins
+                                delegate: MouseArea {
+                                    id: thumb
+                                    required property var model
+                                    required property int index
+                                    readonly property string winId: (model.WinIdList || [])[0] || ""
+                                    Layout.preferredWidth: Kirigami.Units.gridUnit * 12
+                                    Layout.preferredHeight: Kirigami.Units.gridUnit * 8 + title.height
+                                    hoverEnabled: true
+                                    onClicked: cellArea.activate(index)
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: Kirigami.Units.cornerRadius
+                                        color: Kirigami.Theme.highlightColor
+                                        opacity: thumb.containsMouse ? 0.25 : 0
+                                    }
+                                    TaskManager.ScreencastingRequest { id: cast; uuid: thumb.winId }
+                                    PipeWire.PipeWireSourceItem {
+                                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: Kirigami.Units.smallSpacing }
+                                        height: Kirigami.Units.gridUnit * 8 - Kirigami.Units.smallSpacing
+                                        nodeId: cast.nodeId
+                                        visible: nodeId > 0
+                                    }
+                                    Kirigami.Icon {
+                                        anchors.centerIn: parent
+                                        visible: cast.nodeId <= 0
+                                        width: Kirigami.Units.iconSizes.large
+                                        height: width
+                                        source: cellArea.modelData.icon || "application-x-executable"
+                                    }
+                                    PlasmaComponents3.Label {
+                                        id: title
+                                        anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: Kirigami.Units.smallSpacing }
+                                        text: thumb.model.display || ""
+                                        elide: Text.ElideRight
+                                        horizontalAlignment: Text.AlignHCenter
+                                        font: Kirigami.Theme.smallFont
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Rectangle {
                     anchors.fill: parent
@@ -126,10 +210,10 @@ PlasmoidItem {
                     scale: cellArea.pressed ? 0.9 : 1
                     Behavior on scale { NumberAnimation { duration: Kirigami.Units.shortDuration } }
                 }
-                // The Dock's dot.
+                // The Dock's dot: running.
                 Rectangle {
                     visible: cellArea.modelData.state > 0
-                    readonly property real size: Math.max(4, grid.cell * 0.08)
+                    readonly property real size: Math.max(4, grid.cell * 0.07)
                     width: size
                     height: size
                     radius: size / 2
@@ -139,10 +223,8 @@ PlasmoidItem {
                     anchors.verticalCenter: root.vertical ? parent.verticalCenter : undefined
                     anchors.left: root.vertical ? parent.left : undefined
                     anchors.leftMargin: 1
-                    color: cellArea.modelData.state === 2 ? "transparent" : Kirigami.Theme.textColor
-                    border.color: Kirigami.Theme.textColor
-                    border.width: cellArea.modelData.state === 2 ? 1 : 0
-                    opacity: cellArea.modelData.state === 1 ? 0.45 : 0.9
+                    color: Kirigami.Theme.textColor
+                    opacity: 0.8
                 }
 
                 PlasmaComponents3.Menu {
@@ -151,7 +233,7 @@ PlasmoidItem {
                     PlasmaComponents3.MenuSeparator {}
                     PlasmaComponents3.MenuItem {
                         icon.name: "window-new"
-                        text: cellArea.modelData.state > 0 ? "Show" : "Open"
+                        text: "Open"
                         onTriggered: root.act("launch", cellArea.modelData.id)
                     }
                     PlasmaComponents3.MenuItem {

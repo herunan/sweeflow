@@ -527,7 +527,7 @@ pub fn panel_do(action: &str, arg: &str) {
                 let r = match (action.as_str(), arg.as_str()) {
                     ("taskbar", a) => crate::placement::set_taskbar(a == "on"),
                     ("dock", "off") => crate::placement::remove_dock(),
-                    ("dock", a) => crate::placement::add_dock(a == "own"),
+                    ("dock", _) => crate::placement::add_dock(),
                     (_, a) => crate::placement::set_global_menu(a == "on"),
                 };
                 if let Err(e) = r {

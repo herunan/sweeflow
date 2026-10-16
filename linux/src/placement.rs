@@ -2,7 +2,7 @@
 //! Dock widget (linux/plasmoid/dev.sweeflow.dock) and the Global Menu bar. KDE Plasma only: a
 //! KWin rule for the task manager, Plasma's scripting interface for panels and widgets.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use zbus::blocking::Connection;
 
@@ -71,38 +71,17 @@ pub fn set_taskbar(on: bool) -> Result<()> {
     }
 }
 
-/// Adds the Mac Dock: `own` as a floating dock panel of its own at the bottom (hiding when a
-/// window gets near), otherwise into the panel with the task manager, after it. Either way
-/// Plasma's edit mode opens, so it can be dragged where it belongs.
-pub fn add_dock(own: bool) -> Result<()> {
-    let script = if own {
-        format!(
-            "var p = new Panel('org.kde.panel');\n\
-             p.location = 'bottom'; p.height = 64; p.lengthMode = 'fit'; p.alignment = 'center';\n\
-             p.floating = true; p.hiding = 'dodgewindows';\n\
-             p.addWidget('{DOCK}');\n\
-             print('ok');"
-        )
-    } else {
-        format!(
-            "var ps = panels().filter(function(p){{ return p.widgets('org.kde.plasma.icontasks').length || p.widgets('org.kde.plasma.taskmanager').length; }});\n\
-             var p = ps.filter(function(p){{ return p.screen == 0; }})[0] || ps[0] || panels()[0];\n\
-             if (!p) {{ print('no panel'); }} else {{\n\
-               var tasks = p.widgets('org.kde.plasma.icontasks')[0] || p.widgets('org.kde.plasma.taskmanager')[0];\n\
-               var w = p.addWidget('{DOCK}');\n\
-               // Right after the task manager, rather than at the end.\n\
-               if (tasks) {{\n\
-                 var ids = p.widgetIds.filter(function(id){{ return id != w.id; }});\n\
-                 ids.splice(ids.indexOf(tasks.id) + 1, 0, w.id);\n\
-                 p.currentConfigGroup = ['General']; p.writeConfig('AppletOrder', ids.join(';'));\n\
-               }}\n\
-               print('ok');\n\
-             }}"
-        )
-    };
-    let out = plasma(&script)?;
+/// Adds the Mac Dock: a floating dock panel of its own at the bottom, centred, which gets out of
+/// the way when a window comes near it.
+pub fn add_dock() -> Result<()> {
+    let out = plasma(&format!(
+        "var p = new Panel('org.kde.panel');\n\
+         p.location = 'bottom'; p.height = 64; p.lengthMode = 'fit'; p.alignment = 'center';\n\
+         p.floating = true; p.hiding = 'dodgewindows';\n\
+         p.addWidget('{DOCK}');\n\
+         print('ok');"
+    ))?;
     anyhow::ensure!(out.contains("ok"), "couldn't add the Mac Dock: {out}");
-    edit_mode();
     Ok(())
 }
 
@@ -118,37 +97,39 @@ pub fn remove_dock() -> Result<()> {
     Ok(())
 }
 
-/// The Global Menu bar (the Mac apps' menus, like the Mac's menu bar): a slim panel at the top
-/// with the Global Menu widget. Off removes the widget (and its panel, if that's all it held).
+/// The id of the top bar we made for the Global Menu (only that one is ever removed).
+fn menu_panel_file() -> std::path::PathBuf {
+    crate::config::dir().join("global-menu-panel")
+}
+
+/// The Global Menu (the Mac apps' menus, like the Mac's menu bar). On: into the top panel there
+/// already is, or else a slim bar of its own at the top, centred. Off: the widget goes, and the
+/// bar too if we made it.
 pub fn set_global_menu(on: bool) -> Result<()> {
-    let script = if on {
-        format!(
-            "var has = panels().some(function(p){{ return p.widgets('{APPMENU}').length; }});\n\
-             if (!has) {{ var p = new Panel('org.kde.panel'); p.location = 'top'; p.height = 28; p.lengthMode = 'fit';\n\
-               p.alignment = 'left'; p.floating = false; p.addWidget('{APPMENU}'); }}"
-        )
+    let ours = std::fs::read_to_string(menu_panel_file()).unwrap_or_default().trim().to_string();
+    if on {
+        let out = plasma(&format!(
+            "if (panels().some(function(p){{ return p.widgets('{APPMENU}').length; }})) print('has');\n\
+             else {{\n\
+               var top = panels().filter(function(p){{ return p.location == 'top'; }})[0];\n\
+               if (top) {{ top.addWidget('{APPMENU}'); print('added'); }}\n\
+               else {{ var p = new Panel('org.kde.panel'); p.location = 'top'; p.height = 28; p.lengthMode = 'fit';\n\
+                 p.alignment = 'center'; p.floating = false; p.addWidget('{APPMENU}'); print('made ' + p.id); }}\n\
+             }}"
+        ))?;
+        if let Some(id) = out.trim().strip_prefix("made ") {
+            std::fs::write(menu_panel_file(), id)?;
+        }
     } else {
-        format!(
+        plasma(&format!(
             "panels().forEach(function(p){{\n\
                var m = p.widgets('{APPMENU}');\n\
                if (!m.length) return;\n\
-               if (p.widgets().length == m.length) p.remove(); else m.forEach(function(w){{ w.remove(); }});\n\
+               if (p.id == '{ours}' && p.widgets().length == m.length) p.remove(); else m.forEach(function(w){{ w.remove(); }});\n\
              }});"
-        )
-    };
-    plasma(&script).map(|_| ()).context("Global Menu")
+        ))?;
+        let _ = std::fs::remove_file(menu_panel_file());
+    }
+    Ok(())
 }
 
-/// Plasma's edit mode, to drag the new widget where it belongs.
-fn edit_mode() {
-    let _ = Connection::session().and_then(|c| {
-        c.call_method(
-            Some("org.kde.plasmashell"),
-            "/PlasmaShell",
-            Some("org.freedesktop.DBus.Properties"),
-            "Set",
-            &("org.kde.PlasmaShell", "editMode", zvariant::Value::from(true)),
-        )
-        .map(|_| ())
-    });
-}

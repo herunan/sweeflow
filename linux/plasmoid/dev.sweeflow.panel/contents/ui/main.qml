@@ -43,6 +43,7 @@ PlasmoidItem {
     readonly property var settings: st.settings || null
     readonly property bool streaming: connected && !!settings && settings.enabled
     readonly property string macName: st.mac || "Mac"
+    readonly property var placement: st.placement || {}
 
     readonly property string statusText: {
         if (!running) return "Sweeflow isn't running";
@@ -95,7 +96,7 @@ PlasmoidItem {
 
     fullRepresentation: PlasmaExtras.Representation {
         Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 25
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 30
         collapseMarginsHint: true
 
         header: PlasmaExtras.PlasmoidHeading {
@@ -190,7 +191,9 @@ PlasmoidItem {
         }
         Connections {
             target: root
-            function onExpandedChanged() { if (!root.expanded) stack.pop(null); }
+            // Closed: back to the main page. Opened: look again at panels and rules (they can be
+            // changed in Plasma's own settings too).
+            function onExpandedChanged() { if (!root.expanded) stack.pop(null); else root.act("placement"); }
         }
 
         Component {
@@ -216,31 +219,6 @@ PlasmoidItem {
                                 readonly property int running: (root.st.apps || []).filter(a => a.state > 0).length
                                 text: (running ? running + " running · " : "") + (hidden ? (total - hidden) + " of " + total : "All " + total)
                                 opacity: 0.6
-                            }
-                            Kirigami.Icon { source: "go-next-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.small; Layout.preferredHeight: Kirigami.Units.iconSizes.small }
-                        }
-                    }
-
-                    PlasmaComponents3.ItemDelegate {
-                        Layout.fillWidth: true
-                        onClicked: { root.act("placement"); stack.push(placementPage); }
-                        contentItem: RowLayout {
-                            spacing: Kirigami.Units.largeSpacing
-                            Kirigami.Icon { source: "window-duplicate-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium; Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium }
-                            ColumnLayout {
-                                spacing: 0
-                                Layout.fillWidth: true
-                                PlasmaComponents3.Label { text: "Where Mac apps appear"; Layout.fillWidth: true }
-                                PlasmaComponents3.Label {
-                                    readonly property var p: root.st.placement || {}
-                                    text: [!!root.settings && root.settings.desktop ? "Own desktop" : "",
-                                           p.taskbar ? "Task manager" : "", p.dock ? "Mac Dock" : "",
-                                           p.globalMenu ? "Global Menu" : ""].filter(x => x).join(" · ") || "Windows only"
-                                    font: Kirigami.Theme.smallFont
-                                    opacity: 0.6
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                }
                             }
                             Kirigami.Icon { source: "go-next-symbolic"; Layout.preferredWidth: Kirigami.Units.iconSizes.small; Layout.preferredHeight: Kirigami.Units.iconSizes.small }
                         }
@@ -285,111 +263,67 @@ PlasmoidItem {
 
                     Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
 
+                    // Where Mac apps appear (the KDE ones only on Plasma).
+                    Kirigami.Heading {
+                        level: 5
+                        text: "Where Mac apps appear"
+                        opacity: 0.7
+                        Layout.leftMargin: Kirigami.Units.largeSpacing
+                        Layout.bottomMargin: Kirigami.Units.smallSpacing
+                    }
+                    ToggleRow {
+                        iconName: "virtual-desktops-symbolic"
+                        label: "Own desktop"
+                        hint: "Mac apps open on a desktop of their own"
+                        on: !!root.settings && root.settings.desktop
+                        enabled: !!root.settings
+                        onFlipped: (v) => root.set({ desktop: v })
+                        actionText: "Gather"
+                        actionIcon: "view-refresh-symbolic"
+                        actionTip: "Bring every Mac window back to the Mac desktop"
+                        onExtraClicked: root.act("gather")
+                    }
+                    ToggleRow {
+                        visible: !!root.placement.plasma
+                        iconName: "window-symbolic"
+                        label: "Task manager"
+                        hint: "Mac windows listed with your Linux apps"
+                        on: !!root.placement.taskbar
+                        onFlipped: (v) => root.act("taskbar", v ? "on" : "off")
+                    }
+                    ToggleRow {
+                        visible: !!root.placement.plasma
+                        iconName: root.logo
+                        label: "Mac Dock"
+                        hint: "A dock of Mac apps, with window previews"
+                        on: !!root.placement.dock
+                        onFlipped: (v) => root.act("dock", v ? "own" : "off")
+                    }
+                    ToggleRow {
+                        visible: !!root.placement.plasma
+                        iconName: "application-menu-symbolic"
+                        label: "Global Menu"
+                        hint: "The Mac apps' menus at the top of the screen"
+                        on: !!root.placement.globalMenu
+                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
+                    }
+                    ToggleRow {
+                        iconName: "view-app-grid-symbolic"
+                        label: "Mac apps in Linux menu"
+                        hint: "Listed alongside your Linux apps"
+                        on: !!root.settings && root.settings.launcher
+                        enabled: !!root.settings
+                        onFlipped: (v) => root.set({ launcher: v })
+                    }
+
+                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
+
                     ToggleRow {
                         iconName: "system-run-symbolic"
                         label: "Open at login"
                         hint: "Start Sweeflow when you log in"
                         on: !!root.st.openAtLogin
                         onFlipped: (v) => root.act("login", v ? "on" : "off")
-                    }
-                }
-            }
-        }
-
-        Component {
-            id: placementPage
-            ColumnLayout {
-                id: placement
-                readonly property var p: root.st.placement || {}
-                property bool choosingDock: false
-                spacing: Kirigami.Units.smallSpacing
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.margins: Kirigami.Units.smallSpacing
-                    PlasmaComponents3.ToolButton {
-                        icon.name: "go-previous-symbolic"
-                        onClicked: stack.pop()
-                        PlasmaComponents3.ToolTip.text: "Back"
-                        PlasmaComponents3.ToolTip.visible: hovered
-                    }
-                    Kirigami.Heading { level: 4; text: "Where Mac apps appear"; Layout.fillWidth: true }
-                }
-                PlasmaComponents3.ScrollView {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    contentWidth: availableWidth
-                    ColumnLayout {
-                        width: parent.width
-                        spacing: 0
-
-                        ToggleRow {
-                            iconName: "virtual-desktops-symbolic"
-                            label: "Own desktop"
-                            hint: "Mac apps open on a desktop of their own"
-                            on: !!root.settings && root.settings.desktop
-                            enabled: !!root.settings
-                            onFlipped: (v) => root.set({ desktop: v })
-                            actionText: "Gather"
-                            actionIcon: "view-refresh-symbolic"
-                            actionTip: "Bring every Mac window back to the Mac desktop"
-                            onExtraClicked: root.act("gather")
-                        }
-                        ToggleRow {
-                            visible: !!placement.p.plasma
-                            iconName: "window-symbolic"
-                            label: "Task manager"
-                            hint: "Mac windows listed with your Linux apps"
-                            on: !!placement.p.taskbar
-                            onFlipped: (v) => root.act("taskbar", v ? "on" : "off")
-                        }
-                        ToggleRow {
-                            visible: !!placement.p.plasma
-                            iconName: root.logo
-                            label: "Mac Dock"
-                            hint: placement.choosingDock ? "Where should it go?" : "Mac apps with the Dock's dots: open, minimised, running"
-                            on: !!placement.p.dock || placement.choosingDock
-                            onFlipped: (v) => {
-                                if (!v) { placement.choosingDock = false; if (placement.p.dock) root.act("dock", "off"); }
-                                else placement.choosingDock = true;
-                            }
-                        }
-                        RowLayout {
-                            visible: placement.choosingDock && !placement.p.dock
-                            Layout.fillWidth: true
-                            Layout.leftMargin: Kirigami.Units.gridUnit * 2
-                            Layout.rightMargin: Kirigami.Units.largeSpacing
-                            Layout.bottomMargin: Kirigami.Units.smallSpacing
-                            PlasmaComponents3.Button {
-                                text: "Next to my apps"
-                                icon.name: "window-symbolic"
-                                onClicked: { placement.choosingDock = false; root.act("dock", "panel"); root.expanded = false; }
-                                PlasmaComponents3.ToolTip.text: "In the panel with your task manager; drag it where you like"
-                                PlasmaComponents3.ToolTip.visible: hovered
-                            }
-                            PlasmaComponents3.Button {
-                                text: "As its own dock"
-                                icon.name: "go-bottom-symbolic"
-                                onClicked: { placement.choosingDock = false; root.act("dock", "own"); root.expanded = false; }
-                                PlasmaComponents3.ToolTip.text: "A floating dock at the bottom that hides when a window gets near"
-                                PlasmaComponents3.ToolTip.visible: hovered
-                            }
-                        }
-                        ToggleRow {
-                            visible: !!placement.p.plasma
-                            iconName: "application-menu-symbolic"
-                            label: "Global Menu bar"
-                            hint: "The Mac apps' menus in a bar at the top"
-                            on: !!placement.p.globalMenu
-                            onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
-                        }
-                        ToggleRow {
-                            iconName: "view-app-grid-symbolic"
-                            label: "Mac apps in Linux menu"
-                            hint: "Listed alongside your Linux apps"
-                            on: !!root.settings && root.settings.launcher
-                            enabled: !!root.settings
-                            onFlipped: (v) => root.set({ launcher: v })
-                        }
                     }
                 }
             }
