@@ -613,9 +613,9 @@ impl App {
         let wid = info.wid;
         log::info!("window {wid} added: {} kind {} parent {} {}x{} at {},{}",
                    info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
-        // An overlay over a whole Mac display (macOS's screenshot UI): shown dimmed, above
-        // everything, and closed by a click on it or Esc. A popup that big can only be one; left
-        // a plain popup it would sit there invisible and take every click on the screen.
+        // An overlay over a whole Mac display (one screencaptureui leaves behind): shown dimmed,
+        // above everything, and closed by a click on it or Esc. A popup that big can only be one;
+        // left a plain popup it would sit there invisible and take every click on the screen.
         let overlay = info.kind == 4 || (info.kind == 1 && self.covers_screen(info.w, info.h));
         if overlay {
             info.kind = 1;
@@ -1468,15 +1468,20 @@ impl App {
             return;
         }
         w.overlay = true;
-        log::warn!("window {wid} ({}) covers a whole Mac display: shown as an overlay, closed by a click or Esc", w.info.app_name);
+        // Whose it is: the Mac titles a helper's overlay with its owner, else it's the app's own.
+        let owner = if w.info.title.is_empty() { w.info.app_name.clone() } else { w.info.title.clone() };
+        log::warn!("window {wid} ({owner}) covers a whole Mac display: shown as an overlay, closed by a click or Esc");
         if w.configured {
             self.draw_base(wid, qh);
         }
-        std::thread::spawn(|| {
+        // "Screenshot" is screencaptureui, which also runs the screen-sharing pickers (a video-call app's)
+        // and can leave a window behind without anyone taking a screenshot.
+        let who = if owner == "Screenshot" { "macOS's screen capture helper (screenshots, screen-sharing pickers)".to_string() } else { owner };
+        std::thread::spawn(move || {
             let _ = std::process::Command::new("notify-send")
                 .args(["--app-name=sweeflow", "--icon=preferences-desktop-display", "--transient", "--expire-time=8000",
-                       "Something on your Mac covers its screen",
-                       "Most likely macOS's screenshot tools (Cmd+Shift+5). Click the dimmed area or press Esc to close it."])
+                       "A Mac window covers the whole screen",
+                       &format!("It belongs to {who}, and is invisible. Click the dimmed area or press Esc to close it.")])
                 .status();
         });
     }

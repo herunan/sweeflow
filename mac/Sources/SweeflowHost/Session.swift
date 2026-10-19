@@ -483,8 +483,8 @@ final class Session {
     }
 
     /// Closes an overlay (see TrackedWindow.overlay) the way it closes on the Mac: Esc, sent to the
-    /// process that owns it. The screenshot UI, if that doesn't do it, is quit (macOS starts it
-    /// again next time it's asked for). Linux drops the overlay anyway if it stays.
+    /// process that owns it. screencaptureui ("Screenshot"), if that doesn't do it, is quit
+    /// (macOS starts it again when it's next needed). Linux drops the overlay anyway if it stays.
     private func closeOverlay(_ wid: UInt32) {
         func owner() -> (pid: pid_t, name: String)? {
             guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, wid) as? [[String: Any]])?.first,

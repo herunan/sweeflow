@@ -136,9 +136,9 @@ final class WindowTracker {
         return ids.prefix(Int(n)).contains { r.contains(CGDisplayBounds($0)) }
     }
 
-    /// A window covering one whole display (the screenshot UI's, Cmd-Shift-5) is no menu,
-    /// popover or panel either: streamed as a plain popup it would cover the Linux screen,
-    /// invisible, and take every click. It's sent as an overlay instead, which Linux lets the
+    /// A window covering one whole display (screencaptureui's, left behind by a screenshot or a
+    /// screen-sharing picker) is no menu, popover or panel either: streamed as a plain popup it
+    /// would cover the Linux screen, invisible, and take every click. It's sent as an overlay instead, which Linux lets the
     /// user close. A few points short of the display still counts. (Ones over more than one
     /// display are drag layers, see spansDisplays: not streamed at all.)
     static func coversDisplay(_ r: CGRect) -> Bool {
@@ -173,7 +173,7 @@ final class WindowTracker {
         var popups: [TrackedWindow] = []
         var badges: [pid_t: [CGRect]] = [:]
         var blindNow: [UInt32: BlindWindow] = [:]
-        var helperPopups: [(wid: UInt32, pid: pid_t, frame: CGRect, layer: Int)] = []
+        var helperPopups: [(wid: UInt32, pid: pid_t, frame: CGRect, layer: Int, owner: String)] = []
 
         for info in list {
             // Windows that refuse capture (security prompts, sign-in verifiers): can't be streamed, but
@@ -206,7 +206,7 @@ final class WindowTracker {
                    !Self.spansDisplays(bounds),
                    let owner = info[kCGWindowOwnerName as String] as? String, !Self.notBlind.contains(owner),
                    bounds.width >= 8, bounds.height >= 8 {
-                    helperPopups.append((wid, pid, bounds, layer))
+                    helperPopups.append((wid, pid, bounds, layer, owner))
                 }
                 continue
             }
@@ -307,8 +307,11 @@ final class WindowTracker {
             // is in front would do, and moving it from one to the next re-creates it on Linux).
             let kept = Self.coversDisplay(h.frame) ? windows[h.wid].flatMap { seen[$0.parent] } : nil
             guard let parent = kept ?? owners.first(where: { $0.frame.insetBy(dx: -40, dy: -40).intersects(h.frame) }) else { continue }
-            popups.append(TrackedWindow(wid: h.wid, pid: parent.pid, bundleId: parent.bundleId, appName: parent.appName, title: "",
-                                        frame: h.frame, layer: h.layer, parent: 0, kind: .popup, overlay: Self.coversDisplay(h.frame)))
+            // An overlay is titled with whose it really is, so Linux can say what covers the screen.
+            let overlay = Self.coversDisplay(h.frame)
+            popups.append(TrackedWindow(wid: h.wid, pid: parent.pid, bundleId: parent.bundleId, appName: parent.appName,
+                                        title: overlay ? h.owner : "", frame: h.frame, layer: h.layer, parent: 0, kind: .popup,
+                                        overlay: overlay))
         }
         for var p in popups where p.kind == .popup {
             // Closing: macOS shrinks popovers (a calendar app's event card) toward where they opened.
