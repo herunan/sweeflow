@@ -5,7 +5,7 @@
 //! decoded video 1:1. Video frames are GPU dmabufs straight from the VA-API decoder.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -208,6 +208,8 @@ struct Win {
     display: bool,
     /// Display view only: logical px per Mac point, and where the picture starts (logical px).
     fit: (f64, f64, f64),
+    /// An overlay covering a whole Mac display (see add_window).
+    overlay: bool,
 }
 
 impl Win {
@@ -281,6 +283,10 @@ pub struct App {
     background: Option<wl_buffer::WlBuffer>,
     /// Fully transparent 1x1 buffer: base for popups (menus have rounded, translucent edges).
     clear: Option<wl_buffer::WlBuffer>,
+    /// Translucent black: base for overlays, so it shows that something covers the screen.
+    dim: Option<wl_buffer::WlBuffer>,
+    /// Overlays closed here because the Mac didn't close them: not shown again until it does.
+    dropped_overlays: HashSet<u32>,
 
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -380,6 +386,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         icon_pngs: HashMap::new(),
         background: None,
         clear: None,
+        dim: None,
+        dropped_overlays: HashSet::new(),
         seat: None,
         keyboard: None,
         pointer: None,
@@ -422,6 +430,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         app.srgb = Some(params.create(&qh, ()));
     }
     app.clear = Some(app.single_pixel.get()?.create_u32_rgba_buffer(0, 0, 0, 0, &qh, ()));
+    app.dim = Some(app.single_pixel.get()?.create_u32_rgba_buffer(0, 0, 0, u32::MAX / 3, &qh, ()));
 
     let qh2 = qh.clone();
     event_loop
@@ -493,9 +502,17 @@ impl App {
             UiEvent::Disconnected(why) => {
                 self.connected = false;
                 log::warn!("disconnected: {why}");
+                // Windows wait for the Mac to come back; menus and popovers don't (nothing would
+                // close them meanwhile, and they sit above everything else).
+                let popups: Vec<u32> = self.windows.values().filter(|w| matches!(w.role, Role::Popup(_))).map(|w| w.info.wid).collect();
+                for wid in popups {
+                    self.remove_window(wid);
+                }
             }
             UiEvent::WindowAdded(info) => self.add_window(info, qh),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
+                let grew = self.windows.get(&wid).is_some_and(|win| matches!(win.role, Role::Popup(_)) && !win.overlay)
+                    && self.covers_screen(w, h);
                 if let Some(win) = self.windows.get_mut(&wid) {
                     if let Role::Toplevel(t) = &win.role {
                         if title != win.info.title {
@@ -513,8 +530,15 @@ impl App {
                     }
                     self.adopt_mac_size(wid, qh);
                 }
+                if grew {
+                    log::warn!("popup {wid} grew to {w}x{h}, as big as the screen");
+                    self.make_overlay(wid, qh);
+                }
             }
-            UiEvent::WindowRemoved(wid) => self.remove_window(wid),
+            UiEvent::WindowRemoved(wid) => {
+                self.dropped_overlays.remove(&wid);
+                self.remove_window(wid)
+            }
             UiEvent::AppIcon { bundle_id, png } => {
                 self.icon_pngs.insert(bundle_id.clone(), png);
                 let wids: Vec<u32> =
@@ -585,18 +609,31 @@ impl App {
         }
     }
 
-    fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
+    fn add_window(&mut self, mut info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
         log::info!("window {wid} added: {} kind {} parent {} {}x{} at {},{}",
                    info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
+        // An overlay over a whole Mac display (macOS's screenshot UI): shown dimmed, above
+        // everything, and closed by a click on it or Esc. A popup that big can only be one; left
+        // a plain popup it would sit there invisible and take every click on the screen.
+        let overlay = info.kind == 4 || (info.kind == 1 && self.covers_screen(info.w, info.h));
+        if overlay {
+            info.kind = 1;
+        }
         if let Some(w) = self.windows.get_mut(&wid) {
             // Re-announced after a reconnect: keep the native window, restart the video, and make
             // sure the Mac window still has this window's size.
             w.stale = false;
             w.info = info;
             w.requested = None;
-            let _ = self.net.send(NetCmd::Subscribe(wid));
+            if !w.overlay {
+                let _ = self.net.send(NetCmd::Subscribe(wid));
+            }
             self.adopt_mac_size(wid, qh);
+            return;
+        }
+        if overlay && self.dropped_overlays.contains(&wid) {
+            log::info!("overlay {wid} ({}) was closed here already: not shown again", info.app_name);
             return;
         }
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
@@ -610,7 +647,7 @@ impl App {
             pos.set_anchor_rect(info.rel_x.round() as i32, info.rel_y.round() as i32, 1, 1);
             pos.set_anchor(xdg_positioner::Anchor::TopLeft);
             pos.set_gravity(xdg_positioner::Gravity::BottomRight);
-            pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);
+            pos.set_constraint_adjustment(popup_adjustment(overlay));
             let popup = match Popup::new(&parent_xdg, &pos, qh, &self.compositor, &self.xdg) {
                 Ok(p) => p,
                 Err(e) => {
@@ -729,10 +766,17 @@ impl App {
                 display,
                 fit: (1.0, 0.0, 0.0),
                 popup_settled: false,
+                overlay: false,
             },
         );
         if !is_popup {
             self.apply_icon(wid, qh);
+        }
+        if overlay {
+            // Its picture isn't needed (nothing on it is used from here), and a display-sized
+            // lossless stream would only hold up the rest.
+            self.make_overlay(wid, qh);
+            return;
         }
         let _ = self.net.send(NetCmd::Subscribe(wid));
     }
@@ -944,7 +988,7 @@ impl App {
                 pos.set_anchor_rect(w.info.rel_x.round() as i32, w.info.rel_y.round() as i32, 1, 1);
                 pos.set_anchor(xdg_positioner::Anchor::TopLeft);
                 pos.set_gravity(xdg_positioner::Gravity::BottomRight);
-                pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);
+                pos.set_constraint_adjustment(popup_adjustment(w.overlay));
                 p.reposition(&pos, 0);
                 w.size = mac;
                 self.draw_base(wid, qh);
@@ -978,7 +1022,13 @@ impl App {
         let base = w.base();
         // Transparent: the window's rounded corners must show the desktop behind them. The
         // display view is letterboxed: dark bars.
-        let fill = if w.display { &self.background } else { &self.clear };
+        let fill = if w.display {
+            &self.background
+        } else if w.overlay {
+            &self.dim
+        } else {
+            &self.clear
+        };
         base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -1411,6 +1461,54 @@ impl App {
         });
     }
 
+    /// Shows a popup as an overlay (see add_window) and says how to get rid of it.
+    fn make_overlay(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.overlay {
+            return;
+        }
+        w.overlay = true;
+        log::warn!("window {wid} ({}) covers a whole Mac display: shown as an overlay, closed by a click or Esc", w.info.app_name);
+        if w.configured {
+            self.draw_base(wid, qh);
+        }
+        std::thread::spawn(|| {
+            let _ = std::process::Command::new("notify-send")
+                .args(["--app-name=sweeflow", "--icon=preferences-desktop-display", "--transient", "--expire-time=8000",
+                       "Something on your Mac covers its screen",
+                       "Most likely macOS's screenshot tools (Cmd+Shift+5). Click the dimmed area or press Esc to close it."])
+                .status();
+        });
+    }
+
+    /// Asks the Mac to close an overlay. If it's still there a moment later (stuck, or nothing
+    /// on the Mac can close it), it goes from here anyway: it must never keep the screen.
+    fn close_overlay(&mut self, wid: u32) {
+        log::info!("closing overlay {wid}");
+        self.send(W::new(t::CLOSE).u32(wid).finish());
+        let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_secs(2)), move |_, _, app| {
+            if app.windows.get(&wid).is_some_and(|w| w.overlay) {
+                log::warn!("overlay {wid} still there on the Mac: closed here");
+                app.dropped_overlays.insert(wid);
+                app.remove_window(wid);
+            }
+            TimeoutAction::Drop
+        });
+    }
+
+    /// Whether a popup of this size (Mac points) would cover our largest monitor, the one the
+    /// Mac's display is sized to.
+    fn covers_screen(&self, w: f32, h: f32) -> bool {
+        let best = self
+            .output_state
+            .outputs()
+            .filter_map(|o| self.output_state.info(&o)?.logical_size)
+            .max_by_key(|(w, h)| w * h);
+        let Some((sw, sh)) = best else { return false };
+        let (sw, sh) = (sw as f64 / self.scale, sh as f64 / self.scale);
+        w as f64 >= sw * 0.9 && h as f64 >= sh * 0.9
+    }
+
     /// Tells the Mac how big our largest monitor is, so its virtual display can match.
     fn send_screen_size(&self) {
         if !self.connected {
@@ -1644,7 +1742,15 @@ fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64
 
 /// Smallest a Mac window gets here, unless its app is known to need more.
 const MIN_SIZE: (u32, u32) = (100, 60);
+
+/// Popups go exactly where they are on the Mac; an overlay is moved onto the screen whole,
+/// covering it like it covers the Mac's.
+fn popup_adjustment(overlay: bool) -> xdg_positioner::ConstraintAdjustment {
+    use xdg_positioner::ConstraintAdjustment as A;
+    if overlay { A::SlideX | A::SlideY | A::ResizeX | A::ResizeY } else { A::None }
+}
 const BTN_LEFT: u32 = 0x110;
+const KEY_ESC: u32 = 1;
 const KEY_TAB: u32 = 15;
 const KEY_SPACE: u32 = 57;
 const KEY_LEFTSHIFT: u32 = 42;
@@ -1852,6 +1958,23 @@ impl PointerHandler for App {
     fn pointer_frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for e in events {
             let Some(wid) = self.wid_for(&e.surface) else { continue };
+            if self.windows.get(&wid).is_some_and(|w| w.overlay) {
+                // Nothing on it is meant to be used from here: a click closes it.
+                match e.kind {
+                    PointerEventKind::Enter { serial } => {
+                        self.pointer_focus = Some(wid);
+                        self.enter_serial = serial;
+                        if let Some(mgr) = &self.cursor_mgr {
+                            let d = self.cursor_device.get_or_insert_with(|| mgr.get_pointer(pointer, qh, ()));
+                            d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
+                        }
+                    }
+                    PointerEventKind::Leave { .. } if self.pointer_focus == Some(wid) => self.pointer_focus = None,
+                    PointerEventKind::Press { .. } => self.close_overlay(wid),
+                    _ => {}
+                }
+                continue;
+            }
             let (x, y) = self.to_mac(wid, e.position.0, e.position.1);
             match e.kind {
                 PointerEventKind::Enter { serial } => {
@@ -2038,6 +2161,14 @@ impl KeyboardHandler for App {
             switch_windows(self.shift_down > 0);
             self.swallowed.push(e.raw_code);
             return;
+        }
+        if e.raw_code == KEY_ESC {
+            let overlays: Vec<u32> = self.windows.values().filter(|w| w.overlay).map(|w| w.info.wid).collect();
+            if !overlays.is_empty() {
+                overlays.into_iter().for_each(|wid| self.close_overlay(wid));
+                self.swallowed.push(e.raw_code);
+                return;
+            }
         }
         if e.raw_code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
             open_search();

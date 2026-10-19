@@ -67,7 +67,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
 
-`kind`: 0 = normal toplevel, 1 = popup/menu (child of `parent`), 2 = sheet/dialog, 3 = the Mac display view.
+`kind`: 0 = normal toplevel, 1 = popup/menu (child of `parent`), 2 = sheet/dialog, 3 = the Mac display view, 4 = overlay: a popup covering a whole Mac display (the screenshot UI). The client shows it dimmed instead of streaming it, and sends Close for it on a click or Esc; the host then sends Esc to its owner (and quits the screenshot UI if that isn't enough). The client also treats a kind-1 popup as big as its largest monitor as an overlay, and drops an overlay that is still there 2 s after Close.
 
 ## Video streams
 

@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Network
 
 /// State for one connected client: the control stream, the video streams and the window
@@ -355,6 +356,7 @@ final class Session {
         case .close:
             let wid = try m.u32()
             if wid == displayViewWid { closeDisplayView(); return }
+            if tracker.windows[wid]?.overlay == true { closeOverlay(wid); return }
             // The window takes a moment to go after its close button is pressed: watch for it.
             if let win = tracker.windows[wid] { ax(burstFor: 2) { $0.close(wid, pid: win.pid) } }
             log("close \(wid)")
@@ -478,6 +480,30 @@ final class Session {
             return (gone.parent, CGPoint(x: gone.frame.minX + x, y: gone.frame.minY + y))
         }
         return (wid, nil)
+    }
+
+    /// Closes an overlay (see TrackedWindow.overlay) the way it closes on the Mac: Esc, sent to the
+    /// process that owns it. The screenshot UI, if that doesn't do it, is quit (macOS starts it
+    /// again next time it's asked for). Linux drops the overlay anyway if it stays.
+    private func closeOverlay(_ wid: UInt32) {
+        func owner() -> (pid: pid_t, name: String)? {
+            guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, wid) as? [[String: Any]])?.first,
+                  info[kCGWindowIsOnscreen as String] as? Bool ?? false,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != getpid() else { return nil }
+            return (pid, info[kCGWindowOwnerName as String] as? String ?? "")
+        }
+        guard let o = owner() else { return }
+        log("close overlay \(wid) of \(o.name) (pid \(o.pid)): Esc")
+        for down in [true, false] {
+            CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Escape), keyDown: down)?.postToPid(o.pid)
+        }
+        tracker.burst(everyMs: 20, for: 2)
+        guard ["Screenshot", "screencaptureui"].contains(o.name) else { return }
+        queue.asyncAfter(deadline: .now() + 0.8) {
+            guard let still = owner(), still.pid == o.pid else { return }
+            log("overlay \(wid) still open: quitting \(o.name)")
+            kill(o.pid, SIGTERM)
+        }
     }
 
     /// Where windows that just went away were (see pointerTarget).
@@ -1136,7 +1162,7 @@ final class Session {
         m.str(w.bundleId); m.str(w.appName); m.str(w.title)
         m.f32(w.frame.width); m.f32(w.frame.height)
         m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
-        m.u8(w.kind.rawValue)
+        m.u8(w.overlay ? 4 : w.kind.rawValue)
         control?.send(m)
         sendButtons(w)
     }

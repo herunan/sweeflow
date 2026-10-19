@@ -15,6 +15,9 @@ struct TrackedWindow: Equatable {
     var kind: Kind
 
     var rel: CGPoint = .zero   // offset from parent's origin, for popups
+    /// A popup covering a whole display (see WindowTracker.coversDisplay): Linux shows it as an
+    /// overlay that a click or Esc closes, instead of a popup taking the whole screen.
+    var overlay = false
 }
 
 /// Polls the window server for on-screen windows of the streamed apps and reports diffs.
@@ -133,6 +136,18 @@ final class WindowTracker {
         return ids.prefix(Int(n)).contains { r.contains(CGDisplayBounds($0)) }
     }
 
+    /// A window covering one whole display (the screenshot UI's, Cmd-Shift-5) is no menu,
+    /// popover or panel either: streamed as a plain popup it would cover the Linux screen,
+    /// invisible, and take every click. It's sent as an overlay instead, which Linux lets the
+    /// user close. A few points short of the display still counts. (Ones over more than one
+    /// display are drag layers, see spansDisplays: not streamed at all.)
+    static func coversDisplay(_ r: CGRect) -> Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8)
+        var n: UInt32 = 0
+        guard CGGetDisplaysWithRect(r, 8, &ids, &n) == .success else { return false }
+        return ids.prefix(Int(n)).contains { r.insetBy(dx: -4, dy: -4).contains(CGDisplayBounds($0)) }
+    }
+
     /// Processes known to have no app bundle (system helpers owning windows): not asked again.
     private var noBundle: Set<pid_t> = []
 
@@ -172,7 +187,9 @@ final class WindowTracker {
                !Self.notBlind.contains(owner) {
                 // An open pop-up menu (layer 101) is small; anything else that small is no dialog.
                 let menu = layer == 101 && (info[kCGWindowSharingState as String] as? Int) == 0
-                if menu ? (b.width >= 30 && b.height >= 16) : (b.width >= 150 && b.height >= 80) {
+                if !Self.promptOwners.contains(owner), Self.coversDisplay(b) {
+                    // An overlay (streamed as one, see below), not a dialog: no stand-in.
+                } else if menu ? (b.width >= 30 && b.height >= 16) : (b.width >= 150 && b.height >= 80) {
                     blindNow[wid] = BlindWindow(wid: wid, pid: pid, owner: owner, frame: b, menu: menu)
                 }
             }
@@ -208,17 +225,23 @@ final class WindowTracker {
                 // Not a real window of the app but a transient one drawn at window level (a calendar app's
                 // event card): shown attached to the app window it sits on, like a popover.
                 w.kind = .popup
+                w.overlay = Self.coversDisplay(bounds)
                 popups.append(w)
             } else if layer == 0 {
                 guard bounds.width >= 40, bounds.height >= 30 else { continue }
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
                 order.append(wid)
-            } else if layer < 1000, bounds.width >= 4, bounds.height >= 4, !Self.spansDisplays(bounds) {
+            } else if layer < 1000, bounds.width >= 4, bounds.height >= 4 {
                 // Below the menu-bar level (24) are floating panels, utility and modal panel
                 // windows (reminders, palettes, inspectors): real windows of their own, attached
                 // to the app. Above are menus, popovers and tooltips.
+                if Self.spansDisplays(bounds) { continue }
                 w.kind = layer < 24 ? .dialog : .popup
+                if Self.coversDisplay(bounds), layer >= 24 || title.isEmpty {
+                    w.kind = .popup
+                    w.overlay = true
+                }
                 popups.append(w)
             }
         }
@@ -280,9 +303,12 @@ final class WindowTracker {
         // dropdown must not be positioned relative to the app's main window).
         let owners = order.compactMap { seen[$0] }   // front-to-back: toplevels, then panels
         for h in helperPopups {
-            guard let parent = owners.first(where: { $0.frame.insetBy(dx: -40, dy: -40).intersects(h.frame) }) else { continue }
+            // An overlay stays with the window it came up over (it covers them all, so whichever
+            // is in front would do, and moving it from one to the next re-creates it on Linux).
+            let kept = Self.coversDisplay(h.frame) ? windows[h.wid].flatMap { seen[$0.parent] } : nil
+            guard let parent = kept ?? owners.first(where: { $0.frame.insetBy(dx: -40, dy: -40).intersects(h.frame) }) else { continue }
             popups.append(TrackedWindow(wid: h.wid, pid: parent.pid, bundleId: parent.bundleId, appName: parent.appName, title: "",
-                                        frame: h.frame, layer: h.layer, parent: 0, kind: .popup))
+                                        frame: h.frame, layer: h.layer, parent: 0, kind: .popup, overlay: Self.coversDisplay(h.frame)))
         }
         for var p in popups where p.kind == .popup {
             // Closing: macOS shrinks popovers (a calendar app's event card) toward where they opened.
@@ -298,7 +324,8 @@ final class WindowTracker {
             popupMax[p.wid] = CGSize(width: max(big.width, p.frame.width), height: max(big.height, p.frame.height))
             let near = owners.filter { $0.pid == p.pid && $0.frame.insetBy(dx: -40, dy: -40).intersects(p.frame) }
             // Prefer a panel (drawn above its app's windows), then the frontmost window.
-            guard let parent = near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
+            let kept = p.overlay ? windows[p.wid].flatMap { seen[$0.parent] } : nil
+            guard let parent = kept ?? near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
             p.parent = parent.wid
             p.rel = CGPoint(x: p.frame.minX - parent.frame.minX, y: p.frame.minY - parent.frame.minY)
             seen[p.wid] = p
