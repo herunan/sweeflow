@@ -45,6 +45,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x2A | C→S | ShowDisplay | u8 on — open (1) or close (0) the "Mac display" view: the host announces the whole virtual display as window 0xFFFFFF00 (WindowAdded kind 3), captured as a display; pointer events for it are display-relative points. The client scales it to fit and never sends Resize for it; Close on it closes the view |
 | 0x2B | C→S | QuitApp | str bundleId — quit the app as ⌘Q would |
 | 0x2C | S→C | RunningApps | u16 n, n × (str bundleId, u8 state) — regular apps running on the Mac; state 3 = a window shown on Linux, 2 = only minimised windows, 1 = no window. Sent on change |
+| 0x2D | S→C | ScreenSelect | u8 on — macOS's screenshot selection (Cmd+Shift+4) started (1) or ended (0). Its windows can't be captured and aren't streamed: the client draws the rectangle of a left drag itself meanwhile |
 | 0x26 | C→S | Restore | u32 wid — the user restored a window that was minimised on the Mac |
 | 0x25 | C→S | MenuRefresh | i32 pid — re-read and resend the app's menus |
 | 0x18 | S→C | ToggleMaximize | u32 wid — the app zoomed its window (title-bar double-click); client toggles maximised |

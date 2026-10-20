@@ -39,6 +39,8 @@ pub mod t {
     pub const QUIT_APP: u8 = 0x2B;
     /// u16 n × (str bundle id, u8 state 3 shown / 2 minimised / 1 no window): running Mac apps.
     pub const RUNNING_APPS: u8 = 0x2C;
+    /// u8 on: macOS's screenshot selection (Cmd+Shift+4) started or ended.
+    pub const SCREEN_SELECT: u8 = 0x2D;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
     pub const SCROLL: u8 = 0x32;

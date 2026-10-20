@@ -148,6 +148,16 @@ enum Role {
     Popup(Popup),
 }
 
+/// The screenshot selection being dragged in a window: a veil and a 1 px edge above its video.
+/// macOS draws its own in windows that can't be captured, so it's drawn here instead.
+struct Selection {
+    wid: u32,
+    /// Where the drag started, window coordinates.
+    start: (f64, f64),
+    /// Veil, then top, bottom, left and right edges.
+    parts: Vec<(wl_subsurface::WlSubsurface, wl_surface::WlSurface, WpViewport)>,
+}
+
 struct Win {
     info: WinInfo,
     role: Role,
@@ -281,6 +291,12 @@ pub struct App {
     background: Option<wl_buffer::WlBuffer>,
     /// Fully transparent 1x1 buffer: base for popups (menus have rounded, translucent edges).
     clear: Option<wl_buffer::WlBuffer>,
+    /// macOS's screenshot selection (Cmd+Shift+4) is up: a left drag draws its rectangle here.
+    screen_select: bool,
+    /// The selection being dragged (see start_selection).
+    selection: Option<Selection>,
+    /// Fill and edge of the selection: 1x1 buffers, stretched.
+    selection_bufs: Option<(wl_buffer::WlBuffer, wl_buffer::WlBuffer)>,
 
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -380,6 +396,9 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         icon_pngs: HashMap::new(),
         background: None,
         clear: None,
+        screen_select: false,
+        selection: None,
+        selection_bufs: None,
         seat: None,
         keyboard: None,
         pointer: None,
@@ -493,6 +512,8 @@ impl App {
             UiEvent::Disconnected(why) => {
                 self.connected = false;
                 log::warn!("disconnected: {why}");
+                self.screen_select = false;
+                self.end_selection();
                 // Windows wait for the Mac to come back; menus and popovers don't (nothing would
                 // close them meanwhile, and they sit above everything else).
                 let popups: Vec<u32> = self.windows.values().filter(|w| matches!(w.role, Role::Popup(_))).map(|w| w.info.wid).collect();
@@ -569,6 +590,13 @@ impl App {
             UiEvent::MenuTree { pid, json } => {
                 if let Some(m) = self.menus.as_mut() {
                     m.update(pid, &json);
+                }
+            }
+            UiEvent::ScreenSelect(on) => {
+                log::info!("Mac screenshot selection {}", if on { "started" } else { "ended" });
+                self.screen_select = on;
+                if !on {
+                    self.end_selection();
                 }
             }
             UiEvent::Minimize(wid) => {
@@ -744,6 +772,9 @@ impl App {
     }
 
     fn remove_window(&mut self, wid: u32) {
+        if self.selection.as_ref().is_some_and(|s| s.wid == wid) {
+            self.end_selection();
+        }
         let Some(w) = self.windows.remove(&wid) else { return };
         log::info!("window {wid} removed ({})", w.info.app_name);
         let _ = self.net.send(NetCmd::Unsubscribe(wid));
@@ -1280,7 +1311,8 @@ impl App {
             return;
         }
         let (fw, fh) = (pw as u32, ph as u32);
-        if self.trace {
+        // Menus only: a PNG of a big one (Quick Look) takes seconds, and this is the UI thread.
+        if self.trace && fw * fh <= 1 << 20 {
             dump_bgra(&format!("/tmp/sweeflow-popup-{wid}.png"), fw, fh, &bgra);
         }
         let Ok(mut pool) = RawPool::new(bgra.len(), &self.shm) else { return };
@@ -1415,6 +1447,70 @@ impl App {
                 let _ = net.send(NetCmd::Clipboard(items));
             }
         });
+    }
+
+    /// Starts drawing the screenshot selection at (x, y) in a window (see Selection).
+    fn start_selection(&mut self, wid: u32, x: f64, y: f64, qh: &QueueHandle<Self>) {
+        self.end_selection();
+        if self.selection_bufs.is_none() {
+            let Ok(sp) = self.single_pixel.get() else { return };
+            let v = |f: f64| (f * u32::MAX as f64) as u32;
+            // Premultiplied: a gray veil, and an edge that shows on light and dark content alike.
+            let fill = sp.create_u32_rgba_buffer(v(0.12), v(0.12), v(0.12), v(0.25), qh, ());
+            let edge = sp.create_u32_rgba_buffer(v(0.35), v(0.35), v(0.35), v(0.9), qh, ());
+            self.selection_bufs = Some((fill, edge));
+        }
+        let Some((fill, edge)) = self.selection_bufs.clone() else { return };
+        let Some(w) = self.windows.get(&wid) else { return };
+        let (base, video) = (w.base().clone(), w.video.clone());
+        let viewporter = self.viewporter.get().expect("wp_viewporter").clone();
+        let parts = (0..5)
+            .map(|i| {
+                let (sub, surf) = self.subcompositor.create_subsurface(base.clone(), qh);
+                sub.set_desync();
+                sub.place_above(&video);
+                let vp = viewporter.get_viewport(&surf, qh, ());
+                // Purely visual: the drag goes on to the Mac.
+                let empty = self.compositor.wl_compositor().create_region(qh, ());
+                surf.set_input_region(Some(&empty));
+                empty.destroy();
+                surf.attach(Some(if i == 0 { &fill } else { &edge }), 0, 0);
+                (sub, surf, vp)
+            })
+            .collect();
+        self.selection = Some(Selection { wid, start: (x, y), parts });
+        self.draw_selection(x, y);
+    }
+
+    /// Draws the selection from where the drag started to (x, y).
+    fn draw_selection(&mut self, x: f64, y: f64) {
+        let Some(sel) = &self.selection else { return };
+        let Some(w) = self.windows.get(&sel.wid) else { return };
+        let (x0, y0) = (sel.start.0.min(x).round() as i32, sel.start.1.min(y).round() as i32);
+        let (x1, y1) = (sel.start.0.max(x).round() as i32, sel.start.1.max(y).round() as i32);
+        let (sw, sh) = ((x1 - x0).max(1), (y1 - y0).max(1));
+        let (x1, y1) = (x0 + sw, y0 + sh);
+        let rects = [(x0, y0, sw, sh), (x0, y0, sw, 1), (x0, y1 - 1, sw, 1), (x0, y0, 1, sh), (x1 - 1, y0, 1, sh)];
+        for ((sub, surf, vp), (rx, ry, rw, rh)) in sel.parts.iter().zip(rects) {
+            sub.set_position(rx, ry);
+            vp.set_destination(rw, rh);
+            surf.damage_buffer(0, 0, 1, 1);
+            surf.commit();
+        }
+        // Subsurface position changes apply on the parent's next commit.
+        w.base().commit();
+    }
+
+    fn end_selection(&mut self) {
+        let Some(sel) = self.selection.take() else { return };
+        for (sub, surf, vp) in sel.parts {
+            vp.destroy();
+            sub.destroy();
+            surf.destroy();
+        }
+        if let Some(w) = self.windows.get(&sel.wid) {
+            w.base().commit();
+        }
     }
 
     /// Tells the Mac how big our largest monitor is, so its virtual display can match.
@@ -1887,6 +1983,9 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Motion { time } => {
                     self.pointer_at = (wid, e.position.0, e.position.1);
+                    if self.selection.as_ref().is_some_and(|s| s.wid == wid) {
+                        self.draw_selection(e.position.0, e.position.1);
+                    }
                     if self.mac_drag.is_some() {
                         self.maybe_take_drag(qh);
                     }
@@ -1929,6 +2028,9 @@ impl PointerHandler for App {
                     if button == BTN_LEFT {
                         self.left_down = Some(wid);
                         self.mac_drag = None;
+                        if self.screen_select {
+                            self.start_selection(wid, e.position.0, e.position.1, qh);
+                        }
                     }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).finish());
                 }
@@ -1955,6 +2057,7 @@ impl PointerHandler for App {
                     if button == BTN_LEFT {
                         self.left_down = None;
                         self.mac_drag = None;
+                        self.end_selection();
                     }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());
                 }

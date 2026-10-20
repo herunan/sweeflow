@@ -914,6 +914,11 @@ final class Session {
         // both start a burst of window checks.
         tracker.onBurstPoll = { [weak self] in self?.checkFocus() }
         tracker.onBlindAdded = { [weak self] b in self?.blindAdded(b) }
+        tracker.onScreenSelect = { [weak self] on in
+            log("screenshot selection \(on ? "started" : "ended")")
+            var m = MsgWriter(.screenSelect); m.u8(on ? 1 : 0)
+            self?.control?.send(m)
+        }
         tracker.onBlindRemoved = { [weak self] b in
             guard let self else { return }
             self.blindButtons[b.wid] = nil

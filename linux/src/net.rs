@@ -49,6 +49,8 @@ pub enum UiEvent {
     MoveStarted(u32),
     ToggleMaximize(u32),
     Minimize(u32),
+    /// macOS's screenshot selection started (true) or ended: drawn here, as the Mac's can't be captured.
+    ScreenSelect(bool),
     /// An app's menu bar (JSON from the Mac).
     MenuTree { pid: i32, json: Vec<u8> },
     Frame(u32, GpuFrame),
@@ -82,6 +84,7 @@ impl UiEvent {
             UiEvent::MoveStarted(_) => "move started",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
             UiEvent::Minimize(_) => "minimize",
+            UiEvent::ScreenSelect(_) => "screen select",
             UiEvent::MenuTree { .. } => "menu tree",
             UiEvent::Frame(..) => "video frame",
             UiEvent::Clipboard(_) => "clipboard",
@@ -509,6 +512,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
+        t::SCREEN_SELECT => UiEvent::ScreenSelect(r.u8()? != 0),
         t::DRAG_BEGAN => {
             let wid = r.u32()?;
             let n = r.u16()?;

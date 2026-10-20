@@ -39,6 +39,12 @@ final class WindowTracker {
     private(set) var blind: [UInt32: BlindWindow] = [:]
     var onBlindAdded: ((BlindWindow) -> Void)?
     var onBlindRemoved: ((BlindWindow) -> Void)?
+    /// macOS's screenshot selection (Cmd+Shift+4) is up, and a callback as it starts and ends.
+    private(set) var screenSelecting = false
+    var onScreenSelect: ((Bool) -> Void)?
+    /// macOS's screenshot tools: screencapture runs the selection, screencaptureui ("Screenshot")
+    /// the toolbar and thumbnails.
+    static let captureOwners: Set<String> = ["screencapture", "screencaptureui", "Screenshot"]
     /// macOS's prompt helpers (not apps, so never streamed): "downloaded from the internet"
     /// checks, password and permission prompts, system alerts. Shown as stand-ins too.
     static let promptOwners: Set<String> = ["CoreServicesUIAgent", "SecurityAgent", "UserNotificationCenter",
@@ -126,6 +132,14 @@ final class WindowTracker {
     /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
     /// Linux desktop and take the pointer. It covers whole displays; a real window that merely
     /// straddles two (a video-call app's meeting window, left across a display edge) is no drag layer.
+    /// Whether a window covers at least one whole display.
+    static func coversDisplay(_ r: CGRect) -> Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8)
+        var n: UInt32 = 0
+        guard CGGetDisplaysWithRect(r, 8, &ids, &n) == .success else { return false }
+        return ids.prefix(Int(n)).contains { r.insetBy(dx: -4, dy: -4).contains(CGDisplayBounds($0)) }
+    }
+
     static func spansDisplays(_ r: CGRect) -> Bool {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
         var n: UInt32 = 0
@@ -159,8 +173,19 @@ final class WindowTracker {
         var badges: [pid_t: [CGRect]] = [:]
         var blindNow: [UInt32: BlindWindow] = [:]
         var helperPopups: [(wid: UInt32, pid: pid_t, frame: CGRect, layer: Int)] = []
+        var selecting = false
 
         for info in list {
+            // The screenshot tools' windows over whole displays: screencapture's selection layer,
+            // and one screencaptureui puts over a display (and sometimes leaves there). Neither
+            // can be captured; shown, they'd only cover the Linux screen, invisible, and take its
+            // clicks. Linux draws the selection itself instead.
+            if let owner = info[kCGWindowOwnerName as String] as? String, Self.captureOwners.contains(owner),
+               let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd),
+               Self.coversDisplay(b) {
+                if owner == "screencapture" { selecting = true }
+                continue
+            }
             // Windows that refuse capture (security prompts, sign-in verifiers): can't be streamed, but
             // Linux can show a stand-in for them (see BlindWindows). Any app, system ones too.
             if let owner = info[kCGWindowOwnerName as String] as? String,
@@ -330,6 +355,10 @@ final class WindowTracker {
         for (wid, b) in blind where blindNow[wid] == nil { onBlindRemoved?(b) }
         for (wid, b) in blindNow where blind[wid] == nil { onBlindAdded?(b) }
         blind = blindNow
+        if selecting != screenSelecting {
+            screenSelecting = selecting
+            onScreenSelect?(selecting)
+        }
     }
 
     /// Where macOS's capture badge overlaps `wid`, relative to the window (points).
