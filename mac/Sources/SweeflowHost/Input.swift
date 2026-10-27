@@ -106,7 +106,7 @@ final class InputInjector {
         g.setDoubleValueField(CGEventField(rawValue: 119)!, value: dy == 0 ? -0.0 : Double(dy) * 1.67)
         g.setIntegerValueField(CGEventField(rawValue: 132)!, value: hidPhase)
         g.timestamp = eventTimestamp()
-        BuiltInScreen.noteInjected()
+        BuiltInScreen.noteInjected(g)
         g.post(tap: .cgSessionEventTap)
     }
 
@@ -152,7 +152,7 @@ final class InputInjector {
         e.location = lastPoint
         // Apps that run their own glide (Mail) measure the fling speed from these.
         e.timestamp = eventTimestamp()
-        BuiltInScreen.noteInjected()
+        BuiltInScreen.noteInjected(e)
         e.post(tap: .cgSessionEventTap)
     }
 
@@ -190,8 +190,9 @@ final class InputInjector {
     }
 
     private func post(_ e: CGEvent?) {
-        BuiltInScreen.noteInjected()
-        e?.post(tap: .cghidEventTap)
+        guard let e else { return }
+        BuiltInScreen.noteInjected(e)
+        e.post(tap: .cghidEventTap)
     }
 }
 

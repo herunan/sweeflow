@@ -83,6 +83,7 @@ enum BuiltInScreen {
         dimming = false
         watch?.invalidate()
         watch = nil
+        stopWatchingLocalInput()
         restore()   // if the lid is closed, done when the screen comes back (watchScreens)
         watchScreens()
     }
@@ -95,21 +96,69 @@ enum BuiltInScreen {
     /// Someone used the Mac's own keyboard or trackpad: dimming ends (the settings say so).
     static var onLocalUse: (() -> Void)?
 
-    static func noteInjected() { lastInjected = ProcessInfo.processInfo.systemUptime }
+    /// Marks an event Sweeflow posts (for Linux), so the watch below tells it from the Mac's own:
+    /// posted at the HID level, macOS reports it as if it came from the hardware.
+    static let injectedMark: Int64 = 0x5357_4545_464C   // "SWEEFL"
+    static func noteInjected(_ e: CGEvent) {
+        e.setIntegerValueField(.eventSourceUserData, value: injectedMark)
+        lastInjected = ProcessInfo.processInfo.systemUptime
+    }
 
-    /// Once a second while dimmed: someone using the Mac itself ends it; anything else that
-    /// brightens the screen (macOS does, on some input from Linux) is turned down again.
+    /// Watches the Mac's own input while dimmed. An event tap sees every event with where it came
+    /// from: the Mac's keyboard, trackpad or mouse (no posting process) vs Sweeflow's, posted for
+    /// Linux. A pointer moved on the Mac itself ends dimming; one moved over a Mac window on
+    /// Linux doesn't.
+    private static var tap: CFMachPort?
+    private static var tapSource: CFRunLoopSource?
+
+    private static func watchLocalInput() {
+        guard tap == nil else { return }
+        let types: [CGEventType] = [.mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged,
+                                    .scrollWheel, .keyDown, .flagsChanged]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                        eventsOfInterest: mask, callback: { _, type, event, _ in
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let t = BuiltInScreen.tap { CGEvent.tapEnable(tap: t, enable: true) }
+            } else if event.getIntegerValueField(.eventSourceUserData) != BuiltInScreen.injectedMark,
+                      event.getIntegerValueField(.eventSourceUnixProcessID) == 0 {
+                DispatchQueue.main.async { BuiltInScreen.localInput() }
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: nil) else {
+            return log("can't watch this Mac's own input (Accessibility): idle time instead")
+        }
+        tap = t
+        tapSource = CFMachPortCreateRunLoopSource(nil, t, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
+        CGEvent.tapEnable(tap: t, enable: true)
+    }
+
+    private static func stopWatchingLocalInput() {
+        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
+        if let s = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
+        tap = nil
+        tapSource = nil
+    }
+
+    private static func localInput() {
+        guard dimming, !paused else { return }
+        log("someone's using the Mac: its screen back on")
+        onLocalUse?()
+    }
+
+    /// Once a second while dimmed: anything that brightens the screen (macOS does, on some input
+    /// from Linux) is turned down again. Without the event tap, the Mac's idle time stands in.
     private static func watchUse() {
+        watchLocalInput()
         guard watch == nil else { return }
         watch = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             guard dimming, !paused else { return }
             let now = ProcessInfo.processInfo.systemUptime
-            let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
-            // Recent input that Sweeflow didn't post: the Mac's own keyboard or trackpad.
-            if idle < 1.1 && now - lastInjected > 1.5 {
-                log("someone's using the Mac: its screen back on")
-                onLocalUse?()
-                return
+            if tap == nil {
+                let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
+                // Recent input that Sweeflow didn't post: the Mac's own keyboard or trackpad.
+                if idle < 1.1 && now - lastInjected > 1.5 { return localInput() }
             }
             guard let id = builtIn, let get = getBrightness else { return }
             var current: Float = 0
