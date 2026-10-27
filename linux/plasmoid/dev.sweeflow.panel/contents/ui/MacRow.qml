@@ -1,5 +1,5 @@
 // A linked Mac: click its name to rename it (in place). The Mac in use has Disconnect (Connect
-// once disconnected), the others Use; every Mac has Forget (asks once).
+// once disconnected), the others Connect (switching to them); every Mac has Forget (asks once).
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
@@ -75,7 +75,8 @@ PlasmaComponents3.ItemDelegate {
         }
         PlasmaComponents3.ToolButton {
             visible: !row.editing && !row.confirming && !row.active
-            text: "Use"
+            icon.name: "network-connect"
+            text: "Connect"
             onClicked: row.activated()
             PlasmaComponents3.ToolTip.text: "Stream from this Mac instead"
             PlasmaComponents3.ToolTip.visible: hovered

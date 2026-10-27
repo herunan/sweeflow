@@ -100,9 +100,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let dim = ClosureMenuItem(title: c.dimMacScreenWhileStreaming ? "Display dimmed" : "Dim display") {
             settings.update { $0.dimMacScreenWhileStreaming = true }
         }
-        dim.isEnabled = client != nil && c.enabled && !c.dimMacScreenWhileStreaming
+        dim.isEnabled = c.enabled && !c.dimMacScreenWhileStreaming
         dim.toolTip = "Turns this screen down until someone uses this Mac's keyboard or trackpad"
-        menu.addItem(dim)
+        // Only while a Linux machine is connected (there's nothing to dim for otherwise).
+        if client != nil { menu.addItem(dim) }
         let login = ClosureMenuItem(title: "Open at login") {
             if LoginItem.enabled { LoginItem.disable() } else { LoginItem.enable() }
         }
