@@ -40,6 +40,12 @@ enum LoginItem {
     static var enabled: Bool { devInstall || service.status == .enabled }
     static var needsApproval: Bool { !devInstall && service.status == .requiresApproval }
 
+    /// Stops starting with the Mac (a development install keeps its own LaunchAgent).
+    static func disable() {
+        if devInstall { return }
+        do { try service.unregister() } catch { log("login item: \(error)") }
+    }
+
     /// Registers the login item (macOS starts it right away, too). True if it's running now.
     @discardableResult
     static func enable() -> Bool {

@@ -37,6 +37,10 @@ final class VirtualDisplay {
     /// (Window backdrop), or following the Mac's appearance; only this invisible display is touched.
     private var appearanceObserver: NSObjectProtocol?
     private var settingsObserver: NSObjectProtocol?
+    /// The backdrop itself: a plain window at desktop level covering the display. macOS doesn't
+    /// always show a desktop picture set on a virtual display (it kept the Mac's own wallpaper),
+    /// so this is what windows actually sit on. Ours, so never streamed.
+    private var backdropWindow: NSWindow?
 
     private func applyBackdrop(attempt: Int) {
         guard let id = displayID else { return }
@@ -71,6 +75,19 @@ final class VirtualDisplay {
                 try? rep.representation(using: .png, properties: [:])?.write(to: url)
             }
         }
+        let w = backdropWindow ?? {
+            let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
+            w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+            w.ignoresMouseEvents = true
+            w.isReleasedWhenClosed = false
+            w.hasShadow = false
+            backdropWindow = w
+            return w
+        }()
+        w.backgroundColor = dark ? .black : .white
+        w.setFrame(screen.frame, display: true)
+        w.orderFront(nil)
         if NSWorkspace.shared.desktopImageURL(for: screen) != url {
             try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [
                 .imageScaling: NSImageScaling.scaleAxesIndependently.rawValue, .allowClipping: false,
@@ -94,6 +111,8 @@ final class VirtualDisplay {
     private var retries = 0
 
     func remove() {
+        backdropWindow?.orderOut(nil)
+        backdropWindow = nil
         display = nil
         size = .zero
         wanted = .zero

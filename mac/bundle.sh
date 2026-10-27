@@ -9,6 +9,10 @@ AGENT_LABEL="dev.sweeflow.agent"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchAgents"
 cp "$BIN" "$APP/Contents/MacOS/SweeflowHost"
+# Icons (drawn by make-icons.sh): the app's, and the menu-bar item's.
+RES="$(cd "$(dirname "$0")" && pwd)/Resources"
+cp "$RES/MenuIcon.png" "$RES/MenuIcon@2x.png" "$APP/Contents/Resources/"
+iconutil -c icns "$RES/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -17,6 +21,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Sweeflow</string>
   <key>CFBundleDisplayName</key><string>Sweeflow</string>
   <key>CFBundleExecutable</key><string>SweeflowHost</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD</string>

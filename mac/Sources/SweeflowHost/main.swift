@@ -35,9 +35,9 @@ struct Config: Codable {
     var ownDesktop = true
     /// "sharp": Retina, 10-bit. "light": 1x, 8-bit, for slower networks.
     var quality = "sharp"
-    /// Behind Mac windows on the virtual display: "auto" (as the Mac's own appearance), "dark"
-    /// or "light". Their see-through sidebars and toolbars take on this tone.
-    var backdrop = "auto"
+    /// Behind Mac windows on the virtual display: "dark" or "light" ("auto", from an earlier
+    /// version: as the Mac's own appearance). Their see-through sidebars take on this tone.
+    var backdrop = "dark"
 
     init() {}
 

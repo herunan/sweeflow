@@ -369,23 +369,30 @@ PlasmoidItem {
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
                         }
                     }
-                    // What Mac windows sit on, on the Mac's own (invisible) screen.
+                    // What Mac windows sit on, on the screen the Mac adds for Linux. Two buttons (a
+                    // dropdown's list would be cut off by the popup's edge).
                     PlasmaComponents3.ItemDelegate {
                         id: backdropRow
-                        readonly property var values: ["auto", "dark", "light"]
+                        readonly property bool light: root.settings.backdrop === "light"
                         Layout.fillWidth: true
-                        onClicked: backdropBox.popup.open()
-                        PlasmaComponents3.ToolTip.text: "The colour behind Mac windows. Their see-through sidebars and toolbars pick it up: dark or light, or as the Mac's own appearance"
+                        onClicked: root.set({ backdrop: light ? "dark" : "light" })
+                        PlasmaComponents3.ToolTip.text: "What Mac windows sit on. Shows through their see-through sidebars, and behind them in Troubleshoot (stream display)"
                         PlasmaComponents3.ToolTip.visible: hovered
                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                         contentItem: RowLayout {
-                            spacing: Kirigami.Units.largeSpacing
-                            PlasmaComponents3.Label { text: "Window backdrop"; elide: Text.ElideRight; Layout.fillWidth: true }
-                            PlasmaComponents3.ComboBox {
-                                id: backdropBox
-                                model: ["Match the Mac", "Dark", "Light"]
-                                currentIndex: Math.max(0, backdropRow.values.indexOf(root.settings.backdrop || "auto"))
-                                onActivated: (i) => root.set({ backdrop: backdropRow.values[i] })
+                            spacing: Kirigami.Units.smallSpacing
+                            PlasmaComponents3.Label { text: "Backdrop"; elide: Text.ElideRight; Layout.fillWidth: true }
+                            PlasmaComponents3.ToolButton {
+                                text: "Dark"
+                                checkable: true
+                                checked: !backdropRow.light
+                                onClicked: { root.set({ backdrop: "dark" }); checked = Qt.binding(() => !backdropRow.light); }
+                            }
+                            PlasmaComponents3.ToolButton {
+                                text: "Light"
+                                checkable: true
+                                checked: backdropRow.light
+                                onClicked: { root.set({ backdrop: "light" }); checked = Qt.binding(() => backdropRow.light); }
                             }
                         }
                     }

@@ -1,6 +1,6 @@
 import AppKit
 
-/// The menu-bar item: the same switches, in the same order, as the Linux tray widget (see Settings).
+/// The menu-bar item: what concerns this Mac (the rest is set on Linux, see Settings).
 final class StatusMenu: NSObject, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let menu = NSMenu()
@@ -18,16 +18,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     private func updateIcon() {
         let on = settings.config.enabled
-        let image = NSImage(systemSymbolName: on ? "macwindow.on.rectangle" : "rectangle.on.rectangle.slash",
-                            accessibilityDescription: "Sweeflow")
+        // The logo (a template: macOS draws it in the menu bar's colour); faded while paused.
+        let image = NSImage(named: "MenuIcon")
+            ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Sweeflow")
         image?.isTemplate = true
+        image?.size = NSSize(width: 18, height: 18)
         item.button?.image = image
         item.button?.appearsDisabled = !on
+        item.button?.toolTip = on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
     }
 
-    /// Built when opened, so it always shows the current state. Laid out like the Linux tray
-    /// widget: where things stand and Pause / Resume first, then the apps, then the settings in
-    /// sections. Nothing is greyed out: settings changed while paused apply when streaming resumes.
+    /// Built when opened, so it always shows the current state. Only what concerns this Mac:
+    /// streaming on or off, the apps, this screen, starting with the Mac, and the Linux
+    /// computers it's linked to. (How Mac apps show up on Linux is set on Linux.)
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let c = settings.config
@@ -50,26 +53,28 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             sub.addItem(i)
         }
         apps.submenu = sub
+        apps.toolTip = "Which apps' windows go to Linux"
         menu.addItem(apps)
 
-        menu.addItem(.sectionHeader(title: "Where Mac Apps Appear"))
-        menu.addItem(toggle("Their Own Desktop", c.ownDesktop) { $0.ownDesktop.toggle() })
-        menu.addItem(toggle("Application Launcher", c.launcherMenu) { $0.launcherMenu.toggle() })
-
-        menu.addItem(.sectionHeader(title: "Streaming"))
-        menu.addItem(toggle("Play Mac Sound on Linux", c.soundOnLinux) { $0.soundOnLinux.toggle() })
-        menu.addItem(toggle("Shared Clipboard", c.clipboard) { $0.clipboard.toggle() })
-        menu.addItem(toggle("Drag and Drop Files", c.dragDrop) { $0.dragDrop.toggle() })
-        menu.addItem(toggle("Dim This Screen", c.dimMacScreenWhileStreaming) { $0.dimMacScreenWhileStreaming.toggle() })
-        menu.addItem(toggle("High Quality", c.quality != "light") { $0.quality = $0.quality == "light" ? "sharp" : "light" })
-        let backdrop = NSMenuItem(title: "Window Backdrop", action: nil, keyEquivalent: "")
+        menu.addItem(.sectionHeader(title: "This Mac"))
+        let dim = toggle("Dim This Screen", c.dimMacScreenWhileStreaming) { $0.dimMacScreenWhileStreaming.toggle() }
+        dim.toolTip = "Turn this screen down while its apps are on Linux"
+        menu.addItem(dim)
+        let backdrop = NSMenuItem(title: "Backdrop", action: nil, keyEquivalent: "")
         let b = NSMenu()
-        for (title, value) in [("Match the Mac", "auto"), ("Dark", "dark"), ("Light", "light")] {
-            b.addItem(toggle(title, c.backdrop == value) { $0.backdrop = value })
+        for (title, value) in [("Dark", "dark"), ("Light", "light")] {
+            b.addItem(toggle(title, c.backdrop == value || (value == "dark" && c.backdrop == "auto")) { $0.backdrop = value })
         }
         backdrop.submenu = b
-        backdrop.toolTip = "What Mac windows sit on: their see-through sidebars and toolbars take on its tone"
+        backdrop.toolTip = "What windows sit on, on the screen Sweeflow adds for Linux: shows through see-through sidebars"
         menu.addItem(backdrop)
+        let login = ClosureMenuItem(title: "Open at Login") {
+            if LoginItem.enabled { LoginItem.disable() } else { LoginItem.enable() }
+        }
+        login.state = LoginItem.enabled ? .on : .off
+        login.isEnabled = !LoginItem.devInstall
+        login.toolTip = LoginItem.devInstall ? "A development install always starts at login" : "Start Sweeflow when you log in to this Mac"
+        menu.addItem(login)
 
         menu.addItem(.sectionHeader(title: "Linked Computers"))
         for p in Identity.pairedClients() {
@@ -80,10 +85,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             computer.submenu = options
             menu.addItem(computer)
         }
-        menu.addItem(ClosureMenuItem(title: "Link Another Computer…") { PairingWindow.shared.show() })
+        let link = ClosureMenuItem(title: "Link a Linux Computer…") { PairingWindow.shared.show() }
+        link.toolTip = "Shows a code to type on the Linux computer"
+        menu.addItem(link)
 
-        menu.addItem(.sectionHeader(title: "General"))
-        menu.addItem(ClosureMenuItem(title: "Setup…") { Onboarding.shared.show() })
+        // Only while something's missing (a permission, starting at login, a linked computer).
+        if !Onboarding.complete {
+            menu.addItem(.separator())
+            let setup = ClosureMenuItem(title: "Finish Setting Up…") { Onboarding.shared.show() }
+            setup.toolTip = "Permissions Sweeflow still needs on this Mac"
+            menu.addItem(setup)
+        }
     }
 
     /// Asks once: linking it again needs a new code.
