@@ -3,7 +3,9 @@ import AppKit
 
 /// The MacBook's own screen, turned down to near-black while streaming, so it can run with the lid
 /// slightly open (a closed lid locks the Mac, and a locked Mac can't be captured) without
-/// lighting up or heating. Restored when streaming stops.
+/// lighting up or heating. Restored when streaming stops, and while someone uses the Mac itself
+/// (its own keyboard or trackpad); dark again once they've left it alone for a while. It stays
+/// dark through anything else that brightens it (macOS does on some input from Linux).
 enum BuiltInScreen {
     private typealias Get = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
     private typealias Set = @convention(c) (CGDirectDisplayID, Float) -> Int32
@@ -70,12 +72,56 @@ enum BuiltInScreen {
         wasOnline = builtIn != nil
         if !paused { dim() }
         watchScreens()
+        watchUse()
     }
 
     static func stopDimming() {
         dimming = false
+        watch?.invalidate()
+        watch = nil
+        localUse = nil
         restore()   // if the lid is closed, done when the screen comes back (watchScreens)
         watchScreens()
+    }
+
+    // MARK: someone at the Mac
+
+    /// Input from Linux being posted now (it can count as activity, like a person's would).
+    private static var lastInjected: TimeInterval = 0
+    /// When the Mac's own keyboard or trackpad was last used, while that keeps the screen lit.
+    private static var localUse: TimeInterval?
+    private static var watch: Timer?
+    /// How long the Mac must be left alone before the screen goes dark again.
+    private static let localGrace: TimeInterval = 30
+
+    static func noteInjected() { lastInjected = ProcessInfo.processInfo.systemUptime }
+
+    /// Once a second while dimming: lit while someone uses the Mac itself, dark otherwise (also
+    /// after macOS brightened it on its own).
+    private static func watchUse() {
+        guard watch == nil else { return }
+        watch = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            guard dimming, !paused else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
+            // Recent input that Sweeflow didn't post: the Mac's own keyboard or trackpad.
+            if idle < 1.1 && now - lastInjected > 1.5 {
+                if localUse == nil {
+                    log("someone's using the Mac: its screen back on")
+                    restore()
+                }
+                localUse = now
+                return
+            }
+            if let since = localUse {
+                guard now - since >= localGrace else { return }
+                localUse = nil
+                log("the Mac left alone: its screen dark again")
+            }
+            guard let id = builtIn, let get = getBrightness else { return }
+            var current: Float = 0
+            if get(id, &current) == 0, current > dimLevel + 0.02 { dim() }
+        }
     }
 
     private static func dim() {
