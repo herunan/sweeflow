@@ -607,13 +607,19 @@ final class Session {
     private var resizing: Set<UInt32> = []
     private var appAXQueues: [pid_t: DispatchQueue] = [:]
 
+    /// Accessibility calls to one app, in order (a slow app doesn't hold the others up).
+    private func appQueue(_ pid: pid_t) -> DispatchQueue {
+        if let q = appAXQueues[pid] { return q }
+        let q = DispatchQueue(label: "sweeflow.ax.\(pid)", qos: .userInteractive)
+        appAXQueues[pid] = q
+        return q
+    }
+
     private func applyResize(_ wid: UInt32) {
         guard !resizing.contains(wid), let t = resizeTargets.removeValue(forKey: wid) else { return }
         resizing.insert(wid)
-        let q = appAXQueues[t.pid] ?? DispatchQueue(label: "sweeflow.ax.\(t.pid)", qos: .userInteractive)
-        appAXQueues[t.pid] = q
         let control = control_
-        q.async { [weak self] in
+        appQueue(t.pid).async { [weak self] in
             let t0 = Date()
             if let o = t.origin { control.setPosition(wid, pid: t.pid, o) }
             control.setSize(wid, pid: t.pid, t.size)
@@ -814,11 +820,34 @@ final class Session {
 
     private func sendButtons(_ w: TrackedWindow) {
         guard w.kind == .toplevel else { return }
-        // Traffic lights always sit in the top-left corner. Apps that hide the native ones
-        // (e.g. a browser, which draws its own) report them elsewhere — outside the window, or inside
-        // it once it's big enough; those are ignored and the drawn ones found in the pixels.
-        let corner = CGRect(x: 0, y: 0, width: min(160, w.frame.width), height: min(80, w.frame.height))
-        let rects = control_.buttonRects(w.wid, pid: w.pid).map { corner.contains($0) ? $0 : .zero }
+        // Looked up on the app's own queue: an app busy resizing answers late, and on the
+        // session's queue every window's frames waited for it (a tiling relayout resizes them
+        // all at once). One look per window at a time; changes meanwhile look once more after.
+        guard buttonLookups.insert(w.wid).inserted else { buttonsAgain.insert(w.wid); return }
+        let control = control_
+        appQueue(w.pid).async { [weak self] in
+            // Traffic lights always sit in the top-left corner. Apps that hide the native ones
+            // (e.g. a browser, which draws its own) report them elsewhere — outside the window, or
+            // inside it once it's big enough; those are ignored and the drawn ones found in the
+            // pixels.
+            let corner = CGRect(x: 0, y: 0, width: min(160, w.frame.width), height: min(80, w.frame.height))
+            let rects = control.buttonRects(w.wid, pid: w.pid).map { corner.contains($0) ? $0 : .zero }
+            self?.queue.async {
+                guard let self else { return }
+                self.buttonLookups.remove(w.wid)
+                if self.buttonsAgain.remove(w.wid) != nil, let now = self.tracker.windows[w.wid] {
+                    self.sendButtons(now)
+                }
+                self.applyButtons(w, rects)
+            }
+        }
+    }
+
+    private var buttonLookups: Set<UInt32> = []
+    private var buttonsAgain: Set<UInt32> = []
+
+    private func applyButtons(_ w: TrackedWindow, _ rects: [CGRect]) {
+        guard tracker.windows[w.wid] != nil else { return }
         // A transient failure (window mid-move) must not wipe known-good positions.
         if rects.allSatisfy({ $0 == .zero }), sentButtons[w.wid]?.contains(where: { $0 != .zero }) == true {
             return
@@ -1123,15 +1152,28 @@ final class Session {
     }
 
     private var lastFocusCheck = DispatchTime(uptimeNanoseconds: 0)
+    private var focusChecking = false
+    private let focusQueue = DispatchQueue(label: "sweeflow.focus", qos: .userInteractive)
 
     private func checkFocus() {
-        // An Accessibility round trip to the frontmost app: not on every 8 ms look.
+        // An Accessibility round trip to the frontmost app: not on every 8 ms look, and not on
+        // the session's queue (an app busy resizing answers late, and every window's frames
+        // waited meanwhile).
         let now = DispatchTime.now()
-        guard now.uptimeNanoseconds - lastFocusCheck.uptimeNanoseconds > 50_000_000 else { return }
+        guard !focusChecking, now.uptimeNanoseconds - lastFocusCheck.uptimeNanoseconds > 50_000_000 else { return }
         lastFocusCheck = now
-        guard let wid = control_.focusedWindowID(), wid != lastFocused, tracker.windows[wid] != nil else { return }
-        lastFocused = wid
-        var m = MsgWriter(.focused); m.u32(wid); control?.send(m)
+        focusChecking = true
+        let control = control_
+        focusQueue.async { [weak self] in
+            let wid = control.focusedWindowID()
+            self?.queue.async {
+                guard let self else { return }
+                self.focusChecking = false
+                guard let wid, wid != self.lastFocused, self.tracker.windows[wid] != nil else { return }
+                self.lastFocused = wid
+                var m = MsgWriter(.focused); m.u32(wid); self.control?.send(m)
+            }
+        }
     }
 
     private func sendAdded(_ w: TrackedWindow) {
