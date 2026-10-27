@@ -13,6 +13,8 @@ use crate::config::{self, Config};
 
 // The Mac host's sources, embedded by build.rs so the Linux binary is all you need.
 include!(concat!(env!("OUT_DIR"), "/mac_files.rs"));
+// The Mac app's installer, if one was built before this binary (see build.rs).
+include!(concat!(env!("OUT_DIR"), "/mac_dmg.rs"));
 
 const REMOTE_SRC: &str = "~/.sweeflow/src";
 const SUPPORT: &str = "\"$HOME/Library/Application Support/sweeflow\"";
@@ -167,8 +169,25 @@ pub fn install() -> Result<()> {
     }
     run(&["restart", "sweeflow.service"])?;
     install_icon_and_widget(&home)?;
+    install_mac_dmg(&home)?;
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
+    Ok(())
+}
+
+/// Puts the Mac app's installer where the "Add a Mac" window serves it from (installer.rs).
+fn install_mac_dmg(home: &std::path::Path) -> Result<()> {
+    let Some(dmg) = MAC_DMG else {
+        println!("    (no Mac installer in this build: run ./release-mac.sh first to include one)");
+        return Ok(());
+    };
+    let dir = home.join(".local/share/sweeflow");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("Sweeflow.dmg");
+    if std::fs::read(&path).ok().as_deref() != Some(dmg) {
+        std::fs::write(&path, dmg)?;
+    }
+    println!("    Mac installer ready for \"Add a Mac\" ({} MB)", dmg.len() / 1_000_000);
     Ok(())
 }
 

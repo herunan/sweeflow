@@ -15,8 +15,10 @@ DMG=$(ssh "$TARGET" "$REMOTE/release.sh $VERSION $BUILD" | tail -1)
 mkdir -p dist ~/.local/share/sweeflow
 scp -q "$TARGET:$DMG" "dist/Sweeflow-$VERSION.dmg"
 cp "dist/Sweeflow-$VERSION.dmg" ~/.local/share/sweeflow/Sweeflow.dmg
+# The copy the Linux build carries (build.rs), so `sweeflow install` sets it up anywhere.
+cp "dist/Sweeflow-$VERSION.dmg" dist/Sweeflow.dmg
 # The signing key never changes; keep a copy off the Mac (not in git).
 mkdir -p ~/.local/share/sweeflow-release && chmod 700 ~/.local/share/sweeflow-release
 ssh "$TARGET" 'cat "$HOME/Library/Application Support/sweeflow-release/release.p12"' > ~/.local/share/sweeflow-release/release.p12
 chmod 600 ~/.local/share/sweeflow-release/release.p12
-echo "==> dist/Sweeflow-$VERSION.dmg (and served by the wizard)"
+echo "==> dist/Sweeflow-$VERSION.dmg (served by the wizard; rebuild linux/ to carry it in the binary)"
