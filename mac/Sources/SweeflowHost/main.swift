@@ -175,6 +175,7 @@ final class HostState {
     func sessionStarted() {
         sessions += 1
         teardown?.cancel()
+        BuiltInScreen.setConnected(true)
         undimForGood()
         apply()
     }
@@ -184,6 +185,7 @@ final class HostState {
     func sessionEnded(leaving: Bool = false) {
         sessions = max(0, sessions - 1)
         guard sessions == 0 else { return }
+        BuiltInScreen.setConnected(false)
         undimForGood()
         // Brightness comes back quickly (you may be back at the Mac); the rest after a grace period.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in

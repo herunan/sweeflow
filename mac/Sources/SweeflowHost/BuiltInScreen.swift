@@ -83,7 +83,7 @@ enum BuiltInScreen {
         dimming = false
         watch?.invalidate()
         watch = nil
-        stopWatchingLocalInput()
+        if !connected { stopWatchingLocalInput() }
         restore()   // if the lid is closed, done when the screen comes back (watchScreens)
         watchScreens()
     }
@@ -124,7 +124,8 @@ enum BuiltInScreen {
                 if let t = BuiltInScreen.tap { CGEvent.tapEnable(tap: t, enable: true) }
             } else if event.getIntegerValueField(.eventSourceUserData) != BuiltInScreen.injectedMark,
                       event.getIntegerValueField(.eventSourceUnixProcessID) == 0 {
-                DispatchQueue.main.async { BuiltInScreen.localInput() }
+                let pointer = type != .keyDown && type != .flagsChanged
+                DispatchQueue.main.async { BuiltInScreen.localInput(pointer: pointer) }
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: nil) else {
@@ -143,10 +144,42 @@ enum BuiltInScreen {
         tapSource = nil
     }
 
-    private static func localInput() {
+    private static func localInput(pointer: Bool) {
+        if pointer { bringPointerBack() }
         guard dimming, !paused else { return }
         log("someone's using the Mac: its screen back on")
         onLocalUse?()
+    }
+
+    // MARK: the pointer, for someone at the Mac
+
+    /// Watched while Linux is connected (and while dimmed): see `bringPointerBack`.
+    private static var connected = false
+
+    static func setConnected(_ on: Bool) {
+        connected = on
+        if on { watchLocalInput() } else if !dimming { stopWatchingLocalInput() }
+    }
+
+    private static var lastWarp: TimeInterval = 0
+
+    /// While Linux is connected the pointer lives on the virtual display (where Linux's clicks
+    /// land), which nobody at the Mac can see. Moved with the Mac's own trackpad or mouse, it
+    /// comes back to a screen they see.
+    private static func bringPointerBack() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastWarp > 0.5, let vid = host.display.displayID else { return }
+        let at = CGEvent(source: nil)?.location ?? .zero
+        guard CGDisplayBounds(vid).contains(at) else { return }
+        let visible = NSScreen.screens.compactMap {
+            $0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        }.filter { $0 != vid }
+        guard let target = builtIn.flatMap({ id in visible.contains(id) ? id : nil }) ?? visible.first else { return }
+        let b = CGDisplayBounds(target)
+        lastWarp = now
+        CGWarpMouseCursorPosition(CGPoint(x: b.midX, y: b.midY))
+        CGAssociateMouseAndMouseCursorPosition(1)
+        log("pointer moved on the Mac: brought back to its own screen")
     }
 
     /// Once a second while dimmed: anything that brightens the screen (macOS does, on some input
@@ -160,7 +193,7 @@ enum BuiltInScreen {
             if tap == nil {
                 let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
                 // Recent input that Sweeflow didn't post: the Mac's own keyboard or trackpad.
-                if idle < 1.1 && now - lastInjected > 1.5 { return localInput() }
+                if idle < 1.1 && now - lastInjected > 1.5 { return localInput(pointer: false) }
             }
             guard let id = builtIn, let get = getBrightness else { return }
             var current: Float = 0
