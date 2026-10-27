@@ -14,6 +14,8 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
         if p.is_dir() {
             walk(&p, root, out);
         } else {
+            // Each file: a directory only counts as changed when files come or go.
+            println!("cargo:rerun-if-changed={}", p.display());
             let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
             let abs = fs::canonicalize(&p).unwrap();
             out.push(format!("({rel:?}, include_bytes!({:?}) as &[u8]),", abs.to_string_lossy()));
