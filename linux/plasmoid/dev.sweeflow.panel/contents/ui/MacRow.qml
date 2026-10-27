@@ -14,6 +14,9 @@ PlasmaComponents3.ItemDelegate {
     signal activated()
     signal renamed(string name)
     signal forgotten()
+    signal connectAsked()
+    /// Disconnected (the tray's Disconnect): the Mac in use isn't streaming.
+    property bool offline: false
 
     // Nothing happens on a stray click: switching Macs is the "Use" button.
     hoverEnabled: false
@@ -49,13 +52,19 @@ PlasmaComponents3.ItemDelegate {
         }
         PlasmaComponents3.Label {
             visible: row.active && !row.editing && !row.confirming
-            text: "In use"
+            text: row.offline ? "Disconnected" : "In use"
             opacity: 0.6
         }
         PlasmaComponents3.ToolButton {
             visible: !row.active && !row.editing && !row.confirming
             text: "Use"
             onClicked: row.activated()
+        }
+        PlasmaComponents3.ToolButton {
+            visible: row.active && row.offline && !row.editing && !row.confirming
+            icon.name: "network-connect"
+            text: "Connect"
+            onClicked: row.connectAsked()
         }
         PlasmaComponents3.ToolButton {
             visible: row.editing

@@ -60,6 +60,10 @@ slint::slint! {
 
         in-out property <int> page: 0;
         in property <string> installer-url;
+        // A firewall (ufw) is on and may block the page: offer to let it through.
+        in property <bool> firewall-on;
+        in-out property <string> firewall-note;
+        callback open-firewall();
         in property <[MacRow]> macs;
         in property <string> mac-name;
         in property <string> our-code;
@@ -95,7 +99,12 @@ slint::slint! {
                     font-family: "monospace";
                     horizontal-alignment: center;
                 }
-                if installer-url != "": Body { text: "    Page won't load? This computer's firewall may be blocking it (port 44130)."; }
+                if installer-url != "" && !firewall-on: Body { text: "    Page won't load? This computer's firewall may be blocking it (port 44130)."; }
+                if installer-url != "" && firewall-on: HorizontalLayout {
+                    spacing: 8px;
+                    Body { text: firewall-note != "" ? "    " + firewall-note : "    This computer's firewall blocks the page until you let it through."; }
+                    if firewall-note == "": Button { text: "Allow through firewall"; clicked => { open-firewall(); } }
+                }
                 Body { text: "    The first time, macOS asks whether to open it: choose System Settings → Privacy & Security → Open Anyway."; }
                 Body { text: "2.  Open Sweeflow and allow what it asks for. It then shows a code for this computer."; }
                 Rectangle {}
@@ -207,6 +216,20 @@ pub fn run() -> Result<()> {
     if let Some(s) = &_server {
         ui.set_installer_url(s.url.clone().into());
     }
+
+    // CachyOS and others ship ufw switched on: the Mac can't reach the page until it's allowed.
+    ui.set_firewall_on(_server.is_some() && firewall_active());
+    let weak_fw = ui.as_weak();
+    ui.on_open_firewall(move || {
+        let weak = weak_fw.clone();
+        std::thread::spawn(move || {
+            let note = match allow_installer_port() {
+                Ok(()) => "Let through: open the address on your Mac now.".to_string(),
+                Err(e) => format!("Not changed ({e}). Allow TCP port 44130 in your firewall settings."),
+            };
+            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_firewall_note(note.into()));
+        });
+    });
 
     let weak = ui.as_weak();
     let _browser = pair::browse(pair::PAIR_SERVICE, move |f| {
@@ -356,4 +379,35 @@ fn use_paired_mac() -> Result<()> {
         cfg.save()?;
     }
     crate::setup::start_client()
+}
+
+/// ufw is running (it blocks incoming connections by default).
+fn firewall_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "ufw"])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Lets the local network reach the installer page: one ufw rule, for this computer's network
+/// only, asked for with the usual password prompt (pkexec).
+fn allow_installer_port() -> anyhow::Result<()> {
+    let net = local_network().ok_or_else(|| anyhow::anyhow!("couldn't tell which network this is"))?;
+    let port = crate::installer::PORT.to_string();
+    let ok = std::process::Command::new("pkexec")
+        .args(["ufw", "allow", "from", &net, "to", "any", "port", &port, "proto", "tcp", "comment", "Sweeflow installer"])
+        .status()?
+        .success();
+    anyhow::ensure!(ok, "the firewall wasn't changed");
+    Ok(())
+}
+
+/// This computer's local network as an address range ("192.168.1.0/24"), from `ip`.
+fn local_network() -> Option<String> {
+    let out = std::process::Command::new("ip").args(["-o", "-4", "route", "show", "scope", "link"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .find(|n| n.contains('/') && !n.starts_with("169.254."))
+        .map(String::from)
 }

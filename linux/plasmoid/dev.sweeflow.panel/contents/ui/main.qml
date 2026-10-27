@@ -290,9 +290,9 @@ PlasmoidItem {
         }
         Connections {
             target: root
-            // Closed: back to the main page. Opened: look again at panels and rules (they can be
-            // changed in Plasma's own settings too).
-            function onExpandedChanged() { if (!root.expanded) stack.pop(null); else root.act("placement"); }
+            // Opens where it was left (Apps, Linked Macs…). Opened: look again at panels and rules
+            // (they can be changed in Plasma's own settings too).
+            function onExpandedChanged() { if (root.expanded) root.act("placement"); }
         }
 
         // Main page: the apps (a page of their own), then every setting, in sections.
@@ -450,6 +450,8 @@ PlasmoidItem {
                             width: ListView.view.width
                             name: modelData.name
                             active: modelData.active
+                            offline: root.offline
+                            onConnectAsked: root.act("connect")
                             onActivated: root.act("switch", modelData.fingerprint)
                             onRenamed: (n) => root.rename(modelData.fingerprint, n)
                             onForgotten: root.act("forget", modelData.fingerprint)
