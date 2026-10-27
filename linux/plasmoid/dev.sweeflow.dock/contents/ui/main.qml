@@ -239,19 +239,16 @@ PlasmoidItem {
                              : PlasmaExtras.Menu.TopPosedLeftAlignedPopup
                     PlasmaExtras.MenuItem { text: cellArea.modelData.name; section: true }
                     PlasmaExtras.MenuItem {
-                        icon: "window-new"
                         text: "Open"
                         onClicked: root.act("launch", cellArea.modelData.id)
                     }
                     PlasmaExtras.MenuItem {
-                        icon: cellArea.isPinned ? "window-unpin" : "window-pin"
                         text: cellArea.isPinned ? "Remove from Dock" : "Keep in Dock"
                         onClicked: root.setPinned(cellArea.modelData.id, !cellArea.isPinned)
                     }
                     PlasmaExtras.MenuItem { separator: true; visible: cellArea.modelData.state > 0 }
                     PlasmaExtras.MenuItem {
                         visible: cellArea.modelData.state > 0
-                        icon: "application-exit"
                         text: "Quit"
                         onClicked: root.act("quit-app", cellArea.modelData.id)
                     }

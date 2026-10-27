@@ -5,7 +5,7 @@
 //! decoded video 1:1. Video frames are GPU dmabufs straight from the VA-API decoder.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -324,6 +324,8 @@ pub struct App {
     scale: f64,
     host: String,
     connected: bool,
+    /// Windows closed here while the Mac was away: closed there too once it's back.
+    closed_offline: HashSet<u32>,
     trace_event_ms: Option<u32>,
     /// Whether the Global Menu panel is currently shown (it only shows for Mac windows).
     menu_panel_shown: Option<bool>,
@@ -419,6 +421,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         scale,
         host,
         connected: false,
+        closed_offline: HashSet::new(),
         trace_event_ms: None,
         menu_panel_shown: None,
     };
@@ -506,6 +509,7 @@ impl App {
                     for wid in stale {
                         app.remove_window(wid);
                     }
+                    app.closed_offline.clear();
                     TimeoutAction::Drop
                 });
             }
@@ -516,8 +520,14 @@ impl App {
                 self.end_selection();
                 // Windows wait for the Mac to come back; menus and popovers don't (nothing would
                 // close them meanwhile, and they sit above everything else).
-                let popups: Vec<u32> = self.windows.values().filter(|w| matches!(w.role, Role::Popup(_))).map(|w| w.info.wid).collect();
-                for wid in popups {
+                // Disconnected on purpose (the tray), nothing waits.
+                let gone: Vec<u32> = self
+                    .windows
+                    .values()
+                    .filter(|w| crate::net::offline() || matches!(w.role, Role::Popup(_)))
+                    .map(|w| w.info.wid)
+                    .collect();
+                for wid in gone {
                     self.remove_window(wid);
                 }
             }
@@ -621,6 +631,12 @@ impl App {
 
     fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
+        if self.closed_offline.remove(&wid) {
+            // Closed here while the Mac was away: close it there (it comes back if the app asks
+            // first, e.g. to save).
+            log::info!("window {wid} was closed while the Mac was away: closing it there");
+            self.send(W::new(t::CLOSE).u32(wid).finish());
+        }
         log::info!("window {wid} added: {} kind {} parent {} {}x{} at {},{}",
                    info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
         if let Some(w) = self.windows.get_mut(&wid) {
@@ -1530,6 +1546,17 @@ impl App {
         }
     }
 
+    /// Closes a Mac window. With the Mac away nothing would answer, so the window goes now
+    /// (and the Mac's is closed once it's back).
+    fn close(&mut self, wid: u32) {
+        if self.connected {
+            self.send(W::new(t::CLOSE).u32(wid).finish());
+        } else {
+            self.closed_offline.insert(wid);
+            self.remove_window(wid);
+        }
+    }
+
     fn toggle_maximize(&self, wid: u32) {
         let Some(w) = self.windows.get(&wid) else { return };
         let Role::Toplevel(t) = &w.role else { return };
@@ -1854,7 +1881,7 @@ fn decode_png_argb(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 impl WindowHandler for App {
     fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &Window) {
         if let Some(wid) = self.wid_for(window.wl_surface()) {
-            self.send(W::new(t::CLOSE).u32(wid).finish());
+            self.close(wid);
         }
     }
 
@@ -2042,7 +2069,7 @@ impl PointerHandler for App {
                             // Traffic lights act on the Linux window; on the Mac they would
                             // minimise/fullscreen the window out of the stream.
                             match b {
-                                0 => self.send(W::new(t::CLOSE).u32(wid).finish()),
+                                0 => self.close(wid),
                                 1 => {
                                     if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
                                         t.set_minimized();

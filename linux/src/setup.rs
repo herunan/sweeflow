@@ -228,6 +228,59 @@ const WIDGET_FILES: &[(&str, &str)] = &[
     ("dev.sweeflow.dock/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.dock/contents/ui/main.qml")),
 ];
 
+/// Sweeflow in the app menu: opens it (see `open`). Also how desktops match Sweeflow's own
+/// windows (the wizard, app id "sweeflow") to the logo.
+pub fn write_launcher(home: &std::path::Path) -> Result<()> {
+    let apps = home.join(".local/share/applications");
+    std::fs::create_dir_all(&apps)?;
+    let file = apps.join("sweeflow.desktop");
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=Sweeflow\nGenericName=Mac apps\nComment=Mac apps on this desktop\n\
+         Exec={} open\nIcon=sweeflow\nTerminal=false\nStartupNotify=false\nStartupWMClass=sweeflow\n\
+         Categories=Network;RemoteAccess;\nKeywords=mac;macos;stream;\n",
+        home.join(".local/bin/sweeflow").display()
+    );
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(entry.as_str()) {
+        std::fs::write(file, entry)?;
+    }
+    Ok(())
+}
+
+/// The service is running.
+fn service_active() -> bool {
+    Command::new("systemctl").args(["--user", "is-active", "--quiet", "sweeflow"]).status().is_ok_and(|s| s.success())
+}
+
+/// `sweeflow open`, what the app menu entry runs: installs Sweeflow the first time, starts it if
+/// it isn't running, and shows it: the tray widget's popup, or "Add a Mac" while none is paired.
+pub fn open() -> Result<()> {
+    if !service_installed() {
+        // The service opens "Add a Mac" itself when there's no Mac yet.
+        install()?;
+    } else if Config::load_or_default()?.host.is_empty() {
+        if !service_active() {
+            // Asks for a Mac as it starts.
+            Command::new("systemctl").args(["--user", "start", "sweeflow"]).status()?;
+            return Ok(());
+        }
+        return crate::wizard::run();
+    } else if !service_active() {
+        let ok = Command::new("systemctl").args(["--user", "start", "sweeflow"]).status()?.success();
+        anyhow::ensure!(ok, "couldn't start sweeflow (see `journalctl --user -u sweeflow`)");
+    }
+    // Pop the tray widget open, once the client is there to ask.
+    let bus = zbus::blocking::Connection::session()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let r = bus.call_method(Some("dev.sweeflow.Client"), "/dev/sweeflow/Panel", Some("dev.sweeflow.Panel"), "Do", &("show", ""));
+        match r {
+            Ok(_) => return Ok(()),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(e) => bail!("sweeflow didn't answer: {e}"),
+        }
+    }
+}
+
 /// The logo (icon theme name "sweeflow"), and on Plasma the tray widget (linux/plasmoid), added
 /// to every system tray. Plasma keeps its own copy of the panel config, so the tray is changed
 /// through its scripting interface rather than the file.
@@ -235,17 +288,7 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     let icons = home.join(".local/share/icons/hicolor/scalable/apps");
     std::fs::create_dir_all(&icons)?;
     std::fs::write(icons.join("sweeflow.svg"), LOGO)?;
-    // Hidden: only so desktops can match Sweeflow's own windows (the wizard, app id
-    // "sweeflow") to their icon. Not a launcher: the client runs as a service.
-    let apps = home.join(".local/share/applications");
-    std::fs::create_dir_all(&apps)?;
-    std::fs::write(
-        apps.join("sweeflow.desktop"),
-        format!(
-            "[Desktop Entry]\nType=Application\nName=Sweeflow\nComment=Add a Mac\nExec={} pair\nIcon=sweeflow\nNoDisplay=true\n",
-            home.join(".local/bin/sweeflow").display()
-        ),
-    )?;
+    write_launcher(home)?;
     if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") {
         return Ok(());
     }

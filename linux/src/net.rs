@@ -108,6 +108,8 @@ pub enum NetCmd {
     Clipboard(Vec<crate::clipboard::ClipItem>),
     /// A framed message for the clipboard stream (drag and drop data).
     ClipStream(Vec<u8>),
+    /// "Disconnect" or "Connect" was chosen (see `set_offline`): look again.
+    Recheck,
 }
 
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
@@ -144,6 +146,30 @@ static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = s
 /// The Mac's lock state as last reported (kept across reconnects).
 static MAC_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Disconnected on purpose (the tray's Disconnect): no connection until Connect. Kept across
+/// restarts, in a file beside the config.
+static OFFLINE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(offline_file().exists()));
+
+fn offline_file() -> std::path::PathBuf {
+    crate::config::dir().join("disconnected")
+}
+
+pub fn offline() -> bool {
+    OFFLINE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Disconnects from the Mac (its windows go) and stays so, or connects again.
+pub fn set_offline(on: bool) {
+    if OFFLINE.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
+        return;
+    }
+    log::info!("{}", if on { "disconnecting, as asked" } else { "connecting again, as asked" });
+    let _ = if on { std::fs::write(offline_file(), "") } else { std::fs::remove_file(offline_file()) };
+    if let Some(tx) = NET_TX.get() {
+        let _ = tx.send(NetCmd::Recheck);
+    }
+}
 
 /// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
 /// brief network blip doesn't make them flicker).
@@ -255,6 +281,16 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
     };
     let mut backoff = Duration::from_millis(250);
     loop {
+        if offline() {
+            let _ = ui.send(UiEvent::Disconnected("disconnected, as asked".into()));
+            // Any command wakes this to look again; only Connect (a Recheck) changes anything.
+            while offline() {
+                if cmds.recv().await.is_none() {
+                    return;
+                }
+            }
+            backoff = Duration::from_millis(250);
+        }
         match session(&cfg, &endpoint, &ui, &mut cmds).await {
             Ok(()) => return, // UI went away
             Err(e) => {
@@ -264,6 +300,9 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         }
         // Drop commands meant for the dead connection.
         while cmds.try_recv().is_ok() {}
+        if offline() {
+            continue;
+        }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(3));
     }
@@ -395,6 +434,8 @@ async fn session(
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else { return Ok(()) };
                 match cmd {
+                    NetCmd::Recheck if offline() => break Err(anyhow::anyhow!("disconnected, as asked")),
+                    NetCmd::Recheck => {}
                     NetCmd::Control(m) => ctl_tx.write_all(&m).await?,
                     NetCmd::Subscribe(wid) => {
                         // A window minimised on the Mac loses its capture; its task has ended.

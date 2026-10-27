@@ -39,7 +39,7 @@ impl Iface {
         crate::tray::rename(&fingerprint, &name);
     }
 
-    /// One of: wake, pair, display (show the Mac's display in a window), gather (Mac windows
+    /// One of: wake, pair, disconnect, connect, show (pop the widget open), display (show the Mac's display in a window), gather (Mac windows
     /// back onto the Mac desktop), switch <fingerprint>,
     /// forget <fingerprint>, launch <bundle id>, quit-app <bundle id>, pin|unpin <bundle id>,
     /// login on|off (open at login), taskbar on|off, dock own|panel|off, global-menu on|off,

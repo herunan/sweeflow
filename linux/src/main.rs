@@ -26,6 +26,7 @@ sweeflow — stream Mac app windows into your Linux desktop
 
 USAGE:
     sweeflow                 connect to the paired Mac and show its windows
+    sweeflow open            start Sweeflow if needed and show its controls (the app menu entry)
     sweeflow pair            pair with a Mac on this network (it shows a code to type here)
     sweeflow pair --text     the same, in the terminal
     sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it (development)
@@ -87,12 +88,19 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             let _lock = single_instance()?;
+            if in_service {
+                // Installs from before Sweeflow was in the app menu.
+                if let Some(home) = std::env::var_os("HOME") {
+                    let _ = setup::write_launcher(std::path::Path::new(&home));
+                }
+            }
             ui::run(wait_for_a_mac()?)
         }
         Some("pair") if args.get(1).is_some_and(|a| a == "--text") => pair::run_text(),
         Some("pair") => wizard::run(),
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
+        Some("open") => setup::open(),
         Some("launch") => launchers::launch(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("status") => setup::status(),
         _ => {

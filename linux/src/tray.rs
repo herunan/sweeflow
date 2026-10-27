@@ -56,6 +56,8 @@ struct State {
     pinned: Vec<String>,
     /// Where Mac apps show up (task manager, Mac Dock, Global Menu), as last looked at.
     placement: crate::placement::Placement,
+    /// When Sweeflow was last opened from the app menu (ms since the epoch): the widget pops up.
+    show_at: u64,
 }
 
 static STATE: LazyLock<Mutex<State>> =
@@ -225,6 +227,7 @@ impl ksni::Tray for Tray {
         let description = match (&s.mac, &s.settings) {
             (Some(mac), Some(st)) if st.enabled => format!("Streaming apps from {mac}"),
             (Some(mac), _) => format!("Connected to {mac}, streaming off"),
+            (None, _) if crate::net::offline() => "Disconnected".into(),
             (None, _) => "Mac not connected".into(),
         };
         ToolTip { title: "sweeflow".into(), description, ..Default::default() }
@@ -237,7 +240,11 @@ impl ksni::Tray for Tray {
         let on = s.as_ref().is_some_and(|s| s.enabled);
         let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
-                label: state.mac.as_ref().map_or("Mac not connected".into(), |m| format!("Connected to {m}")),
+                label: match &state.mac {
+                    Some(m) => format!("Connected to {m}"),
+                    None if crate::net::offline() => "Disconnected".into(),
+                    None => "Mac not connected".into(),
+                },
                 enabled: false,
                 ..Default::default()
             }
@@ -269,6 +276,15 @@ impl ksni::Tray for Tray {
                 }
                 .into()
             },
+            StandardItem {
+                label: if crate::net::offline() { "Connect" } else { "Disconnect" }.into(),
+                activate: Box::new(|_| {
+                    crate::net::set_offline(!crate::net::offline());
+                    refresh();
+                }),
+                ..Default::default()
+            }
+            .into(),
             MenuItem::Separator,
         ];
 
@@ -347,7 +363,6 @@ impl ksni::Tray for Tray {
         items.push(
             StandardItem {
                 label: "Quit sweeflow".into(),
-                icon_name: "application-exit".into(),
                 activate: Box::new(|_| {
                     quit();
                 }),
@@ -381,7 +396,6 @@ fn macs_menu() -> MenuItem<Tray> {
     sub.push(
         StandardItem {
             label: "Add a Mac…".into(),
-            icon_name: "list-add".into(),
             activate: Box::new(|_| open_wizard()),
             ..Default::default()
         }
@@ -403,7 +417,7 @@ fn macs_menu() -> MenuItem<Tray> {
             .collect();
         sub.push(SubMenu { label: "Forget".into(), submenu: forget, ..Default::default() }.into());
     }
-    SubMenu { label: "Mac".into(), icon_name: "computer-laptop".into(), submenu: sub, ..Default::default() }.into()
+    SubMenu { label: "Mac".into(), submenu: sub, ..Default::default() }.into()
 }
 
 fn quit() {
@@ -487,6 +501,8 @@ pub fn panel_state() -> serde_json::Value {
         "openAtLogin": open_at_login(),
         "placement": state.placement,
         "pinned": state.pinned,
+        "offline": crate::net::offline(),
+        "showAt": state.show_at,
     })
 }
 
@@ -524,6 +540,15 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
+        "disconnect" | "connect" => {
+            crate::net::set_offline(action == "disconnect");
+            refresh();
+        }
+        "show" => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            STATE.lock().unwrap().show_at = now.as_millis() as u64;
+            refresh();
+        }
         "switch" => switch_to(arg),
         "forget" => forget(arg),
         "launch" => {
@@ -640,6 +665,7 @@ fn switch_to(fingerprint: &str) {
         return log::warn!("saving config: {e:#}");
     }
     log::info!("switching to {}", cfg.host);
+    crate::net::set_offline(false);
     restart();
 }
 
