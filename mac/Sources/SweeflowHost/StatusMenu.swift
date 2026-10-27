@@ -93,7 +93,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             sub.addItem(i)
         }
         apps.submenu = sub
-        apps.toolTip = "Which apps' windows go to Linux"
         menu.addItem(apps)
         menu.addItem(.separator())
 
@@ -101,7 +100,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             settings.update { $0.dimMacScreenWhileStreaming = true }
         }
         dim.isEnabled = c.enabled && !c.dimMacScreenWhileStreaming
-        dim.toolTip = "Turns this screen down until someone uses this Mac's keyboard or trackpad"
         // Only while a Linux machine is connected (there's nothing to dim for otherwise).
         if client != nil { menu.addItem(dim) }
         let login = ClosureMenuItem(title: "Open at login") {
@@ -109,14 +107,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
         login.state = LoginItem.enabled ? .on : .off
         login.isEnabled = !LoginItem.devInstall
-        login.toolTip = LoginItem.devInstall ? "A development install always starts at login" : "Start Sweeflow when you log in to this Mac"
         menu.addItem(login)
         menu.addItem(.separator())
 
         let linked = NSMenuItem(title: "Linux machines", action: nil, keyEquivalent: "")
         let list = NSMenu()
         let link = ClosureMenuItem(title: "Link a Linux machine…") { PairingWindow.shared.show() }
-        link.toolTip = "Shows a code to type on the Linux machine"
         list.addItem(link)
         let paired = Identity.pairedClients()
         if !paired.isEmpty { list.addItem(.separator()) }
@@ -146,12 +142,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         // Only while something's missing (a permission, starting at login, a linked computer).
         if !Onboarding.complete {
             let setup = ClosureMenuItem(title: "Finish setting up…") { Onboarding.shared.show() }
-            setup.toolTip = "Permissions Sweeflow still needs on this Mac"
             menu.addItem(setup)
         }
         let quit = ClosureMenuItem(title: "Quit Sweeflow") { Self.quit() }
         quit.keyEquivalent = "q"
-        quit.toolTip = "Until you open it again (or log in again, with Open at login)"
         menu.addItem(quit)
     }
 
