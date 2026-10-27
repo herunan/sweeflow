@@ -162,15 +162,23 @@ final class HostState {
         }
     }
 
+    /// Dimming lasts one connection at most: a new one (or the last one ending) never finds the
+    /// screen left dark.
+    private func undimForGood() {
+        if settings.config.dimMacScreenWhileStreaming { settings.update { $0.dimMacScreenWhileStreaming = false } }
+    }
+
     func sessionStarted() {
         sessions += 1
         teardown?.cancel()
+        undimForGood()
         apply()
     }
 
     func sessionEnded() {
         sessions = max(0, sessions - 1)
         guard sessions == 0 else { return }
+        undimForGood()
         // Brightness comes back quickly (you may be back at the Mac); the rest after a grace period.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.sessions == 0, self.dimmed else { return }
@@ -237,6 +245,8 @@ final class HostState {
 let host = HostState()
 Wakefulness.resetLidSleep()   // in case a previous run died while streaming
 BuiltInScreen.restore()
+// Started afresh (after a crash, an update): never dimmed from the start.
+if settings.config.dimMacScreenWhileStreaming { settings.update { $0.dimMacScreenWhileStreaming = false } }
 
 let server = Server(identity: identity) { group, queue in Session(group: group, queue: queue) }
 do { try server.start(port: settings.config.port) } catch { log("listen failed: \(error)"); exit(1) }

@@ -15,6 +15,10 @@ enum BuiltInScreen {
     /// Kept on disk so a crash while dimmed still gets the brightness back on the next start.
     static let dimLevel: Float = 0.01
     private static let savedKey = "builtInBrightnessBeforeDim"
+    /// Never brought back dimmer than this.
+    private static let minRestore: Float = 0.5
+    /// The brightness it last had while lit (what a dull reading is replaced with).
+    private static var lastLit: Float = 0.75
 
     private static var builtIn: CGDirectDisplayID? {
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
@@ -117,8 +121,10 @@ enum BuiltInScreen {
         guard let id = builtIn, let get = getBrightness, let set = setBrightness else { return }
         var current: Float = 0
         guard get(id, &current) == 0 else { return }
-        if UserDefaults.standard.object(forKey: savedKey) == nil && current > dimLevel {
-            UserDefaults.standard.set(current, forKey: savedKey)
+        // The brightness to come back to. Only a real one: read while macOS is already bringing a
+        // dimmed screen back up, it would be a dull in-between, and restoring that looks stuck dim.
+        if UserDefaults.standard.object(forKey: savedKey) == nil {
+            UserDefaults.standard.set(current >= minRestore ? current : max(lastLit, minRestore), forKey: savedKey)
         }
         // Not 0: that switches the backlight off, which macOS counts as the display turning off
         // (and the Mac may then lock within seconds).
@@ -131,7 +137,8 @@ enum BuiltInScreen {
     static func restore() -> Bool {
         guard let saved = UserDefaults.standard.object(forKey: savedKey) as? Float else { return true }
         // With the lid closed the screen is offline: the caller tries again later.
-        guard let id = builtIn, let set = setBrightness, set(id, max(saved, 0.1)) == 0 else { return false }
+        guard let id = builtIn, let set = setBrightness, set(id, max(saved, minRestore)) == 0 else { return false }
+        lastLit = max(saved, minRestore)
         UserDefaults.standard.removeObject(forKey: savedKey)
         log(String(format: "built-in screen brightness restored to %.2f", saved))
         return true
