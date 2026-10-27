@@ -76,6 +76,8 @@ struct State {
     placement: crate::placement::Placement,
     /// When Sweeflow was last opened from the app menu (ms since the epoch): the widget pops up.
     show_at: u64,
+    /// The Mac disconnected this computer from its own menu (it refuses until connected there).
+    mac_refused: bool,
 }
 
 static STATE: LazyLock<Mutex<State>> =
@@ -135,6 +137,9 @@ fn refresh() {
 
 pub fn connected(mac: Option<String>) {
     let mut s = STATE.lock().unwrap();
+    if mac.is_some() {
+        s.mac_refused = false;
+    }
     if mac.is_none() {
         s.settings = None;
         s.running.clear();
@@ -596,6 +601,7 @@ pub fn panel_state() -> serde_json::Value {
         "placement": state.placement,
         "pinned": state.pinned,
         "offline": crate::net::offline(),
+        "macRefused": state.mac_refused,
         "showAt": state.show_at,
     })
 }
@@ -714,6 +720,26 @@ fn open_at_login() -> bool {
         .args(["--user", "is-enabled", "--quiet", "sweeflow"])
         .status()
         .is_ok_and(|s| s.success())
+}
+
+pub fn set_mac_refused(on: bool) {
+    let mut s = STATE.lock().unwrap();
+    if s.mac_refused != on {
+        s.mac_refused = on;
+        drop(s);
+        refresh();
+    }
+}
+
+/// The Mac in use forgot this computer (from its menu): forget it here too.
+pub fn mac_forgot_us() {
+    let Ok(cfg) = crate::config::Config::load_or_default() else { return };
+    let name = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint).map(|m| m.name.clone()).unwrap_or_else(|| "The Mac".into());
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=Sweeflow", "--icon=sweeflow", &format!("{name} unlinked this computer"),
+               "It was forgotten on the Mac, so Sweeflow forgot it here too. Link it again from Linked Macs."])
+        .spawn();
+    forget(&cfg.host_fingerprint);
 }
 
 /// What sort of Mac each linked one is ("laptop", "imac", "desktop"), by fingerprint: its icon.

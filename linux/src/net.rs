@@ -582,6 +582,16 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             });
             return Ok(());
         }
+        t::MAC_DISCONNECTED => {
+            log::info!("the Mac disconnected this computer: refused until it connects again");
+            crate::tray::set_mac_refused(true);
+            return Ok(());
+        }
+        t::FORGOTTEN => {
+            log::info!("the Mac forgot this computer: forgetting it too");
+            crate::tray::mac_forgot_us();
+            return Ok(());
+        }
         t::SCREEN_LOCKED => {
             let locked = r.u8()? != 0;
             log::info!("Mac screen {}", if locked { "locked" } else { "unlocked" });

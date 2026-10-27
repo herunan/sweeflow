@@ -52,6 +52,15 @@ final class Session {
     private var clipboardStream: MsgStream?
     private var settingsObserver: NSObjectProtocol?
 
+    /// The Linux computer on the other end (its certificate's fingerprint).
+    var clientFingerprint: String?
+
+    /// Says something and ends the connection (a moment later, so it gets there).
+    func sendAndClose(_ msg: Msg) {
+        control?.send(MsgWriter(msg))
+        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.shutdown() }
+    }
+
     init(group: NWConnectionGroup, queue: DispatchQueue) {
         self.group = group
         self.queue = queue
@@ -86,7 +95,7 @@ final class Session {
     func shutdown() {
         if started {
             started = false
-            DispatchQueue.main.async { host.sessionEnded() }
+            DispatchQueue.main.async { host.client = nil; host.sessionEnded() }
         }
         tracker.stop()
         if let o = screensObserver { NotificationCenter.default.removeObserver(o) }
@@ -123,10 +132,21 @@ final class Session {
             captureScale = (try? m.f32()) ?? 0
             log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
             control = s
+            // Forgotten here: told once, so it forgets this Mac too. Disconnected here: refused.
+            if let fp = clientFingerprint, Identity.forgottenClients().contains(fp) {
+                log("client \(fp.prefix(8)) was forgotten here: telling it")
+                Identity.setForgotten(fp, false)
+                return sendAndClose(.forgotten)
+            }
+            if let fp = clientFingerprint, Identity.disconnectedClients().contains(fp) {
+                log("client \(fp.prefix(8)) was disconnected here: refused")
+                return sendAndClose(.macDisconnected)
+            }
             DebugPort.session = self
             if !started {
                 started = true
-                DispatchQueue.main.async { host.sessionStarted() }
+                let fp = clientFingerprint
+                DispatchQueue.main.async { host.client = fp; host.sessionStarted() }
             }
             let key = ObjectIdentifier(s)
             if let st = streamers.removeValue(forKey: key) { st.stop() }

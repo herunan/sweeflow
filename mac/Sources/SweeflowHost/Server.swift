@@ -71,6 +71,16 @@ final class Server {
     private var listener: NWListener?
     private var session: Session?
     private var groups: [ObjectIdentifier: NWConnectionGroup] = [:]
+    /// The client certificate of the latest handshake (one client connects at a time).
+    private var lastVerified: String?
+
+    /// Ends the connection of that client, if it's the one connected.
+    func drop(_ fingerprint: String, telling msg: Msg) {
+        queue.async { [weak self] in
+            guard let s = self?.session, s.clientFingerprint == fingerprint else { return }
+            s.sendAndClose(msg)
+        }
+    }
     let makeSession: (NWConnectionGroup, DispatchQueue) -> Session
 
     init(identity: Identity, makeSession: @escaping (NWConnectionGroup, DispatchQueue) -> Session) {
@@ -94,14 +104,14 @@ final class Server {
         sec_protocol_options_set_local_identity(sec, identity.secIdentity)
         sec_protocol_options_set_peer_authentication_required(sec, true)
         let authorized = identity.authorizedClients
-        sec_protocol_options_set_verify_block(sec, { _, trust, complete in
+        sec_protocol_options_set_verify_block(sec, { [weak self] _, trust, complete in
             let t = sec_trust_copy_ref(trust).takeRetainedValue()
             guard let chain = SecTrustCopyCertificateChain(t) as? [SecCertificate], let leaf = chain.first else {
                 return complete(false)
             }
             let fp = SHA256.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
             let ok = authorized().contains(fp)
-            if !ok { log("rejected client certificate \(fp)") }
+            if !ok { log("rejected client certificate \(fp)") } else { self?.lastVerified = fp }
             complete(ok)
         }, queue)
 
@@ -121,6 +131,7 @@ final class Server {
         let key = ObjectIdentifier(group)
         groups[key] = group
         let s = makeSession(group, queue)
+        s.clientFingerprint = lastVerified
         group.stateUpdateHandler = { [weak self, weak s] state in
             log("connection: \(state)")
             switch state {
@@ -191,8 +202,9 @@ struct Identity {
         try fp.write(to: dir.appendingPathComponent("fingerprint"), atomically: true, encoding: .utf8)
 
         return Identity(secIdentity: sec_identity_create(secIdent)!, fingerprint: fp, authorizedClients: {
-            // Re-read on every handshake so pairing a new client needs no restart.
-            Set(pairedClients().map(\.fingerprint))
+            // Re-read on every handshake so pairing a new client needs no restart. Forgotten ones
+            // still get in once, to be told (and forget this Mac too).
+            Set(pairedClients().map(\.fingerprint)).union(forgottenClients())
         })
     }
 
@@ -217,6 +229,42 @@ struct Identity {
 
     static func removeClient(_ fingerprint: String) {
         writeClients(pairedClients().filter { $0.fingerprint != fingerprint })
+    }
+
+    static func renameClient(_ fingerprint: String, to name: String) {
+        writeClients(pairedClients().map { $0.fingerprint == fingerprint ? ($0.fingerprint, name) : $0 })
+    }
+
+    /// What a paired client is called here.
+    static func clientName(_ fingerprint: String) -> String {
+        let n = pairedClients().first { $0.fingerprint == fingerprint }?.name ?? ""
+        return n.isEmpty ? "Linux \(PairingCode.of(fingerprint: fingerprint))" : n
+    }
+
+    // Lists of fingerprints, one per line, beside the clients file.
+    private static func list(_ name: String) -> Set<String> {
+        let text = (try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)) ?? ""
+        return Set(text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
+    }
+
+    private static func setList(_ name: String, _ items: Set<String>) {
+        try? (items.sorted().joined(separator: "\n") + "\n").write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    /// Clients disconnected from this Mac's menu: refused until connected again.
+    static func disconnectedClients() -> Set<String> { list("disconnected") }
+    static func setDisconnected(_ fingerprint: String, _ on: Bool) {
+        var s = disconnectedClients()
+        if on { s.insert(fingerprint) } else { s.remove(fingerprint) }
+        setList("disconnected", s)
+    }
+
+    /// Clients forgotten here, still to be told (on their next connection).
+    static func forgottenClients() -> Set<String> { list("forgotten") }
+    static func setForgotten(_ fingerprint: String, _ on: Bool) {
+        var s = forgottenClients()
+        if on { s.insert(fingerprint) } else { s.remove(fingerprint) }
+        setList("forgotten", s)
     }
 
     private static func writeClients(_ all: [(fingerprint: String, name: String)]) {

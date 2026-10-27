@@ -7,6 +7,10 @@ pub const VERSION: u16 = 1;
 pub mod t {
     pub const HELLO: u8 = 0x01;
     pub const WELCOME: u8 = 0x02;
+    /// The Mac disconnected this computer (its menu): refused until connected there again.
+    pub const MAC_DISCONNECTED: u8 = 0x03;
+    /// The Mac forgot this computer: forget it too.
+    pub const FORGOTTEN: u8 = 0x04;
     pub const WINDOW_ADDED: u8 = 0x10;
     pub const WINDOW_CHANGED: u8 = 0x11;
     pub const WINDOW_REMOVED: u8 = 0x12;

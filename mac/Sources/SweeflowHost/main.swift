@@ -148,6 +148,8 @@ final class HostState {
     let wake = Wakefulness()
     private var sessions = 0
     var connected: Bool { sessions > 0 }
+    /// The Linux computer connected now (its certificate's fingerprint). Main thread.
+    var client: String?
     private var teardown: DispatchWorkItem?
 
     private var mutedByUs = false

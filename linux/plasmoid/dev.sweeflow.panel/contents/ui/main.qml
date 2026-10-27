@@ -65,7 +65,8 @@ PlasmoidItem {
         case "stopped": return "Not running";
         case "unpaired": return "No Mac linked yet";
         case "offline": return "Disconnected";
-        case "away": return st.pending ? "Can't reach the Mac · changes wait for it" : "Can't reach the Mac";
+        case "away": return st.macRefused ? "Disconnected on the Mac"
+                          : st.pending ? "Can't reach the Mac · changes wait for it" : "Can't reach the Mac";
         case "streaming": return "Streaming";
         default: return "Paused";
         }
@@ -236,6 +237,8 @@ PlasmoidItem {
                 }
                 // The one thing to do next.
                 PlasmaComponents3.Button {
+                    // Refused by the Mac: nothing to do here (Connect is in the Mac's menu).
+                    visible: !(root.phase === "away" && !!root.st.macRefused)
                     icon.name: ({ stopped: "media-playback-start", unpaired: "list-add", offline: "network-connect",
                                   away: "system-reboot", streaming: "media-playback-pause", paused: "media-playback-start" })[root.phase]
                     text: ({ stopped: "Start", unpaired: "Link a Mac…", offline: "Connect", away: "Wake Mac",
