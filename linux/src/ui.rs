@@ -602,7 +602,12 @@ impl App {
                 self.update_lights(wid, qh);
             }
             UiEvent::MoveStarted(wid) => {
-                if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
+                // Only while the press that started it is still held here. Asked for after the
+                // release (a busy app is slow to say it's being dragged), KWin's move has no
+                // release to end it and keeps the pointer: nothing can be clicked.
+                if self.left_down != Some(wid) {
+                    log::warn!("window {wid}: title-bar drag reported after the button was released: not moved");
+                } else if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
                     if let Role::Toplevel(t) = &w.role {
                         t.move_(seat, self.press_serial);
                     }
