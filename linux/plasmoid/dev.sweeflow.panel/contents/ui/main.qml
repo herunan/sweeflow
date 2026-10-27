@@ -88,7 +88,8 @@ PlasmoidItem {
         onNewData: (source) => disconnectSource(source)
     }
 
-    readonly property string logo: Qt.resolvedUrl("../icons/sweeflow.svg")
+    // Not "sweeflow.svg": a file named like an icon in the theme gets that icon (the app icon).
+    readonly property string logo: Qt.resolvedUrl("../icons/sweeflow-tray.svg")
     // The app icon (violet square): inside the popup. The plain logo is the tray icon.
     readonly property string appIcon: Qt.resolvedUrl("../icons/sweeflow-app.svg")
     Plasmoid.icon: logo
@@ -368,30 +369,30 @@ PlasmoidItem {
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
                         }
                     }
-                    // The Mac's dark or light mode. Two buttons (a dropdown's list would be cut off
-                    // by the popup's edge).
+                    // The Mac's virtual desktop, behind its windows (not the Mac's own appearance).
+                    // Two buttons: a dropdown's list would be cut off by the popup's edge.
                     PlasmaComponents3.ItemDelegate {
                         id: backgroundRow
-                        readonly property bool light: root.settings.appearance === "light"
+                        readonly property bool light: root.settings.backdrop === "light"
                         Layout.fillWidth: true
-                        onClicked: root.set({ appearance: light ? "dark" : "light" })
-                        PlasmaComponents3.ToolTip.text: "The background of Mac windows"
+                        onClicked: root.set({ backdrop: light ? "dark" : "light" })
+                        PlasmaComponents3.ToolTip.text: "The Mac's virtual desktop behind its windows (seen in Troubleshoot)"
                         PlasmaComponents3.ToolTip.visible: hovered
                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                         contentItem: RowLayout {
                             spacing: Kirigami.Units.smallSpacing
-                            PlasmaComponents3.Label { text: "Window background"; elide: Text.ElideRight; Layout.fillWidth: true }
+                            PlasmaComponents3.Label { text: "Desktop background"; elide: Text.ElideRight; Layout.fillWidth: true }
                             PlasmaComponents3.ToolButton {
                                 text: "Dark"
                                 checkable: true
-                                checked: root.settings.appearance === "dark"
-                                onClicked: { root.set({ appearance: "dark" }); checked = Qt.binding(() => root.settings.appearance === "dark"); }
+                                checked: !backgroundRow.light
+                                onClicked: { root.set({ backdrop: "dark" }); checked = Qt.binding(() => !backgroundRow.light); }
                             }
                             PlasmaComponents3.ToolButton {
                                 text: "Light"
                                 checkable: true
                                 checked: backgroundRow.light
-                                onClicked: { root.set({ appearance: "light" }); checked = Qt.binding(() => backgroundRow.light); }
+                                onClicked: { root.set({ backdrop: "light" }); checked = Qt.binding(() => backgroundRow.light); }
                             }
                         }
                     }

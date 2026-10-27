@@ -32,9 +32,9 @@ pub struct Settings {
     /// Mac windows on a desktop of their own (see desktop.rs).
     #[serde(default = "yes")]
     pub desktop: bool,
-    /// Window background: the Mac's dark or light mode ("dark", "light"; "" from older Macs).
+    /// The Mac's virtual desktop, behind its windows: "dark" or "light" ("" from older Macs).
     #[serde(default)]
-    pub appearance: String,
+    pub backdrop: String,
 }
 
 fn yes() -> bool {
@@ -54,7 +54,7 @@ impl Default for Settings {
             launcher: true,
             quality: "sharp".into(),
             desktop: true,
-            appearance: String::new(),
+            backdrop: String::new(),
         }
     }
 }

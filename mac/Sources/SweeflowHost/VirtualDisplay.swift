@@ -32,9 +32,9 @@ final class VirtualDisplay {
         return CGRect(x: b.minX + left, y: b.minY + top, width: b.width - left - right, height: b.height - top - bottom)
     }
 
-    /// A plain backdrop: black in dark mode, white in light mode. Mac windows tint their
-    /// sidebars and toolbars with what's behind them, so a neutral one keeps their colours
-    /// clean. Follows the Mac's appearance; only this invisible display is touched.
+    /// A plain desktop background: black or white, as chosen (Desktop background). Mac windows
+    /// tint their sidebars and toolbars with what's behind them, so a neutral one keeps their
+    /// colours clean. Only this display is touched; the Mac's own appearance is left alone.
     private var appearanceObserver: NSObjectProtocol?
     private var settingsObserver: NSObjectProtocol?
     /// The backdrop itself: a plain window at desktop level covering the display. macOS doesn't
@@ -52,7 +52,7 @@ final class VirtualDisplay {
             }
             return
         }
-        let dark = Appearance.isDark
+        let dark = settings.config.backdrop != "light"
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
         // Old copies of the Linux wallpaper (an earlier version), no longer used.
         for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
