@@ -19,9 +19,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     /// The logo (a template: macOS draws it in the menu bar's colour). Paused or not connected:
-    /// faded, with a small badge saying which (a pause sign, a cross), as on Linux.
+    /// faded, with a small badge saying which, the same as the Linux tray icon's.
     private func updateIcon() {
-        let connected = host.client != nil
+        let connected = host.connected
         let on = settings.config.enabled && connected
         let base = NSImage(named: "MenuIcon")
             ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Sweeflow")
@@ -30,7 +30,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         if base.size.height > 0 {
             base.size = NSSize(width: (16 * base.size.width / base.size.height).rounded(), height: 16)
         }
-        let badge = !connected ? "xmark.circle.fill" : !settings.config.enabled ? "pause.circle.fill" : nil
+        let badge = !connected ? "BadgeDisconnected" : !settings.config.enabled ? "BadgePaused" : nil
         let image = badge.map { Self.badged(base, $0) } ?? base
         image.isTemplate = true
         item.button?.image = image
@@ -38,15 +38,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         item.button?.toolTip = !connected ? "Sweeflow: not connected" : on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
     }
 
-    /// The logo with a small symbol in its bottom-right corner, cut out around it so it reads.
-    private static func badged(_ base: NSImage, _ symbol: String) -> NSImage {
-        guard let sign = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 9, weight: .bold)) else { return base }
+    /// The logo with a badge in its bottom-right corner, half its height (as on Linux), cut out
+    /// around it so it reads.
+    private static func badged(_ base: NSImage, _ name: String) -> NSImage {
+        guard let sign = NSImage(named: name) else { return base }
         return NSImage(size: base.size, flipped: false) { rect in
             base.draw(in: rect)
-            let b = NSRect(x: rect.maxX - 10, y: rect.minY, width: 10, height: 10)
+            let side = rect.height / 2 + 1
+            let b = NSRect(x: rect.maxX - side, y: rect.minY, width: side, height: side)
             NSGraphicsContext.current?.compositingOperation = .destinationOut
-            NSBezierPath(ovalIn: b.insetBy(dx: -1.5, dy: -1.5)).fill()
+            NSBezierPath(roundedRect: b.insetBy(dx: -1, dy: -1), xRadius: 2, yRadius: 2).fill()
             NSGraphicsContext.current?.compositingOperation = .sourceOver
             sign.draw(in: b)
             return true
@@ -54,16 +55,18 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     /// Built when opened, so it always shows the current state. Only what concerns this Mac:
-    /// the connection, the apps, this screen, starting at login, and the Linux computers it's
+    /// the connection, the apps, this screen, starting at login, and the Linux machines it's
     /// linked to. (How Mac apps show up on Linux is set on Linux.)
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let c = settings.config
-        let client = host.client
+        // Connected even before its name is known (a handshake that didn't say who).
+        let client: String? = host.connected ? (host.client ?? "") : nil
         let refused = Identity.disconnectedClients().intersection(Identity.pairedClients().map(\.fingerprint))
         let statusText: String
         if let fp = client {
-            statusText = c.enabled ? "Streaming to \(Identity.clientName(fp))" : "Paused · \(Identity.clientName(fp))"
+            let who = fp.isEmpty ? "Linux machine" : Identity.clientName(fp)
+            statusText = c.enabled ? "Streaming to \(who)" : "Paused · \(who)"
         } else {
             statusText = refused.isEmpty ? "Not connected" : "Disconnected"
         }
@@ -109,10 +112,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(login)
         menu.addItem(.separator())
 
-        let linked = NSMenuItem(title: "Linux computers", action: nil, keyEquivalent: "")
+        let linked = NSMenuItem(title: "Linux machines", action: nil, keyEquivalent: "")
         let list = NSMenu()
-        let link = ClosureMenuItem(title: "Link a Linux computer…") { PairingWindow.shared.show() }
-        link.toolTip = "Shows a code to type on the Linux computer"
+        let link = ClosureMenuItem(title: "Link a Linux machine…") { PairingWindow.shared.show() }
+        link.toolTip = "Shows a code to type on the Linux machine"
         list.addItem(link)
         let paired = Identity.pairedClients()
         if !paired.isEmpty { list.addItem(.separator()) }
@@ -177,7 +180,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// Asks once: linking it again needs a new code. The Linux computer forgets this Mac too
+    /// Asks once: linking it again needs a new code. The Linux machine forgets this Mac too
     /// (now, or the next time it connects).
     private static func confirmForget(_ label: String, _ fingerprint: String) {
         let alert = NSAlert()

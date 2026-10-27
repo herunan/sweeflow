@@ -31,6 +31,31 @@ slint::slint! {
         color: #888;
     }
 
+    // One numbered step: a violet number, a title, a line of detail, and anything else below.
+    component Step inherits HorizontalLayout {
+        in property <string> n;
+        in property <string> title;
+        in property <string> detail;
+        spacing: 12px;
+        alignment: start;
+        VerticalLayout {
+            alignment: start;
+            Rectangle {
+                width: 26px; height: 26px; border-radius: 13px;
+                background: #7c3aed33;
+                Text { text: root.n; color: #a78bfa; font-size: 13px; font-weight: 700;
+                       horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            horizontal-stretch: 1;
+            Text { text: root.title; font-size: 14px; font-weight: 600; wrap: word-wrap; }
+            if root.detail != "": Body { text: root.detail; }
+            @children
+        }
+    }
+
     component Row inherits Rectangle {
         in property <string> name;
         in property <string> detail;
@@ -55,8 +80,8 @@ slint::slint! {
         title: "Add a Mac — Sweeflow";
         icon: @image-url("../../assets/sweeflow-app.svg");
         // A fixed size: a dialog, which tiling window managers leave floating.
-        width: 540px;
-        height: 460px;
+        width: 560px;
+        height: 520px;
 
         in-out property <int> page: 0;
         in property <string> installer-url;
@@ -81,32 +106,46 @@ slint::slint! {
             spacing: 14px;
 
             if page == 0: VerticalLayout {
-                spacing: 14px;
+                spacing: 18px;
                 HorizontalLayout {
                     spacing: 14px;
                     alignment: start;
                     Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 56px; height: 56px; }
-                    Title { text: "Add a Mac"; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Title { text: "Add a Mac"; }
+                        Body { text: "Its apps, as windows here. Three steps on the Mac:"; }
+                    }
                 }
-                Body {
-                    text: installer-url != ""
-                        ? "1.  On your Mac, open this address in Safari and install Sweeflow from it:"
-                        : "1.  Install Sweeflow on your Mac (drag it from Sweeflow.dmg into Applications).";
+                Step {
+                    n: "1";
+                    title: "Get Sweeflow";
+                    detail: installer-url != "" ? "On your Mac, open this address in Safari and download it:" : "Copy Sweeflow.dmg to your Mac.";
+                    if installer-url != "": Rectangle {
+                        height: 40px;
+                        border-radius: 8px;
+                        background: #8881;
+                        Text { text: installer-url; font-size: 17px; font-family: "monospace"; color: #a78bfa;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    if installer-url != "" && !firewall-on: Body { text: "Page won't load? This computer's firewall may be blocking it (port 44130)."; }
+                    if installer-url != "" && firewall-on: HorizontalLayout {
+                        spacing: 8px;
+                        Body { text: firewall-note != "" ? firewall-note : "This computer's firewall blocks the page until you let it through."; vertical-alignment: center; }
+                        if firewall-note == "": Button { text: "Allow through firewall"; clicked => { open-firewall(); } }
+                    }
                 }
-                if installer-url != "": Text {
-                    text: installer-url;
-                    font-size: 18px;
-                    font-family: "monospace";
-                    horizontal-alignment: center;
+                Step {
+                    n: "2";
+                    title: "Install and open it";
+                    detail: "Drag Sweeflow into Applications and open it. If macOS can't check it: System Settings → Privacy & Security → Open Anyway.";
                 }
-                if installer-url != "" && !firewall-on: Body { text: "    Page won't load? This computer's firewall may be blocking it (port 44130)."; }
-                if installer-url != "" && firewall-on: HorizontalLayout {
-                    spacing: 8px;
-                    Body { text: firewall-note != "" ? "    " + firewall-note : "    This computer's firewall blocks the page until you let it through."; }
-                    if firewall-note == "": Button { text: "Allow through firewall"; clicked => { open-firewall(); } }
+                Step {
+                    n: "3";
+                    title: "Allow and link";
+                    detail: "Sweeflow asks for what it needs, then shows a code. Next, you pick the Mac and type it.";
                 }
-                Body { text: "    The first time, macOS asks whether to open it: choose System Settings → Privacy & Security → Open Anyway."; }
-                Body { text: "2.  Open Sweeflow and allow what it asks for. It then shows a code for this computer."; }
                 Rectangle {}
                 HorizontalLayout {
                     alignment: end;
@@ -130,7 +169,7 @@ slint::slint! {
                         for m[i] in macs: Row { name: m.name; detail: m.detail; clicked => { root.pick(i); } }
                     }
                 }
-                Body { text: "Don't see it? On the Mac, choose Sweeflow → Pair with Linux… in the menu bar. Both computers need to be on the same network (a VPN can hide them from each other)."; }
+                Body { text: "Don't see it? On the Mac, choose Sweeflow → Linux machines → Link a Linux machine… in the menu bar. Both need to be on the same network (a VPN can hide them from each other)."; }
                 HorizontalLayout {
                     spacing: 8px;
                     addr := LineEdit { placeholder-text: "Or type the Mac's address"; accepted => { root.manual(self.text); } }

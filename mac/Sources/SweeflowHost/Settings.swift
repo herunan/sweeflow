@@ -2,7 +2,7 @@ import Foundation
 
 extension Notification.Name {
     static let sweeflowSettingsChanged = Notification.Name("sweeflowSettingsChanged")
-    /// A Linux computer connected or went away (HostState.client).
+    /// A Linux machine connected or went away (HostState.client).
     static let sweeflowConnectionChanged = Notification.Name("sweeflowConnectionChanged")
 }
 

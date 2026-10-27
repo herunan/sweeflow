@@ -225,7 +225,7 @@ final class PairingWindow: NSObject, NSWindowDelegate {
         let title = NSTextField(labelWithString: "Pair with Linux")
         title.font = .systemFont(ofSize: 17, weight: .semibold)
         let how = NSTextField(wrappingLabelWithString:
-            "On your Linux computer, open Sweeflow and choose “Add a Mac…”. Pick “\(macName)” and type this code:")
+            "On your Linux machine, open Sweeflow and choose “Add a Mac…”. Pick “\(macName)” and type this code:")
         let code = NSTextField(labelWithString: Pairing.shared.code)
         code.font = .monospacedSystemFont(ofSize: 34, weight: .medium)
         code.isSelectable = true

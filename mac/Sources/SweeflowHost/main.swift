@@ -130,12 +130,10 @@ if ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] != LoginItem.devAgent
 
 let settings = Settings(Config.load())
 
-if !CGPreflightScreenCaptureAccess() {
-    log("requesting Screen Recording permission")
-    CGRequestScreenCaptureAccess()
-}
-let axTrusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
-if !axTrusted { log("Accessibility permission not granted yet — input and window control will not work") }
+// Permissions are asked for in the setup window, one after another (not macOS's prompts all at
+// once at launch).
+if !CGPreflightScreenCaptureAccess() { log("Screen Recording permission not granted yet") }
+if !AXIsProcessTrusted() { log("Accessibility permission not granted yet — input and window control will not work") }
 
 let identity: Identity
 do { identity = try Identity.loadOrCreate() } catch { log("identity: \(error)"); exit(1) }
@@ -146,9 +144,11 @@ log("host fingerprint \(identity.fingerprint)")
 final class HostState {
     let display = VirtualDisplay()
     let wake = Wakefulness()
-    private var sessions = 0
+    private var sessions = 0 {
+        didSet { if (sessions > 0) != (oldValue > 0) { NotificationCenter.default.post(name: .sweeflowConnectionChanged, object: nil) } }
+    }
     var connected: Bool { sessions > 0 }
-    /// The Linux computer connected now (its certificate's fingerprint). Main thread.
+    /// The Linux machine connected now (its certificate's fingerprint). Main thread.
     var client: String? {
         didSet { if client != oldValue { NotificationCenter.default.post(name: .sweeflowConnectionChanged, object: nil) } }
     }

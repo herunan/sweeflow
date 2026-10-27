@@ -211,14 +211,23 @@ struct Identity {
     static let clientsFile = dir.appendingPathComponent("clients")
 
     /// Paired clients, one per line: `<sha256 hex> [name]` (older lines have no name).
+    /// Once each: a machine listed twice (an older setup added it again, without its name)
+    /// keeps the line with its name.
     static func pairedClients() -> [(fingerprint: String, name: String)] {
         let text = (try? String(contentsOf: clientsFile, encoding: .utf8)) ?? ""
-        return text.split(whereSeparator: \.isNewline).compactMap { line in
+        var out: [(fingerprint: String, name: String)] = []
+        for line in text.split(whereSeparator: \.isNewline) {
             let l = line.trimmingCharacters(in: .whitespaces)
-            guard !l.isEmpty, !l.hasPrefix("#") else { return nil }
+            guard !l.isEmpty, !l.hasPrefix("#") else { continue }
             let parts = l.split(separator: " ", maxSplits: 1)
-            return (parts[0].lowercased(), parts.count > 1 ? String(parts[1]) : "")
+            let fp = parts[0].lowercased(), name = parts.count > 1 ? String(parts[1]) : ""
+            if let i = out.firstIndex(where: { $0.fingerprint == fp }) {
+                if out[i].name.isEmpty { out[i].name = name }
+            } else {
+                out.append((fp, name))
+            }
         }
+        return out
     }
 
     static func addClient(_ fingerprint: String, name: String) {

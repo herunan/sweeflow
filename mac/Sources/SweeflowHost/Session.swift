@@ -52,7 +52,7 @@ final class Session {
     private var clipboardStream: MsgStream?
     private var settingsObserver: NSObjectProtocol?
 
-    /// The Linux computer on the other end (its certificate's fingerprint).
+    /// The Linux machine on the other end (its certificate's fingerprint).
     var clientFingerprint: String?
 
     /// Says something and ends the connection (a moment later, so it gets there).

@@ -80,7 +80,8 @@ fn answer(mut conn: TcpStream, dmg: &PathBuf) -> Result<()> {
         )?;
         conn.write_all(&data)?;
     } else {
-        let page = PAGE.as_bytes();
+        let page = PAGE.replace("{ICON}", ICON);
+        let page = page.as_bytes();
         write!(
             conn,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -91,25 +92,46 @@ fn answer(mut conn: TcpStream, dmg: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// The app icon, shown on the page.
+const ICON: &str = include_str!("../../assets/sweeflow-app.svg");
+
 const PAGE: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Install Sweeflow</title>
 <style>
-  body { font: 16px -apple-system, system-ui, sans-serif; max-width: 34em; margin: 4em auto; padding: 0 1em; color: #222; }
-  @media (prefers-color-scheme: dark) { body { background: #1e1e1e; color: #ddd; } }
-  a.button { display: inline-block; margin: 1em 0; padding: .7em 1.4em; border-radius: 8px;
-             background: #0a64d8; color: white; text-decoration: none; font-weight: 600; }
-  ol li { margin: .6em 0; }
+  :root { --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --accent: #7c3aed; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161618; --card: #232326; --text: #f5f5f7; --muted: #a1a1a6; --line: #333338; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  main { width: min(520px, 92vw); padding: 48px 0; text-align: center; }
+  .icon svg { width: 112px; height: 112px; filter: drop-shadow(0 10px 24px rgba(109, 40, 217, .35)); }
+  h1 { font-size: 30px; font-weight: 700; letter-spacing: -.02em; margin: 18px 0 6px; }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+  a.button { display: inline-flex; align-items: center; gap: 8px; padding: 13px 26px; border-radius: 12px;
+             background: linear-gradient(135deg, #a855f7, #6d28d9); color: #fff; text-decoration: none;
+             font-weight: 600; font-size: 16px; box-shadow: 0 6px 18px rgba(109, 40, 217, .35); }
+  a.button:hover { filter: brightness(1.08); }
+  .size { display: block; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  ol { list-style: none; counter-reset: step; padding: 0; margin: 34px 0 0; text-align: left;
+       background: var(--card); border-radius: 16px; border: 1px solid var(--line); overflow: hidden; }
+  li { counter-increment: step; display: grid; grid-template-columns: 34px 1fr; gap: 12px; padding: 16px 20px; }
+  li + li { border-top: 1px solid var(--line); }
+  li::before { content: counter(step); width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center;
+               background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-weight: 700; font-size: 14px; }
+  li b { display: block; }
+  li span { color: var(--muted); font-size: 14px; }
 </style></head>
-<body>
-<h1>Install Sweeflow</h1>
-<p>Sweeflow shows this Mac's apps as windows on your Linux computer.</p>
-<a class="button" href="/Sweeflow.dmg">Download Sweeflow</a>
-<ol>
-  <li>Open the downloaded <b>Sweeflow.dmg</b> and drag <b>Sweeflow</b> into <b>Applications</b>.</li>
-  <li>Open Sweeflow from Applications. macOS says it can't check it: open
-      <b>System Settings → Privacy &amp; Security</b>, scroll down and click <b>Open Anyway</b>.</li>
-  <li>Follow Sweeflow's steps. It then shows a code: type that on your Linux computer.</li>
-</ol>
-</body></html>
+<body><main>
+  <div class="icon">{ICON}</div>
+  <h1>Install Sweeflow</h1>
+  <p class="lead">Your Mac's apps, as windows on your Linux machine.</p>
+  <a class="button" href="/Sweeflow.dmg">Download Sweeflow</a>
+  <span class="size">For macOS 15 or later</span>
+  <ol>
+    <li><div><b>Install it</b><span>Open the downloaded Sweeflow.dmg and drag Sweeflow into Applications.</span></div></li>
+    <li><div><b>Open it</b><span>Open Sweeflow from Applications. If macOS says it can't check it, go to System Settings → Privacy &amp; Security and click Open Anyway.</span></div></li>
+    <li><div><b>Allow and link</b><span>Sweeflow walks you through what it needs, then shows a code. Type that code on your Linux machine.</span></div></li>
+  </ol>
+</main></body></html>
 "#;

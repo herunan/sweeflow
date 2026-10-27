@@ -81,7 +81,7 @@ pub fn setup(target: &str) -> Result<()> {
     let client_fp = config::client_fingerprint()?;
     let script = format!(
         "set -e; d={SUPPORT}; mkdir -p \"$d\"; touch \"$d/clients\"; \
-         grep -qx '{client_fp}' \"$d/clients\" || echo '{client_fp}' >> \"$d/clients\"; \
+         grep -q '^{client_fp}' \"$d/clients\" || echo '{client_fp}' >> \"$d/clients\"; \
          for i in $(seq 1 20); do [ -s \"$d/fingerprint\" ] && break; sleep 0.5; done; cat \"$d/fingerprint\"\n"
     );
     let host_fp = ssh(target, &script)?.trim().to_string();

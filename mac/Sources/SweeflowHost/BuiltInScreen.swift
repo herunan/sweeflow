@@ -116,7 +116,9 @@ enum BuiltInScreen {
         let types: [CGEventType] = [.mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged,
                                     .scrollWheel, .keyDown, .flagsChanged]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
-        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+        // An active tap (it passes everything through): allowed by Accessibility, which Sweeflow
+        // has. A listen-only one would make macOS ask for Input Monitoring as well.
+        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .defaultTap,
                                         eventsOfInterest: mask, callback: { _, type, event, _ in
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 if let t = BuiltInScreen.tap { CGEvent.tapEnable(tap: t, enable: true) }
