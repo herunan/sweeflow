@@ -89,6 +89,8 @@ PlasmoidItem {
     }
 
     readonly property string logo: Qt.resolvedUrl("../icons/sweeflow.svg")
+    // The app icon (violet square): inside the popup. The plain logo is the tray icon.
+    readonly property string appIcon: Qt.resolvedUrl("../icons/sweeflow-app.svg")
     Plasmoid.icon: logo
     Plasmoid.status: running ? PlasmaCore.Types.ActiveStatus : PlasmaCore.Types.PassiveStatus
     toolTipMainText: "Sweeflow"
@@ -199,9 +201,7 @@ PlasmoidItem {
                 anchors.fill: parent
                 spacing: Kirigami.Units.largeSpacing
                 Kirigami.Icon {
-                    source: root.logo
-                    isMask: true
-                    color: Kirigami.Theme.textColor
+                    source: root.appIcon
                     Layout.preferredWidth: Kirigami.Units.iconSizes.medium
                     Layout.preferredHeight: Kirigami.Units.iconSizes.medium
                 }
