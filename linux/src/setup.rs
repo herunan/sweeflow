@@ -229,19 +229,28 @@ const WIDGET_FILES: &[(&str, &str)] = &[
 ];
 
 /// Sweeflow in the app menu: opens it (see `open`). Also how desktops match Sweeflow's own
-/// windows (the wizard, app id "sweeflow") to the logo.
+/// windows (the wizard, app id "sweeflow", by the file's name) to the logo. No StartupWMClass:
+/// with it, Plasma's task manager takes every window of the process (the Mac apps too) for
+/// Sweeflow and shows them all with its logo.
 pub fn write_launcher(home: &std::path::Path) -> Result<()> {
     let apps = home.join(".local/share/applications");
     std::fs::create_dir_all(&apps)?;
     let file = apps.join("sweeflow.desktop");
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=Sweeflow\nGenericName=Mac apps\nComment=Mac apps on this desktop\n\
-         Exec={} open\nIcon=sweeflow\nTerminal=false\nStartupNotify=false\nStartupWMClass=sweeflow\n\
+         Exec={} open\nIcon=sweeflow\nTerminal=false\nStartupNotify=false\n\
          Categories=Network;RemoteAccess;\nKeywords=mac;macos;stream;\n",
         home.join(".local/bin/sweeflow").display()
     );
     if std::fs::read_to_string(&file).ok().as_deref() != Some(entry.as_str()) {
         std::fs::write(file, entry)?;
+    }
+    // The Mac display window (app id "sweeflow-display"): the logo in its title bar and taskbar
+    // entry. Hidden: it's opened from the tray.
+    let display = apps.join(crate::launchers::DISPLAY_ENTRY);
+    let entry = "[Desktop Entry]\nType=Application\nName=Mac display\nIcon=sweeflow\nNoDisplay=true\n";
+    if std::fs::read_to_string(&display).ok().as_deref() != Some(entry) {
+        std::fs::write(display, entry)?;
     }
     Ok(())
 }

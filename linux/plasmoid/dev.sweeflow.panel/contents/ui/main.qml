@@ -1,5 +1,9 @@
-// The Sweeflow tray widget: the client's state over D-Bus (src/panel.rs), shown as a popup with
-// the same layout as the Mac's menu-bar panel (StatusPanel.swift).
+// The Sweeflow tray widget: the client's state over D-Bus (src/panel.rs), shown as a popup.
+//
+// Layout: the header says where things stand and holds every connection control (Pause /
+// Resume, Wake, Connect, Disconnect); below, the apps (a page of their own) and every setting in
+// sections; the footer opens Linked Macs. Settings can always be changed: with the Mac away the
+// client keeps them and applies them once it's back.
 
 import QtQuick
 import QtQuick.Controls as QQC2
@@ -39,23 +43,32 @@ PlasmoidItem {
         const json = props.properties["State"];
         try { return json ? JSON.parse(json) : {}; } catch (e) { return {}; }
     }
+    readonly property bool paired: running && !!st.paired
     readonly property bool connected: running && !!st.connected
-    readonly property var settings: st.settings || null
-    readonly property bool streaming: connected && !!settings && settings.enabled
+    readonly property bool offline: running && !!st.offline
+    // Always there: the Mac's, or (while it's away) the last known with the changes made since.
+    readonly property var settings: st.settings || ({ exclude: [] })
+    readonly property bool streaming: connected && !!settings.enabled
     readonly property string macName: st.mac || "Mac"
     readonly property var placement: st.placement || {}
-    readonly property bool offline: running && !!st.offline
 
     // Opened from the app menu (sweeflow open): pop up.
     readonly property real showAt: st.showAt || 0
     onShowAtChanged: if (showAt > 0 && Math.abs(Date.now() - showAt) < 10000) root.expanded = true
 
+    // One of: stopped, unpaired, offline, away, streaming, paused.
+    readonly property string phase: !running ? "stopped" : !paired ? "unpaired" : offline ? "offline"
+                                  : !connected ? "away" : settings.enabled ? "streaming" : "paused"
+
     readonly property string statusText: {
-        if (!running) return "Sweeflow isn't running";
-        if (!st.paired) return "No Mac paired yet";
-        if (offline) return "Disconnected";
-        if (!connected) return st.resumeWanted ? "Not connected · will stream when it's back" : "Not connected";
-        return streaming ? "Streaming apps" : "Paused";
+        switch (phase) {
+        case "stopped": return "Not running";
+        case "unpaired": return "No Mac linked yet";
+        case "offline": return "Disconnected";
+        case "away": return st.pending ? "Can't reach the Mac · changes wait for it" : "Can't reach the Mac";
+        case "streaming": return "Streaming";
+        default: return "Paused";
+        }
     }
 
     function call(member, args) {
@@ -78,7 +91,7 @@ PlasmoidItem {
     readonly property string logo: Qt.resolvedUrl("../icons/sweeflow.svg")
     Plasmoid.icon: logo
     Plasmoid.status: running ? PlasmaCore.Types.ActiveStatus : PlasmaCore.Types.PassiveStatus
-    toolTipMainText: running && st.paired ? macName : "Sweeflow"
+    toolTipMainText: paired ? macName : "Sweeflow"
     toolTipSubText: statusText
 
     compactRepresentation: MouseArea {
@@ -100,11 +113,77 @@ PlasmoidItem {
         }
     }
 
+    // A section's start: a dividing line, then its title (small capitals, as Plasma's own
+    // applets title their sections).
+    component Section: ColumnLayout {
+        property alias text: title.text
+        spacing: Kirigami.Units.smallSpacing
+        Layout.fillWidth: true
+        Layout.topMargin: Kirigami.Units.largeSpacing
+        Layout.bottomMargin: Kirigami.Units.smallSpacing
+        Kirigami.Separator { Layout.fillWidth: true }
+        PlasmaComponents3.Label {
+            id: title
+            Layout.leftMargin: Kirigami.Units.largeSpacing
+            Layout.topMargin: Kirigami.Units.smallSpacing
+            font.capitalization: Font.AllUppercase
+            font.weight: Font.DemiBold
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+            font.letterSpacing: 0.5
+            opacity: 0.6
+        }
+    }
+
+    // A row that opens something: icon, name, and on the right a note and/or an arrow.
+    component LinkRow: PlasmaComponents3.ItemDelegate {
+        id: link
+        property string iconName
+        property string label
+        property string note
+        property bool arrow: false
+        Layout.fillWidth: true
+        contentItem: RowLayout {
+            spacing: Kirigami.Units.largeSpacing
+            Kirigami.Icon {
+                source: link.iconName
+                Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
+                Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+            }
+            PlasmaComponents3.Label { text: link.label; elide: Text.ElideRight; Layout.fillWidth: true }
+            PlasmaComponents3.Label { visible: link.note !== ""; text: link.note; opacity: 0.6 }
+            Kirigami.Icon {
+                visible: link.arrow
+                source: "go-next-symbolic"
+                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+            }
+        }
+    }
+
+    // A sub-page's title bar: back, the title, and room for more on the right.
+    component PageBar: RowLayout {
+        id: bar
+        default property alias extra: more.data
+        property string title
+        signal back()
+        Layout.fillWidth: true
+        Layout.margins: Kirigami.Units.smallSpacing
+        PlasmaComponents3.ToolButton {
+            icon.name: "go-previous-symbolic"
+            onClicked: bar.back()
+            PlasmaComponents3.ToolTip.text: "Back"
+            PlasmaComponents3.ToolTip.visible: hovered
+        }
+        Kirigami.Heading { level: 4; text: bar.title }
+        RowLayout { id: more; Layout.fillWidth: true }
+    }
+
     fullRepresentation: PlasmaExtras.Representation {
-        Layout.preferredWidth: Kirigami.Units.gridUnit * 22
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 30
+        Layout.preferredWidth: Kirigami.Units.gridUnit * 24
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 32
         collapseMarginsHint: true
 
+        // Where things stand, and what can be done about it.
         header: PlasmaExtras.PlasmoidHeading {
             RowLayout {
                 anchors.fill: parent
@@ -119,7 +198,7 @@ PlasmoidItem {
                     Layout.fillWidth: true
                     Kirigami.Heading {
                         level: 4
-                        text: root.running && !!root.st.paired ? root.macName : "Sweeflow"
+                        text: root.paired ? root.macName : "Sweeflow"
                         elide: Text.ElideRight
                         Layout.fillWidth: true
                     }
@@ -129,8 +208,8 @@ PlasmoidItem {
                             width: Kirigami.Units.smallSpacing * 2
                             height: width
                             radius: width / 2
-                            color: root.streaming ? Kirigami.Theme.positiveTextColor
-                                 : root.connected ? Kirigami.Theme.neutralTextColor
+                            color: root.phase === "streaming" ? Kirigami.Theme.positiveTextColor
+                                 : root.phase === "paused" ? Kirigami.Theme.neutralTextColor
                                  : Kirigami.Theme.disabledTextColor
                         }
                         PlasmaComponents3.Label {
@@ -142,29 +221,29 @@ PlasmoidItem {
                         }
                     }
                 }
+                // The one thing to do next.
                 PlasmaComponents3.Button {
-                    visible: root.offline
-                    text: "Connect"
-                    onClicked: root.act("connect")
-                }
-                PlasmaComponents3.Button {
-                    visible: root.running && !!root.st.paired && !root.offline
-                    text: !root.connected ? (!!root.st.resumeWanted ? "Cancel" : "Wake Mac")
-                        : root.streaming ? "Pause" : "Resume"
+                    icon.name: ({ stopped: "media-playback-start", unpaired: "list-add", offline: "network-connect",
+                                  away: "system-reboot", streaming: "media-playback-pause", paused: "media-playback-start" })[root.phase]
+                    text: ({ stopped: "Start", unpaired: "Link a Mac…", offline: "Connect", away: "Wake Mac",
+                             streaming: "Pause", paused: "Resume" })[root.phase]
                     onClicked: {
-                        if (root.connected) root.set({ enabled: !root.streaming });
-                        else root.set({ enabled: !root.st.resumeWanted });
+                        switch (root.phase) {
+                        case "stopped": shell.connectSource("systemctl --user start sweeflow"); break;
+                        case "unpaired": root.act("pair"); break;
+                        case "offline": root.act("connect"); break;
+                        case "away": root.act("wake"); break;
+                        default: root.set({ enabled: !root.streaming });
+                        }
                     }
                 }
+                // Stops connecting (the Mac's windows close here) without unlinking it.
                 PlasmaComponents3.Button {
-                    visible: !root.running
-                    text: "Start"
-                    onClicked: shell.connectSource("systemctl --user start sweeflow")
-                }
-                PlasmaComponents3.Button {
-                    visible: root.running && !root.st.paired
-                    text: "Link a Mac…"
-                    onClicked: root.act("pair")
+                    visible: ["away", "streaming", "paused"].includes(root.phase)
+                    icon.name: "network-disconnect"
+                    text: "Disconnect"
+                    flat: true
+                    onClicked: root.act("disconnect")
                 }
             }
         }
@@ -175,29 +254,24 @@ PlasmoidItem {
             RowLayout {
                 anchors.fill: parent
                 PlasmaComponents3.ToolButton {
+                    icon.name: "computer-laptop"
                     text: "Linked Macs"
                     enabled: stack.visible
                     onClicked: { stack.pop(null); stack.push(macsPage); }
                 }
                 Item { Layout.fillWidth: true }
                 PlasmaComponents3.ToolButton {
-                    // Stops connecting (the Mac's windows close here) without forgetting it.
-                    visible: !!root.st.paired
-                    text: root.offline ? "Connect" : "Disconnect"
-                    onClicked: root.act(root.offline ? "connect" : "disconnect")
-                }
-                PlasmaComponents3.ToolButton {
+                    icon.name: "application-exit"
                     text: "Quit Sweeflow"
                     onClicked: root.act("quit")
                 }
             }
         }
 
-        // Main page: switches. "Apps ›" springs out a second page with the full list.
         QQC2.StackView {
             id: stack
             anchors.fill: parent
-            visible: root.running && !!root.st.paired
+            visible: root.paired
             initialItem: mainPage
         }
         Connections {
@@ -207,6 +281,7 @@ PlasmoidItem {
             function onExpandedChanged() { if (!root.expanded) stack.pop(null); else root.act("placement"); }
         }
 
+        // Main page: the apps (a page of their own), then every setting, in sections.
         Component {
             id: mainPage
             PlasmaComponents3.ScrollView {
@@ -214,87 +289,29 @@ PlasmoidItem {
                 ColumnLayout {
                     width: parent.width
                     spacing: 0
-                    enabled: !!root.settings
 
-                    PlasmaComponents3.ItemDelegate {
-                        Layout.fillWidth: true
-                        enabled: root.streaming
+                    LinkRow {
+                        readonly property var apps: root.st.apps || []
+                        readonly property int open: apps.filter(a => a.state > 0).length
+                        iconName: "view-app-grid-symbolic"
+                        label: "Apps"
+                        note: apps.length ? apps.length + (apps.length === 1 ? " app" : " apps") + " · " + open + " running" : ""
+                        arrow: true
                         onClicked: stack.push(appsPage)
-                        contentItem: RowLayout {
-                            spacing: Kirigami.Units.largeSpacing
-                            PlasmaComponents3.Label { text: "Apps"; Layout.fillWidth: true }
-                            PlasmaComponents3.Label {
-                                readonly property int total: (root.st.apps || []).length
-                                readonly property int hidden: root.settings ? root.settings.exclude.length : 0
-                                readonly property int running: (root.st.apps || []).filter(a => a.state > 0).length
-                                text: (running ? running + " running · " : "") + (hidden ? (total - hidden) + " of " + total : "All " + total)
-                                opacity: 0.6
-                            }
-                            PlasmaComponents3.Label { text: "›"; opacity: 0.6 }
-                        }
                     }
 
-                    PlasmaComponents3.ItemDelegate {
-                        Layout.fillWidth: true
-                        enabled: root.streaming
-                        onClicked: { root.act("display"); root.expanded = false; }
-                        contentItem: PlasmaComponents3.Label { text: "Show Mac display" }
-                    }
-
-                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
-
-                    Kirigami.Heading {
-                        level: 5
-                        text: "Streaming"
-                        opacity: 0.7
-                        Layout.leftMargin: Kirigami.Units.largeSpacing
-                        Layout.bottomMargin: Kirigami.Units.smallSpacing
-                    }
-                    Repeater {
-                        model: [
-                            { key: "sound", label: "Play Mac sound" },
-                            { key: "clipboard", label: "Shared clipboard" },
-                            { key: "dragDrop", label: "Drag and drop files" },
-                            { key: "dim", label: "Dim Mac screen" },
-                            { key: "sharp", label: "High quality" },
-                        ]
-                        delegate: ToggleRow {
-                            required property var modelData
-                            label: modelData.label
-                            on: !!root.settings && (modelData.key === "sharp" ? root.settings.quality !== "light" : !!root.settings[modelData.key])
-                            enabled: root.streaming
-                            onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
-                        }
-                    }
+                    Section { text: "Where Mac apps appear" }
                     ToggleRow {
-                        label: "Open at login"
-                        on: !!root.st.openAtLogin
-                        onFlipped: (v) => root.act("login", v ? "on" : "off")
-                    }
-
-
-                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.smallSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
-
-                    // Mac apps: where they show up (the KDE ones only on Plasma).
-                    Kirigami.Heading {
-                        level: 5
-                        text: "Mac apps"
-                        opacity: 0.7
-                        Layout.leftMargin: Kirigami.Units.largeSpacing
-                        Layout.bottomMargin: Kirigami.Units.smallSpacing
-                    }
-                    ToggleRow {
-                        label: "Mac windows in own desktop"
-                        on: !!root.settings && root.settings.desktop
-                        enabled: !!root.settings
+                        label: "Their own desktop"
+                        on: !!root.settings.desktop
                         onFlipped: (v) => root.set({ desktop: v })
-                        actionText: "Gather"
+                        actionText: root.connected ? "Gather" : ""
                         actionTip: "Bring every Mac window back to the Mac desktop"
                         onExtraClicked: root.act("gather")
                     }
                     ToggleRow {
                         visible: !!root.placement.plasma
-                        label: "Mac apps in Task Manager"
+                        label: "Task Manager"
                         on: !!root.placement.taskbar
                         onFlipped: (v) => root.act("taskbar", v ? "on" : "off")
                     }
@@ -311,11 +328,35 @@ PlasmoidItem {
                         onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
                     }
                     ToggleRow {
-                        label: "Mac apps in Linux menu"
-                        on: !!root.settings && root.settings.launcher
-                        enabled: !!root.settings
+                        label: "Application launcher"
+                        on: !!root.settings.launcher
                         onFlipped: (v) => root.set({ launcher: v })
                     }
+
+                    Section { text: "Streaming" }
+                    Repeater {
+                        model: [
+                            { key: "sound", label: "Play Mac sound here" },
+                            { key: "clipboard", label: "Shared clipboard" },
+                            { key: "dragDrop", label: "Drag and drop files" },
+                            { key: "dim", label: "Dim the Mac's screen" },
+                            { key: "sharp", label: "High quality" },
+                        ]
+                        delegate: ToggleRow {
+                            required property var modelData
+                            label: modelData.label
+                            on: modelData.key === "sharp" ? root.settings.quality !== "light" : !!root.settings[modelData.key]
+                            onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
+                        }
+                    }
+
+                    Section { text: "General" }
+                    ToggleRow {
+                        label: "Open at login"
+                        on: !!root.st.openAtLogin
+                        onFlipped: (v) => root.act("login", v ? "on" : "off")
+                    }
+                    Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                 }
             }
         }
@@ -324,15 +365,12 @@ PlasmoidItem {
             id: macsPage
             ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.margins: Kirigami.Units.smallSpacing
+                PageBar {
+                    title: "Linked Macs"
+                    onBack: stack.pop()
+                    Item { Layout.fillWidth: true }
                     PlasmaComponents3.ToolButton {
-                        text: "‹ Back"
-                        onClicked: stack.pop()
-                    }
-                    Kirigami.Heading { level: 4; text: "Linked Macs"; Layout.fillWidth: true }
-                    PlasmaComponents3.ToolButton {
+                        icon.name: "list-add"
                         text: "Link a Mac…"
                         onClicked: root.act("pair")
                     }
@@ -348,6 +386,9 @@ PlasmoidItem {
                             width: ListView.view.width
                             name: modelData.name
                             active: modelData.active
+                            logo: root.logo
+                            canShowDisplay: root.streaming
+                            onShowDisplay: { root.act("display"); root.expanded = false; }
                             onActivated: root.act("switch", modelData.fingerprint)
                             onRenamed: (n) => root.rename(modelData.fingerprint, n)
                             onForgotten: root.act("forget", modelData.fingerprint)
@@ -361,14 +402,9 @@ PlasmoidItem {
             id: appsPage
             ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.margins: Kirigami.Units.smallSpacing
-                    PlasmaComponents3.ToolButton {
-                        text: "‹ Back"
-                        onClicked: stack.pop()
-                    }
-                    Kirigami.Heading { level: 4; text: "Apps" }
+                PageBar {
+                    title: "Apps"
+                    onBack: stack.pop()
                     PlasmaExtras.SearchField {
                         id: search
                         Layout.fillWidth: true
@@ -387,7 +423,7 @@ PlasmoidItem {
                             id: appRow
                             required property var modelData
                             required property int index
-                            readonly property bool shown: !!root.settings && !root.settings.exclude.includes(modelData.id)
+                            readonly property bool shown: !(root.settings.exclude || []).includes(modelData.id)
                             function group(a) { return a.pinned ? "Pinned" : a.state > 0 ? "Running" : "Not running"; }
                             readonly property bool firstOfGroup: index === 0 || group(appList.model[index - 1]) !== group(modelData)
                             width: ListView.view.width
@@ -401,55 +437,51 @@ PlasmoidItem {
                                 Layout.topMargin: appRow.index === 0 ? 0 : Kirigami.Units.largeSpacing
                                 Layout.bottomMargin: Kirigami.Units.smallSpacing
                             }
-                        PlasmaComponents3.ItemDelegate {
-                            Layout.fillWidth: true
-                            onClicked: root.act("launch", appRow.modelData.id)
-                            contentItem: RowLayout {
-                                spacing: Kirigami.Units.largeSpacing
-                                Kirigami.Icon {
-                                    source: appRow.modelData.icon || "application-x-executable"
-                                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
-                                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
-                                }
-                                ColumnLayout {
-                                    spacing: 0
-                                    Layout.fillWidth: true
-                                    PlasmaComponents3.Label { text: appRow.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true }
-                                    PlasmaComponents3.Label {
-                                        visible: appRow.modelData.state > 0 || appRow.modelData.pinned
-                                        text: ["Not running", "Running, no window", "Minimised", "Open"][appRow.modelData.state] || ""
-                                        font: Kirigami.Theme.smallFont
-                                        color: appRow.modelData.state === 3 ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.textColor
-                                        opacity: appRow.modelData.state === 3 ? 0.9 : 0.6
+                            // Click to open it; the switch says whether its windows come here.
+                            PlasmaComponents3.ItemDelegate {
+                                Layout.fillWidth: true
+                                onClicked: root.act("launch", appRow.modelData.id)
+                                contentItem: RowLayout {
+                                    spacing: Kirigami.Units.largeSpacing
+                                    Kirigami.Icon {
+                                        source: appRow.modelData.icon || "application-x-executable"
+                                        Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                                        Layout.preferredHeight: Kirigami.Units.iconSizes.medium
                                     }
-                                }
-                                PlasmaComponents3.ToolButton {
-                                    visible: appRow.modelData.state > 0
-                                    text: "Quit"
-                                    onClicked: root.act("quit-app", appRow.modelData.id)
-                                    PlasmaComponents3.ToolTip.text: "Quit " + appRow.modelData.name + " on the Mac"
-                                    PlasmaComponents3.ToolTip.visible: hovered
-                                    PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
-                                }
-                                PlasmaComponents3.ToolButton {
-                                    text: appRow.modelData.pinned ? "Unpin" : "Pin"
-                                    opacity: appRow.modelData.pinned || hovered ? 1 : 0.35
-                                    onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
-                                    PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin" : "Pin (first here and kept in the Mac Dock)"
-                                    PlasmaComponents3.ToolTip.visible: hovered
-                                    PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
-                                }
-                                PlasmaComponents3.Switch {
-                                    checked: appRow.shown
-                                    onToggled: {
-                                        const exclude = root.settings.exclude.filter(b => b !== appRow.modelData.id);
-                                        if (!checked) exclude.push(appRow.modelData.id);
-                                        root.set({ exclude: exclude });
-                                        checked = Qt.binding(() => appRow.shown);
+                                    PlasmaComponents3.Label { text: appRow.modelData.name; elide: Text.ElideRight; Layout.fillWidth: true }
+                                    PlasmaComponents3.ToolButton {
+                                        visible: appRow.modelData.state > 0
+                                        text: "Quit"
+                                        onClicked: root.act("quit-app", appRow.modelData.id)
+                                    }
+                                    PlasmaComponents3.ToolButton {
+                                        icon.name: appRow.modelData.pinned ? "window-unpin" : "window-pin"
+                                        opacity: appRow.modelData.pinned || hovered ? 1 : 0.35
+                                        onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
+                                        PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin" : "First here, and kept in the Mac Dock"
+                                        PlasmaComponents3.ToolTip.visible: hovered
+                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                    }
+                                    PlasmaComponents3.Switch {
+                                        checked: appRow.shown
+                                        onToggled: {
+                                            const exclude = (root.settings.exclude || []).filter(b => b !== appRow.modelData.id);
+                                            if (!checked) exclude.push(appRow.modelData.id);
+                                            root.set({ exclude: exclude });
+                                            checked = Qt.binding(() => appRow.shown);
+                                        }
+                                        PlasmaComponents3.ToolTip.text: appRow.shown ? "Its windows come here" : "Its windows stay on the Mac"
+                                        PlasmaComponents3.ToolTip.visible: hovered
+                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
                                 }
                             }
                         }
+                        PlasmaExtras.PlaceholderMessage {
+                            anchors.centerIn: parent
+                            width: parent.width - Kirigami.Units.gridUnit * 4
+                            visible: appList.count === 0
+                            text: search.text !== "" ? "No matching apps" : "The Mac's apps show here once it has connected"
                         }
                     }
                 }
@@ -459,9 +491,10 @@ PlasmoidItem {
         PlasmaExtras.PlaceholderMessage {
             anchors.centerIn: parent
             width: parent.width - Kirigami.Units.gridUnit * 4
-            visible: !root.running || !root.st.paired
-            text: !root.running ? "Sweeflow isn't running" : "No Mac paired yet"
-            explanation: !root.running ? "Start it to see your Mac's apps here." : "Add a Mac to stream its apps to this desktop."
+            visible: !root.paired
+            iconName: "sweeflow"
+            text: !root.running ? "Sweeflow isn't running" : "No Mac linked yet"
+            explanation: !root.running ? "Start it to see your Mac's apps here." : "Link a Mac to stream its apps to this desktop."
         }
     }
 }

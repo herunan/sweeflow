@@ -1,6 +1,6 @@
 import AppKit
 
-/// The menu-bar item: the same switches as the Linux tray menu (see Settings).
+/// The menu-bar item: the same switches, in the same order, as the Linux tray widget (see Settings).
 final class StatusMenu: NSObject, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let menu = NSMenu()
@@ -25,14 +25,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         item.button?.appearsDisabled = !on
     }
 
-    /// Built when opened, so it always shows the current state.
+    /// Built when opened, so it always shows the current state. Laid out like the Linux tray
+    /// widget: where things stand and Pause / Resume first, then the apps, then the settings in
+    /// sections. Nothing is greyed out: settings changed while paused apply when streaming resumes.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let c = settings.config
-        let status = NSMenuItem(title: host.connected ? "Linux connected" : "No Linux connected", action: nil, keyEquivalent: "")
+        let status = NSMenuItem(title: !host.connected ? "No Linux computer connected" : c.enabled ? "Streaming to Linux" : "Paused",
+                                action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
-        menu.addItem(toggle("Stream to Linux", c.enabled) { $0.enabled.toggle() })
+        menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
         menu.addItem(.separator())
 
         let apps = NSMenuItem(title: "Apps", action: nil, keyEquivalent: "")
@@ -47,45 +50,43 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             sub.addItem(i)
         }
         apps.submenu = sub
-        apps.isEnabled = c.enabled
         menu.addItem(apps)
-        menu.addItem(.separator())
 
-        for (title, on, change) in [
-            ("Mac Sound on Linux", c.soundOnLinux, { (c: inout Config) in c.soundOnLinux.toggle() }),
-            ("Dim Mac Screen", c.dimMacScreenWhileStreaming, { (c: inout Config) in c.dimMacScreenWhileStreaming.toggle() }),
-            ("Shared Clipboard", c.clipboard, { (c: inout Config) in c.clipboard.toggle() }),
-            ("Drag and Drop", c.dragDrop, { (c: inout Config) in c.dragDrop.toggle() }),
-            ("Mac Apps in Linux Menu", c.launcherMenu, { (c: inout Config) in c.launcherMenu.toggle() }),
-            ("Mac Apps on Own Linux Desktop", c.ownDesktop, { (c: inout Config) in c.ownDesktop.toggle() }),
-        ] as [(String, Bool, (inout Config) -> Void)] {
-            let i = toggle(title, on, change)
-            i.isEnabled = c.enabled
-            menu.addItem(i)
-        }
+        menu.addItem(.sectionHeader(title: "Where Mac Apps Appear"))
+        menu.addItem(toggle("Their Own Desktop", c.ownDesktop) { $0.ownDesktop.toggle() })
+        menu.addItem(toggle("Application Launcher", c.launcherMenu) { $0.launcherMenu.toggle() })
 
-        let quality = NSMenuItem(title: "Quality", action: nil, keyEquivalent: "")
-        let q = NSMenu()
-        for (title, value) in [("Sharpest", "sharp"), ("Lighter (for slower networks)", "light")] {
-            q.addItem(toggle(title, c.quality == value) { $0.quality = value })
-        }
-        quality.submenu = q
-        quality.isEnabled = c.enabled
-        menu.addItem(quality)
-        menu.addItem(.separator())
+        menu.addItem(.sectionHeader(title: "Streaming"))
+        menu.addItem(toggle("Play Mac Sound on Linux", c.soundOnLinux) { $0.soundOnLinux.toggle() })
+        menu.addItem(toggle("Shared Clipboard", c.clipboard) { $0.clipboard.toggle() })
+        menu.addItem(toggle("Drag and Drop Files", c.dragDrop) { $0.dragDrop.toggle() })
+        menu.addItem(toggle("Dim This Screen", c.dimMacScreenWhileStreaming) { $0.dimMacScreenWhileStreaming.toggle() })
+        menu.addItem(toggle("High Quality", c.quality != "light") { $0.quality = $0.quality == "light" ? "sharp" : "light" })
 
-        menu.addItem(ClosureMenuItem(title: "Pair with Linux…") { PairingWindow.shared.show() })
-        menu.addItem(ClosureMenuItem(title: "Setup…") { Onboarding.shared.show() })
-        let paired = Identity.pairedClients()
-        let pairedItem = NSMenuItem(title: "Paired Computers", action: nil, keyEquivalent: "")
-        let ps = NSMenu()
-        for p in paired {
+        menu.addItem(.sectionHeader(title: "Linked Computers"))
+        for p in Identity.pairedClients() {
             let label = p.name.isEmpty ? "Linux \(PairingCode.of(fingerprint: p.fingerprint))" : p.name
-            ps.addItem(ClosureMenuItem(title: "Forget \(label)") { Identity.removeClient(p.fingerprint) })
+            let computer = NSMenuItem(title: label, action: nil, keyEquivalent: "")
+            let options = NSMenu()
+            options.addItem(ClosureMenuItem(title: "Forget…") { Self.confirmForget(label, p.fingerprint) })
+            computer.submenu = options
+            menu.addItem(computer)
         }
-        pairedItem.submenu = ps
-        pairedItem.isEnabled = !paired.isEmpty
-        menu.addItem(pairedItem)
+        menu.addItem(ClosureMenuItem(title: "Link Another Computer…") { PairingWindow.shared.show() })
+
+        menu.addItem(.sectionHeader(title: "General"))
+        menu.addItem(ClosureMenuItem(title: "Setup…") { Onboarding.shared.show() })
+    }
+
+    /// Asks once: linking it again needs a new code.
+    private static func confirmForget(_ label: String, _ fingerprint: String) {
+        let alert = NSAlert()
+        alert.messageText = "Forget \(label)?"
+        alert.informativeText = "Linking it again needs a new code."
+        alert.addButton(withTitle: "Forget")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { Identity.removeClient(fingerprint) }
     }
 
     private func toggle(_ title: String, _ on: Bool, _ change: @escaping (inout Config) -> Void) -> NSMenuItem {

@@ -1,4 +1,5 @@
-// A linked Mac: click to stream from it; Rename edits the name in place; Forget unlinks it (asks once).
+// A linked Mac: "Use" streams from it instead; the overflow menu streams its whole display (the
+// Mac in use), renames it (in place) or forgets it (asks once).
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
@@ -13,8 +14,14 @@ PlasmaComponents3.ItemDelegate {
     signal activated()
     signal renamed(string name)
     signal forgotten()
+    signal showDisplay()
+    /// The Mac in use is streaming: its whole display can be shown in a window.
+    property bool canShowDisplay: false
+    property string logo
 
-    onClicked: if (!editing && !active) activated()
+    // Nothing happens on a stray click: switching Macs is the "Use" button.
+    hoverEnabled: false
+    down: false
 
     function finishEdit() {
         if (editing && field.text.trim() !== "" && field.text !== name) renamed(field.text);
@@ -23,10 +30,16 @@ PlasmaComponents3.ItemDelegate {
 
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing
+        Kirigami.Icon {
+            source: "computer-laptop"
+            Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+            Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+        }
         PlasmaComponents3.Label {
             visible: !row.editing
-            text: row.name
-            font.bold: row.active
+            text: row.confirming ? "Forget " + row.name + "? Linking it again needs a new code." : row.name
+            font.bold: row.active && !row.confirming
+            wrapMode: row.confirming ? Text.Wrap : Text.NoWrap
             elide: Text.ElideRight
             Layout.fillWidth: true
         }
@@ -40,26 +53,65 @@ PlasmaComponents3.ItemDelegate {
         }
         PlasmaComponents3.Label {
             visible: row.active && !row.editing && !row.confirming
-            text: "Current"
+            text: "In use"
             opacity: 0.6
         }
         PlasmaComponents3.ToolButton {
-            visible: !row.confirming
-            text: row.editing ? "Save" : "Rename"
-            onClicked: {
-                if (row.editing) { row.finishEdit(); return; }
-                field.text = row.name;
-                row.editing = true;
-                field.forceActiveFocus();
-                field.selectAll();
-            }
+            visible: !row.active && !row.editing && !row.confirming
+            text: "Use"
+            onClicked: row.activated()
         }
         PlasmaComponents3.ToolButton {
-            visible: !row.editing
-            text: row.confirming ? "Really forget?" : "Forget"
-            onClicked: row.confirming ? row.forgotten() : (row.confirming = true)
-            PlasmaComponents3.ToolTip.text: "Unlink this Mac (pairing again needs a code)"
+            visible: row.editing
+            icon.name: "dialog-ok-apply"
+            text: "Save"
+            onClicked: row.finishEdit()
+        }
+        PlasmaComponents3.ToolButton {
+            visible: row.confirming
+            icon.name: "edit-delete-remove"
+            text: "Forget"
+            onClicked: { row.confirming = false; row.forgotten(); }
+        }
+        PlasmaComponents3.ToolButton {
+            visible: row.confirming
+            text: "Cancel"
+            onClicked: row.confirming = false
+        }
+        PlasmaComponents3.ToolButton {
+            id: more
+            visible: !row.editing && !row.confirming
+            icon.name: "overflow-menu"
+            PlasmaComponents3.ToolTip.text: "More"
             PlasmaComponents3.ToolTip.visible: hovered
+            onClicked: menu.popup(more, 0, more.height)
+            PlasmaComponents3.Menu {
+                id: menu
+                // The whole Mac screen in a window: to see what's going on there.
+                PlasmaComponents3.MenuItem {
+                    visible: row.active
+                    height: visible ? implicitHeight : 0
+                    enabled: row.canShowDisplay
+                    icon.source: row.logo
+                    text: "Stream display"
+                    onTriggered: row.showDisplay()
+                }
+                PlasmaComponents3.MenuItem {
+                    icon.name: "document-edit"
+                    text: "Rename"
+                    onTriggered: {
+                        field.text = row.name;
+                        row.editing = true;
+                        field.forceActiveFocus();
+                        field.selectAll();
+                    }
+                }
+                PlasmaComponents3.MenuItem {
+                    icon.name: "edit-delete-remove"
+                    text: "Forget…"
+                    onTriggered: row.confirming = true
+                }
+            }
         }
     }
 }

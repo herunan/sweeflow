@@ -15,6 +15,9 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
 }
 
+/// The Mac display window's entry (see setup::write_launcher), kept when Mac apps' go.
+pub const DISPLAY_ENTRY: &str = "sweeflow-display.desktop";
+
 /// Where a Mac app's icon is saved (as PNG).
 pub fn icon_path(bundle_id: &str) -> PathBuf {
     data_dir().join(format!("sweeflow/icons/{bundle_id}.png"))
@@ -28,7 +31,7 @@ pub fn sync(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
     fs::create_dir_all(&icon_dir)?;
     write_menu()?;
     let exe = std::env::current_exe()?;
-    let mut keep = std::collections::HashSet::new();
+    let mut keep = std::collections::HashSet::from([DISPLAY_ENTRY.to_string()]);
     for (bid, name, png) in apps {
         // Bundle ids are reverse-DNS, safe for file names; guard anyway.
         if bid.is_empty() || bid.contains('/') {

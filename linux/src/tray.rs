@@ -38,6 +38,23 @@ fn yes() -> bool {
     true
 }
 
+impl Default for Settings {
+    /// The Mac's defaults (Config in main.swift): shown before it has ever been reached.
+    fn default() -> Self {
+        Settings {
+            enabled: true,
+            exclude: Vec::new(),
+            sound: true,
+            dim: true,
+            clipboard: true,
+            drag_drop: true,
+            launcher: true,
+            quality: "sharp".into(),
+            desktop: true,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// The Mac's name while connected.
@@ -48,10 +65,11 @@ struct State {
     apps: Vec<(String, String)>,
     /// Running Mac apps: 3 = a window shown here, 2 = only minimised ones, 1 = no window.
     running: std::collections::HashMap<String, u8>,
-    /// "Stream Mac apps" was ticked while the Mac was unreachable: switch it on when it's back.
-    resume_wanted: bool,
-    /// The settings as last seen from the Mac, shown (read-only) while it's away.
+    /// The settings as last seen from the Mac.
     last: Option<Settings>,
+    /// Settings changed while the Mac was away (only those that differ from `last`): shown over
+    /// them, and sent once it's back.
+    pending: serde_json::Map<String, serde_json::Value>,
     /// Pinned Mac apps (bundle ids, in order): first in the tray's Apps page, kept in the Dock.
     pinned: Vec<String>,
     /// Where Mac apps show up (task manager, Mac Dock, Global Menu), as last looked at.
@@ -61,7 +79,15 @@ struct State {
 }
 
 static STATE: LazyLock<Mutex<State>> =
-    LazyLock::new(|| Mutex::new(State { last: load_last(), pinned: load_pinned(), ..Default::default() }));
+    LazyLock::new(|| {
+        Mutex::new(State {
+            last: load_last(),
+            pending: load_pending(),
+            pinned: load_pinned(),
+            apps: load_apps(),
+            ..Default::default()
+        })
+    });
 /// Wakes the tray's thread to redraw (its blocking handle can't be used from async code).
 static REFRESH: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 static NET: OnceLock<UnboundedSender<NetCmd>> = OnceLock::new();
@@ -120,8 +146,22 @@ pub fn connected(mac: Option<String>) {
 
 pub fn set_settings(json: &[u8]) {
     match serde_json::from_slice::<Settings>(json) {
-        Ok(new) => {
+        Ok(mut new) => {
             log::info!("settings: {new:?}");
+            // Changed here while the Mac was away: those win, and go to the Mac now.
+            let pending = std::mem::take(&mut STATE.lock().unwrap().pending);
+            let send = !pending.is_empty();
+            if send {
+                log::info!("applying the changes made while the Mac was away: {pending:?}");
+                if let Ok(serde_json::Value::Object(mut now)) = serde_json::to_value(&new) {
+                    now.extend(pending);
+                    match serde_json::from_value(serde_json::Value::Object(now)) {
+                        Ok(merged) => new = merged,
+                        Err(e) => log::warn!("changes made while away: {e}"),
+                    }
+                }
+                save_pending(&Default::default());
+            }
             // Not tied to streaming being on: pausing would take the desktop away (and back
             // under a new id), and windows opening meanwhile landed on the shared desktop.
             let wanted = new.desktop;
@@ -130,17 +170,14 @@ pub fn set_settings(json: &[u8]) {
             if APPLIED.lock().unwrap().replace(wanted) != Some(wanted) {
                 crate::desktop::apply(wanted);
             }
-            let resume = {
+            {
                 let mut s = STATE.lock().unwrap();
-                let resume = std::mem::take(&mut s.resume_wanted) && !new.enabled;
                 save_last(&new);
                 s.last = Some(new.clone());
                 s.settings = Some(new);
-                resume
-            };
-            if resume {
-                log::info!("the Mac is back: switching streaming on, as asked");
-                change(|s| s.enabled = true);
+            }
+            if send {
+                change(|_| {});
             }
             refresh();
             crate::net::launcher_setting_changed();
@@ -155,6 +192,7 @@ pub fn set_running(running: Vec<(String, u8)>) {
 }
 
 pub fn set_apps(apps: Vec<(String, String)>) {
+    save_apps(&apps);
     STATE.lock().unwrap().apps = apps;
     refresh();
 }
@@ -184,16 +222,29 @@ pub fn launcher_wanted() -> bool {
 }
 
 /// Changes a setting: shown straight away, and sent to the Mac (which confirms with the new
-/// settings for both sides).
+/// settings for both sides). With the Mac away (or streaming not known yet), kept and sent
+/// once it's back.
 fn change(f: impl FnOnce(&mut Settings)) {
     let mut state = STATE.lock().unwrap();
-    let Some(s) = state.settings.as_mut() else { return };
-    f(s);
-    let json = serde_json::to_vec(s).unwrap_or_default();
-    drop(state);
-    if let Some(net) = NET.get() {
-        let _ = net.send(NetCmd::Control(W::new(t::SET_SETTINGS).bytes(&json).finish()));
+    if let Some(s) = state.settings.as_mut() {
+        f(s);
+        let json = serde_json::to_vec(s).unwrap_or_default();
+        drop(state);
+        if let Some(net) = NET.get() {
+            let _ = net.send(NetCmd::Control(W::new(t::SET_SETTINGS).bytes(&json).finish()));
+        }
+        return;
     }
+    let mut wanted = away_view(&state);
+    f(&mut wanted);
+    let mac = serde_json::to_value(state.last.clone().unwrap_or_default()).unwrap_or_default();
+    if let (serde_json::Value::Object(mac), serde_json::Value::Object(wanted)) = (mac, serde_json::to_value(wanted).unwrap_or_default()) {
+        state.pending = wanted.into_iter().filter(|(k, v)| mac.get(k) != Some(v)).collect();
+    }
+    save_pending(&state.pending);
+    log::info!("the Mac is away: will apply {:?} once it's back", state.pending);
+    drop(state);
+    refresh();
 }
 
 struct Tray;
@@ -235,8 +286,8 @@ impl ksni::Tray for Tray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let state = STATE.lock().unwrap();
-        let s = state.settings.clone();
-        let known = s.is_some();
+        let known = state.settings.is_some();
+        let s = Some(state.settings.clone().unwrap_or_else(|| away_view(&state)));
         let on = s.as_ref().is_some_and(|s| s.enabled);
         let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
@@ -249,35 +300,27 @@ impl ksni::Tray for Tray {
                 ..Default::default()
             }
             .into(),
-            if known {
-                CheckmarkItem {
-                    label: "Stream Mac apps".into(),
-                    checked: on,
-                    activate: Box::new(|_| change(|s| s.enabled = !s.enabled)),
-                    ..Default::default()
-                }
-                .into()
-            } else {
-                // The Mac can't be reached (asleep, most likely): remember the wish, try to wake
-                // it, and switch streaming on once it's back.
-                CheckmarkItem {
-                    label: "Stream Mac apps (when the Mac is back)".into(),
-                    checked: state.resume_wanted,
-                    activate: Box::new(|_| {
-                        let mut s = STATE.lock().unwrap();
-                        s.resume_wanted = !s.resume_wanted;
-                        let wanted = s.resume_wanted;
-                        drop(s);
-                        if wanted {
-                            std::thread::spawn(crate::wake::wake);
-                        }
-                    }),
-                    ..Default::default()
-                }
-                .into()
-            },
+            // With the Mac away, applied once it's back.
+            CheckmarkItem {
+                label: "Stream Mac apps".into(),
+                checked: on,
+                activate: Box::new(|_| change(|s| s.enabled = !s.enabled)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Wake Mac".into(),
+                icon_name: "system-reboot".into(),
+                visible: !known && !crate::net::offline(),
+                activate: Box::new(|_| {
+                    std::thread::spawn(crate::wake::wake);
+                }),
+                ..Default::default()
+            }
+            .into(),
             StandardItem {
                 label: if crate::net::offline() { "Connect" } else { "Disconnect" }.into(),
+                icon_name: if crate::net::offline() { "network-connect" } else { "network-disconnect" }.into(),
                 activate: Box::new(|_| {
                     crate::net::set_offline(!crate::net::offline());
                     refresh();
@@ -316,7 +359,7 @@ impl ksni::Tray for Tray {
                 .into()
             })
             .collect();
-        items.push(SubMenu { label: "Apps".into(), enabled: on && !apps.is_empty(), submenu: apps, ..Default::default() }.into());
+        items.push(SubMenu { label: "Apps".into(), enabled: !apps.is_empty(), submenu: apps, ..Default::default() }.into());
         items.push(MenuItem::Separator);
 
         type Toggle = (&'static str, fn(&Settings) -> bool, fn(&mut Settings));
@@ -332,7 +375,6 @@ impl ksni::Tray for Tray {
             items.push(
                 CheckmarkItem {
                     label: label.into(),
-                    enabled: on,
                     checked: s.as_ref().is_some_and(get),
                     activate: Box::new(move |_| change(flip)),
                     ..Default::default()
@@ -343,7 +385,6 @@ impl ksni::Tray for Tray {
         items.push(
             SubMenu {
                 label: "Quality".into(),
-                enabled: on,
                 submenu: vec![
                     RadioGroup {
                         selected: usize::from(s.as_ref().is_some_and(|s| s.quality == "light")),
@@ -363,6 +404,7 @@ impl ksni::Tray for Tray {
         items.push(
             StandardItem {
                 label: "Quit sweeflow".into(),
+                icon_name: "application-exit".into(),
                 activate: Box::new(|_| {
                     quit();
                 }),
@@ -396,6 +438,7 @@ fn macs_menu() -> MenuItem<Tray> {
     sub.push(
         StandardItem {
             label: "Add a Mac…".into(),
+            icon_name: "list-add".into(),
             activate: Box::new(|_| open_wizard()),
             ..Default::default()
         }
@@ -417,7 +460,7 @@ fn macs_menu() -> MenuItem<Tray> {
             .collect();
         sub.push(SubMenu { label: "Forget".into(), submenu: forget, ..Default::default() }.into());
     }
-    SubMenu { label: "Mac".into(), submenu: sub, ..Default::default() }.into()
+    SubMenu { label: "Mac".into(), icon_name: "computer-laptop".into(), submenu: sub, ..Default::default() }.into()
 }
 
 fn quit() {
@@ -444,6 +487,46 @@ fn load_pinned() -> Vec<String> {
 
 fn save_pinned(pinned: &[String]) {
     let _ = std::fs::write(pinned_file(), pinned.join("\n"));
+}
+
+/// The settings as they'll be once the Mac is back: as it last had them, with the changes since.
+fn away_view(state: &State) -> Settings {
+    let mut now = serde_json::to_value(state.last.clone().unwrap_or_default()).unwrap_or_default();
+    if let serde_json::Value::Object(now) = &mut now {
+        now.extend(state.pending.clone());
+    }
+    serde_json::from_value(now).unwrap_or_else(|_| state.last.clone().unwrap_or_default())
+}
+
+fn apps_file() -> std::path::PathBuf {
+    crate::config::dir().join("apps.json")
+}
+
+/// The Mac's apps as last listed: shown (and launchable) while it's away.
+fn load_apps() -> Vec<(String, String)> {
+    serde_json::from_slice(&std::fs::read(apps_file()).unwrap_or_default()).unwrap_or_default()
+}
+
+fn save_apps(apps: &[(String, String)]) {
+    if let Ok(json) = serde_json::to_vec(apps) {
+        let _ = std::fs::write(apps_file(), json);
+    }
+}
+
+fn pending_file() -> std::path::PathBuf {
+    crate::config::dir().join("pending-settings.json")
+}
+
+fn load_pending() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(pending_file()).unwrap_or_default()).unwrap_or_default()
+}
+
+fn save_pending(p: &serde_json::Map<String, serde_json::Value>) {
+    if p.is_empty() {
+        let _ = std::fs::remove_file(pending_file());
+    } else if let Ok(json) = serde_json::to_vec(p) {
+        let _ = std::fs::write(pending_file(), json);
+    }
 }
 
 fn last_file() -> std::path::PathBuf {
@@ -494,8 +577,8 @@ pub fn panel_state() -> serde_json::Value {
         "connected": state.settings.is_some(),
         "paired": !cfg.host.is_empty(),
         "mac": mac_name,
-        "settings": state.settings.as_ref().or(state.last.as_ref()),
-        "resumeWanted": state.resume_wanted,
+        "settings": state.settings.clone().unwrap_or_else(|| away_view(&state)),
+        "pending": !state.pending.is_empty(),
         "apps": apps,
         "macs": macs,
         "openAtLogin": open_at_login(),
@@ -511,17 +594,6 @@ pub fn panel_set(json: &str) {
     let Ok(serde_json::Value::Object(changes)) = serde_json::from_str::<serde_json::Value>(json) else {
         return log::warn!("bad settings from the tray widget: {json}");
     };
-    if STATE.lock().unwrap().settings.is_none() {
-        // The Mac is away: only streaming on/off can be asked for, and is done when it's back.
-        if let Some(on) = changes.get("enabled").and_then(|v| v.as_bool()) {
-            STATE.lock().unwrap().resume_wanted = on;
-            if on {
-                std::thread::spawn(crate::wake::wake);
-            }
-            refresh();
-        }
-        return;
-    }
     change(move |s| {
         let Ok(serde_json::Value::Object(mut now)) = serde_json::to_value(&*s) else { return };
         now.extend(changes);
