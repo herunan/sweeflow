@@ -142,13 +142,31 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         linked.submenu = list
         menu.addItem(linked)
 
+        menu.addItem(.separator())
         // Only while something's missing (a permission, starting at login, a linked computer).
         if !Onboarding.complete {
-            menu.addItem(.separator())
             let setup = ClosureMenuItem(title: "Finish setting up…") { Onboarding.shared.show() }
             setup.toolTip = "Permissions Sweeflow still needs on this Mac"
             menu.addItem(setup)
         }
+        let quit = ClosureMenuItem(title: "Quit Sweeflow") { Self.quit() }
+        quit.keyEquivalent = "q"
+        quit.toolTip = "Until you open it again (or log in again, with Open at login)"
+        menu.addItem(quit)
+    }
+
+    /// Leaves the Mac as it was (screen, virtual display), then stops. Started by launchd (at
+    /// login, kept running), Sweeflow is taken out of it first, or it would be started again.
+    private static func quit() {
+        log("quitting (menu)")
+        BuiltInScreen.stopDimming()
+        BuiltInScreen.restore()
+        host.display.remove()
+        if LoginItem.underLaunchd, let label = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] {
+            // launchd ends this process as it unloads it.
+            _ = try? run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+        }
+        NSApp.terminate(nil)
     }
 
     /// Ends that computer's connection and refuses it until Connect (it shows "Disconnected on
