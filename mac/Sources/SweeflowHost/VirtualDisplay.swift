@@ -32,15 +32,10 @@ final class VirtualDisplay {
         return CGRect(x: b.minX + left, y: b.minY + top, width: b.width - left - right, height: b.height - top - bottom)
     }
 
-    /// A plain desktop background: black or white, as chosen (Desktop background). Mac windows
-    /// tint their sidebars and toolbars with what's behind them, so a neutral one keeps their
-    /// colours clean. Only this display is touched; the Mac's own appearance is left alone.
+    /// A plain backdrop: black in dark mode, white in light mode. Mac windows tint their
+    /// sidebars and toolbars with what's behind them, so a neutral one keeps their colours
+    /// clean. Follows the Mac's appearance; only this invisible display is touched.
     private var appearanceObserver: NSObjectProtocol?
-    private var settingsObserver: NSObjectProtocol?
-    /// The backdrop itself: a plain window at desktop level covering the display. macOS doesn't
-    /// always show a desktop picture set on a virtual display (it kept the Mac's own wallpaper),
-    /// so this is what windows actually sit on. Ours, so never streamed.
-    private var backdropWindow: NSWindow?
 
     private func applyBackdrop(attempt: Int) {
         guard let id = displayID else { return }
@@ -52,7 +47,7 @@ final class VirtualDisplay {
             }
             return
         }
-        let dark = settings.config.backdrop != "light"
+        let dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
         // Old copies of the Linux wallpaper (an earlier version), no longer used.
         for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
@@ -70,19 +65,6 @@ final class VirtualDisplay {
                 try? rep.representation(using: .png, properties: [:])?.write(to: url)
             }
         }
-        let w = backdropWindow ?? {
-            let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
-            w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
-            w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-            w.ignoresMouseEvents = true
-            w.isReleasedWhenClosed = false
-            w.hasShadow = false
-            backdropWindow = w
-            return w
-        }()
-        w.backgroundColor = dark ? .black : .white
-        w.setFrame(screen.frame, display: true)
-        w.orderFront(nil)
         if NSWorkspace.shared.desktopImageURL(for: screen) != url {
             try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [
                 .imageScaling: NSImageScaling.scaleAxesIndependently.rawValue, .allowClipping: false,
@@ -94,11 +76,6 @@ final class VirtualDisplay {
                 forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main
             ) { [weak self] _ in self?.applyBackdrop(attempt: 0) }
         }
-        if settingsObserver == nil {
-            settingsObserver = NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: .main) {
-                [weak self] _ in self?.applyBackdrop(attempt: 0)
-            }
-        }
     }
 
     /// Size the client asked for, kept so a failed creation can be retried.
@@ -106,8 +83,6 @@ final class VirtualDisplay {
     private var retries = 0
 
     func remove() {
-        backdropWindow?.orderOut(nil)
-        backdropWindow = nil
         display = nil
         size = .zero
         wanted = .zero

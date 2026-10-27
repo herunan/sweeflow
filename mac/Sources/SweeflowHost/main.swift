@@ -37,9 +37,6 @@ struct Config: Codable {
     var ownDesktop = true
     /// "sharp": Retina, 10-bit. "light": 1x, 8-bit, for slower networks.
     var quality = "sharp"
-    /// The virtual display's desktop, behind the windows: "dark" or "light" (see VirtualDisplay).
-    /// Only that screen: the Mac's own appearance is left alone.
-    var backdrop = "dark"
 
     init() {}
 
@@ -60,7 +57,6 @@ struct Config: Codable {
         launcherMenu = try c.decodeIfPresent(Bool.self, forKey: .launcherMenu) ?? d.launcherMenu
         quality = try c.decodeIfPresent(String.self, forKey: .quality) ?? d.quality
         ownDesktop = try c.decodeIfPresent(Bool.self, forKey: .ownDesktop) ?? d.ownDesktop
-        backdrop = try c.decodeIfPresent(String.self, forKey: .backdrop) ?? d.backdrop
         videoDatagrams = try c.decodeIfPresent(Bool.self, forKey: .videoDatagrams) ?? d.videoDatagrams
     }
 

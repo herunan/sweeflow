@@ -8,6 +8,8 @@ import org.kde.kirigami as Kirigami
 PlasmaComponents3.ItemDelegate {
     id: row
     property string name
+    /// "laptop", "imac" or "desktop" (Mac mini, Studio, Pro); "" until it has said.
+    property string kind
     property bool active
     /// Disconnected (Disconnect): the Mac in use isn't streaming.
     property bool offline: false
@@ -38,7 +40,7 @@ PlasmaComponents3.ItemDelegate {
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing
         Kirigami.Icon {
-            source: "computer-laptop"
+            source: row.kind === "desktop" ? "computer" : row.kind === "imac" ? "video-display" : "computer-laptop"
             Layout.preferredWidth: Kirigami.Units.iconSizes.medium
             Layout.preferredHeight: Kirigami.Units.iconSizes.medium
         }

@@ -32,9 +32,6 @@ pub struct Settings {
     /// Mac windows on a desktop of their own (see desktop.rs).
     #[serde(default = "yes")]
     pub desktop: bool,
-    /// The Mac's virtual desktop, behind its windows: "dark" or "light" ("" from older Macs).
-    #[serde(default)]
-    pub backdrop: String,
 }
 
 fn yes() -> bool {
@@ -54,7 +51,6 @@ impl Default for Settings {
             launcher: true,
             quality: "sharp".into(),
             desktop: true,
-            backdrop: String::new(),
         }
     }
 }
@@ -558,10 +554,14 @@ fn save_last(s: &Settings) {
 pub fn panel_state() -> serde_json::Value {
     let state = STATE.lock().unwrap();
     let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+    let kinds = load_kinds();
     let macs: Vec<_> = cfg
         .macs
         .iter()
-        .map(|m| serde_json::json!({ "name": m.name, "fingerprint": m.fingerprint, "active": m.fingerprint == cfg.host_fingerprint }))
+        .map(|m| {
+            serde_json::json!({ "name": m.name, "fingerprint": m.fingerprint, "active": m.fingerprint == cfg.host_fingerprint,
+                                "kind": kinds.get(&m.fingerprint).map(String::as_str).unwrap_or("") })
+        })
         .collect();
     // The name given here (renamable) over the one the Mac reports.
     let mac_name = cfg
@@ -714,6 +714,29 @@ fn open_at_login() -> bool {
         .args(["--user", "is-enabled", "--quiet", "sweeflow"])
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// What sort of Mac each linked one is ("laptop", "imac", "desktop"), by fingerprint: its icon.
+/// Kept beside the config, so it shows while the Mac is away.
+fn kinds_file() -> std::path::PathBuf {
+    crate::config::dir().join("mac-kinds.json")
+}
+
+fn load_kinds() -> std::collections::HashMap<String, String> {
+    serde_json::from_slice(&std::fs::read(kinds_file()).unwrap_or_default()).unwrap_or_default()
+}
+
+/// The connected Mac said what sort it is.
+pub fn set_mac_kind(kind: &str) {
+    let Ok(cfg) = crate::config::Config::load_or_default() else { return };
+    let mut kinds = load_kinds();
+    if kinds.get(&cfg.host_fingerprint).map(String::as_str) != Some(kind) {
+        kinds.insert(cfg.host_fingerprint.clone(), kind.to_string());
+        if let Ok(json) = serde_json::to_vec(&kinds) {
+            let _ = std::fs::write(kinds_file(), json);
+        }
+        refresh();
+    }
 }
 
 pub fn rename(fingerprint: &str, name: &str) {

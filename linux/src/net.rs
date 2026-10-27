@@ -508,6 +508,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::WELCOME => {
             let _v = r.u16()?;
             let name = r.str()?;
+            // Newer hosts say what sort of Mac they are (its icon here).
+            if let Ok(kind) = r.str() {
+                crate::tray::set_mac_kind(&kind);
+            }
             crate::tray::connected(Some(name.clone()));
             UiEvent::Connected(name)
         }

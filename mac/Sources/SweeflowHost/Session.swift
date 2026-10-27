@@ -1,4 +1,5 @@
 import AppKit
+import IOKit
 import Network
 
 /// State for one connected client: the control stream, the video streams and the window
@@ -132,6 +133,7 @@ final class Session {
             var w = MsgWriter(.welcome)
             w.u16(protocolVersion)
             w.str(Host.current().localizedName ?? "Mac")
+            w.str(Self.macKind)
             s.send(w)
             startTracking()
             let cw = CursorWatcher(scale: clientScale) { [weak self] png, hot, scale in
@@ -1292,4 +1294,23 @@ func displayScale(at p: CGPoint) -> CGFloat? {
         return nil
     }
     return CGFloat(mode.pixelWidth) / CGFloat(mode.width)
+}
+
+extension Session {
+    /// What sort of Mac this is, for its icon on Linux: "laptop" (MacBook), "imac" or "desktop"
+    /// (Mac mini, Studio, Pro). From the model name, else from whether it has a built-in screen.
+    static let macKind: String = {
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"))
+        defer { IOObjectRelease(svc) }
+        var name = ""
+        for key in ["product-name", "model"] {
+            if let d = IORegistryEntryCreateCFProperty(svc, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Data {
+                name += String(decoding: d.prefix { $0 != 0 }, as: UTF8.self) + " "
+            }
+        }
+        if name.contains("MacBook") { return "laptop" }
+        if name.contains("iMac") { return "imac" }
+        if name.contains("Mac mini") || name.contains("Macmini") || name.contains("Mac Studio") || name.contains("Mac Pro") { return "desktop" }
+        return BuiltInScreen.screen != nil ? "laptop" : "desktop"
+    }()
 }

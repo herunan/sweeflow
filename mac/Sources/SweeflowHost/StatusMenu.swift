@@ -66,14 +66,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         dim.isEnabled = c.enabled && !c.dimMacScreenWhileStreaming
         dim.toolTip = "Turns this screen down until someone uses this Mac's keyboard or trackpad"
         menu.addItem(dim)
-        let background = NSMenuItem(title: "Desktop Background", action: nil, keyEquivalent: "")
-        let b = NSMenu()
-        for (title, value) in [("Dark", "dark"), ("Light", "light")] {
-            b.addItem(toggle(title, (value == "light") == (c.backdrop == "light")) { $0.backdrop = value })
-        }
-        background.submenu = b
-        background.toolTip = "Behind the windows on the screen Sweeflow adds for Linux"
-        menu.addItem(background)
         let login = ClosureMenuItem(title: "Open at Login") {
             if LoginItem.enabled { LoginItem.disable() } else { LoginItem.enable() }
         }
