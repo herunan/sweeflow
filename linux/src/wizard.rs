@@ -132,8 +132,8 @@ slint::slint! {
                     if installer-url != "" && !firewall-on: Body { text: "Page won't load? This computer's firewall may be blocking it (port 44130)."; }
                     if installer-url != "" && firewall-on: HorizontalLayout {
                         spacing: 8px;
-                        Body { text: firewall-note != "" ? firewall-note : "This computer's firewall blocks the page until you let it through."; vertical-alignment: center; }
-                        if firewall-note == "": Button { text: "Allow through firewall"; clicked => { open-firewall(); } }
+                        Body { text: firewall-note != "" ? firewall-note : "This computer's firewall blocks the page. Letting it through is a one-time step: it asks for your password, and stays allowed (this network, port 44130 only)."; vertical-alignment: center; }
+                        if firewall-note == "": Button { text: "Allow (one-time)"; clicked => { open-firewall(); } }
                     }
                 }
                 Step {
@@ -257,13 +257,16 @@ pub fn run() -> Result<()> {
     }
 
     // CachyOS and others ship ufw switched on: the Mac can't reach the page until it's allowed.
-    ui.set_firewall_on(_server.is_some() && firewall_active());
+    ui.set_firewall_on(_server.is_some() && firewall_active() && !firewall_allowed_file().exists());
     let weak_fw = ui.as_weak();
     ui.on_open_firewall(move || {
         let weak = weak_fw.clone();
         std::thread::spawn(move || {
             let note = match allow_installer_port() {
-                Ok(()) => "Let through: open the address on your Mac now.".to_string(),
+                Ok(()) => {
+                    let _ = std::fs::write(firewall_allowed_file(), "");
+                    "Let through for good (this network, port 44130): open the address on your Mac now.".to_string()
+                }
                 Err(e) => format!("Not changed ({e}). Allow TCP port 44130 in your firewall settings."),
             };
             let _ = weak.upgrade_in_event_loop(move |ui| ui.set_firewall_note(note.into()));
@@ -418,6 +421,11 @@ fn use_paired_mac() -> Result<()> {
         cfg.save()?;
     }
     crate::setup::start_client()
+}
+
+/// Set once the firewall rule has been added: it stays, so the window stops offering it.
+fn firewall_allowed_file() -> std::path::PathBuf {
+    crate::config::dir().join("firewall-allowed")
 }
 
 /// ufw is running (it blocks incoming connections by default).
