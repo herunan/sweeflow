@@ -233,7 +233,10 @@ fn append_tar(out: &mut Vec<u8>, path: &str, data: &[u8], mode: u32) {
     out.extend(std::iter::repeat_n(0u8, pad));
 }
 
+/// The logo as a plain silhouette in the theme's text colour: the tray widget's.
 const LOGO: &str = include_str!("../../assets/sweeflow.svg");
+/// The app icon (white on a violet rounded square): app menu, Sweeflow's windows.
+const APP_ICON: &str = include_str!("../../assets/sweeflow-app.svg");
 /// The Plasma widgets' files (published path inside ~/.local/share/plasma/plasmoids, contents),
 /// built in so the binary installs them.
 const WIDGET_FILES: &[(&str, &str)] = &[
@@ -315,7 +318,7 @@ pub fn open() -> Result<()> {
 fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     let icons = home.join(".local/share/icons/hicolor/scalable/apps");
     std::fs::create_dir_all(&icons)?;
-    std::fs::write(icons.join("sweeflow.svg"), LOGO)?;
+    std::fs::write(icons.join("sweeflow.svg"), APP_ICON)?;
     write_launcher(home)?;
     if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") {
         return Ok(());

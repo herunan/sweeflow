@@ -30,10 +30,11 @@ TILE = 'M34 8H94A26 26 0 0 1 120 34V94A26 26 0 0 1 94 120H34A26 26 0 0 1 8 94V34
 out = sys.argv[1]
 open(out, 'w').write(logo('class="ColorScheme-Text" fill="currentColor"',
                           '  <style id="current-color-scheme" type="text/css">.ColorScheme-Text { color: #fcfcfc; }</style>\n'))
-# The Mac's: an app icon (white on a violet rounded square, as Mac app icons are) and the
-# menu-bar icon (black on clear: macOS draws it as a template, in the menu bar's colour).
+# The app icon, on both computers (app menu, windows, the Mac's Finder and Dock): white on a
+# violet rounded square. The plain silhouette above is for the Linux tray; the Mac's menu bar
+# gets its own (black on clear: macOS draws it as a template, in the menu bar's colour).
 base = out.rsplit('.', 1)[0]
-open(base + '-mac-app.svg', 'w').write(logo('fill="#fff"',
+open(base + '-app.svg', 'w').write(logo('fill="#fff"',
     '  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a855f7"/><stop offset="1" stop-color="#6d28d9"/></linearGradient></defs>\n',
     f'  <path d="{TILE}" fill="url(#bg)"/>\n', scale=0.98))
 # Cropped to the shape, so it fills the menu bar's height.

@@ -15,7 +15,7 @@ use crate::{
 };
 
 slint::slint! {
-    import { Button, LineEdit, Spinner, VerticalBox, HorizontalBox, ScrollView, Palette } from "std-widgets.slint";
+    import { Button, LineEdit, Spinner, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
 
     export struct MacRow { name: string, detail: string }
 
@@ -53,7 +53,7 @@ slint::slint! {
 
     export component Wizard inherits Window {
         title: "Add a Mac — Sweeflow";
-        icon: @image-url("../../assets/sweeflow.svg");
+        icon: @image-url("../../assets/sweeflow-app.svg");
         // A fixed size: a dialog, which tiling window managers leave floating.
         width: 540px;
         height: 460px;
@@ -81,7 +81,7 @@ slint::slint! {
                 HorizontalLayout {
                     spacing: 14px;
                     alignment: start;
-                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; colorize: Palette.foreground; }
+                    Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 56px; height: 56px; }
                     Title { text: "Add a Mac"; vertical-alignment: center; }
                 }
                 Body {
@@ -165,7 +165,7 @@ slint::slint! {
                 HorizontalLayout {
                     spacing: 14px;
                     alignment: start;
-                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; colorize: Palette.foreground; }
+                    Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 56px; height: 56px; }
                     Title { text: "Paired with " + mac-name; vertical-alignment: center; }
                 }
                 Body {
