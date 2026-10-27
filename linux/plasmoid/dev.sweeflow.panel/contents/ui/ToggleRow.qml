@@ -1,4 +1,5 @@
-// One setting: its name and a switch. Clicking anywhere on the row flips it.
+// One setting: its name and a switch (a short explanation on hover). Clicking anywhere on the
+// row flips it.
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
@@ -11,11 +12,16 @@ PlasmaComponents3.ItemDelegate {
     /// An optional button beside the switch (shown while on), e.g. "Gather".
     property string actionText
     property string actionTip
+    /// A short explanation, said on hover.
+    property string hint
     signal flipped(bool value)
     signal extraClicked()
 
     Layout.fillWidth: true
     onClicked: flipped(!on)
+    PlasmaComponents3.ToolTip.text: hint
+    PlasmaComponents3.ToolTip.visible: hovered && hint !== ""
+    PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
 
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing

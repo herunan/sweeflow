@@ -15,7 +15,7 @@ use crate::{
 };
 
 slint::slint! {
-    import { Button, LineEdit, Spinner, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+    import { Button, LineEdit, Spinner, VerticalBox, HorizontalBox, ScrollView, Palette } from "std-widgets.slint";
 
     export struct MacRow { name: string, detail: string }
 
@@ -81,7 +81,7 @@ slint::slint! {
                 HorizontalLayout {
                     spacing: 14px;
                     alignment: start;
-                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; }
+                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; colorize: Palette.foreground; }
                     Title { text: "Add a Mac"; vertical-alignment: center; }
                 }
                 Body {
@@ -165,7 +165,7 @@ slint::slint! {
                 HorizontalLayout {
                     spacing: 14px;
                     alignment: start;
-                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; }
+                    Image { source: @image-url("../../assets/sweeflow.svg"); width: 56px; height: 56px; colorize: Palette.foreground; }
                     Title { text: "Paired with " + mac-name; vertical-alignment: center; }
                 }
                 Body {

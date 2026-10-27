@@ -121,12 +121,24 @@ struct Corners {
     tile_buffers: std::collections::VecDeque<(Vec<wl_buffer::WlBuffer>, RawPool)>,
     /// New tile pixels to upload with the next frame.
     pending: Option<(u32, Vec<u8>)>,
+    /// The tiles in use (size, pixels): their alpha shapes a paused window's still too.
+    last_tiles: Option<(u32, Vec<u8>)>,
     /// Whether the split layout was used for the last frame.
     split: bool,
     /// Middle strip's offset from the window's top edge (logical px).
     middle_y: i32,
     /// Colour representation of the top and bottom strips (they show the video too).
     colors: Vec<WpColorRepresentationSurfaceV1>,
+}
+
+/// A paused window's still: its last picture in black and white with a pause sign, on a
+/// subsurface over the video (the video's own surfaces are YUV with colour settings to match).
+struct Still {
+    sub: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
+    viewport: WpViewport,
+    buffer: wl_buffer::WlBuffer,
+    _pool: RawPool,
 }
 
 struct Lights {
@@ -204,6 +216,10 @@ struct Win {
     lights_pressed: Option<(usize, bool)>,
     /// Frame waiting for the first configure.
     pending: Option<GpuFrame>,
+    /// The buffer showing the latest video frame (its frame is in App::in_use).
+    shown: Option<wayland_client::backend::ObjectId>,
+    /// Paused (or the Mac away): the still shown instead of the video.
+    still: Option<Still>,
     /// Lossless frame waiting for the first configure.
     pending_raw: Option<(u16, u16, u8, u64, Vec<u8>)>,
     /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
@@ -324,6 +340,8 @@ pub struct App {
     scale: f64,
     host: String,
     connected: bool,
+    /// Streaming is paused: windows stay, as stills, until it resumes.
+    paused: bool,
     /// Windows closed here while the Mac was away: closed there too once it's back.
     closed_offline: HashSet<u32>,
     trace_event_ms: Option<u32>,
@@ -421,6 +439,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         scale,
         host,
         connected: false,
+        paused: false,
         closed_offline: HashSet::new(),
         trace_event_ms: None,
         menu_panel_shown: None,
@@ -504,14 +523,22 @@ impl App {
                 for w in self.windows.values_mut() {
                     w.stale = true;
                 }
-                let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_secs(3)), |_, _, app| {
-                    let stale: Vec<u32> = app.windows.iter().filter(|(_, w)| w.stale).map(|(k, _)| *k).collect();
-                    for wid in stale {
-                        app.remove_window(wid);
+                self.expire_stale_soon();
+            }
+            UiEvent::Streaming(on) => {
+                self.paused = !on;
+                log::info!("streaming {}", if on { "resumed" } else { "paused: windows stay as stills" });
+                if on {
+                    // The Mac announces its windows again; ones it doesn't (closed meanwhile) go.
+                    for w in self.windows.values_mut() {
+                        if w.still.is_some() {
+                            w.stale = true;
+                        }
                     }
-                    app.closed_offline.clear();
-                    TimeoutAction::Drop
-                });
+                    self.expire_stale_soon();
+                } else {
+                    self.freeze_all(qh);
+                }
             }
             UiEvent::Disconnected(why) => {
                 self.connected = false;
@@ -530,6 +557,7 @@ impl App {
                 for wid in gone {
                     self.remove_window(wid);
                 }
+                self.freeze_all(qh);
             }
             UiEvent::WindowAdded(info) => self.add_window(info, qh),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
@@ -550,6 +578,11 @@ impl App {
                     }
                     self.adopt_mac_size(wid, qh);
                 }
+            }
+            // Paused: the Mac lets go of every window; here they stay, as stills.
+            UiEvent::WindowRemoved(wid) if self.paused && self.windows.get(&wid).is_some_and(|w| matches!(w.role, Role::Toplevel(_))) => {
+                self.freeze(wid, qh);
+                let _ = self.net.send(NetCmd::Unsubscribe(wid));
             }
             UiEvent::WindowRemoved(wid) => self.remove_window(wid),
             UiEvent::AppIcon { bundle_id, png } => {
@@ -639,6 +672,8 @@ impl App {
         }
         log::info!("window {wid} added: {} kind {} parent {} {}x{} at {},{}",
                    info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
+        // Back (after a pause or a reconnect): its video replaces the still.
+        self.unfreeze(wid);
         if let Some(w) = self.windows.get_mut(&wid) {
             // Re-announced after a reconnect: keep the native window, restart the video, and make
             // sure the Mac window still has this window's size.
@@ -765,6 +800,8 @@ impl App {
                 buttons: [[0.0; 4]; 3],
                 lights: None,
                 corners: None,
+                shown: None,
+                still: None,
                 appmenu,
                 dark_titlebar: true,
                 mac_minimized: false,
@@ -791,6 +828,7 @@ impl App {
         if self.selection.as_ref().is_some_and(|s| s.wid == wid) {
             self.end_selection();
         }
+        self.unfreeze(wid);
         let Some(w) = self.windows.remove(&wid) else { return };
         log::info!("window {wid} removed ({})", w.info.app_name);
         let _ = self.net.send(NetCmd::Unsubscribe(wid));
@@ -1058,6 +1096,14 @@ impl App {
     }
 
     fn present(&mut self, wid: u32, frame: GpuFrame, qh: &QueueHandle<Self>) {
+        if self.paused && self.windows.get(&wid).is_some_and(|w| w.still.is_some()) {
+            // Frames still in flight as the Mac lets go (from its own screen by then, at another
+            // size): the still stays.
+            let _ = self.net.send(NetCmd::Video(wid, W::new(t::FRAME_ACK).u64(frame.capture_us).finish()));
+            return;
+        }
+        // Moving again: the still goes.
+        self.unfreeze(wid);
         let Some(w) = self.windows.get_mut(&wid) else { return };
         if w.dark_titlebar != frame.dark_titlebar {
             w.dark_titlebar = frame.dark_titlebar;
@@ -1119,6 +1165,7 @@ impl App {
             w.video.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
             w.video.commit();
             w.base().commit(); // the subsurface position applies with the parent's commit
+            w.shown = Some(buffer.id());
             self.in_use.insert(buffer.id(), frame);
             return;
         }
@@ -1223,6 +1270,7 @@ impl App {
         w.video.attach(Some(&buffer), 0, 0);
         w.video.damage_buffer(0, 0, fw as i32, fh as i32);
         w.video.commit();
+        w.shown = Some(buffer.id());
         self.in_use.insert(buffer.id(), frame);
     }
 
@@ -1287,6 +1335,7 @@ impl App {
                 tiles,
                 tile_buffers: Default::default(),
                 pending: None,
+                last_tiles: None,
                 split: false,
                 middle_y: 0,
                 colors,
@@ -1314,6 +1363,7 @@ impl App {
             }
             dump_bgra(&format!("/tmp/sweeflow-corners-{wid}.png"), t_px * 4, t_px, &sheet);
         }
+        c.last_tiles = (t_px > 0).then(|| (t_px, tile_px.clone()));
         c.pending = (t_px > 0).then_some((t_px, tile_px));
     }
 
@@ -1546,15 +1596,119 @@ impl App {
         }
     }
 
-    /// Closes a Mac window. With the Mac away nothing would answer, so the window goes now
-    /// (and the Mac's is closed once it's back).
+    /// Closes a Mac window. With the Mac away (or streaming paused) nothing would answer, so the
+    /// window goes now (and the Mac's is closed once it's back).
     fn close(&mut self, wid: u32) {
-        if self.connected {
+        if self.connected && !self.paused {
             self.send(W::new(t::CLOSE).u32(wid).finish());
         } else {
             self.closed_offline.insert(wid);
             self.remove_window(wid);
         }
+    }
+
+    /// In a moment, removes the windows the Mac hasn't announced again (marked stale), unless
+    /// streaming is paused (they stay as stills).
+    fn expire_stale_soon(&self) {
+        let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_secs(3)), |_, _, app| {
+            if !app.paused {
+                let stale: Vec<u32> = app.windows.iter().filter(|(_, w)| w.stale).map(|(k, _)| *k).collect();
+                for wid in stale {
+                    app.remove_window(wid);
+                }
+                app.closed_offline.clear();
+            }
+            TimeoutAction::Drop
+        });
+    }
+
+    fn freeze_all(&mut self, qh: &QueueHandle<Self>) {
+        let wids: Vec<u32> = self.windows.iter().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))).map(|(k, _)| *k).collect();
+        for wid in wids {
+            self.freeze(wid, qh);
+        }
+    }
+
+    /// Shows the window's last picture in black and white with a pause sign, over its video.
+    fn freeze(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        if w.still.is_some() || !matches!(w.role, Role::Toplevel(_)) {
+            return;
+        }
+        let Some(frame) = w.shown.as_ref().and_then(|id| self.in_use.get(id)) else { return };
+        let Some(mut px) = frame.grey() else {
+            return log::warn!("window {wid}: couldn't read its picture back for the paused still");
+        };
+        let (fw, fh) = (frame.width, frame.height);
+        // Where the picture sits, as the video's (see present).
+        let (pos, src, dst) = if w.display {
+            let (k, ox, oy) = w.fit;
+            ((ox.round() as i32, oy.round() as i32), (frame.content.0 as f64, frame.content.1 as f64),
+             ((w.info.w as f64 * k).round().max(1.0) as i32, (w.info.h as f64 * k).round().max(1.0) as i32))
+        } else {
+            let s = self.scale;
+            let (bw, bh) = w.size;
+            let (cw, ch) = frame.content;
+            let ppp = px_per_pt(frame.px_per_pt, cw, w.info.w, s);
+            let vis_w = (cw as f64 / ppp).min(bw as f64 / s);
+            let vis_h = (ch as f64 / ppp).min(bh as f64 / s);
+            ((0, 0), (vis_w * ppp, vis_h * ppp), ((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32))
+        };
+        let (sw, sh) = (src.0.max(1.0) as usize, src.1.max(1.0) as usize);
+        // Rounded corners: the alpha of the Mac's own corner tiles.
+        if let Some((t, tiles)) = w.corners.as_ref().and_then(|c| c.last_tiles.as_ref()) {
+            let t = *t as usize;
+            if sw > 2 * t && sh > 2 * t {
+                let n = t * t * 4;
+                for (i, (ox, oy)) in [(0, 0), (sw - t, 0), (0, sh - t), (sw - t, sh - t)].into_iter().enumerate() {
+                    for y in 0..t {
+                        for x in 0..t {
+                            let a = tiles[i * n + (y * t + x) * 4 + 3] as u32;
+                            let p = &mut px[((oy + y) * fw as usize + ox + x) * 4..][..4];
+                            for c in &mut p[..3] {
+                                *c = (*c as u32 * a / 255) as u8;
+                            }
+                            p[3] = a as u8;
+                        }
+                    }
+                }
+            }
+        }
+        draw_pause(&mut px, fw as usize, sw as f64 / 2.0, sh as f64 / 2.0, (sw.min(sh) as f64 * 0.11).clamp(24.0, 96.0));
+        let Ok(mut pool) = RawPool::new(px.len(), &self.shm) else { return };
+        pool.mmap().copy_from_slice(&px);
+        let buffer = pool.create_buffer(0, fw as i32, fh as i32, (fw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
+        let base = w.base().clone();
+        let (sub, surface) = self.subcompositor.create_subsurface(base.clone(), qh);
+        let viewport = self.viewporter.get().expect("wp_viewporter").get_viewport(&surface, qh, ());
+        let empty = self.compositor.wl_compositor().create_region(qh, ());
+        surface.set_input_region(Some(&empty));
+        empty.destroy();
+        sub.set_position(pos.0, pos.1);
+        viewport.set_source(0.0, 0.0, src.0, src.1);
+        viewport.set_destination(dst.0, dst.1);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, fw as i32, fh as i32);
+        surface.commit();
+        // Our traffic lights stay on top (closing a paused window works).
+        if let Some(l) = &w.lights {
+            l.sub.place_above(&surface);
+        }
+        base.commit();
+        log::info!("window {wid}: paused still shown");
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.still = Some(Still { sub, surface, viewport, buffer, _pool: pool });
+        }
+    }
+
+    fn unfreeze(&mut self, wid: u32) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let Some(st) = w.still.take() else { return };
+        st.viewport.destroy();
+        st.sub.destroy();
+        st.surface.destroy();
+        st.buffer.destroy();
+        w.base().commit();
     }
 
     fn toggle_maximize(&self, wid: u32) {
@@ -1874,6 +2028,37 @@ fn decode_png_argb(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         out.extend_from_slice(&[pm(b), pm(g), pm(r), a]);
     }
     Ok((w, h, out))
+}
+
+/// A pause sign (a dark disc with two white bars) drawn into an opaque BGRA picture.
+fn draw_pause(px: &mut [u8], stride_px: usize, cx: f64, cy: f64, r: f64) {
+    let rows = px.len() / 4 / stride_px.max(1);
+    let (bar_w, bar_h, gap) = (r * 0.2, r * 0.9, r * 0.2);
+    let x0 = (cx - r - 1.0).max(0.0) as usize;
+    let y0 = (cy - r - 1.0).max(0.0) as usize;
+    let x1 = ((cx + r + 1.0) as usize).min(stride_px);
+    let y1 = ((cy + r + 1.0) as usize).min(rows);
+    // Coverage of a rounded rectangle (half sizes hx, hy, corner radius rr) at (dx, dy).
+    let rect = |dx: f64, dy: f64, hx: f64, hy: f64, rr: f64| {
+        let qx = dx.abs() - (hx - rr);
+        let qy = dy.abs() - (hy - rr);
+        let d = (qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0)) - rr;
+        (0.5 - d).clamp(0.0, 1.0)
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
+            let disc = (r - dx.hypot(dy) + 0.5).clamp(0.0, 1.0) * 0.6;
+            let bars = rect(dx - (gap / 2.0 + bar_w / 2.0), dy, bar_w / 2.0, bar_h / 2.0, bar_w / 2.5)
+                .max(rect(dx + (gap / 2.0 + bar_w / 2.0), dy, bar_w / 2.0, bar_h / 2.0, bar_w / 2.5));
+            let p = &mut px[(y * stride_px + x) * 4..][..4];
+            let a = p[3] as f64 / 255.0;
+            for c in &mut p[..3] {
+                let v = *c as f64 * (1.0 - disc);
+                *c = (v * (1.0 - bars) + 255.0 * a * bars).round() as u8;
+            }
+        }
+    }
 }
 
 // --- window management -----------------------------------------------------------------

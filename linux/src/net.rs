@@ -38,6 +38,8 @@ pub struct WinInfo {
 pub enum UiEvent {
     Connected(String),
     Disconnected(String),
+    /// Streaming switched on (true) or paused (false), here or on the Mac.
+    Streaming(bool),
     WindowAdded(WinInfo),
     WindowChanged { wid: u32, title: String, w: f32, h: f32, rel_x: f32, rel_y: f32 },
     WindowRemoved(u32),
@@ -74,6 +76,7 @@ impl UiEvent {
         match self {
             UiEvent::Connected(_) => "connected",
             UiEvent::Disconnected(_) => "disconnected",
+            UiEvent::Streaming(_) => "streaming",
             UiEvent::WindowAdded(_) => "window added",
             UiEvent::WindowChanged { .. } => "window changed",
             UiEvent::WindowRemoved(_) => "window removed",
@@ -601,6 +604,14 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::SETTINGS => {
             crate::tray::set_settings(r.bytes()?);
+            // Compared with what the UI was last told (the tray already shows a change made here
+            // before the Mac confirms it). 2 = not told yet, taken as streaming.
+            static TOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            let now = crate::tray::streaming();
+            let before = TOLD.swap(now as u8, std::sync::atomic::Ordering::SeqCst);
+            if before != now as u8 && !(before == 2 && now) {
+                let _ = ui.send(UiEvent::Streaming(now));
+            }
             return Ok(());
         }
         t::RUNNING_APPS => {

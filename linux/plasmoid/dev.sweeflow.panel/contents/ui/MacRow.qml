@@ -1,5 +1,5 @@
-// A linked Mac: "Use" streams from it instead; the overflow menu streams its whole display (the
-// Mac in use), renames it (in place) or forgets it (asks once).
+// A linked Mac: "Use" streams from it instead; the overflow menu renames it (in place) or forgets
+// it (asks once).
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
@@ -14,10 +14,6 @@ PlasmaComponents3.ItemDelegate {
     signal activated()
     signal renamed(string name)
     signal forgotten()
-    signal showDisplay()
-    /// The Mac in use is streaming: its whole display can be shown in a window.
-    property bool canShowDisplay: false
-    property string logo
 
     // Nothing happens on a stray click: switching Macs is the "Use" button.
     hoverEnabled: false
@@ -87,15 +83,6 @@ PlasmaComponents3.ItemDelegate {
             onClicked: menu.popup(more, 0, more.height)
             PlasmaComponents3.Menu {
                 id: menu
-                // The whole Mac screen in a window: to see what's going on there.
-                PlasmaComponents3.MenuItem {
-                    visible: row.active
-                    height: visible ? implicitHeight : 0
-                    enabled: row.canShowDisplay
-                    icon.source: row.logo
-                    text: "Stream display"
-                    onTriggered: row.showDisplay()
-                }
                 PlasmaComponents3.MenuItem {
                     icon.name: "document-edit"
                     text: "Rename"

@@ -321,10 +321,7 @@ impl ksni::Tray for Tray {
             StandardItem {
                 label: if crate::net::offline() { "Connect" } else { "Disconnect" }.into(),
                 icon_name: if crate::net::offline() { "network-connect" } else { "network-disconnect" }.into(),
-                activate: Box::new(|_| {
-                    crate::net::set_offline(!crate::net::offline());
-                    refresh();
-                }),
+                activate: Box::new(|_| set_connected(crate::net::offline())),
                 ..Default::default()
             }
             .into(),
@@ -612,10 +609,7 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
-        "disconnect" | "connect" => {
-            crate::net::set_offline(action == "disconnect");
-            refresh();
-        }
+        "disconnect" | "connect" => set_connected(action == "connect"),
         "show" => {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             STATE.lock().unwrap().show_at = now.as_millis() as u64;
@@ -673,6 +667,16 @@ pub fn panel_do(action: &str, arg: &str) {
         "quit" => quit(),
         _ => log::warn!("unknown tray widget action {action}"),
     }
+}
+
+/// Connects (which always means streaming: never back into a pause from before) or disconnects.
+fn set_connected(connect: bool) {
+    if connect {
+        // With the Mac still away, kept and applied once it's back.
+        change(|s| s.enabled = true);
+    }
+    crate::net::set_offline(!connect);
+    refresh();
 }
 
 /// Looks again at where Mac apps show up (off the calling thread), and tells the widget.

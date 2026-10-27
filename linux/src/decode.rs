@@ -51,6 +51,8 @@ pub struct Plane {
 /// outlive the wl_buffer created from it.
 pub struct GpuFrame {
     frame: *mut AVFrame,
+    /// The decoded VA-API surface itself (another reference): read back for a still (`grey`).
+    source: *mut AVFrame,
     pub width: u32,
     pub height: u32,
     /// The part of the frame (from its top-left) that is the window: the Mac keeps its encoder
@@ -72,7 +74,39 @@ unsafe impl Send for GpuFrame {}
 
 impl Drop for GpuFrame {
     fn drop(&mut self) {
-        unsafe { av_frame_free(&mut self.frame) };
+        unsafe {
+            av_frame_free(&mut self.frame);
+            av_frame_free(&mut self.source);
+        }
+    }
+}
+
+impl GpuFrame {
+    /// The picture in black and white, as opaque BGRA (width × height): read back from the GPU
+    /// (VA-API copes with its own tiling). For a paused window's still; not for every frame.
+    pub fn grey(&self) -> Option<Vec<u8>> {
+        unsafe {
+            let mut sw = av_frame_alloc();
+            if sw.is_null() || av_hwframe_transfer_data(sw, self.source, 0) < 0 {
+                av_frame_free(&mut sw);
+                return None;
+            }
+            let ten_bit = (*sw).format == AVPixelFormat::AV_PIX_FMT_P010LE as i32;
+            let (w, h) = (self.width as usize, (self.height as usize).min((*sw).height as usize));
+            let (luma, stride) = ((*sw).data[0], (*sw).linesize[0] as isize);
+            let mut out = vec![0u8; self.width as usize * self.height as usize * 4];
+            for y in 0..h {
+                let row = luma.offset(stride * y as isize);
+                for x in 0..w.min((*sw).width as usize) {
+                    // P010 keeps its 10 bits at the top of each 16-bit sample.
+                    let v = if ten_bit { *row.add(x * 2 + 1) as i32 } else { *row.add(x) as i32 };
+                    let v = if self.full_range { v } else { ((v - 16) * 255 / 219).clamp(0, 255) } as u8;
+                    out[(y * w + x) * 4..][..4].copy_from_slice(&[v, v, v, 255]);
+                }
+            }
+            av_frame_free(&mut sw);
+            Some(out)
+        }
     }
 }
 
@@ -203,6 +237,7 @@ impl Decoder {
                 );
             }
             Ok(GpuFrame {
+                source: av_frame_clone(self.frame),
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
                 content: ((*self.frame).width as u32, (*self.frame).height as u32),
