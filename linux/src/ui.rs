@@ -1097,7 +1097,7 @@ impl App {
             let (k, ox, oy) = w.fit;
             let (dw, dh) = ((w.info.w as f64 * k).round().max(1.0) as i32, (w.info.h as f64 * k).round().max(1.0) as i32);
             w.video_sub.set_position(ox.round() as i32, oy.round() as i32);
-            w.video_viewport.set_source(0.0, 0.0, frame.width as f64, frame.height as f64);
+            w.video_viewport.set_source(0.0, 0.0, frame.content.0 as f64, frame.content.1 as f64);
             w.video_viewport.set_destination(dw, dh);
             w.video.attach(Some(&buffer), 0, 0);
             w.video.damage_buffer(0, 0, frame.width as i32, frame.height as i32);
@@ -1111,7 +1111,7 @@ impl App {
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
         let s = self.scale;
         let (bw, bh) = w.size;
-        let (fw, fh) = (frame.width, frame.height);
+        let (fw, fh) = frame.content;
         let px_per_pt = px_per_pt(frame.px_per_pt, fw, w.info.w, s);
         let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
         let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);

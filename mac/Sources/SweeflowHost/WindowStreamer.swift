@@ -313,20 +313,54 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     static var tenBit: Bool { settings.config.quality != "light" }
     /// What the current encoder was made for.
     private var encoderTenBit = true
+
+    /// The size to encode a w×h picture at. A new encoder's first frame takes ~30 ms longer
+    /// than one from a running encoder (more with several windows at once on the shared hardware
+    /// encoder), and a tiling relayout or a drag resizes windows over and over, often back and
+    /// forth. So while a window is being resized its encoder stays as it is if the picture still
+    /// fits (in at least half its area), and grows with room to spare. The picture goes in the
+    /// top-left corner; the frame tells Linux its real size. Once the size has held for a few
+    /// seconds the encoder fits it again (encoding the spare room costs a little every frame).
+    /// (Only for 10-bit: that picture is converted into a buffer of our own anyway.)
+    private func codedSize(_ w: Int32, _ h: Int32) -> (Int32, Int32) {
+        guard Self.tenBit, displayID == nil else { return (w, h) }
+        if (w, h) != pictureSize {
+            pictureSize = (w, h)
+            pictureSince = .now()
+        }
+        func up(_ v: Int32, room: Bool) -> Int32 { min(8192, (v + (room ? v / 8 : 0) + 63) / 64 * 64) }
+        let fitted = (up(w, room: false), up(h, room: false))
+        let (ew, eh) = encoderSize
+        let settled = DispatchTime.now().uptimeNanoseconds - pictureSince.uptimeNanoseconds > 3_000_000_000
+        if encoder != nil, encoderTenBit, w <= ew, h <= eh, Int64(w) * Int64(h) * 2 >= Int64(ew) * Int64(eh),
+           !settled || encoderSize == fitted {
+            return encoderSize
+        }
+        // A new window, or one whose size has settled, gets its own size (in the encoder's
+        // 64-pixel blocks); one being resized more.
+        return settled || encoder == nil ? fitted : (up(w, room: true), up(h, room: true))
+    }
+    private var pictureSize: (Int32, Int32) = (0, 0)
+    private var pictureSince = DispatchTime.now()
     private var transfer: VTPixelTransferSession?
     private var yuvPool: CVPixelBufferPool?
     private var yuvPoolSize = (0, 0)
+    /// Picture and buffer size the conversion is set up for.
+    private var transferArea: [Int] = []
 
     /// BGRA → 10-bit 4:2:0 limited-range BT.709 YUV (tagged sRGB like the capture, so no
     /// brightness curve is applied on the way).
-    private func toVideoRange10(_ pb: CVPixelBuffer) -> CVPixelBuffer? {
-        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+    private func toVideoRange10(_ pb: CVPixelBuffer, size: (Int32, Int32)) -> CVPixelBuffer? {
+        let pw = CVPixelBufferGetWidth(pb), ph = CVPixelBufferGetHeight(pb)
+        let (w, h) = (Int(size.0), Int(size.1))
+        guard pw <= w, ph <= h else { return nil }
         if transfer == nil {
             var t: VTPixelTransferSession?
             guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &t) == noErr, let t else { return nil }
             VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
             VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
             VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationTransferFunction, value: kCVImageBufferTransferFunction_sRGB)
+            VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_CropSourceToCleanAperture)
             transfer = t
         }
         if yuvPool == nil || yuvPoolSize != (w, h) {
@@ -343,10 +377,23 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let pool = yuvPool, let t = transfer else { return nil }
         var out: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) == kCVReturnSuccess, let out else { return nil }
+        // The picture goes in the top-left corner, unscaled, and the conversion fills the rest
+        // with black: a clean aperture that size there (its offsets are from the centre).
+        if transferArea != [pw, ph, w, h] {
+            transferArea = [pw, ph, w, h]
+            let aperture: [CFString: Any] = [
+                kCVImageBufferCleanApertureWidthKey: pw, kCVImageBufferCleanApertureHeightKey: ph,
+                kCVImageBufferCleanApertureHorizontalOffsetKey: -(w - pw) / 2,
+                kCVImageBufferCleanApertureVerticalOffsetKey: -(h - ph) / 2,
+            ]
+            VTSessionSetProperty(t, key: kVTPixelTransferPropertyKey_DestinationCleanAperture, value: aperture as CFDictionary)
+        }
         CVBufferSetAttachment(out, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
         CVBufferSetAttachment(out, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
         CVBufferSetAttachment(out, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
         guard VTPixelTransferSessionTransferImage(t, from: pb, to: out) == noErr else { return nil }
+        // The conversion tags the buffer with that aperture; the encoder must see the whole.
+        CVBufferRemoveAttachment(out, kCVImageBufferCleanApertureKey)
         return out
     }
     /// The paused picture is up: captures are dropped until unlocked.
@@ -694,10 +741,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func encode(_ pb: CVPixelBuffer) {
         flushCorners()
         let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
-        if encoder == nil || encoderSize != (w, h) || encoderTenBit != Self.tenBit {
+        let coded = codedSize(w, h)
+        if encoder == nil || encoderSize != coded || encoderTenBit != Self.tenBit {
             if let e = encoder { VTCompressionSessionInvalidate(e) }
-            encoder = makeEncoder(width: w, height: h)
-            encoderSize = (w, h)
+            encoder = makeEncoder(width: coded.0, height: coded.1)
+            encoderSize = coded
             forceKeyframe = true
         }
         guard let enc = encoder else { return }
@@ -715,7 +763,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let pts = CMTime(value: CMTimeValue(captureUs), timescale: 1_000_000)
         // 10-bit goes in as limited-range YUV we convert ourselves: from BGRA the encoder writes
         // full-range 10-bit, which KWin shows as limited whatever it's tagged (too dark).
-        let input = encoderTenBit ? (toVideoRange10(pb) ?? pb) : pb
+        let input = encoderTenBit ? (toVideoRange10(pb, size: encoderSize) ?? pb) : pb
         VTCompressionSessionEncodeFrame(enc, imageBuffer: input, presentationTimeStamp: pts, duration: .invalid,
                                         frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }

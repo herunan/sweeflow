@@ -53,6 +53,9 @@ pub struct GpuFrame {
     frame: *mut AVFrame,
     pub width: u32,
     pub height: u32,
+    /// The part of the frame (from its top-left) that is the window: the Mac keeps its encoder
+    /// a size up while a window shrinks (no new encoder and keyframe per resize) and pads.
+    pub content: (u32, u32),
     pub format: u32,
     pub planes: Vec<Plane>,
     pub capture_us: u64,
@@ -202,6 +205,7 @@ impl Decoder {
             Ok(GpuFrame {
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
+                content: ((*self.frame).width as u32, (*self.frame).height as u32),
                 frame: drm,
                 format,
                 planes,

@@ -654,6 +654,9 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                     Ok(Some(mut frame)) => {
                         frame.dark_titlebar = f.dark;
                         frame.px_per_pt = f.px_per_pt;
+                        if f.w > 0 && f.h > 0 {
+                            frame.content = ((f.w as u32).min(frame.width), (f.h as u32).min(frame.height));
+                        }
                         // The Mac knows the encoder's range; FFmpeg's VA-API frames don't report it.
                         frame.full_range = f.full_range;
                         if ui2.send(UiEvent::Frame(wid, frame)).is_err() {
