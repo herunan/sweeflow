@@ -109,6 +109,12 @@ final class Session {
     // MARK: messages
 
     private func handle(_ m: inout MsgReader, on s: MsgStream) throws {
+        // Input that comes while a press waits for its window to come to the front (see
+        // holdInput) waits too, so it all lands in order.
+        if heldInput != nil, [.pointerMove, .pointerButton, .scroll, .key, .releaseAll].contains(m.type) {
+            heldInput?.append((m, s))
+            return
+        }
         switch m.type {
         case .hello:
             let v = try m.u16()
@@ -369,12 +375,18 @@ final class Session {
             let b = Int(try m.u8()), pressed = try m.u8() != 0
             log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")")
             if let p {
-                if pressed { ensureFront(wid, at: p) }
-                input.button(b, pressed: pressed, at: p)
-                userDidSomething(click: true)
-                if b == 0 {
-                    watchGesture(wid, buttonDown: pressed)
-                    watchDrag(wid, buttonDown: pressed)
+                let post = { [self] in
+                    input.button(b, pressed: pressed, at: p)
+                    userDidSomething(click: true)
+                    if b == 0 {
+                        watchGesture(wid, buttonDown: pressed)
+                        watchDrag(wid, buttonDown: pressed)
+                    }
+                }
+                if pressed && ensureFront(wid, at: p) {
+                    holdInput(until: wid, at: p, then: post)
+                } else {
+                    post()
                 }
             }
         case .scroll:
@@ -485,12 +497,48 @@ final class Session {
 
     /// Windows overlap on the Mac, so the one under the pointer must be on top before we
     /// inject events at its location.
-    private func ensureFront(_ wid: UInt32, at p: CGPoint) {
-        guard let win = tracker.windows[wid] else { return }
-        if win.kind != .toplevel { return }   // menus and floating panels are already on top
-        if raisedWid == wid && tracker.isFrontmost(wid, at: p) { return }
-        if !tracker.isFrontmost(wid, at: p) { raise(win) }
+    /// Brings the window to the front if another one covers `p` on the Mac. Whether it had to.
+    @discardableResult
+    private func ensureFront(_ wid: UInt32, at p: CGPoint) -> Bool {
+        guard let win = tracker.windows[wid] else { return false }
+        if win.kind != .toplevel { return false }   // menus and floating panels are already on top
+        if raisedWid == wid && tracker.isFrontmost(wid, at: p) { return false }
+        let covered = !tracker.isFrontmost(wid, at: p)
+        if covered { raise(win) }
         raisedWid = wid
+        return covered
+    }
+
+    /// Input waiting for a window to come to the front, and the stream each message came on.
+    private var heldInput: [(MsgReader, MsgStream)]?
+
+    /// A press on a window that another one covers on the Mac (windows Linux shows side by side
+    /// can overlap there, big tiled ones especially) waits until the raise has taken effect, and
+    /// what follows it with it. Raising goes through Accessibility, which a busy app answers
+    /// from a few ms to most of a second later; sent straight away, the press landed on the
+    /// window in front. Sent anyway after 0.6 s.
+    private func holdInput(until wid: UInt32, at p: CGPoint, then post: @escaping () -> Void) {
+        heldInput = []
+        let start = DispatchTime.now()
+        func check() {
+            let waited = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e6
+            let front = tracker.isFrontmost(wid, at: p)
+            guard front || waited > 600 else {
+                queue.asyncAfter(deadline: .now() + .milliseconds(8)) { check() }
+                return
+            }
+            log(String(format: "click on %u held %.0f ms for its window to come to the front%@", wid, waited, front ? "" : ": still covered, sent anyway"))
+            post()
+            var rest = heldInput ?? []
+            heldInput = nil
+            while !rest.isEmpty {
+                var (m, s) = rest.removeFirst()
+                // A press in there may wait for a raise of its own: the rest waits behind it.
+                if heldInput != nil { heldInput?.append((m, s)); continue }
+                do { try handle(&m, on: s) } catch { log("held input: \(error)") }
+            }
+        }
+        check()
     }
 
     /// While the left button is held in a streamed window, watch for a file drag starting there
