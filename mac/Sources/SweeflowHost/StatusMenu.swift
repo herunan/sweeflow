@@ -60,8 +60,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(apps)
 
         menu.addItem(.sectionHeader(title: "This Mac"))
-        let dim = toggle("Dim This Screen", c.dimMacScreenWhileStreaming) { $0.dimMacScreenWhileStreaming.toggle() }
-        dim.toolTip = "Turn this screen down while its apps are on Linux"
+        let dim = ClosureMenuItem(title: c.dimMacScreenWhileStreaming ? "Screen Dimmed" : "Dim This Screen") {
+            settings.update { $0.dimMacScreenWhileStreaming = true }
+        }
+        dim.isEnabled = c.enabled && !c.dimMacScreenWhileStreaming
+        dim.toolTip = "Turns this screen down until someone uses this Mac's keyboard or trackpad"
         menu.addItem(dim)
         let background = NSMenuItem(title: "Window Background", action: nil, keyEquivalent: "")
         let b = NSMenu()

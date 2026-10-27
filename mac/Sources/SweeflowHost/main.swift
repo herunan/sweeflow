@@ -11,7 +11,9 @@ struct Config: Codable {
     var excludeApps: [String] = []
     /// Mute the Mac's own speakers while a client is connected (sound plays on Linux instead).
     var muteMacWhileStreaming = true
-    var dimMacScreenWhileStreaming = true
+    /// The built-in screen is dimmed now: asked for ("Dim Mac screen", from either side) and
+    /// switched off again as soon as someone uses the Mac itself (see BuiltInScreen).
+    var dimMacScreenWhileStreaming = false
 
     /// Put streamed windows on an invisible display sized to the Linux monitor (lets windows be
     /// as large as that monitor and keeps working with the lid closed). Turn off to keep windows
@@ -157,6 +159,10 @@ final class HostState {
     init() {
         NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: .main) { [weak self] _ in
             self?.apply()
+        }
+        // Someone at the Mac: dimming is over (until asked for again).
+        BuiltInScreen.onLocalUse = {
+            if settings.config.dimMacScreenWhileStreaming { settings.update { $0.dimMacScreenWhileStreaming = false } }
         }
     }
 

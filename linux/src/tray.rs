@@ -48,7 +48,7 @@ impl Default for Settings {
             enabled: true,
             exclude: Vec::new(),
             sound: true,
-            dim: true,
+            dim: false,
             clipboard: true,
             drag_drop: true,
             launcher: true,
@@ -364,9 +364,8 @@ impl ksni::Tray for Tray {
         items.push(MenuItem::Separator);
 
         type Toggle = (&'static str, fn(&Settings) -> bool, fn(&mut Settings));
-        let toggles: [Toggle; 6] = [
+        let toggles: [Toggle; 5] = [
             ("Mac sound on Linux", |s| s.sound, |s| s.sound = !s.sound),
-            ("Dim Mac screen", |s| s.dim, |s| s.dim = !s.dim),
             ("Shared clipboard", |s| s.clipboard, |s| s.clipboard = !s.clipboard),
             ("Drag and drop", |s| s.drag_drop, |s| s.drag_drop = !s.drag_drop),
             ("Mac Apps in app menu", |s| s.launcher, |s| s.launcher = !s.launcher),
@@ -397,6 +396,17 @@ impl ksni::Tray for Tray {
                     }
                     .into(),
                 ],
+                ..Default::default()
+            }
+            .into(),
+        );
+        // Dims the Mac's own screen now; using the Mac itself brings it back.
+        let dimmed = s.as_ref().is_some_and(|s| s.dim);
+        items.push(
+            StandardItem {
+                label: if dimmed { "Mac screen dimmed" } else { "Dim Mac screen" }.into(),
+                enabled: known && on && !dimmed,
+                activate: Box::new(|_| change(|s| s.dim = true)),
                 ..Default::default()
             }
             .into(),

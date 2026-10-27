@@ -358,7 +358,6 @@ PlasmoidItem {
                             { key: "sound", label: "Play Mac sound here", hint: "Mac audio plays on Linux" },
                             { key: "clipboard", label: "Shared clipboard", hint: "Copy on one, paste on the other" },
                             { key: "dragDrop", label: "Drag and drop files", hint: "Between Mac windows and Linux" },
-                            { key: "dim", label: "Dim the Mac's screen", hint: "While its apps are streaming" },
                             { key: "sharp", label: "High quality", hint: "Turn off for slower connections" },
                         ]
                         delegate: ToggleRow {
@@ -403,6 +402,14 @@ PlasmoidItem {
                         hint: "Start Sweeflow when you log in"
                         on: !!root.st.openAtLogin
                         onFlipped: (v) => root.act("login", v ? "on" : "off")
+                    }
+                    // Dims the MacBook's own screen now; using the Mac itself brings it back.
+                    LinkRow {
+                        label: "Dim Mac screen"
+                        note: root.settings.dim ? "Dimmed" : ""
+                        enabled: root.streaming && !root.settings.dim
+                        hint: "Turns the Mac's own screen down until someone uses the Mac itself"
+                        onClicked: root.set({ dim: true })
                     }
                     // The Mac's whole screen in a window, to see what's going on there.
                     LinkRow {
