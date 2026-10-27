@@ -369,6 +369,26 @@ PlasmoidItem {
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
                         }
                     }
+                    // What Mac windows sit on, on the Mac's own (invisible) screen.
+                    PlasmaComponents3.ItemDelegate {
+                        id: backdropRow
+                        readonly property var values: ["auto", "dark", "light"]
+                        Layout.fillWidth: true
+                        onClicked: backdropBox.popup.open()
+                        PlasmaComponents3.ToolTip.text: "The colour behind Mac windows. Their see-through sidebars and toolbars pick it up: dark or light, or as the Mac's own appearance"
+                        PlasmaComponents3.ToolTip.visible: hovered
+                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                        contentItem: RowLayout {
+                            spacing: Kirigami.Units.largeSpacing
+                            PlasmaComponents3.Label { text: "Window backdrop"; elide: Text.ElideRight; Layout.fillWidth: true }
+                            PlasmaComponents3.ComboBox {
+                                id: backdropBox
+                                model: ["Match the Mac", "Dark", "Light"]
+                                currentIndex: Math.max(0, backdropRow.values.indexOf(root.settings.backdrop || "auto"))
+                                onActivated: (i) => root.set({ backdrop: backdropRow.values[i] })
+                            }
+                        }
+                    }
 
                     Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.largeSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
                     ToggleRow {

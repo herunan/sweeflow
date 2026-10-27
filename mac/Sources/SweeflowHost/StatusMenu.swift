@@ -62,6 +62,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(toggle("Drag and Drop Files", c.dragDrop) { $0.dragDrop.toggle() })
         menu.addItem(toggle("Dim This Screen", c.dimMacScreenWhileStreaming) { $0.dimMacScreenWhileStreaming.toggle() })
         menu.addItem(toggle("High Quality", c.quality != "light") { $0.quality = $0.quality == "light" ? "sharp" : "light" })
+        let backdrop = NSMenuItem(title: "Window Backdrop", action: nil, keyEquivalent: "")
+        let b = NSMenu()
+        for (title, value) in [("Match the Mac", "auto"), ("Dark", "dark"), ("Light", "light")] {
+            b.addItem(toggle(title, c.backdrop == value) { $0.backdrop = value })
+        }
+        backdrop.submenu = b
+        backdrop.toolTip = "What Mac windows sit on: their see-through sidebars and toolbars take on its tone"
+        menu.addItem(backdrop)
 
         menu.addItem(.sectionHeader(title: "Linked Computers"))
         for p in Identity.pairedClients() {

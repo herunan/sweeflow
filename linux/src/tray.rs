@@ -32,6 +32,14 @@ pub struct Settings {
     /// Mac windows on a desktop of their own (see desktop.rs).
     #[serde(default = "yes")]
     pub desktop: bool,
+    /// Behind Mac windows on the Mac's virtual display: "auto" (as the Mac's appearance),
+    /// "dark" or "light". Older Macs don't send it.
+    #[serde(default = "auto")]
+    pub backdrop: String,
+}
+
+fn auto() -> String {
+    "auto".into()
 }
 
 fn yes() -> bool {
@@ -51,6 +59,7 @@ impl Default for Settings {
             launcher: true,
             quality: "sharp".into(),
             desktop: true,
+            backdrop: auto(),
         }
     }
 }

@@ -32,10 +32,11 @@ final class VirtualDisplay {
         return CGRect(x: b.minX + left, y: b.minY + top, width: b.width - left - right, height: b.height - top - bottom)
     }
 
-    /// A plain backdrop: black in dark mode, white in light mode. Mac windows tint their
-    /// sidebars and toolbars with what's behind them, so a neutral one keeps their colours
-    /// clean. Follows the Mac's appearance; only this invisible display is touched.
+    /// A plain backdrop: black or white. Mac windows tint their sidebars and toolbars with
+    /// what's behind them, so a neutral one keeps their colours clean. As chosen in the settings
+    /// (Window backdrop), or following the Mac's appearance; only this invisible display is touched.
     private var appearanceObserver: NSObjectProtocol?
+    private var settingsObserver: NSObjectProtocol?
 
     private func applyBackdrop(attempt: Int) {
         guard let id = displayID else { return }
@@ -47,7 +48,12 @@ final class VirtualDisplay {
             }
             return
         }
-        let dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        let dark: Bool
+        switch settings.config.backdrop {
+        case "dark": dark = true
+        case "light": dark = false
+        default: dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        }
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/sweeflow")
         // Old copies of the Linux wallpaper (an earlier version), no longer used.
         for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
@@ -75,6 +81,11 @@ final class VirtualDisplay {
             appearanceObserver = DistributedNotificationCenter.default().addObserver(
                 forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main
             ) { [weak self] _ in self?.applyBackdrop(attempt: 0) }
+        }
+        if settingsObserver == nil {
+            settingsObserver = NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: .main) {
+                [weak self] _ in self?.applyBackdrop(attempt: 0)
+            }
         }
     }
 
