@@ -33,14 +33,14 @@ final class Settings {
         var launcher: Bool?
         var quality: String?
         var desktop: Bool?
-        var backdrop: String?
+        var appearance: String?
     }
 
     func wire() -> Data {
         let c = config
         let w = Wire(enabled: c.enabled, exclude: c.excludeApps, sound: c.soundOnLinux, dim: c.dimMacScreenWhileStreaming,
                      clipboard: c.clipboard, dragDrop: c.dragDrop, launcher: c.launcherMenu, quality: c.quality,
-                     desktop: c.ownDesktop, backdrop: c.backdrop)
+                     desktop: c.ownDesktop, appearance: c.appearance)
         return (try? JSONEncoder().encode(w)) ?? Data()
     }
 
@@ -61,6 +61,6 @@ final class Settings {
         if let v = w.launcher { c.launcherMenu = v }
         if let v = w.quality, ["sharp", "light"].contains(v) { c.quality = v }
         if let v = w.desktop { c.ownDesktop = v }
-        if let v = w.backdrop, ["auto", "dark", "light"].contains(v) { c.backdrop = v }
+        if let v = w.appearance, ["dark", "light"].contains(v) { c.appearance = v }
     }
 }

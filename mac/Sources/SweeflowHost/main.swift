@@ -35,9 +35,9 @@ struct Config: Codable {
     var ownDesktop = true
     /// "sharp": Retina, 10-bit. "light": 1x, 8-bit, for slower networks.
     var quality = "sharp"
-    /// Behind Mac windows on the virtual display: "dark" or "light" ("auto", from an earlier
-    /// version: as the Mac's own appearance). Their see-through sidebars take on this tone.
-    var backdrop = "dark"
+    /// Window background: the Mac's dark or light mode, "dark" or "light". Mirrors the Mac's own
+    /// setting (see Appearance); changing it here switches the Mac.
+    var appearance = ""
 
     init() {}
 
@@ -58,7 +58,7 @@ struct Config: Codable {
         launcherMenu = try c.decodeIfPresent(Bool.self, forKey: .launcherMenu) ?? d.launcherMenu
         quality = try c.decodeIfPresent(String.self, forKey: .quality) ?? d.quality
         ownDesktop = try c.decodeIfPresent(Bool.self, forKey: .ownDesktop) ?? d.ownDesktop
-        backdrop = try c.decodeIfPresent(String.self, forKey: .backdrop) ?? d.backdrop
+        appearance = try c.decodeIfPresent(String.self, forKey: .appearance) ?? d.appearance
         videoDatagrams = try c.decodeIfPresent(Bool.self, forKey: .videoDatagrams) ?? d.videoDatagrams
     }
 
@@ -242,6 +242,7 @@ do { try server.start(port: settings.config.port) } catch { log("listen failed: 
 let debugPort = DebugPort()
 if settings.config.debugPort != 0 { debugPort.start(port: settings.config.debugPort) }
 let statusMenu = StatusMenu()
+Appearance.start()
 
 // Something still to set up (a fresh install): the setup window says what.
 if !Onboarding.complete { Onboarding.shared.show() }

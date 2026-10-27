@@ -369,30 +369,30 @@ PlasmoidItem {
                             onFlipped: (v) => root.set(modelData.key === "sharp" ? { quality: v ? "sharp" : "light" } : { [modelData.key]: v })
                         }
                     }
-                    // What Mac windows sit on, on the screen the Mac adds for Linux. Two buttons (a
-                    // dropdown's list would be cut off by the popup's edge).
+                    // The Mac's dark or light mode. Two buttons (a dropdown's list would be cut off
+                    // by the popup's edge).
                     PlasmaComponents3.ItemDelegate {
-                        id: backdropRow
-                        readonly property bool light: root.settings.backdrop === "light"
+                        id: backgroundRow
+                        readonly property bool light: root.settings.appearance === "light"
                         Layout.fillWidth: true
-                        onClicked: root.set({ backdrop: light ? "dark" : "light" })
-                        PlasmaComponents3.ToolTip.text: "What Mac windows sit on. Shows through their see-through sidebars, and behind them in Troubleshoot (stream display)"
+                        onClicked: root.set({ appearance: light ? "dark" : "light" })
+                        PlasmaComponents3.ToolTip.text: "The background of Mac windows"
                         PlasmaComponents3.ToolTip.visible: hovered
                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                         contentItem: RowLayout {
                             spacing: Kirigami.Units.smallSpacing
-                            PlasmaComponents3.Label { text: "Backdrop"; elide: Text.ElideRight; Layout.fillWidth: true }
+                            PlasmaComponents3.Label { text: "Window background"; elide: Text.ElideRight; Layout.fillWidth: true }
                             PlasmaComponents3.ToolButton {
                                 text: "Dark"
                                 checkable: true
-                                checked: !backdropRow.light
-                                onClicked: { root.set({ backdrop: "dark" }); checked = Qt.binding(() => !backdropRow.light); }
+                                checked: root.settings.appearance === "dark"
+                                onClicked: { root.set({ appearance: "dark" }); checked = Qt.binding(() => root.settings.appearance === "dark"); }
                             }
                             PlasmaComponents3.ToolButton {
                                 text: "Light"
                                 checkable: true
-                                checked: backdropRow.light
-                                onClicked: { root.set({ backdrop: "light" }); checked = Qt.binding(() => backdropRow.light); }
+                                checked: backgroundRow.light
+                                onClicked: { root.set({ appearance: "light" }); checked = Qt.binding(() => backgroundRow.light); }
                             }
                         }
                     }

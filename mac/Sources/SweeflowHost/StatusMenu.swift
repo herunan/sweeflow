@@ -63,14 +63,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let dim = toggle("Dim This Screen", c.dimMacScreenWhileStreaming) { $0.dimMacScreenWhileStreaming.toggle() }
         dim.toolTip = "Turn this screen down while its apps are on Linux"
         menu.addItem(dim)
-        let backdrop = NSMenuItem(title: "Backdrop", action: nil, keyEquivalent: "")
+        let background = NSMenuItem(title: "Window Background", action: nil, keyEquivalent: "")
         let b = NSMenu()
         for (title, value) in [("Dark", "dark"), ("Light", "light")] {
-            b.addItem(toggle(title, c.backdrop == value || (value == "dark" && c.backdrop == "auto")) { $0.backdrop = value })
+            b.addItem(toggle(title, (value == "dark") == Appearance.isDark) { $0.appearance = value })
         }
-        backdrop.submenu = b
-        backdrop.toolTip = "What windows sit on, on the screen Sweeflow adds for Linux: shows through see-through sidebars"
-        menu.addItem(backdrop)
+        background.submenu = b
+        background.toolTip = "The background of Mac windows (this Mac's dark or light mode)"
+        menu.addItem(background)
         let login = ClosureMenuItem(title: "Open at Login") {
             if LoginItem.enabled { LoginItem.disable() } else { LoginItem.enable() }
         }
