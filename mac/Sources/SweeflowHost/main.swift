@@ -149,7 +149,9 @@ final class HostState {
     private var sessions = 0
     var connected: Bool { sessions > 0 }
     /// The Linux computer connected now (its certificate's fingerprint). Main thread.
-    var client: String?
+    var client: String? {
+        didSet { if client != oldValue { NotificationCenter.default.post(name: .sweeflowConnectionChanged, object: nil) } }
+    }
     private var teardown: DispatchWorkItem?
 
     private var mutedByUs = false

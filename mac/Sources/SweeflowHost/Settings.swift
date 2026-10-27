@@ -2,6 +2,8 @@ import Foundation
 
 extension Notification.Name {
     static let sweeflowSettingsChanged = Notification.Name("sweeflowSettingsChanged")
+    /// A Linux computer connected or went away (HostState.client).
+    static let sweeflowConnectionChanged = Notification.Name("sweeflowConnectionChanged")
 }
 
 /// The switches in the Mac menu-bar item and the Linux tray menu (the same ones: changing one

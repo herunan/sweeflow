@@ -11,24 +11,46 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.autoenablesItems = false
         item.menu = menu
         updateIcon()
-        NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: .main) { [weak self] _ in
-            self?.updateIcon()
+        for name in [Notification.Name.sweeflowSettingsChanged, .sweeflowConnectionChanged] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.updateIcon()
+            }
         }
     }
 
+    /// The logo (a template: macOS draws it in the menu bar's colour). Paused or not connected:
+    /// faded, with a small badge saying which (a pause sign, a cross), as on Linux.
     private func updateIcon() {
-        let on = settings.config.enabled
-        // The logo (a template: macOS draws it in the menu bar's colour); faded while paused.
-        let image = NSImage(named: "MenuIcon")
+        let connected = host.client != nil
+        let on = settings.config.enabled && connected
+        let base = NSImage(named: "MenuIcon")
             ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Sweeflow")
-        image?.isTemplate = true
+        guard let base else { return }
         // The logo is wider than tall (a wrapped sweet): the menu bar's usual height, its own width.
-        if let i = image, i.size.height > 0 {
-            i.size = NSSize(width: (16 * i.size.width / i.size.height).rounded(), height: 16)
+        if base.size.height > 0 {
+            base.size = NSSize(width: (16 * base.size.width / base.size.height).rounded(), height: 16)
         }
+        let badge = !connected ? "xmark.circle.fill" : !settings.config.enabled ? "pause.circle.fill" : nil
+        let image = badge.map { Self.badged(base, $0) } ?? base
+        image.isTemplate = true
         item.button?.image = image
         item.button?.appearsDisabled = !on
-        item.button?.toolTip = on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
+        item.button?.toolTip = !connected ? "Sweeflow: not connected" : on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
+    }
+
+    /// The logo with a small symbol in its bottom-right corner, cut out around it so it reads.
+    private static func badged(_ base: NSImage, _ symbol: String) -> NSImage {
+        guard let sign = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .bold)) else { return base }
+        return NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            let b = NSRect(x: rect.maxX - 10, y: rect.minY, width: 10, height: 10)
+            NSGraphicsContext.current?.compositingOperation = .destinationOut
+            NSBezierPath(ovalIn: b.insetBy(dx: -1.5, dy: -1.5)).fill()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            sign.draw(in: b)
+            return true
+        }
     }
 
     /// Built when opened, so it always shows the current state. Only what concerns this Mac:
