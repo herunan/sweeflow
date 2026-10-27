@@ -179,7 +179,9 @@ final class HostState {
         apply()
     }
 
-    func sessionEnded() {
+    /// `leaving`: the client said goodbye (switched to another Mac, disconnected, quit). Tidied
+    /// up at once then: the grace period is for connections that drop (a Wi-Fi blip).
+    func sessionEnded(leaving: Bool = false) {
         sessions = max(0, sessions - 1)
         guard sessions == 0 else { return }
         undimForGood()
@@ -191,14 +193,20 @@ final class HostState {
         }
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.sessions == 0 else { return }
-            log("no client for a while: removing virtual display, allowing sleep")
+            log("no client: removing virtual display, allowing sleep")
             self.display.remove()
             self.wake.release()
             self.wake.releaseReachable()
             self.setMuted(false)
         }
         teardown = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
+        if leaving {
+            if dimmed { dimmed = false; BuiltInScreen.stopDimming() }
+            log("client left: tidying up now")
+            work.perform()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
+        }
     }
 
     /// A client is connected, or the settings changed: keep the Mac awake, dimmed and muted as

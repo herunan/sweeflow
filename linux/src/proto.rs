@@ -11,6 +11,8 @@ pub mod t {
     pub const MAC_DISCONNECTED: u8 = 0x03;
     /// The Mac forgot this computer: forget it too.
     pub const FORGOTTEN: u8 = 0x04;
+    /// Leaving on purpose (switching Macs, disconnecting, quitting): the Mac tidies up at once.
+    pub const GOODBYE: u8 = 0x05;
     pub const WINDOW_ADDED: u8 = 0x10;
     pub const WINDOW_CHANGED: u8 = 0x11;
     pub const WINDOW_REMOVED: u8 = 0x12;

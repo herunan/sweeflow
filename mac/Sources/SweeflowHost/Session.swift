@@ -54,6 +54,8 @@ final class Session {
 
     /// The Linux machine on the other end (its certificate's fingerprint).
     var clientFingerprint: String?
+    /// It said goodbye: leaving on purpose, so no grace period for it to come back.
+    private var leaving = false
 
     /// Says something and ends the connection (a moment later, so it gets there).
     func sendAndClose(_ msg: Msg) {
@@ -95,7 +97,8 @@ final class Session {
     func shutdown() {
         if started {
             started = false
-            DispatchQueue.main.async { host.client = nil; host.sessionEnded() }
+            let leaving = leaving
+            DispatchQueue.main.async { host.client = nil; host.sessionEnded(leaving: leaving) }
         }
         tracker.stop()
         if let o = screensObserver { NotificationCenter.default.removeObserver(o) }
@@ -126,6 +129,9 @@ final class Session {
             return
         }
         switch m.type {
+        case .goodbye:
+            log("client leaving (switching Macs, disconnecting or quitting)")
+            leaving = true
         case .hello:
             let v = try m.u16()
             clientScale = try m.f32()

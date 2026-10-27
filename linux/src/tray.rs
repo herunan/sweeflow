@@ -476,6 +476,7 @@ fn macs_menu() -> MenuItem<Tray> {
 }
 
 fn quit() {
+    crate::net::goodbye();
     // Through systemd, which would otherwise start it again (under the service, this stop is what
     // ends us). Started any other way (KRunner, a terminal), the stop is a no-op, so exit ourselves.
     let _ = std::process::Command::new("systemctl").args(["--user", "stop", "sweeflow"]).status();
@@ -822,6 +823,8 @@ fn forget(fingerprint: &str) {
 }
 
 fn restart() {
+    // Switching Macs or forgetting the one in use: the old Mac is told, and tidies up at once.
+    crate::net::goodbye();
     // Through systemd (it runs us); a plain exit would also do, but slower (RestartSec).
     let _ = std::process::Command::new("systemctl").args(["--user", "restart", "sweeflow"]).spawn();
 }

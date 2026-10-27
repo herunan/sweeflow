@@ -113,6 +113,9 @@ pub enum NetCmd {
     ClipStream(Vec<u8>),
     /// "Disconnect" or "Connect" was chosen (see `set_offline`): look again.
     Recheck,
+    /// Leaving on purpose (switching Macs, quitting): say so to the Mac, then close (the sender
+    /// is told when that's done).
+    Goodbye(std::sync::mpsc::Sender<()>),
 }
 
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
@@ -156,6 +159,19 @@ static OFFLINE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
 
 fn offline_file() -> std::path::PathBuf {
     crate::config::dir().join("disconnected")
+}
+
+/// Tells the Mac this computer is leaving on purpose (so it tidies up at once, without waiting
+/// for the connection to time out), and closes the connection. Waits a moment at most.
+pub fn goodbye() {
+    let Some(tx) = NET_TX.get() else { return };
+    if !CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if tx.send(NetCmd::Goodbye(done_tx)).is_ok() {
+        let _ = done_rx.recv_timeout(std::time::Duration::from_millis(800));
+    }
 }
 
 pub fn offline() -> bool {
@@ -437,8 +453,21 @@ async fn session(
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else { return Ok(()) };
                 match cmd {
-                    NetCmd::Recheck if offline() => break Err(anyhow::anyhow!("disconnected, as asked")),
+                    NetCmd::Recheck if offline() => {
+                        let _ = ctl_tx.write_all(&W::new(t::GOODBYE).finish()).await;
+                        let _ = ctl_tx.finish();
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        break Err(anyhow::anyhow!("disconnected, as asked"));
+                    }
                     NetCmd::Recheck => {}
+                    NetCmd::Goodbye(done) => {
+                        let _ = ctl_tx.write_all(&W::new(t::GOODBYE).finish()).await;
+                        let _ = ctl_tx.finish();
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        conn.close(0u32.into(), b"bye");
+                        let _ = done.send(());
+                        break Err(anyhow::anyhow!("leaving"));
+                    }
                     NetCmd::Control(m) => ctl_tx.write_all(&m).await?,
                     NetCmd::Subscribe(wid) => {
                         // A window minimised on the Mac loses its capture; its task has ended.
