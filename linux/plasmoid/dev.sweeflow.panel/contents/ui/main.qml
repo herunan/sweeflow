@@ -452,6 +452,7 @@ PlasmoidItem {
                             active: modelData.active
                             offline: root.offline
                             onConnectAsked: root.act("connect")
+                            onDisconnectAsked: root.act("disconnect")
                             onActivated: root.act("switch", modelData.fingerprint)
                             onRenamed: (n) => root.rename(modelData.fingerprint, n)
                             onForgotten: root.act("forget", modelData.fingerprint)
