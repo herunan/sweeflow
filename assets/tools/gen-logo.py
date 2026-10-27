@@ -21,8 +21,8 @@ def wrapper_end(side, pinch=23, reach=20, half=17, lobes=3, bulge=7):
     return d + f'C{x1 - s*7} {half + 1} {x0 + s*6} 4.5 {x0} 3 Z'
 
 shapes = [wrapper_end(-1), wrapper_end(1), APPLE, STEM, LEAF]
-def logo(fill_attrs, defs='', backdrop='', scale=1.2):
-    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">\n' + defs + backdrop
+def logo(fill_attrs, defs='', backdrop='', scale=1.2, view='0 0 128 128'):
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{view}">\n' + defs + backdrop
             + f'  <g transform="translate(64 64) rotate(-20) scale({scale})" {fill_attrs}>\n'
             + ''.join(f'    <path d="{d}"/>\n' for d in shapes) + '  </g>\n</svg>\n')
 
@@ -36,4 +36,5 @@ base = out.rsplit('.', 1)[0]
 open(base + '-mac-app.svg', 'w').write(logo('fill="#fff"',
     '  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a855f7"/><stop offset="1" stop-color="#6d28d9"/></linearGradient></defs>\n',
     f'  <path d="{TILE}" fill="url(#bg)"/>\n', scale=0.98))
-open(base + '-mac-menu.svg', 'w').write(logo('fill="#000"'))
+# Cropped to the shape, so it fills the menu bar's height.
+open(base + '-mac-menu.svg', 'w').write(logo('fill="#000"', view='4 22.5 119.5 79'))

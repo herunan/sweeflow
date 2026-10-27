@@ -2,7 +2,7 @@ import AppKit
 
 /// The menu-bar item: what concerns this Mac (the rest is set on Linux, see Settings).
 final class StatusMenu: NSObject, NSMenuDelegate {
-    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
 
     override init() {
@@ -22,7 +22,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let image = NSImage(named: "MenuIcon")
             ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Sweeflow")
         image?.isTemplate = true
-        image?.size = NSSize(width: 18, height: 18)
+        // The logo is wider than tall (a wrapped sweet): the menu bar's usual height, its own width.
+        if let i = image, i.size.height > 0 {
+            i.size = NSSize(width: (16 * i.size.width / i.size.height).rounded(), height: 16)
+        }
         item.button?.image = image
         item.button?.appearsDisabled = !on
         item.button?.toolTip = on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
