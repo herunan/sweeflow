@@ -47,6 +47,36 @@ enum LoginItem {
         do { try service.unregister() } catch { log("login item: \(error)") }
     }
 
+    /// Another copy of Sweeflow (the one launchd runs) is up.
+    static var running: Bool {
+        let me = getpid()
+        return NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .contains { $0.processIdentifier != me && !$0.isTerminated }
+    }
+
+    /// Gets launchd running the login item when it isn't: after Quit (which takes it out of
+    /// launchd), a force quit, or Sweeflow.app replaced with a newer one. True once it's up.
+    static func start() -> Bool {
+        let domain = "gui/\(getuid())"
+        let label = devInstall ? devAgentLabel : agentLabel
+        if (try? run("/bin/launchctl", ["kickstart", "\(domain)/\(label)"])) == nil {
+            // Not loaded any more: load it again (registering starts it).
+            if devInstall {
+                let plist = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/LaunchAgents/\(devAgentLabel).plist").path
+                _ = try? run("/bin/launchctl", ["bootstrap", domain, plist])
+            } else {
+                try? service.unregister()
+                do { try service.register() } catch { log("login item: \(error)") }
+            }
+        }
+        for _ in 0..<20 {
+            if running { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        return false
+    }
+
     /// Registers the login item (macOS starts it right away, too). True if it's running now.
     @discardableResult
     static func enable() -> Bool {

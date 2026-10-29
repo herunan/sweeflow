@@ -108,13 +108,23 @@ if CommandLine.arguments.contains("--pair") {
 }
 
 // Opened by hand (Finder, Launchpad): the copy macOS keeps running is the one that serves Linux.
-// Make sure that one exists (the login item), ask it to show its window, and step aside. If
-// macOS wants the login item approved first, carry on here; the setup window explains.
+// Make sure that one is running (the login item), ask it to show its window, and step aside. If
+// macOS wants the login item approved first, or it won't start, carry on here; the setup window
+// explains.
 if !LoginItem.underLaunchd {
     if LoginItem.devInstall || LoginItem.service.status == .enabled || LoginItem.enable() {
-        DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.show"), object: nil,
-                                                                     userInfo: nil, deliverImmediately: true)
-        exit(0)
+        let wasRunning = LoginItem.running
+        if wasRunning || LoginItem.start() {
+            // One just started only listens once it's set up: keep asking for a few seconds.
+            let until = Date().addingTimeInterval(wasRunning ? 0 : 4)
+            repeat {
+                DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.show"), object: nil,
+                                                                             userInfo: nil, deliverImmediately: true)
+                RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            } while Date() < until
+            exit(0)
+        }
+        log("the login item didn't start: running this copy instead")
     }
 }
 
