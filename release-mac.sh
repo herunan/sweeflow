@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds Sweeflow.dmg on a Mac over SSH and brings it back: dist/ here, plus the copy the
 # "Add a Mac" wizard serves to other Macs (~/.local/share/sweeflow/Sweeflow.dmg).
-# Usage: ./release-mac.sh VERSION [user@mac]
+# Usage: ./release-mac.sh VERSION [user@mac]  (default: your Mac)
 set -euo pipefail
 cd "$(dirname "$0")"
 VERSION="${1:?usage: $0 VERSION [user@mac]}"

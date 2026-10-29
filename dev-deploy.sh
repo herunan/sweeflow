@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rebuild everything, push the Mac host (sources are embedded at build time) and restart the
-# local client service. Usage: ./dev-deploy.sh [user@mac]
+# local client service. Usage: ./dev-deploy.sh [user@mac]  (default: your Mac)
 set -euo pipefail
 cd "$(dirname "$0")/linux"
 cargo build --release
