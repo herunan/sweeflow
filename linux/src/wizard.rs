@@ -4,7 +4,14 @@
 //! Install Sweeflow on the Mac → pick the Mac (found on the network) → type the code it shows →
 //! wait while someone clicks Allow there → done.
 
-use std::{cell::RefCell, net::ToSocketAddrs, rc::Rc};
+use std::{
+    cell::RefCell,
+    io::{BufRead, BufReader},
+    net::ToSocketAddrs,
+    process::{Child, Command, Stdio},
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Result;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -132,8 +139,8 @@ slint::slint! {
                     if installer-url != "" && !firewall-on: Body { text: "Page won't load? This computer's firewall may be blocking it (port 44130)."; }
                     if installer-url != "" && firewall-on: HorizontalLayout {
                         spacing: 8px;
-                        Body { text: firewall-note != "" ? firewall-note : "This computer's firewall blocks the page. Letting it through is a one-time step: it asks for your password, and stays allowed (this network, port 44130 only)."; vertical-alignment: center; }
-                        if firewall-note == "": Button { text: "Allow (one-time)"; clicked => { open-firewall(); } }
+                        Body { text: firewall-note != "" ? firewall-note : "This computer's firewall blocks the page. Let it through while this window is open (asks for your password; this network, port 44130 only)."; vertical-alignment: center; }
+                        if firewall-note == "": Button { text: "Allow while open"; clicked => { open-firewall(); } }
                     }
                 }
                 Step {
@@ -257,15 +264,20 @@ pub fn run() -> Result<()> {
     }
 
     // CachyOS and others ship ufw switched on: the Mac can't reach the page until it's allowed.
-    ui.set_firewall_on(_server.is_some() && firewall_active() && !firewall_allowed_file().exists());
+    // The opening lasts while this window is open, so it's offered again each time.
+    let _ = std::fs::remove_file(crate::config::dir().join("firewall-allowed"));
+    ui.set_firewall_on(_server.is_some() && firewall_active());
+    let opening: Arc<Mutex<Option<Child>>> = Arc::default();
     let weak_fw = ui.as_weak();
+    let opening_fw = opening.clone();
     ui.on_open_firewall(move || {
         let weak = weak_fw.clone();
+        let opening = opening_fw.clone();
         std::thread::spawn(move || {
             let note = match allow_installer_port() {
-                Ok(()) => {
-                    let _ = std::fs::write(firewall_allowed_file(), "");
-                    "Let through for good (this network, port 44130): open the address on your Mac now.".to_string()
+                Ok(child) => {
+                    *opening.lock().unwrap() = Some(child);
+                    "Let through until this window closes: open the address on your Mac now.".to_string()
                 }
                 Err(e) => format!("Not changed ({e}). Allow TCP port 44130 in your firewall settings."),
             };
@@ -382,7 +394,13 @@ pub fn run() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
 
-    ui.run()?;
+    let shown = ui.run();
+    // Closing the helper's input takes the firewall rule back out.
+    if let Some(mut child) = opening.lock().unwrap().take() {
+        drop(child.stdin.take());
+        let _ = child.wait();
+    }
+    shown?;
     Ok(())
 }
 
@@ -423,35 +441,43 @@ fn use_paired_mac() -> Result<()> {
     crate::setup::start_client()
 }
 
-/// Set once the firewall rule has been added: it stays, so the window stops offering it.
-fn firewall_allowed_file() -> std::path::PathBuf {
-    crate::config::dir().join("firewall-allowed")
-}
-
 /// ufw is running (it blocks incoming connections by default).
 fn firewall_active() -> bool {
-    std::process::Command::new("systemctl")
+    Command::new("systemctl")
         .args(["is-active", "--quiet", "ufw"])
         .status()
         .is_ok_and(|s| s.success())
 }
 
-/// Lets the local network reach the installer page: one ufw rule, for this computer's network
-/// only, asked for with the usual password prompt (pkexec).
-fn allow_installer_port() -> anyhow::Result<()> {
+/// Lets the local network reach the installer page for a while: one ufw rule, for this
+/// computer's network only, asked for with the usual password prompt (pkexec). The helper keeps
+/// running as root and deletes the rule when its input closes: when the window closes, or if
+/// Sweeflow dies, so it's never left open.
+fn allow_installer_port() -> anyhow::Result<Child> {
     let net = local_network().ok_or_else(|| anyhow::anyhow!("couldn't tell which network this is"))?;
     let port = crate::installer::PORT.to_string();
-    let ok = std::process::Command::new("pkexec")
-        .args(["ufw", "allow", "from", &net, "to", "any", "port", &port, "proto", "tcp", "comment", "Sweeflow installer"])
-        .status()?
-        .success();
-    anyhow::ensure!(ok, "the firewall wasn't changed");
-    Ok(())
+    let script = r#"rule="from $1 to any port $2 proto tcp"
+ufw allow $rule comment 'Sweeflow installer' >/dev/null || exit 1
+echo open
+cat >/dev/null
+ufw delete allow $rule >/dev/null"#;
+    let mut child = Command::new("pkexec")
+        .args(["sh", "-c", script, "sh", &net, &port])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line)?;
+    if line.trim() != "open" {
+        let _ = child.wait();
+        anyhow::bail!("the firewall wasn't changed");
+    }
+    Ok(child)
 }
 
 /// This computer's local network as an address range ("192.168.1.0/24"), from `ip`.
 fn local_network() -> Option<String> {
-    let out = std::process::Command::new("ip").args(["-o", "-4", "route", "show", "scope", "link"]).output().ok()?;
+    let out = Command::new("ip").args(["-o", "-4", "route", "show", "scope", "link"]).output().ok()?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_whitespace().next())
