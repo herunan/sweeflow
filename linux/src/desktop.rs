@@ -180,21 +180,38 @@ pub fn check() {
 }
 
 fn disable() -> Result<()> {
+    let had_rule = has_rule(RULE);
     write_rule(None)?;
     let (id, adopted) = stored();
-    if id.is_empty() {
+    if !had_rule && id.is_empty() {
         return Ok(());
     }
+    if !id.is_empty() {
+        remove_or_rename(&id, adopted.as_deref())?;
+    }
+    let _ = fs::remove_file(id_file());
+    // KWin reloads rules a little after being asked, so a Mac window opening meanwhile still
+    // gets the old rule, naming a desktop that's gone by then: KWin puts it on all desktops
+    // (and the tiler leaves it floating). Bring any such window to the desktop in use: now, and
+    // again shortly, once the reload has surely happened.
+    let js = "for (const w of workspace.windowList())\n\
+              if (w.onAllDesktops && w.resourceClass.startsWith('sweeflow-') && w.resourceClass != 'sweeflow-display') w.desktops = [workspace.currentDesktop];";
+    run_script(js)?;
+    std::thread::sleep(Duration::from_secs(3));
+    run_script(js)
+}
+
+fn remove_or_rename(id: &str, adopted: Option<&str>) -> Result<()> {
     let conn = Connection::session()?;
     if desktops(&conn)?.iter().any(|(_, d, _)| *d == id) {
-        if let Some(name) = &adopted {
+        if let Some(name) = adopted {
             // The user's own desktop: give it its name back, windows and all.
             conn.call_method(
                 Some("org.kde.KWin"),
                 "/VirtualDesktopManager",
                 Some("org.kde.KWin.VirtualDesktopManager"),
                 "setDesktopName",
-                &(id.as_str(), name.as_str()),
+                &(id, name),
             )?;
             log::info!("gave the desktop its name {name} back");
         } else {
@@ -204,12 +221,11 @@ fn disable() -> Result<()> {
                 "/VirtualDesktopManager",
                 Some("org.kde.KWin.VirtualDesktopManager"),
                 "removeDesktop",
-                &(id.as_str(),),
+                &(id,),
             )?;
             log::info!("removed the {NAME} desktop");
         }
     }
-    let _ = fs::remove_file(id_file());
     Ok(())
 }
 
