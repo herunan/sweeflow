@@ -37,6 +37,21 @@ pub fn code_of(fingerprint_hex: &str) -> String {
 
 /// What someone typed, as a code (Crockford base32: case, dashes and spaces don't matter,
 /// O reads as 0 and I/L as 1). None if it can't be one.
+/// What's been typed of a code so far: its alphabet's characters only, upper case (O and I/L
+/// read as 0 and 1), at most 8. Anything else (the dash, spaces, other letters) is dropped.
+pub fn clean_code_chars(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| match ch.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            ch => ch,
+        })
+        .filter(|ch| ch.is_ascii() && ALPHABET.contains(&(*ch as u8)))
+        .take(8)
+        .collect()
+}
+
 pub fn normalize_code(input: &str) -> Option<String> {
     let mut c = String::new();
     for ch in input.chars().filter(|c| !c.is_whitespace() && *c != '-') {

@@ -1,8 +1,8 @@
 // The Sweeflow tray widget: the client's state over D-Bus (src/panel.rs), shown as a popup.
 //
 // Layout: the header says where things stand and holds every connection control (Pause /
-// Resume, Wake, Connect, Disconnect); below, the apps (a page of their own) and every setting in
-// sections; the footer opens Linked Macs. Settings can always be changed: with the Mac away the
+// Resume, Wake, Connect, Disconnect); below, three tabs: Options (every setting, in sections),
+// Linked Macs and Apps. Settings can always be changed: with the Mac away the
 // client keeps them and applies them once it's back.
 
 import QtQuick
@@ -124,11 +124,13 @@ PlasmoidItem {
     // applets title their sections).
     component Section: ColumnLayout {
         property alias text: title.text
+        // The first under the tabs: no line of its own.
+        property bool first: false
         spacing: Kirigami.Units.smallSpacing
         Layout.fillWidth: true
         Layout.topMargin: Kirigami.Units.largeSpacing
         Layout.bottomMargin: Kirigami.Units.smallSpacing
-        Kirigami.Separator { Layout.fillWidth: true }
+        Kirigami.Separator { Layout.fillWidth: true; visible: !parent.first }
         PlasmaComponents3.Label {
             id: title
             Layout.leftMargin: Kirigami.Units.largeSpacing
@@ -174,22 +176,10 @@ PlasmoidItem {
         }
     }
 
-    // A sub-page's title bar: back, the title, and room for more on the right.
+    // A tab's tool row (search, Link a Mac…).
     component PageBar: RowLayout {
-        id: bar
-        default property alias extra: more.data
-        property string title
-        signal back()
         Layout.fillWidth: true
         Layout.margins: Kirigami.Units.smallSpacing
-        PlasmaComponents3.ToolButton {
-            icon.name: "go-previous-symbolic"
-            onClicked: bar.back()
-            PlasmaComponents3.ToolTip.text: "Back"
-            PlasmaComponents3.ToolTip.visible: hovered
-        }
-        Kirigami.Heading { level: 4; text: bar.title }
-        RowLayout { id: more; Layout.fillWidth: true }
     }
 
     fullRepresentation: PlasmaExtras.Representation {
@@ -264,41 +254,39 @@ PlasmoidItem {
             }
         }
 
-        footer: PlasmaExtras.PlasmoidHeading {
-            visible: root.running
-            position: PlasmaComponents3.ToolBar.Footer
-            RowLayout {
-                anchors.fill: parent
-                PlasmaComponents3.ToolButton {
-                    icon.name: "computer-laptop"
-                    text: "Linked Macs"
-                    // Not while already there.
-                    visible: stack.visible && !(stack.currentItem && stack.currentItem.objectName === "macs")
-                    onClicked: { stack.pop(null); stack.push(macsPage); }
-                }
-                Item { Layout.fillWidth: true }
-                PlasmaComponents3.ToolButton {
-                    icon.name: "application-exit"
-                    text: "Quit Sweeflow"
-                    onClicked: root.act("quit")
-                }
-            }
-        }
-
-        QQC2.StackView {
-            id: stack
+        // Opens on the tab it was left on.
+        ColumnLayout {
             anchors.fill: parent
             visible: root.paired
-            initialItem: mainPage
+            spacing: 0
+            PlasmaComponents3.TabBar {
+                id: tabs
+                Layout.fillWidth: true
+                PlasmaComponents3.TabButton { text: "Options"; icon.name: "configure" }
+                PlasmaComponents3.TabButton { text: "Linked Macs"; icon.name: "computer-laptop" }
+                PlasmaComponents3.TabButton {
+                    readonly property int count: (root.st.apps || []).length
+                    text: count ? "Apps (" + count + ")" : "Apps"
+                    icon.name: "view-app-grid-symbolic"
+                }
+            }
+            StackLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                currentIndex: tabs.currentIndex
+                Loader { sourceComponent: mainPage }
+                Loader { sourceComponent: macsPage }
+                Loader { sourceComponent: appsPage }
+            }
         }
         Connections {
             target: root
-            // Opens where it was left (Apps, Linked Macs…). Opened: look again at panels and rules
+            // Opened: look again at panels and rules
             // (they can be changed in Plasma's own settings too).
             function onExpandedChanged() { if (root.expanded) root.act("placement"); }
         }
 
-        // Main page: the apps (a page of their own), then every setting, in sections.
+        // Options: every setting, in sections.
         Component {
             id: mainPage
             PlasmaComponents3.ScrollView {
@@ -307,18 +295,7 @@ PlasmoidItem {
                     width: parent.width
                     spacing: 0
 
-                    LinkRow {
-                        readonly property var apps: root.st.apps || []
-                        readonly property int open: apps.filter(a => a.state > 0).length
-                        iconName: "view-app-grid-symbolic"
-                        label: "Apps"
-                        note: apps.length ? apps.length + (apps.length === 1 ? " app" : " apps") + " · " + open + " running" : ""
-                        hint: "Open Mac apps, and choose which ones show here"
-                        arrow: true
-                        onClicked: stack.push(appsPage)
-                    }
-
-                    Section { text: "Where Mac apps appear" }
+                    Section { text: "Where Mac apps appear"; first: true }
                     ToggleRow {
                         label: "Their own desktop"
                         hint: "A desktop just for Mac windows"
@@ -394,6 +371,14 @@ PlasmoidItem {
                         hint: "Show the Mac's whole screen in a window"
                         onClicked: { root.act("display"); root.expanded = false; }
                     }
+                    // Last, out of the way.
+                    Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: Kirigami.Units.largeSpacing; Layout.bottomMargin: Kirigami.Units.smallSpacing }
+                    LinkRow {
+                        iconName: "application-exit"
+                        label: "Quit Sweeflow"
+                        hint: "Stop Sweeflow on this computer (the Mac's windows close here)"
+                        onClicked: root.act("quit")
+                    }
                     Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                 }
             }
@@ -402,11 +387,8 @@ PlasmoidItem {
         Component {
             id: macsPage
             ColumnLayout {
-                objectName: "macs"
                 spacing: Kirigami.Units.smallSpacing
                 PageBar {
-                    title: "Linked Macs"
-                    onBack: stack.pop()
                     Item { Layout.fillWidth: true }
                     PlasmaComponents3.ToolButton {
                         icon.name: "list-add"
@@ -443,12 +425,11 @@ PlasmoidItem {
             ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
                 PageBar {
-                    title: "Apps"
-                    onBack: stack.pop()
                     PlasmaExtras.SearchField {
                         id: search
                         Layout.fillWidth: true
-                        Component.onCompleted: forceActiveFocus()
+                        // Ready to type into whenever the tab opens.
+                        onVisibleChanged: if (visible) forceActiveFocus()
                     }
                 }
                 PlasmaComponents3.ScrollView {

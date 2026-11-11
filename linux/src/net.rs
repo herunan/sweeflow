@@ -49,6 +49,8 @@ pub enum UiEvent {
     /// Close / minimise / zoom button rects (x, y, w, h) in window points.
     WindowButtons(u32, [[f32; 4]; 3]),
     MoveStarted(u32),
+    /// (window, press id): that press can start a window move right away.
+    MoveReady(u32, u32),
     ToggleMaximize(u32),
     Minimize(u32),
     /// macOS's screenshot selection started (true) or ended: drawn here, as the Mac's can't be captured.
@@ -85,6 +87,7 @@ impl UiEvent {
             UiEvent::Focused => "focused",
             UiEvent::WindowButtons(..) => "window buttons",
             UiEvent::MoveStarted(_) => "move started",
+            UiEvent::MoveReady(..) => "move ready",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
             UiEvent::Minimize(_) => "minimize",
             UiEvent::ScreenSelect(_) => "screen select",
@@ -124,6 +127,16 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
     let (tx, rx) = mpsc::unbounded_channel();
     let _ = NET_TX.set(tx.clone());
     listen_local(tx.clone());
+    // A ping on the control stream every 2 s: the round trip through QUIC and the Mac's
+    // session queue, logged now and then (latency figures).
+    let ping_tx = tx.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        if CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let us = EPOCH.elapsed().as_micros() as u64;
+            let _ = ping_tx.send(NetCmd::Control(W::new(t::PING).u64(us).finish()));
+        }
+    });
     std::thread::Builder::new()
         .name("net".into())
         .spawn(move || {
@@ -133,6 +146,11 @@ pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
         .unwrap();
     tx
 }
+
+static EPOCH: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+static PINGS: std::sync::Mutex<(u32, u64, u64, i64, i64)> = std::sync::Mutex::new((0, 0, 0, 0, 0));
+/// Quickest ping round trip seen (µs) and the Mac's clock minus ours then.
+static BEST_PING: std::sync::Mutex<Option<(i64, i64)>> = std::sync::Mutex::new(None);
 
 /// Each window's decoder input, for frames arriving as datagrams.
 static FRAME_SINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, std::sync::mpsc::Sender<Encoded>>>> =
@@ -389,7 +407,16 @@ async fn session(
         let conn = conn.clone();
         tokio::spawn(async move {
             let mut r = crate::frames::Reassembler::default();
+            let mut since = std::time::Instant::now();
             while let Ok(d) = conn.read_datagram().await {
+                if since.elapsed().as_secs() >= 5 && r.frames > 0 {
+                    log::debug!(
+                        "datagram frames: {} in {} pieces, first piece → last {:.1} ms on average, worst {:.1} ms",
+                        r.frames, r.pieces, r.spread_us as f64 / r.frames as f64 / 1000.0, r.worst_us as f64 / 1000.0
+                    );
+                    (r.frames, r.pieces, r.spread_us, r.worst_us) = (0, 0, 0, 0);
+                    since = std::time::Instant::now();
+                }
                 match r.push(&d, std::time::Instant::now()) {
                     Some((wid, Ok(f))) => {
                         if let Some(tx) = FRAME_SINKS.lock().unwrap().get(&wid) {
@@ -587,6 +614,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             UiEvent::WindowButtons(wid, rects)
         }
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
+        t::MOVE_READY => UiEvent::MoveReady(r.u32()?, r.u32()?),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
         t::SCREEN_SELECT => UiEvent::ScreenSelect(r.u8()? != 0),
@@ -670,7 +698,36 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             crate::blind::gone(r.u32()?);
             return Ok(());
         }
-        t::PONG => return Ok(()),
+        t::PONG => {
+            let now = EPOCH.elapsed().as_micros() as i64;
+            let sent = r.u64()? as i64;
+            let rtt = now - sent;
+            // The Mac's clock when it got the ping: with the offset between the clocks taken
+            // from the quickest round trip seen, how the time splits between the two ways.
+            let (to_mac, from_mac) = match r.u64() {
+                Ok(mac) => {
+                    let mac = mac as i64;
+                    let mut best = BEST_PING.lock().unwrap();
+                    if best.map_or(true, |(r, _)| rtt < r) {
+                        *best = Some((rtt, mac - (sent + rtt / 2)));
+                    }
+                    let offset = best.unwrap().1;
+                    (mac - offset - sent, now - (mac - offset))
+                }
+                Err(_) => (0, 0),
+            };
+            let mut p = PINGS.lock().unwrap();
+            *p = (p.0 + 1, p.1 + rtt as u64, p.2.max(rtt as u64), p.3 + to_mac, p.4 + from_mac);
+            if p.0 >= 15 {
+                let n = p.0 as f64 * 1000.0;
+                log::info!(
+                    "control round trip {:.1} ms on average (to the Mac {:.1}, back {:.1}), worst {:.1} ms",
+                    p.1 as f64 / n, p.3 as f64 / n, p.4 as f64 / n, p.2 as f64 / 1000.0
+                );
+                *p = (0, 0, 0, 0, 0);
+            }
+            return Ok(());
+        }
         _ => {
             log::debug!("ignoring control message {ty:#x}");
             return Ok(());
@@ -704,9 +761,16 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
             let mut order = crate::frames::Orderer::default();
             let mut reported_lost = 0;
             let mut last_report = std::time::Instant::now();
+            // Where the time goes on this side: waiting to be put in order, and decoding.
+            let mut arrived: std::collections::HashMap<u64, std::time::Instant> = Default::default();
+            let (mut n, mut wait_us, mut dec_us, mut max_us) = (0u32, 0u128, 0u128, 0u128);
+            let mut stats_since = std::time::Instant::now();
             loop {
                 let ready = match frx.recv_timeout(std::time::Duration::from_millis(20)) {
-                    Ok(f) => order.push(f, std::time::Instant::now()),
+                    Ok(f) => {
+                        arrived.insert(f.capture_us, std::time::Instant::now());
+                        order.push(f, std::time::Instant::now())
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => order.tick(std::time::Instant::now()),
                     Err(_) => break,
                 };
@@ -745,7 +809,25 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                         }
                     }
                 }
-                match dec.as_mut().unwrap().decode(&f.data, f.capture_us) {
+                let t0 = std::time::Instant::now();
+                let decoded = dec.as_mut().unwrap().decode(&f.data, f.capture_us);
+                if let Some(a) = arrived.remove(&f.capture_us) {
+                    let total = a.elapsed().as_micros();
+                    n += 1;
+                    wait_us += t0.duration_since(a).as_micros();
+                    dec_us += t0.elapsed().as_micros();
+                    max_us = max_us.max(total);
+                }
+                arrived.retain(|_, a| a.elapsed().as_secs() < 2);
+                if stats_since.elapsed().as_secs() >= 5 && n > 0 {
+                    log::debug!(
+                        "window {wid}: {n} frames, arrival→decoded: waiting {:.1} ms, decoding {:.1} ms (worst total {:.1} ms)",
+                        wait_us as f64 / n as f64 / 1000.0, dec_us as f64 / n as f64 / 1000.0, max_us as f64 / 1000.0
+                    );
+                    (n, wait_us, dec_us, max_us) = (0, 0, 0, 0);
+                    stats_since = std::time::Instant::now();
+                }
+                match decoded {
                     Ok(Some(mut frame)) => {
                         frame.dark_titlebar = f.dark;
                         frame.px_per_pt = f.px_per_pt;

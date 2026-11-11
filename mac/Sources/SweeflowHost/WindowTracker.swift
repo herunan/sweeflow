@@ -105,8 +105,7 @@ final class WindowTracker {
             t.schedule(deadline: .now(), repeating: .milliseconds(interval), leeway: .milliseconds(1))
             t.setEventHandler { [weak self] in
                 guard let self else { return }
-                self.poll()
-                self.onBurstPoll?()
+                self.poll(then: self.onBurstPoll)
                 if DispatchTime.now() > self.burstUntil {
                     self.burstTimer?.cancel()
                     self.burstTimer = nil
@@ -162,9 +161,28 @@ final class WindowTracker {
         return info
     }
 
-    func poll() {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]] else { return }
+    /// The window server's list takes a few ms to fetch (and more to bridge): fetched on a
+    /// queue of its own, so input on the session queue doesn't wait behind it (during a burst
+    /// it otherwise took half the queue's time). At most one fetch at a time.
+    private let listQueue = DispatchQueue(label: "sweeflow.windowlist", qos: .userInteractive)
+    private var listing = false
+
+    func poll(then done: (() -> Void)? = nil) {
+        guard !listing else { return }   // the fetch under way is fresh enough
+        listing = true
+        listQueue.async { [weak self] in
+            let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]]
+            self?.queue.async {
+                guard let self else { return }
+                self.listing = false
+                if let list { self.update(list) }
+                done?()
+            }
+        }
+    }
+
+    private func update(_ list: [[String: Any]]) {
         var seen: [UInt32: TrackedWindow] = [:]
         var order: [UInt32] = []
         // Frontmost toplevel per pid, to parent popups/menus onto.

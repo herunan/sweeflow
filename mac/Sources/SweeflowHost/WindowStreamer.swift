@@ -34,6 +34,19 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     // Enough for 100–120 fps over a ~25 ms pipeline; more only queues frames in the encoder.
     private let maxInFlight = 3
     private var pendingBuffer: CVPixelBuffer?   // newest capture not yet encoded (throttled)
+    /// A frame is in the encoder. Only one at a time: a big Retina window takes 20–40 ms to
+    /// encode, and frames handed over meanwhile queued inside it, each waiting for the ones
+    /// ahead (70–240 ms behind under steady updates). Now the newest capture waits here
+    /// instead, replacing older ones, and goes in as soon as the encoder is free.
+    private var encoding = false
+    private var encodingSince = DispatchTime.now()
+    /// The pending buffer has had its overlays painted already (a re-encode of the last one).
+    private var pendingPrepared = false
+    /// Pixel work on a frame (overlays, corners, the 10-bit conversion: 5–15 ms on a Retina
+    /// window) runs here, off the session queue, so input never waits behind video.
+    private let work = DispatchQueue(label: "sweeflow.frame", qos: .userInteractive)
+    /// The focus changed while a frame was being prepared: repaint the lights once it's done.
+    private var repaintAfter = false
     private var lastBuffer: CVPixelBuffer?      // last encoded capture, reused for refinement
     private var lastEncodeAt = DispatchTime.now()
     private var refinementsLeft = 0
@@ -278,15 +291,21 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func setPaused(_ p: Bool) {
         paused = p
-        if !p { forceKeyframe = true; if let b = lastBuffer { pendingBuffer = pendingBuffer ?? b; pump() } }
+        if !p {
+            forceKeyframe = true
+            if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b; pendingPrepared = true }
+            pump()
+        }
     }
 
     /// Re-encode the last capture with fresh overlays (e.g. focus changed the traffic lights).
     /// The capture buffer still holds the previously painted lights, so this only runs the paint.
     func requestRepaint() {
+        if encoding { repaintAfter = true; return }   // that buffer is being worked on
         guard pendingBuffer == nil, let b = lastBuffer else { return }
         eraseCaptureBadge(b, buttons: buttons, badge: badgeRect(), scale: scale)
         pendingBuffer = b
+        pendingPrepared = true
         refinementsLeft = 2
         pump()
     }
@@ -527,55 +546,70 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
-        if !lossless && displayID == nil {
-            // Apps that hide the standard buttons and draw their own: find them in the pixels
-            // (a few times a second until found).
-            if !buttons.contains(where: { $0.width > 0 }), onDetectedButtons != nil {
-                detectCountdown -= 1
-                if detectCountdown <= 0 {
-                    detectCountdown = 20
-                    if let found = detectTrafficLights(pb, scale: scale) {
-                        log("stream \(wid): found app-drawn traffic lights at \(found.map { "\(Int($0.minX)),\(Int($0.minY))" })")
-                        buttons = found
-                        onDetectedButtons?(found)
-                    }
-                }
-            }
-            // Order matters: erase the capture badge first (it overlaps the top-left
-            // corner), cut the transparent corner tiles, then flatten the corners for HEVC.
-            if let dark = eraseCaptureBadge(pb, buttons: buttons, badge: badgeRect(), scale: scale) { darkTitleBar = dark }
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            // A few radius measurements per window (not every frame) feed the shared vote.
-            measureCountdown -= 1
-            if radiusSamples < 5, measureCountdown <= 0 {
-                measureCountdown = 15
-                if let r = measureCornerRadius(pb, scale: scale) {
-                    radiusSamples += 1
-                    let pt = Int((CGFloat(r) / scale).rounded())
-                    WindowStreamer.radiusVotes[pt, default: 0] += 1
-                    log("stream \(wid): corner radius sample \(pt)pt → consensus \(WindowStreamer.consensusRadiusPt)pt")
-                }
-            }
-            let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded())
-            let visiblePx = visibleSize.map { CGSize(width: $0.width * scale, height: $0.height * scale) }
-            if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale, visible: visiblePx),
-               hash != cornersHash {
-                cornersHash = hash
-                pendingCorners = (t, tiles)
-            }
-            fillCorners(pb, radiusPx: Int(28 * scale))
-            fillEdges(pb, ring: max(2, Int(scale)))
-            // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
-            // drops alpha, which would leave them darkened. Restore their real colour.
-            // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
-            // the full pass is needed.
-            if hasTranslucency(pb, skip: Int(28 * scale)) { unpremultiply(pb) }
-            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
-            if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", wid, ms)) }
-        }
+        // Prepared only if it's encoded: a newer capture may replace it while the encoder is busy.
         pendingBuffer = pb
+        pendingPrepared = false
         refinementsLeft = 2
         pump()
+    }
+
+    /// What preparing a frame needs from the streamer's state, taken on `queue`.
+    private struct Prep {
+        let buttons: [CGRect], badge: CGRect?, scale: CGFloat, visiblePx: CGSize?, radiusPx: Int
+        let detect: Bool, measure: Bool
+    }
+
+    /// And what it found, applied back on `queue`.
+    private struct Prepared {
+        var dark: Bool?
+        var detected: [CGRect]?
+        var radiusPx: Int?
+        var corners: (Int, Data, UInt64)?
+    }
+
+    /// Paints the overlays over a capture and cuts its corners (on `work`): order matters:
+    /// erase the capture badge first (it overlaps the top-left corner), cut the transparent
+    /// corner tiles, then flatten the corners for HEVC.
+    private static func prepare(_ pb: CVPixelBuffer, _ p: Prep) -> Prepared {
+        var r = Prepared()
+        var buttons = p.buttons
+        // Apps that hide the standard buttons and draw their own: find them in the pixels
+        // (a few times a second until found).
+        if p.detect, let found = detectTrafficLights(pb, scale: p.scale) {
+            r.detected = found
+            buttons = found
+        }
+        r.dark = eraseCaptureBadge(pb, buttons: buttons, badge: p.badge, scale: p.scale)
+        // A few radius measurements per window (not every frame) feed the shared vote.
+        if p.measure { r.radiusPx = measureCornerRadius(pb, scale: p.scale) }
+        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, visible: p.visiblePx)
+        fillCorners(pb, radiusPx: Int(28 * p.scale))
+        fillEdges(pb, ring: max(2, Int(p.scale)))
+        // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
+        // drops alpha, which would leave them darkened. Restore their real colour.
+        // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
+        // the full pass is needed.
+        if hasTranslucency(pb, skip: Int(28 * p.scale)) { unpremultiply(pb) }
+        return r
+    }
+
+    private func apply(_ r: Prepared) {
+        if let found = r.detected, !buttons.contains(where: { $0.width > 0 }) {
+            log("stream \(wid): found app-drawn traffic lights at \(found.map { "\(Int($0.minX)),\(Int($0.minY))" })")
+            buttons = found
+            onDetectedButtons?(found)
+        }
+        if let dark = r.dark { darkTitleBar = dark }
+        if let px = r.radiusPx {
+            radiusSamples += 1
+            let pt = Int((CGFloat(px) / scale).rounded())
+            WindowStreamer.radiusVotes[pt, default: 0] += 1
+            log("stream \(wid): corner radius sample \(pt)pt → consensus \(WindowStreamer.consensusRadiusPt)pt")
+        }
+        if let (t, tiles, hash) = r.corners, hash != cornersHash {
+            cornersHash = hash
+            pendingCorners = (t, tiles)
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -626,9 +660,54 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // A frame lost on the way (datagrams) is never acknowledged: don't wait for it forever.
         let now = hostMicros()
         inFlight.removeAll { now > $0 && now - $0 > 300_000 }
-        guard !stopped, !paused, inFlight.count < maxInFlight, let pb = pendingBuffer else { return }
+        // An encoder dropped mid-frame may never call back: don't wait on it for ever.
+        if encoding, DispatchTime.now().uptimeNanoseconds - encodingSince.uptimeNanoseconds > 300_000_000 { encoding = false }
+        guard !stopped, !paused, !encoding, inFlight.count < maxInFlight, let pb = pendingBuffer else { return }
         pendingBuffer = nil
-        if lossless { sendLossless(pb) } else { encode(pb) }
+        if lossless { sendLossless(pb); return }
+        let prepare = !pendingPrepared && displayID == nil
+        var prep: Prep?
+        if prepare {
+            var detect = false
+            if !buttons.contains(where: { $0.width > 0 }), onDetectedButtons != nil {
+                detectCountdown -= 1
+                if detectCountdown <= 0 { detectCountdown = 20; detect = true }
+            }
+            measureCountdown -= 1
+            let measure = radiusSamples < 5 && measureCountdown <= 0
+            if measure { measureCountdown = 15 }
+            prep = Prep(buttons: buttons, badge: badgeRect(), scale: scale, visiblePx: visiblePx(),
+                        radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure)
+        }
+        let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
+        let coded = codedSize(w, h)
+        if encoder == nil || encoderSize != coded || encoderTenBit != Self.tenBit {
+            if let e = encoder { VTCompressionSessionInvalidate(e) }
+            encoder = makeEncoder(width: coded.0, height: coded.1)
+            encoderSize = coded
+            forceKeyframe = true
+        }
+        guard encoder != nil else { return }
+        lastBuffer = pb
+        lastEncodeAt = .now()
+        encoding = true
+        encodingSince = .now()
+        let startUs = hostMicros()
+        let tenBit = encoderTenBit
+        work.async { [weak self] in
+            guard let self else { return }
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let result = prep.map { Self.prepare(pb, $0) }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            if ms > 3 { log(String(format: "stream %u: frame prep took %.1f ms", self.wid, ms)) }
+            // 10-bit goes in as limited-range YUV we convert ourselves: from BGRA the encoder
+            // writes full-range 10-bit, which KWin shows as limited whatever it's tagged (too dark).
+            let input = tenBit ? (self.toVideoRange10(pb, size: coded) ?? pb) : pb
+            self.queue.async {
+                if let result { self.apply(result) }
+                self.encode(input, w: w, h: h, startUs: startUs)
+            }
+        }
     }
 
     /// When the window goes idle, re-encode the last frame a couple of times: the rate controller
@@ -738,22 +817,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         out_send(m, bytes: n)
     }
 
-    private func encode(_ pb: CVPixelBuffer) {
+    /// Hands a prepared frame to the encoder (on `queue`). `startUs`: when its preparation
+    /// began, so the latency figures cover that too.
+    private func encode(_ input: CVPixelBuffer, w: Int32, h: Int32, startUs: UInt64) {
+        guard !stopped, let enc = encoder else { encoding = false; return }
         flushCorners()
-        let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
-        let coded = codedSize(w, h)
-        if encoder == nil || encoderSize != coded || encoderTenBit != Self.tenBit {
-            if let e = encoder { VTCompressionSessionInvalidate(e) }
-            encoder = makeEncoder(width: coded.0, height: coded.1)
-            encoderSize = coded
-            forceKeyframe = true
-        }
-        guard let enc = encoder else { return }
-        lastBuffer = pb
-        lastEncodeAt = .now()
         scheduleRefine()
         logStatsIfDue()
-        let captureUs = hostMicros()
+        let captureUs = startUs
         var props: CFDictionary?
         if forceKeyframe {
             props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
@@ -761,9 +832,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         inFlight.append(captureUs)
         let pts = CMTime(value: CMTimeValue(captureUs), timescale: 1_000_000)
-        // 10-bit goes in as limited-range YUV we convert ourselves: from BGRA the encoder writes
-        // full-range 10-bit, which KWin shows as limited whatever it's tagged (too dark).
-        let input = encoderTenBit ? (toVideoRange10(pb, size: encoderSize) ?? pb) : pb
         VTCompressionSessionEncodeFrame(enc, imageBuffer: input, presentationTimeStamp: pts, duration: .invalid,
                                         frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
@@ -774,6 +842,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.queue.async {
                     self.inFlight.removeAll { $0 == captureUs }
                     if status != noErr { self.forceKeyframe = true }
+                    self.encoded()
                 }
                 return
             }
@@ -793,8 +862,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             self.queue.async {
                 self.statEncodeSum += encodeUs; self.statEncodeN += 1
                 self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, fullRange: fullRange, data: data)
+                self.encoded()
             }
         }
+    }
+
+    /// The encoder is free again: the newest capture (or a wanted repaint) goes in.
+    private func encoded() {
+        encoding = false
+        if repaintAfter { repaintAfter = false; requestRepaint() }
+        pump()
     }
 
     private func sendLossless(_ pb: CVPixelBuffer) {

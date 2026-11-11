@@ -61,6 +61,8 @@ pub struct GpuFrame {
     pub format: u32,
     pub planes: Vec<Plane>,
     pub capture_us: u64,
+    /// When decoding finished (for the latency figures).
+    pub decoded_at: std::time::Instant,
     /// The Mac saw a dark title bar in this frame (picks the inactive traffic-light colour).
     pub dark_titlebar: bool,
     /// Pixels per point (from the Mac); 0 = unknown.
@@ -237,6 +239,7 @@ impl Decoder {
                 );
             }
             Ok(GpuFrame {
+                decoded_at: std::time::Instant::now(),
                 source: av_frame_clone(self.frame),
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,

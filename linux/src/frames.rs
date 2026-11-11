@@ -63,6 +63,11 @@ struct Partial {
 #[derive(Default)]
 pub struct Reassembler {
     partial: HashMap<(u32, u32), Partial>,
+    /// Frames completed, their pieces, and the time from first to last piece (latency figures).
+    pub frames: u32,
+    pub pieces: u32,
+    pub spread_us: u64,
+    pub worst_us: u64,
 }
 
 impl Reassembler {
@@ -89,6 +94,11 @@ impl Reassembler {
             return None;
         }
         let p = self.partial.remove(&(wid, seq)).unwrap();
+        let spread = now.duration_since(p.since).as_micros() as u64;
+        self.frames += 1;
+        self.pieces += count as u32;
+        self.spread_us += spread;
+        self.worst_us = self.worst_us.max(spread);
         let msg: Vec<u8> = p.pieces.into_iter().flatten().flatten().collect();
         Some((wid, frame_body(&msg).and_then(parse_frame)))
     }

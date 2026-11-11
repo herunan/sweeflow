@@ -83,6 +83,45 @@ slint::slint! {
         }
     }
 
+    // The pairing code: a box per character, the dash between the halves only drawn. One hidden
+    // text field on top takes the typing (and pasting); Rust cleans it and fills the boxes.
+    component CodeBoxes inherits Rectangle {
+        in property <[string]> chars;
+        in property <int> filled;
+        in-out property <string> text <=> input.text;
+        callback edited(string);
+        callback accepted(string);
+        forward-focus: input;
+        height: 60px;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            for c[i] in chars: HorizontalLayout {
+                spacing: 8px;
+                if i == 4: Text { text: "–"; font-size: 24px; vertical-alignment: center; opacity: 0.5; }
+                Rectangle {
+                    width: 42px;
+                    height: 56px;
+                    border-radius: 8px;
+                    border-width: input.has-focus && i == min(filled, 7) ? 2px : 1px;
+                    border-color: input.has-focus && i == min(filled, 7) ? #6a5acd : #8888;
+                    Text { text: c; font-size: 26px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+        input := TextInput {
+            x: 0; y: 0;
+            width: parent.width;
+            height: parent.height;
+            single-line: true;
+            color: transparent;
+            selection-background-color: transparent;
+            text-cursor-width: 0px;
+            edited => { root.edited(self.text); }
+            accepted => { root.accepted(self.text); }
+        }
+    }
+
     export component Wizard inherits Window {
         title: "Add a Mac — Sweeflow";
         icon: @image-url("../../assets/sweeflow-app.svg");
@@ -99,6 +138,10 @@ slint::slint! {
         in property <[MacRow]> macs;
         in property <string> mac-name;
         in property <string> our-code;
+        in property <[string]> code-chars: ["", "", "", "", "", "", "", ""];
+        in property <int> code-filled;
+        in-out property <string> code-text;
+        callback code-edited(string);
         in-out property <string> error;
         in property <bool> streaming-mac-set;
 
@@ -188,11 +231,12 @@ slint::slint! {
             if page == 2: VerticalLayout {
                 spacing: 14px;
                 Title { text: "Type the code shown on " + mac-name; }
-                code := LineEdit {
-                    placeholder-text: "XXXX-XXXX";
-                    font-size: 22px;
-                    horizontal-alignment: center;
-                    accepted => { root.submit(self.text); }
+                code := CodeBoxes {
+                    chars: code-chars;
+                    filled: code-filled;
+                    text <=> code-text;
+                    edited(t) => { root.code-edited(t); }
+                    accepted(t) => { root.submit(t); }
                     init => { self.focus(); }
                 }
                 if error != "": Text { text: error; color: #d33; wrap: word-wrap; }
@@ -202,7 +246,7 @@ slint::slint! {
                     spacing: 8px;
                     Button { text: "Back"; clicked => { error = ""; page = 1; } }
                     Rectangle {}
-                    Button { text: "Pair"; primary: true; enabled: code.text != ""; clicked => { root.submit(code.text); } }
+                    Button { text: "Pair"; primary: true; enabled: code-filled == 8; clicked => { root.submit(code-text); } }
                 }
             }
 
@@ -299,7 +343,10 @@ pub fn run() -> Result<()> {
                 all.sort_by(|a, b| a.name.cmp(&b.name));
                 let rows: Vec<MacRow> = all
                     .iter()
-                    .map(|m| MacRow { name: m.name.clone().into(), detail: format!("{}", m.addr.ip()).into() })
+                    .map(|m| MacRow {
+                        name: m.name.clone().into(),
+                        detail: if already_linked(m) { "Already linked".into() } else { format!("{}", m.addr.ip()).into() },
+                    })
                     .collect();
                 if let Some(vm) = ui.get_macs().as_any().downcast_ref::<VecModel<MacRow>>() {
                     vm.set_vec(rows);
@@ -312,6 +359,10 @@ pub fn run() -> Result<()> {
     ui.on_pick(move |i| {
         let Some(ui) = weak.upgrade() else { return };
         let Some(m) = FOUND.with_borrow(|all| all.get(i as usize).cloned()) else { return };
+        if already_linked(&m) {
+            ui.set_error(format!("{} is already linked to this computer. To link it again, forget it in Sweeflow's Linked Macs first.", m.name).into());
+            return;
+        }
         choose(&ui, m);
     });
 
@@ -321,6 +372,17 @@ pub fn run() -> Result<()> {
         match manual_mac(&text) {
             Some(m) => choose(&ui, m),
             None => ui.set_error(format!("Couldn't find “{text}”. Type its name (like my-mac.local) or IP address.").into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_code_edited(move |typed| {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_error(SharedString::new());
+        // All 8 there: pair straight away.
+        if show_code(&ui, &typed).len() == 8 {
+            let code = ui.get_code_text();
+            ui.invoke_submit(code);
         }
     });
 
@@ -404,7 +466,27 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// One of this computer's linked Macs (by its certificate, whatever address it's found at).
+fn already_linked(m: &FoundMac) -> bool {
+    !m.id.is_empty() && Config::load_or_default().is_ok_and(|c| c.macs.iter().any(|p| p.fingerprint.starts_with(&m.id)))
+}
+
+/// Shows `typed` in the code boxes as the code it can be: letters and digits of the code's
+/// alphabet, upper case, at most 8 (the dash is drawn, never typed).
+fn show_code(ui: &Wizard, typed: &str) -> String {
+    let clean = pair::clean_code_chars(typed);
+    if ui.get_code_text().as_str() != clean {
+        ui.set_code_text(clean.clone().into());
+    }
+    let mut chars: Vec<SharedString> = clean.chars().map(|c| c.to_string().into()).collect();
+    chars.resize(8, SharedString::new());
+    ui.set_code_chars(std::rc::Rc::new(VecModel::from(chars)).into());
+    ui.set_code_filled(clean.len() as i32);
+    clean
+}
+
 fn choose(ui: &Wizard, m: FoundMac) {
+    show_code(ui, "");
     ui.set_mac_name(m.name.clone().into());
     ui.set_error(SharedString::new());
     CHOSEN.with_borrow_mut(|c| *c = Some(m));

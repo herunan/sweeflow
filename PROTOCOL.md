@@ -34,6 +34,8 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x15 | S→C | Focused | u32 wid (Mac-side key window changed) |
 | 0x16 | S→C | WindowButtons | u32 wid, 3 × (f32 x, y, w, h): close, minimise, zoom button frames (window-relative; zero = absent) |
 | 0x17 | S→C | MoveStarted | u32 wid — the app began dragging its window; client should start an interactive move |
+| 0x2E | S→C | MoveReady | u32 wid, u32 pressId — the press with that id is on a spot that drags the window (title bar, toolbar, or a spot that did before): the client starts its move on the first motion |
+| 0x2F | C→S | MoveTaken | u32 wid — the client started moving the window itself: release the press on the Mac |
 | 0x1A | S→C | Minimize | u32 wid — the window was minimised on the Mac (restored there); client minimises its window |
 | 0x1B | S→C | MenuTree | i32 pid, bytes json — the app's menu bar: `[{t,e,sep?,k?,m?,c?,sub?}]` (Apple menu omitted) |
 | 0x24 | C→S | MenuActivate | i32 pid, u16 n, n × u16 path — press that menu item (indices as in MenuTree) |
@@ -57,7 +59,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x22 | C→S | Close | u32 wid |
 | 0x23 | C→S | ScreenSize | u16 w, u16 h — logical size of the client's largest monitor (sizes the Mac's virtual display) |
 | 0x30 | C→S | PointerMove | u32 wid, f32 x, f32 y (window-relative points) |
-| 0x31 | C→S | PointerButton | u32 wid, f32 x, f32 y, u8 button (0 left,1 right,2 middle,3+ other), u8 pressed |
+| 0x31 | C→S | PointerButton | u32 wid, f32 x, f32 y, u8 button (0 left,1 right,2 middle,3+ other), u8 pressed, u32 pressId (newer clients; numbers left presses, for MoveReady) |
 | 0x32 | C→S | Scroll | u32 wid, f32 x, f32 y, f32 dx, f32 dy, u8 unit (0 wheel notches, fractional — the host animates them; 1 pixels), u8 phase (0 none, 1 began, 2 changed, 3 ended) |
 | 0x33 | C→S | Key | u32 evdevKeycode, u8 pressed |
 | 0x34 | C→S | ReleaseAll | (no payload) — client lost focus; release held keys/buttons |

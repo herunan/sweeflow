@@ -279,15 +279,22 @@ let debugPort = DebugPort()
 if settings.config.debugPort != 0 { debugPort.start(port: settings.config.debugPort) }
 let statusMenu = StatusMenu()
 
-// Something still to set up (a fresh install): the setup window says what.
-if !Onboarding.complete { Onboarding.shared.show() }
+// Something still to set up (a fresh install): the setup window says what. Already linked (an
+// update, a restart): macOS can be slow to report permissions right after a new copy starts, so
+// look again before asking.
+if Identity.pairedClients().isEmpty {
+    Onboarding.shared.show()
+} else if !Onboarding.complete {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { if !Onboarding.complete { Onboarding.shared.show() } }
+}
 // Opens pairing from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
 DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.pair"), object: nil, queue: .main) { _ in
     PairingWindow.shared.show()
 }
-// Sweeflow opened again by hand while running (see above): show the setup window.
+// Sweeflow opened again by hand while running (see above), or by an update: the setup window, if
+// anything is left to set up. Otherwise the menu bar item is where Sweeflow lives.
 DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.show"), object: nil, queue: .main) { _ in
-    Onboarding.shared.show()
+    if !Onboarding.complete { Onboarding.shared.show() }
 }
 
 app.run()

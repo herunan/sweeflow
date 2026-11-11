@@ -141,6 +141,13 @@ final class Pairing {
                 return self.reply(stream, ok: false)
             }
             log("pairing request from \(name) (protocol \(version), code \(PairingCode.of(fingerprint: fp)))")
+            // Linked already: nothing to ask, and nothing to add.
+            if Identity.pairedClients().contains(where: { $0.fingerprint == fp.lowercased() }) {
+                log("pairing: \(name) is linked already")
+                self.reply(stream, ok: true)
+                self.queue.asyncAfter(deadline: .now() + 1) { self.stop(paired: name) }
+                return
+            }
             guard self.asking == nil else { return self.reply(stream, ok: false) }
             self.asking = key
             DispatchQueue.main.async {

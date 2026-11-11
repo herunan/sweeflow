@@ -1,4 +1,5 @@
 import AppKit
+import CPrivate
 import IOKit
 import Network
 
@@ -174,6 +175,7 @@ final class Session {
             sendAppList()
             sendSettings()
             watchRunningApps()
+            probeQueue()
             openDatagrams()
             if !watchingLock {
                 watchingLock = true
@@ -181,7 +183,8 @@ final class Session {
             }
             sendLockState()
         case .ping:
-            var w = MsgWriter(.pong); w.u64(try m.u64()); s.send(w)
+            // Echoed, plus when it got here (Mac clock), for one-way delays on the client.
+            var w = MsgWriter(.pong); w.u64(try m.u64()); w.u64(hostMicros()); s.send(w)
 
         case .subscribe:
             let wid = try m.u32()
@@ -396,11 +399,14 @@ final class Session {
         case .pointerMove:
             let (wid, p) = try pointerTarget(&m)
             // A drop from Linux is being replayed with the Mac's own pointer: don't pull it away.
-            if let p, !DragBridge.replaying { ensureFront(wid, at: p); input.move(to: p) }
+            // Only onto another window: looking at the window list costs a few ms, and motion
+            // comes hundreds of times a second (a press still checks every time).
+            if let p, !DragBridge.replaying { if wid != raisedWid { ensureFront(wid, at: p) }; input.move(to: p) }
             userDidSomething(click: false)
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
+            let pressId = (try? m.u32()) ?? 0   // newer clients number their presses
             log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")")
             if let p {
                 let post = { [self] in
@@ -409,6 +415,7 @@ final class Session {
                     if b == 0 {
                         watchGesture(wid, buttonDown: pressed)
                         watchDrag(wid, buttonDown: pressed)
+                        if pressed, pressId != 0 { classifyPress(wid, at: p, id: pressId) }
                     }
                 }
                 if pressed && ensureFront(wid, at: p) {
@@ -429,6 +436,8 @@ final class Session {
         case .releaseAll:
             input.releaseAll()
             setClientFocus(0)
+        case .moveTaken:
+            moveTaken(try m.u32())
 
         default:
             log("unhandled message \(m.type)")
@@ -438,6 +447,30 @@ final class Session {
     /// Which apps are running and how (RunningApps): looked at every second, sent on change.
     private var runningTimer: DispatchSourceTimer?
     private var lastRunning: [String: UInt8] = [:]
+
+    /// How long work waits for the session queue (input and frame acks go through it), from
+    /// a probe every 50 ms on a queue of its own, logged every 10 s while anything waited.
+    private func probeQueue() {
+        let probe = DispatchQueue(label: "sweeflow.probe")
+        var n = 0, sum = 0.0, worst = 0.0, since = DispatchTime.now()
+        func tick() {
+            let t0 = DispatchTime.now()
+            queue.async { [weak self] in
+                guard let self, self.control != nil else { return }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
+                probe.async {
+                    if n == 0 && sum == 0 && worst == 0 { log("session queue probe running") }
+                    n += 1; sum += ms; worst = max(worst, ms)
+                    if DispatchTime.now().uptimeNanoseconds - since.uptimeNanoseconds > 10_000_000_000 {
+                        if worst > 2 { log(String(format: "session queue: work waits %.1f ms on average, worst %.1f ms", sum / Double(n), worst)) }
+                        n = 0; sum = 0; worst = 0; since = .now()
+                    }
+                    probe.asyncAfter(deadline: .now() + .milliseconds(50)) { tick() }
+                }
+            }
+        }
+        probe.async { tick() }
+    }
 
     private func watchRunningApps() {
         runningTimer?.cancel()
@@ -595,6 +628,83 @@ final class Session {
         }
     }
 
+    // MARK: window moves straight from the press
+
+    /// What's under the held press, as classifyPress saw it: kept to learn from if the press
+    /// turns out to drag the window the slow way (checkGesture).
+    private var pressSpot: (wid: UInt32, id: UInt32, spot: String)?
+    /// Spots ("bundle id|role|subrole|identifier") that have dragged their window before: a
+    /// press there moves it at once next time. Kept across restarts.
+    private var dragSpots = Set(UserDefaults.standard.stringArray(forKey: "dragSpots") ?? [])
+    private let hitQueue = DispatchQueue(label: "sweeflow.hit", qos: .userInteractive)
+
+    /// The app moves its window itself when its title bar is dragged, and we only see that
+    /// once the window has moved (tens of ms for native windows, a few hundred for web-based
+    /// ones): KWin's move then takes hold of the window wherever the pointer has got to by
+    /// then, the window lagging behind it. So at the press, look at what's under it: the window
+    /// itself or its toolbar within the title-bar strip (above the controls), or a spot that
+    /// dragged this app's window before, tells Linux to move the window on the first motion.
+    private func classifyPress(_ wid: UInt32, at p: CGPoint, id: UInt32) {
+        guard let win = tracker.windows[wid], win.kind == .toplevel,
+              let button = sentButtons[wid]?.first(where: { $0 != .zero }) else { return }
+        // The traffic lights sit centred in the title bar (or the toolbar merged with it).
+        let strip = button.minY + button.maxY + 2
+        let y = p.y - win.frame.minY
+        guard y >= 0, y <= strip else { return }
+        let bundle = win.bundleId
+        hitQueue.async { [weak self] in
+            let system = AXUIElementCreateSystemWide()
+            AXUIElementSetMessagingTimeout(system, 0.25)
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(system, Float(p.x), Float(p.y), &hit) == .success, let el = hit else { return }
+            func attr(_ e: AXUIElement, _ name: String) -> String {
+                var v: CFTypeRef?
+                AXUIElementCopyAttributeValue(e, name as CFString, &v)
+                return v as? String ?? ""
+            }
+            // It must be this window's (not one in front of it).
+            var owner: AXUIElement? = el
+            if attr(el, kAXRoleAttribute) != kAXWindowRole {
+                var w: CFTypeRef?
+                owner = AXUIElementCopyAttributeValue(el, kAXWindowAttribute as CFString, &w) == .success ? (w as! AXUIElement) : nil
+            }
+            var ownerId: CGWindowID = 0
+            guard let owner, _AXUIElementGetWindow(owner, &ownerId) == .success, ownerId == wid else { return }
+            let role = attr(el, kAXRoleAttribute)
+            let spot = [bundle, role, attr(el, kAXSubroleAttribute), attr(el, kAXIdentifierAttribute)].joined(separator: "|")
+            self?.queue.async {
+                guard let self, let g = self.gesture, g.wid == wid, g.buttonDown else { return }
+                self.pressSpot = (wid, id, spot)
+                let bare = role == kAXWindowRole || role == kAXToolbarRole
+                guard bare || self.dragSpots.contains(spot) else { return }
+                var m = MsgWriter(.moveReady); m.u32(wid); m.u32(id); self.control?.send(m)
+            }
+        }
+    }
+
+    /// The press dragged its window the slow way: next time, a press there moves it at once.
+    private func learnDragSpot(_ wid: UInt32) {
+        guard let s = pressSpot, s.wid == wid else { return }
+        pressSpot = nil
+        guard dragSpots.insert(s.spot).inserted else { return }
+        log("learned a window-drag spot: \(s.spot)")
+        UserDefaults.standard.set(Array(dragSpots), forKey: "dragSpots")
+    }
+
+    /// Linux has started moving the window itself (after moveReady): let go of the press here,
+    /// and undo any move the app had begun meanwhile.
+    private func moveTaken(_ wid: UInt32) {
+        guard let g = gesture, g.wid == wid, g.buttonDown, let win = tracker.windows[wid] else { return }
+        gesture = nil; gestureTimer?.cancel(); gestureTimer = nil
+        pressSpot = nil
+        input.button(0, pressed: false, at: input.lastPoint)
+        watchDrag(wid, buttonDown: false)
+        if let now = tracker.liveFrame(wid), now.origin != g.frame.origin {
+            ax { $0.setPosition(wid, pid: win.pid, g.frame.origin) }
+        }
+        log("window \(wid): moved by Linux from the press")
+    }
+
     private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
         guard let win = tracker.windows[wid], win.kind == .toplevel else { return }
         if buttonDown || gesture?.wid != wid {
@@ -626,6 +736,7 @@ final class Session {
             input.button(0, pressed: false, at: input.lastPoint)
             ax { $0.setPosition(g.wid, pid: win.pid, g.frame.origin) }
             log("window \(g.wid): title-bar drag → handing move to Linux")
+            learnDragSpot(g.wid)
             var m = MsgWriter(.moveStarted); m.u32(g.wid); control?.send(m)
         } else if now.size != g.frame.size && !g.buttonDown {
             // Double-click zoom: undo it on the Mac and maximise the Linux window instead.

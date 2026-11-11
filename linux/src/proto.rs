@@ -22,6 +22,9 @@ pub mod t {
     pub const WINDOW_BUTTONS: u8 = 0x16;
     pub const MOVE_STARTED: u8 = 0x17;
     pub const TOGGLE_MAXIMIZE: u8 = 0x18;
+    /// The press just made is on a spot that drags the window (title bar, toolbar): start the
+    /// move on the first bit of motion instead of waiting for the app to begin dragging.
+    pub const MOVE_READY: u8 = 0x2E;
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;
@@ -49,6 +52,8 @@ pub mod t {
     pub const SCREEN_SELECT: u8 = 0x2D;
     pub const POINTER_MOVE: u8 = 0x30;
     pub const POINTER_BUTTON: u8 = 0x31;
+    /// Linux started moving the window itself (after MOVE_READY): let go of the press there.
+    pub const MOVE_TAKEN: u8 = 0x2F;
     pub const SCROLL: u8 = 0x32;
     pub const KEY: u8 = 0x33;
     pub const RELEASE_ALL: u8 = 0x34;

@@ -81,10 +81,13 @@ pub fn setup(target: &str) -> Result<()> {
     let client_fp = config::client_fingerprint()?;
     let script = format!(
         "set -e; d={SUPPORT}; mkdir -p \"$d\"; touch \"$d/clients\"; \
-         grep -q '^{client_fp}' \"$d/clients\" || echo '{client_fp}' >> \"$d/clients\"; \
+         if grep -q '^{client_fp}' \"$d/clients\"; then echo known; else echo '{client_fp}' >> \"$d/clients\"; echo new; fi; \
          for i in $(seq 1 20); do [ -s \"$d/fingerprint\" ] && break; sleep 0.5; done; cat \"$d/fingerprint\"\n"
     );
-    let host_fp = ssh(target, &script)?.trim().to_string();
+    let out = ssh(target, &script)?;
+    let mut out = out.lines();
+    let already_linked = out.next() == Some("known");
+    let host_fp = out.next().unwrap_or("").trim().to_string();
     if host_fp.len() != 64 {
         bail!("could not read the Mac's certificate fingerprint (is Sweeflow running? see ~/Library/Logs/sweeflow.log on the Mac)");
     }
@@ -94,6 +97,10 @@ pub fn setup(target: &str) -> Result<()> {
     cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp }, true);
     cfg.save()?;
     println!("==> paired. Config written to {}", Config::path().display());
+    if already_linked {
+        println!("==> updated (already linked, so the Mac keeps its permissions)");
+        return Ok(());
+    }
     println!();
     println!("On the Mac, allow Sweeflow in System Settings → Privacy & Security under both");
     println!("  • Screen & System Audio Recording");

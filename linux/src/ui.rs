@@ -333,6 +333,16 @@ pub struct App {
     swallowed: Vec<u32>,
     /// Serial of the last button press forwarded to the Mac (for handing drags to KWin).
     press_serial: u32,
+    /// Numbers left presses sent to the Mac, so its MOVE_READY answer is matched to its press.
+    press_id: u32,
+    /// Frames presented, total and worst decoded→presented µs, since when (latency figures).
+    present_stats: (u64, u64, u64, std::time::Instant),
+    /// Where (surface coordinates) the held left press went down, and whether the Mac said it
+    /// can move the window (MOVE_READY): then the first bit of motion starts KWin's move.
+    press_at: (f64, f64),
+    move_ready: bool,
+    /// The window Linux started moving itself (the Mac's own MOVE_STARTED for it is moot).
+    moved_here: Option<u32>,
     /// A pointer button handled locally (traffic light, resize edge): swallow its release.
     local_press: Option<u32>,
     /// Showing a resize cursor over a window edge instead of the Mac cursor.
@@ -434,6 +444,11 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         shift_down: 0,
         swallowed: Vec::new(),
         press_serial: 0,
+        press_id: 0,
+        present_stats: (0, 0, 0, std::time::Instant::now()),
+        press_at: (0.0, 0.0),
+        move_ready: false,
+        moved_here: None,
         local_press: None,
         edge_cursor: false,
         scale,
@@ -601,6 +616,16 @@ impl App {
                 }
                 self.update_lights(wid, qh);
             }
+            UiEvent::MoveReady(wid, id) => {
+                if id == self.press_id && self.left_down == Some(wid) {
+                    self.move_ready = true;
+                    let (x, y) = (self.pointer_at.1, self.pointer_at.2);
+                    if self.pointer_at.0 == wid && self.moved_enough(x, y) {
+                        self.move_here(wid);
+                    }
+                }
+            }
+            UiEvent::MoveStarted(wid) if self.moved_here.take() == Some(wid) => {}
             UiEvent::MoveStarted(wid) => {
                 // Only while the press that started it is still held here. Asked for after the
                 // release (a busy app is slow to say it's being dragged), KWin's move has no
@@ -1129,6 +1154,18 @@ impl App {
         self.describe_srgb(wid, qh);
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let capture_us = frame.capture_us;
+        {
+            // Decoded → here (the UI thread's turn), for the latency figures.
+            let st = &mut self.present_stats;
+            let us = frame.decoded_at.elapsed().as_micros() as u64;
+            st.0 += 1;
+            st.1 += us;
+            st.2 = st.2.max(us);
+            if st.3.elapsed().as_secs() >= 5 {
+                log::debug!("frames: decoded→presented {:.1} ms on average, worst {:.1} ms ({} frames)", st.1 as f64 / st.0 as f64 / 1000.0, st.2 as f64 / 1000.0, st.0);
+                *st = (0, 0, 0, std::time::Instant::now());
+            }
+        }
         // Always ack so the Mac keeps streaming, even if we drop this frame.
         let ack = W::new(t::FRAME_ACK).u64(capture_us).finish();
         let _ = self.net.send(NetCmd::Video(wid, ack));
@@ -1440,6 +1477,27 @@ impl App {
             }
             TimeoutAction::Drop
         });
+    }
+
+    /// The pointer has moved far enough from the press to count as a drag (not a click).
+    fn moved_enough(&self, x: f64, y: f64) -> bool {
+        let (px, py) = self.press_at;
+        (x - px).abs() >= 2.0 || (y - py).abs() >= 2.0
+    }
+
+    /// A press the Mac said moves the window (MOVE_READY) has started moving: KWin moves it
+    /// now, from where the pointer is, rather than once the app has noticed (tens to hundreds
+    /// of ms later, by when the pointer is well away from where it took hold). The Mac lets go
+    /// of its press.
+    fn move_here(&mut self, wid: u32) {
+        self.move_ready = false;
+        let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) else { return };
+        let Role::Toplevel(t) = &w.role else { return };
+        t.move_(seat, self.press_serial);
+        self.left_down = None;
+        self.mac_drag = None;
+        self.moved_here = Some(wid);
+        self.send(W::new(t::MOVE_TAKEN).u32(wid).finish());
     }
 
     /// A file drag started in a Mac window and the pointer (button still down) has left it:
@@ -2217,6 +2275,10 @@ impl PointerHandler for App {
                         // its tiling menu, which then takes every click until it's dismissed.
                         continue;
                     }
+                    if self.move_ready && self.left_down == Some(wid) && self.moved_enough(e.position.0, e.position.1) {
+                        self.move_here(wid);
+                        continue;
+                    }
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
                 PointerEventKind::Press { button, serial, .. } => {
@@ -2245,11 +2307,16 @@ impl PointerHandler for App {
                     if button == BTN_LEFT {
                         self.left_down = Some(wid);
                         self.mac_drag = None;
+                        self.press_id = self.press_id.wrapping_add(1);
+                        self.press_at = e.position;
+                        self.pointer_at = (wid, e.position.0, e.position.1);
+                        self.move_ready = false;
+                        self.moved_here = None;
                         if self.screen_select {
                             self.start_selection(wid, e.position.0, e.position.1, qh);
                         }
                     }
-                    self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).finish());
+                    self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).u32(self.press_id).finish());
                 }
                 PointerEventKind::Release { button, .. } => {
                     if self.local_press == Some(button) {
@@ -2274,6 +2341,7 @@ impl PointerHandler for App {
                     if button == BTN_LEFT {
                         self.left_down = None;
                         self.mac_drag = None;
+                        self.move_ready = false;
                         self.end_selection();
                     }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());

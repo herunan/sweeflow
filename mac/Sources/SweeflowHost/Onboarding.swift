@@ -1,4 +1,5 @@
 import AppKit
+import ScreenCaptureKit
 import Network
 import ServiceManagement
 
@@ -59,22 +60,29 @@ enum LoginItem {
     static func start() -> Bool {
         let domain = "gui/\(getuid())"
         let label = devInstall ? devAgentLabel : agentLabel
-        if (try? run("/bin/launchctl", ["kickstart", "\(domain)/\(label)"])) == nil {
-            // Not loaded any more: load it again (registering starts it).
-            if devInstall {
-                let plist = FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent("Library/LaunchAgents/\(devAgentLabel).plist").path
-                _ = try? run("/bin/launchctl", ["bootstrap", domain, plist])
-            } else {
-                try? service.unregister()
-                do { try service.register() } catch { log("login item: \(error)") }
-            }
+        let kicked = (try? run("/bin/launchctl", ["kickstart", "\(domain)/\(label)"])) != nil
+        if kicked && waitRunning(seconds: 2) { return true }
+        // Not loaded any more, or launchd won't start it: after Sweeflow.app is replaced, the
+        // registration still names the old copy's code and every start fails. Load it again
+        // (registering starts it).
+        if devInstall {
+            let plist = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/LaunchAgents/\(devAgentLabel).plist").path
+            _ = try? run("/bin/launchctl", ["bootstrap", domain, plist])
+        } else {
+            try? service.unregister()
+            do { try service.register() } catch { log("login item: \(error)") }
         }
-        for _ in 0..<20 {
+        return waitRunning(seconds: 5)
+    }
+
+    private static func waitRunning(seconds: Double) -> Bool {
+        let until = Date().addingTimeInterval(seconds)
+        repeat {
             if running { return true }
             RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-        }
-        return false
+        } while Date() < until
+        return running
     }
 
     /// Registers the login item (macOS starts it right away, too). True if it's running now.
@@ -93,7 +101,7 @@ final class Onboarding: NSObject, NSWindowDelegate {
     private var timer: Timer?
     private let screenRow = PermissionRow(
         title: "Screen & System Audio Recording",
-        detail: "To show your apps' windows and play their sound on Linux.",
+        detail: "To show your apps' windows and play their sound on Linux. Once it's on, macOS restarts Sweeflow (choose Quit & Reopen).",
         settings: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     private let axRow = PermissionRow(
         title: "Accessibility",
@@ -137,7 +145,7 @@ final class Onboarding: NSObject, NSWindowDelegate {
         let intro = NSTextField(wrappingLabelWithString:
             "Your Mac's apps, as windows on your Linux machine. A few things first, then you link them:")
         intro.preferredMaxLayoutWidth = 420
-        screenRow.onAction = { CGRequestScreenCaptureAccess() }
+        screenRow.onAction = { _ = CGRequestScreenCaptureAccess() }
         axRow.onAction = {
             _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         }
@@ -179,9 +187,33 @@ final class Onboarding: NSObject, NSWindowDelegate {
         loginRow.set(granted: login)
         loginRow.button.title = LoginItem.needsApproval ? "Open Settings" : "Turn On"
         pair.isEnabled = screen && ax
-        note.stringValue = !screen
-            ? "After allowing screen recording, macOS may ask to quit and reopen Sweeflow: choose Quit & Reopen."
-            : (screen && ax ? "All set. Now link this Mac with your Linux machine." : "")
+        note.stringValue = screen && ax ? "All set. Now link this Mac with your Linux machine." : ""
+        if screen { warmUpCapture() }
+    }
+
+    /// Recording allowed: capture for a moment now, so anything else macOS asks the first time an
+    /// app records (like letting it skip the window picker) comes up here, not once Linux connects.
+    private var warmedUp = false
+    private func warmUpCapture() {
+        guard !warmedUp else { return }
+        warmedUp = true
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                guard let display = content.displays.first else { return }
+                let cfg = SCStreamConfiguration()
+                cfg.width = 64
+                cfg.height = 64
+                cfg.capturesAudio = true
+                let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: cfg, delegate: nil)
+                try await stream.startCapture()
+                try? await Task.sleep(for: .milliseconds(500))
+                try? await stream.stopCapture()
+                log("setup: test capture ok")
+            } catch {
+                log("setup: test capture failed: \(error)")
+            }
+        }
     }
 
     /// Browsing for Sweeflow on the network makes macOS ask for Local Network (once), and says
@@ -226,7 +258,10 @@ private final class PermissionRow {
     private let settingsURL: URL?
     var onAction: () -> Void = {}
 
+    private let title: String
+
     init(title: String, detail: String, settings: String?) {
+        self.title = title
         settingsURL = settings.flatMap(URL.init(string:))
         let t = NSTextField(labelWithString: title)
         t.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -238,7 +273,8 @@ private final class PermissionRow {
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
-        button = NSButton(title: "Open Settings", target: nil, action: nil)
+        let asked = UserDefaults.standard.bool(forKey: "asked." + title)
+        button = NSButton(title: settings == nil || asked ? "Open Settings" : "Allow…", target: nil, action: nil)
         button.bezelStyle = .push
         mark.font = .systemFont(ofSize: 18)
         let spacer = NSView()
@@ -259,9 +295,17 @@ private final class PermissionRow {
         button.isHidden = granted
     }
 
+    /// First press: macOS's own question (which has its own way to Settings). Pressed again, or
+    /// asked before (macOS then shows nothing): the settings page. Never both at once.
     @objc private func act() {
-        onAction()
-        // The request may show nothing (asked before): the settings page always works.
-        if let url = settingsURL { NSWorkspace.shared.open(url) }
+        guard let url = settingsURL else { return onAction() }
+        let key = "asked." + title
+        if UserDefaults.standard.bool(forKey: key) {
+            NSWorkspace.shared.open(url)
+        } else {
+            UserDefaults.standard.set(true, forKey: key)
+            onAction()
+            button.title = "Open Settings"
+        }
     }
 }
