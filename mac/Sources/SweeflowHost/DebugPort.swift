@@ -10,6 +10,9 @@ import CoreImage
 ///   winshot WID PATH          PNG of one window via a display filter (tests the capture badge)
 ///   move WID X Y              pointer move, window-relative points
 ///   click WID X Y [right]     press + release
+///   resize WID W H            as the client resizing a window (points)
+///   focus WID                 as the client focusing a window
+///   front WID X Y             whether the window is in front at that point: by the last look and asked now
 ///   windows                   list tracked windows
 final class DebugPort {
     private var listener: NWListener?
@@ -156,6 +159,23 @@ final class DebugPort {
             guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
             s.queue.async {
                 let r = s.debugClose(wid)
+                DispatchQueue.main.async { reply(r) }
+            }
+        case "resize" where p.count == 4:
+            guard let s = session, let wid = UInt32(p[1]), let w = Double(p[2]), let h = Double(p[3]) else {
+                return reply("usage: resize wid w h / no session")
+            }
+            s.queue.async {
+                let r = s.debugResize(wid: wid, w: w, h: h)
+                DispatchQueue.main.async { reply(r) }
+            }
+        case "front" where p.count == 4:
+            guard let s = session, let wid = UInt32(p[1]), let x = Double(p[2]), let y = Double(p[3]) else { return reply("usage / no session") }
+            s.queue.async { s.debugFront(wid: wid, x: x, y: y) { r in DispatchQueue.main.async { reply(r) } } }
+        case "focus" where p.count == 2:
+            guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
+            s.queue.async {
+                let r = s.debugFocus(wid: wid)
                 DispatchQueue.main.async { reply(r) }
             }
         case "blind":

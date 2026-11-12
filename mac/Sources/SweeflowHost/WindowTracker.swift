@@ -61,14 +61,49 @@ final class WindowTracker {
     private var noButtonsSeen: [UInt32: Bool] = [:]
     /// Untitled windows' answers, looked at for their first second (the list can lag a new
     /// window), then kept.
-    private var appWindowSeen: [UInt32: (isApp: Bool, first: DispatchTime)] = [:]
+    private var appWindowSeen: [UInt32: (isApp: Bool?, first: DispatchTime)] = [:]
+    /// Both questions go to the app through Accessibility, which answers when the app gets to
+    /// it (a second, with an app busy opening its windows): asked off this queue, where every
+    /// look at the window list, and all input behind it, waited for the answer. One question
+    /// per window at a time; the look after the answer uses it.
+    private let askQueue = DispatchQueue(label: "sweeflow.windowax", qos: .userInteractive, attributes: .concurrent)
+    private var askingApp: Set<UInt32> = []
+    private var askingButtons: Set<UInt32> = []
 
-    private func looksLikeAppWindow(_ wid: UInt32, pid: pid_t) -> Bool {
+    /// nil while the first answer is on its way.
+    private func looksLikeAppWindow(_ wid: UInt32, pid: pid_t) -> Bool? {
         let now = DispatchTime.now()
-        if let c = appWindowSeen[wid], now.uptimeNanoseconds - c.first.uptimeNanoseconds > 1_000_000_000 { return c.isApp }
-        let isApp = isAppWindow?(wid, pid) ?? true
-        appWindowSeen[wid] = (isApp, appWindowSeen[wid]?.first ?? now)
-        return isApp
+        if let c = appWindowSeen[wid], let isApp = c.isApp,
+           now.uptimeNanoseconds - c.first.uptimeNanoseconds > 1_000_000_000 { return isApp }
+        if appWindowSeen[wid] == nil { appWindowSeen[wid] = (nil, now) }
+        if askingApp.insert(wid).inserted {
+            let ask = isAppWindow
+            askQueue.async { [weak self] in
+                let isApp = ask?(wid, pid) ?? true
+                self?.queue.async {
+                    guard let self else { return }
+                    self.askingApp.remove(wid)
+                    guard let c = self.appWindowSeen[wid] else { return }   // gone meanwhile
+                    self.appWindowSeen[wid] = (isApp, c.first)
+                    if c.isApp != isApp { self.poll() }
+                }
+            }
+        }
+        return appWindowSeen[wid]?.isApp
+    }
+
+    private func askNoButtons(_ wid: UInt32, pid: pid_t) {
+        guard askingButtons.insert(wid).inserted else { return }
+        let ask = hasNoButtons
+        askQueue.async { [weak self] in
+            let none = ask?(wid, pid) ?? false
+            self?.queue.async {
+                guard let self else { return }
+                self.askingButtons.remove(wid)
+                self.noButtonsSeen[wid] = none
+                self.poll()
+            }
+        }
     }
 
     init(queue: DispatchQueue, allowed: @escaping (String) -> Bool) {
@@ -89,7 +124,10 @@ final class WindowTracker {
         for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
                      NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didHideApplicationNotification,
                      NSWorkspace.didUnhideApplicationNotification] {
-            nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.burst(everyMs: 20) }
+            nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                self?.queue.async { self?.lastAppChange = .now() }
+                self?.burst(everyMs: 20)
+            }
         }
     }
 
@@ -171,12 +209,13 @@ final class WindowTracker {
         guard !listing else { return }   // the fetch under way is fresh enough
         listing = true
         listQueue.async { [weak self] in
+            let began = DispatchTime.now()
             let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]]
             self?.queue.async {
                 guard let self else { return }
                 self.listing = false
-                if let list { self.update(list) }
+                if let list { self.lastList = list; self.lastListAt = began; self.update(list) }
                 done?()
             }
         }
@@ -246,7 +285,14 @@ final class WindowTracker {
             let title = info[kCGWindowName as String] as? String ?? ""
             var w = TrackedWindow(wid: wid, pid: pid, bundleId: bid, appName: appName, title: title,
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
-            if layer == 0, title.isEmpty, !looksLikeAppWindow(wid, pid: pid) {
+            // Whether an untitled window is one of the app's own isn't known until the app has
+            // answered: a new one waits for that (a moment), one already shown stays as it is.
+            var realWindow = true
+            if layer == 0, title.isEmpty {
+                if let isApp = looksLikeAppWindow(wid, pid: pid) { realWindow = isApp }
+                else if windows[wid] == nil { continue }
+            }
+            if layer == 0, title.isEmpty, !realWindow {
                 if Self.spansDisplays(bounds) { continue }   // a drag image layer, see spansDisplays
                 // Not a real window of the app but a transient one drawn at window level (a calendar app's
                 // event card): shown attached to the app window it sits on, like a popover.
@@ -290,8 +336,19 @@ final class WindowTracker {
                     && $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
             }
             guard host else { continue }
-            let none = noButtonsSeen[wid] ?? (hasNoButtons?(wid, w.pid) ?? false)
-            noButtonsSeen[wid] = none
+            guard let none = noButtonsSeen[wid] else {
+                // Not known until the app has answered: a new window waits for that (a moment),
+                // one already shown stays a window.
+                askNoButtons(wid, pid: w.pid)
+                if windows[wid] == nil {
+                    seen[wid] = nil
+                    order.removeAll { $0 == wid }
+                    if frontToplevel[w.pid]?.wid == wid {
+                        frontToplevel[w.pid] = order.lazy.compactMap { seen[$0] }.first { $0.pid == w.pid }
+                    }
+                }
+                continue
+            }
             guard none else { continue }
             var p = w
             p.kind = .popup
@@ -398,14 +455,55 @@ final class WindowTracker {
         return CGRect(dictionaryRepresentation: d)
     }
 
-    /// Returns true when `wid` is the topmost window covering `point` (global coords),
-    /// i.e. a click there would land on it.
-    /// Whether `wid` is what's in front at `point` — or only its own app's menu, tooltip or
-    /// popover is (raising the window then would dismiss that menu: a raise counts as a click).
-    func isFrontmost(_ wid: UInt32, at point: CGPoint) -> Bool {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+    /// The window list as last fetched (front to back), and when that fetch began.
+    private var lastList: [[String: Any]] = []
+    private var lastListAt = DispatchTime(uptimeNanoseconds: 0)
+
+    /// How long ago the last look at the window list began.
+    var lastLookAgeMs: Double { Double(DispatchTime.now().uptimeNanoseconds - lastListAt.uptimeNanoseconds) / 1e6 }
+
+    /// When an app last came to the front, started, quit, hid or unhid: what's in front may
+    /// have changed then.
+    private var lastAppChange = DispatchTime(uptimeNanoseconds: 0)
+
+    /// Whether `wid` was in front at `point` at the last look at the window list, without
+    /// asking the window server again. nil when what's in front may have changed since that
+    /// look began: something was raised (`since`) or an app came or went; when the look is
+    /// older than `maxAgeMs`; or when the window isn't known.
+    func frontmostAtLastLook(_ wid: UInt32, at point: CGPoint, maxAgeMs: Double, since: DispatchTime) -> Bool? {
+        guard let pid = windows[wid]?.pid, lastLookAgeMs <= maxAgeMs, lastListAt > since, lastListAt > lastAppChange else { return nil }
+        // Not in the list at all: not on screen, so not in front.
+        return Self.frontmost(in: lastList, wid: wid, pid: pid, point: point, kindOf: { windows[$0]?.kind }) ?? false
+    }
+
+    /// Whether `wid` is what's in front at `point` (global coords), i.e. a click there would
+    /// land on it — or only its own app's menu, tooltip or popover is (raising the window then
+    /// would dismiss that menu: a raise counts as a click). Asks the window server, so not for
+    /// the session queue: what it needs from the tracker is passed in. Only the windows in
+    /// front of `wid` are listed: with many windows open the whole list kept the window server
+    /// (and whoever waited on it) busy for long.
+    static func isFrontmost(wid: UInt32, pid: pid_t, point: CGPoint, kindOf: (UInt32) -> TrackedWindow.Kind?) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], wid)
                 as? [[String: Any]] else { return false }
-        let pid = windows[wid]?.pid
+        // Nothing in front of it there.
+        return frontmost(in: list, wid: wid, pid: pid, point: point, kindOf: kindOf) ?? true
+    }
+
+    /// For the debug port: what the window server lists in front of `wid` at `point`.
+    static func describeAbove(wid: UInt32, point: CGPoint) -> String {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], wid) as? [[String: Any]] ?? []
+        let at = list.filter { info in
+            (info[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) }?.contains(point) ?? false
+        }
+        return "\(list.count) windows above, \(at.count) at the point: " + at.prefix(8).map {
+            "\($0[kCGWindowNumber as String] ?? 0) \($0[kCGWindowOwnerName as String] ?? "?") layer \($0[kCGWindowLayer as String] ?? "?") alpha \($0[kCGWindowAlpha as String] ?? "?")"
+        }.joined(separator: "; ")
+    }
+
+    /// Going through `list` front to back: true at `wid` itself or its own app's popup, false
+    /// at another window covering `point`, nil when the list has neither.
+    private static func frontmost(in list: [[String: Any]], wid: UInt32, pid: pid_t, point: CGPoint,
+                                  kindOf: (UInt32) -> TrackedWindow.Kind?) -> Bool? {
         for info in list {
             guard let layer = info[kCGWindowLayer as String] as? Int, layer < 1000,
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
@@ -417,9 +515,8 @@ final class WindowTracker {
             // Other apps' windows above the normal level (the Dock keeps a transparent one over
             // the whole display) stay on top whatever we raise: they don't count.
             if layer > 0 && owner != pid { continue }
-            let isOwnPopup = owner != nil && owner == pid && (layer > 0 || number.flatMap { windows[$0]?.kind } != .toplevel)
-            return isOwnPopup
+            return owner == pid && (layer > 0 || number.flatMap { kindOf($0) } != .toplevel)
         }
-        return false
+        return nil
     }
 }

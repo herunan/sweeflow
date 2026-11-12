@@ -110,6 +110,10 @@ enum BuiltInScreen {
     /// Linux doesn't.
     private static var tap: CFMachPort?
     private static var tapSource: CFRunLoopSource?
+    /// The tap is served on a thread of its own. It's an active tap, so every event (the ones
+    /// Sweeflow posts for Linux included) waits until its callback has run; on the main thread
+    /// that meant every click and pointer move waited for whatever the main thread was busy with.
+    private static var tapRunLoop: CFRunLoop?
 
     private static func watchLocalInput() {
         guard tap == nil else { return }
@@ -132,16 +136,32 @@ enum BuiltInScreen {
             return log("can't watch this Mac's own input (Accessibility): idle time instead")
         }
         tap = t
-        tapSource = CFMachPortCreateRunLoopSource(nil, t, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
-        CGEvent.tapEnable(tap: t, enable: true)
+        let source = CFMachPortCreateRunLoopSource(nil, t, 0)
+        tapSource = source
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            tapRunLoop = CFRunLoopGetCurrent()
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CGEvent.tapEnable(tap: t, enable: true)
+            ready.signal()
+            CFRunLoopRun()   // until stopWatchingLocalInput stops it
+        }
+        thread.name = "sweeflow.eventtap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        // So stopWatchingLocalInput always finds the run loop to stop.
+        _ = ready.wait(timeout: .now() + 2)
     }
 
     private static func stopWatchingLocalInput() {
         if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
-        if let s = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
+        if let rl = tapRunLoop {
+            if let s = tapSource { CFRunLoopRemoveSource(rl, s, .commonModes) }
+            CFRunLoopStop(rl)
+        }
         tap = nil
         tapSource = nil
+        tapRunLoop = nil
     }
 
     private static func localInput(pointer: Bool) {

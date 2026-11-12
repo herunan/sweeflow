@@ -19,8 +19,12 @@ swift build -c release 2>&1 | grep -E "error|Compiling|Build complete" || true
 BIN=".build/release/SweeflowHost"
 [ -x "$BIN" ] || { echo "build failed"; exit 1; }
 
-if [ -f "$REL/release.keychain-db" ]; then
-    # This Mac makes the releases: update the released, permitted copy in place.
+if [ -z "${SWEEFLOW_DEV_COPY:-}" ] && [ -f "$REL/release.keychain-db" ] &&
+   { [ -d /Applications/Sweeflow.app ] || [ ! -d "$HOME/Applications/Sweeflow.app" ]; }; then
+    # This Mac makes the releases: update the released, permitted copy in place. (Not when
+    # only a development copy is installed here: that's the one macOS has the permissions for,
+    # and replacing it with the released app would lose them. SWEEFLOW_DEV_COPY=1 asks for the
+    # development copy outright.)
     APP="/Applications/Sweeflow.app"
     KEYCHAIN="$REL/release.keychain-db"
     KC_PASS="sweeflow-release"

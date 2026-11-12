@@ -74,6 +74,10 @@ final class WindowControl {
         AXUIElementSetAttributeValue(e, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
     }
 
+    /// Brings the window (and its app) to the front in the window server alone: quick, and it
+    /// doesn't wait for the app. `focus` does the rest.
+    func frontNow(_ wid: UInt32, pid: pid_t) { _ = MFSetFrontWindow(pid, wid) }
+
     /// Brings the window to the front and makes its app active so it receives keystrokes.
     func focus(_ wid: UInt32, pid: pid_t) {
         // Front process and window at once (NSRunningApplication.activate waits up to a second

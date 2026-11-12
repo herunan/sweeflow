@@ -126,7 +126,11 @@ final class Session {
         // Input that comes while a press waits for its window to come to the front (see
         // holdInput) waits too, so it all lands in order.
         if heldInput != nil, [.pointerMove, .pointerButton, .scroll, .key, .releaseAll].contains(m.type) {
-            heldInput?.append((m, s))
+            let held = m
+            heldInput?.append { [weak self] in
+                var m = held
+                do { try self?.handle(&m, on: s) } catch { log("held input: \(error)") }
+            }
             return
         }
         switch m.type {
@@ -162,6 +166,9 @@ final class Session {
             w.str(Host.current().localizedName ?? "Mac")
             w.str(Self.macKind)
             s.send(w)
+            // Accessibility calls wait at most a second for an app (not the default 6 s): a
+            // hung app must not hold its queue, and everything behind it, for long.
+            AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
             startTracking()
             let cw = CursorWatcher(scale: clientScale) { [weak self] png, hot, scale in
                 self?.queue.async {
@@ -322,10 +329,7 @@ final class Session {
 
         case .resize:
             let wid = try m.u32(), w = try m.f32(), h = try m.f32()
-            guard let win = tracker.windows[wid] else { return }
-            requestedSizes[wid] = CGSize(width: w, height: h)
-            for st in streamers.values where st.wid == wid { st.visibleSize = CGSize(width: w, height: h) }
-            resize(win, to: CGSize(width: w, height: h))
+            clientResized(wid, to: CGSize(width: w, height: h))
         case .launchApp:
             let bid = try m.str()
             log("launching \(bid)")
@@ -338,7 +342,7 @@ final class Session {
             // re-announces it and the client resubscribes to its video.
             let wid = try m.u32()
             if let w = minimized.removeValue(forKey: wid) {
-                ax(burstFor: 1) { $0.unminimize(wid, pid: w.pid); $0.focus(wid, pid: w.pid) }
+                ax(pid: w.pid, burstFor: 1) { $0.unminimize(wid, pid: w.pid); $0.focus(wid, pid: w.pid) }
             }
         case .menuRefresh:
             sendMenus(pid: pid_t(try m.i32()))
@@ -359,12 +363,17 @@ final class Session {
         case .blindPress:
             let wid = try m.u32(), index = Int(try m.u16())
             if wid == 1 { log("stand-in test: button \(index) chosen") }
+            // Off the session queue: a prompt that has gone, or a busy app, answers only when
+            // the Accessibility timeout runs out, and input waited that long behind each press.
             if index == 0xFFFF, let menu = blindMenus[wid] {
                 // Cancelled on Linux: close the menu on the Mac too.
-                AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+                DispatchQueue.global(qos: .userInitiated).async { AXUIElementPerformAction(menu, kAXCancelAction as CFString) }
             } else if let b = blindButtons[wid], index < b.count {
-                let r = AXUIElementPerformAction(b[index], kAXPressAction as CFString)
-                log("uncapturable window \(wid): pressed button \(index) (\(r == .success ? "ok" : "failed"))")
+                let button = b[index]
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let r = AXUIElementPerformAction(button, kAXPressAction as CFString)
+                    log("uncapturable window \(wid): pressed button \(index) (\(r == .success ? "ok" : "failed"))")
+                }
             }
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
@@ -375,11 +384,7 @@ final class Session {
             DispatchQueue.main.async { host.display.ensure(points: CGSize(width: w, height: h)) }
             refreshVirtualDisplayArea(attempt: 0)
         case .focus:
-            let wid = try m.u32()
-            setClientFocus(wid)
-            guard let win = tracker.windows[wid] else { return }
-            raise(win)
-            ax { $0.focus(wid, pid: win.pid) }
+            clientFocused(try m.u32())
         case .quitApp:
             // As ⌘Q: the app may still ask about unsaved changes (on the Mac, via a stand-in).
             let bid = try m.str()
@@ -393,15 +398,16 @@ final class Session {
             let wid = try m.u32()
             if wid == displayViewWid { closeDisplayView(); return }
             // The window takes a moment to go after its close button is pressed: watch for it.
-            if let win = tracker.windows[wid] { ax(burstFor: 2) { $0.close(wid, pid: win.pid) } }
+            if let win = tracker.windows[wid] { ax(pid: win.pid, burstFor: 2) { $0.close(wid, pid: win.pid) } }
             log("close \(wid)")
 
         case .pointerMove:
             let (wid, p) = try pointerTarget(&m)
             // A drop from Linux is being replayed with the Mac's own pointer: don't pull it away.
             // Only onto another window: looking at the window list costs a few ms, and motion
-            // comes hundreds of times a second (a press still checks every time).
-            if let p, !DragBridge.replaying { if wid != raisedWid { ensureFront(wid, at: p) }; input.move(to: p) }
+            // comes hundreds of times a second (a press still checks every time). And not here:
+            // with many windows open the window server answers late, and every move waited.
+            if let p, !DragBridge.replaying { if wid != raisedWid { ensureFrontSoon(wid, at: p) }; input.move(to: p) }
             userDidSomething(click: false)
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
@@ -418,11 +424,7 @@ final class Session {
                         if pressed, pressId != 0 { classifyPress(wid, at: p, id: pressId) }
                     }
                 }
-                if pressed && ensureFront(wid, at: p) {
-                    holdInput(until: wid, at: p, then: post)
-                } else {
-                    post()
-                }
+                if pressed { press(wid, at: p, then: post) } else { post() }
             }
         case .scroll:
             let (_, p) = try pointerTarget(&m)
@@ -432,7 +434,9 @@ final class Session {
         case .key:
             let code = try m.u32(), v = try m.u8()   // 0 up, 1 down, 2 repeat
             input.key(evdev: code, pressed: v != 0, isRepeat: v == 2)
-            if v == 1 { userDidSomething(click: true) }
+            // Keys that open, close or switch things (menus, dialogs, fields, shortcuts) look
+            // closely; plain typing only as closely as pointer motion.
+            if v == 1 { userDidSomething(click: Self.actionKeys.contains(code) || input.commandOrControlHeld) }
         case .releaseAll:
             input.releaseAll()
             setClientFocus(0)
@@ -452,14 +456,14 @@ final class Session {
     /// a probe every 50 ms on a queue of its own, logged every 10 s while anything waited.
     private func probeQueue() {
         let probe = DispatchQueue(label: "sweeflow.probe")
-        var n = 0, sum = 0.0, worst = 0.0, since = DispatchTime.now()
+        var n = 0, sum = 0.0, worst = 0.0, since = DispatchTime.now(), announced = false
         func tick() {
             let t0 = DispatchTime.now()
             queue.async { [weak self] in
                 guard let self, self.control != nil else { return }
                 let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
                 probe.async {
-                    if n == 0 && sum == 0 && worst == 0 { log("session queue probe running") }
+                    if !announced { announced = true; log("session queue probe running") }
                     n += 1; sum += ms; worst = max(worst, ms)
                     if DispatchTime.now().uptimeNanoseconds - since.uptimeNanoseconds > 10_000_000_000 {
                         if worst > 2 { log(String(format: "session queue: work waits %.1f ms on average, worst %.1f ms", sum / Double(n), worst)) }
@@ -482,9 +486,17 @@ final class Session {
         runningTimer = t
     }
 
+    private let appsQueue = DispatchQueue(label: "sweeflow.apps", qos: .utility)
+    private var scanningApps = false
+
     /// 3 = has a window showing here, 2 = only minimised ones, 1 = running with no window.
     private func sendRunningApps() {
-        DispatchQueue.main.async { [weak self] in
+        // Asking each app what kind it is goes to the system, one round trip per app, and takes
+        // over a second when the Mac is busy: not on the main thread (where it held up the
+        // cursor, the clipboard and the rest), and never two looks at once.
+        guard !scanningApps else { return }
+        scanningApps = true
+        appsQueue.async { [weak self] in
             let own = Bundle.main.bundleIdentifier
             let bids = NSWorkspace.shared.runningApplications
                 .filter { $0.activationPolicy == .regular }
@@ -492,6 +504,7 @@ final class Session {
                 .filter { $0 != own }
             self?.queue.async {
                 guard let self else { return }
+                self.scanningApps = false
                 var now: [String: UInt8] = [:]
                 for bid in bids {
                     let open = self.tracker.windows.values.contains { $0.bundleId == bid && $0.kind != .popup }
@@ -557,49 +570,126 @@ final class Session {
     private var recentlyGone: [UInt32: (frame: CGRect, parent: UInt32, at: DispatchTime)] = [:]
 
     /// Windows overlap on the Mac, so the one under the pointer must be on top before we
-    /// inject events at its location.
-    /// Brings the window to the front if another one covers `p` on the Mac. Whether it had to.
-    @discardableResult
-    private func ensureFront(_ wid: UInt32, at p: CGPoint) -> Bool {
-        guard let win = tracker.windows[wid] else { return false }
-        if win.kind != .toplevel { return false }   // menus and floating panels are already on top
-        if raisedWid == wid && tracker.isFrontmost(wid, at: p) { return false }
-        let covered = !tracker.isFrontmost(wid, at: p)
-        if covered { raise(win) }
+    /// inject events at its location. A press never waits for the window server on this queue
+    /// (it answers late with many windows open, and all input waited with it):
+    /// - the tracker's last look at the window list is recent, and nothing has been raised
+    ///   since: it says whether the window is in front. In front (the usual case: the pointer
+    ///   was already over it), the press goes straight through;
+    /// - covered, or not known: the press and what follows it wait (holdInput) while the
+    ///   window server is asked off this queue, and the window is raised if it's covered.
+    private func press(_ wid: UInt32, at p: CGPoint, then post: @escaping () -> Void) {
+        // Menus and floating panels are already on top.
+        guard let win = tracker.windows[wid], win.kind == .toplevel else { return post() }
         raisedWid = wid
-        return covered
+        let raises = raiseState
+        let known = raises.pending ? nil : tracker.frontmostAtLastLook(wid, at: p, maxAgeMs: 2000, since: raises.doneAt)
+        if known == true { return post() }
+        if known == false { raise(win) }
+        let why = known == false ? "for its window to come to the front"
+            : raises.pending ? "for the window server's answer (a raise was under way)"
+            : String(format: "for the window server's answer (last look %.0f ms ago)", tracker.lastLookAgeMs)
+        holdInput(until: wid, at: p, raised: known == false, why: why, then: post)
     }
 
-    /// Input waiting for a window to come to the front, and the stream each message came on.
-    private var heldInput: [(MsgReader, MsgStream)]?
+    /// Whether a raise asked of an app may still change what's in front (it's under way, or
+    /// the newest one hasn't had its turn), and when the last one finished: a look at the
+    /// window list from before then doesn't say what's in front now. Raises skipped because a
+    /// newer one came don't count: they wait their turn behind an app's slow resizes for
+    /// seconds, and change nothing. (All under raiseLock.)
+    private let raiseNowQueue = DispatchQueue(label: "sweeflow.raise", qos: .userInteractive)
+    private var raisesExecuting = 0
+    private var raiseDoneGeneration = 0
+    private var raiseDoneAt = DispatchTime(uptimeNanoseconds: 0)
+    private var raiseState: (pending: Bool, doneAt: DispatchTime) {
+        raiseLock.withLock { (raisesExecuting > 0 || raiseDoneGeneration != raiseGeneration, raiseDoneAt) }
+    }
+
+    /// Asks the window server which window is in front, off the session queue: for the window
+    /// the pointer moves onto (frontQueue, newest question only), and for a press and the
+    /// window a held button may be dragging (pressQueue, so they never wait behind the former).
+    private let frontQueue = DispatchQueue(label: "sweeflow.front", qos: .userInteractive)
+    private let pressQueue = DispatchQueue(label: "sweeflow.press", qos: .userInteractive)
+    private var frontGeneration = 0
+    private let frontLock = NSLock()
+
+    /// As ensureFront, for pointer motion, which never waits for the answer: the window server
+    /// can take long to give it with many windows open, and input queued up behind it for
+    /// seconds. The window counts as raised at once, so the moves that follow don't ask again.
+    private func ensureFrontSoon(_ wid: UInt32, at p: CGPoint) {
+        guard let win = tracker.windows[wid], win.kind == .toplevel else { return }
+        raisedWid = wid
+        // What isFrontmost needs from the tracker, read here: its state belongs to this queue.
+        let pid = win.pid
+        let snapshot = tracker.windows
+        // Only the newest question matters: the ones still waiting when the pointer has gone on
+        // to another window are dropped (asked one after another, they queued up for seconds
+        // when the window server answered late).
+        let gen = frontLock.withLock { frontGeneration += 1; return frontGeneration }
+        frontQueue.async { [weak self] in
+            guard let self, self.frontLock.withLock({ self.frontGeneration == gen }) else { return }
+            let front = WindowTracker.isFrontmost(wid: wid, pid: pid, point: p, kindOf: { snapshot[$0]?.kind })
+            guard !front else { return }
+            self.queue.async {
+                // Not if the pointer has gone on to another window meanwhile, or this one has gone.
+                guard self.raisedWid == wid, let now = self.tracker.windows[wid] else { return }
+                self.raise(now)
+            }
+        }
+    }
+
+    /// Input waiting for a window to come to the front (each to be handled in turn).
+    private var heldInput: [() -> Void]?
+
+    /// Does `f` now, or after the press that input is waiting behind.
+    private func afterHeld(_ f: @escaping () -> Void) {
+        if heldInput != nil { heldInput?.append(f) } else { f() }
+    }
 
     /// A press on a window that another one covers on the Mac (windows Linux shows side by side
     /// can overlap there, big tiled ones especially) waits until the raise has taken effect, and
     /// what follows it with it. Raising goes through Accessibility, which a busy app answers
     /// from a few ms to most of a second later; sent straight away, the press landed on the
-    /// window in front. Sent anyway after 0.6 s.
-    private func holdInput(until wid: UInt32, at p: CGPoint, then post: @escaping () -> Void) {
+    /// window in front. Sent anyway after 0.6 s. The window server is asked off this queue, one
+    /// question at a time; `raised`: the window has been asked to the front already (if not,
+    /// the first answer decides whether it needs to be).
+    private func holdInput(until wid: UInt32, at p: CGPoint, raised: Bool, why: String, then post: @escaping () -> Void) {
         heldInput = []
         let start = DispatchTime.now()
-        func check() {
+        var raised = raised, released = false
+        func release(front: Bool) {
+            guard !released else { return }
+            released = true
             let waited = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e6
-            let front = tracker.isFrontmost(wid, at: p)
-            guard front || waited > 600 else {
-                queue.asyncAfter(deadline: .now() + .milliseconds(8)) { check() }
-                return
+            if raised || waited > 20 {
+                log(String(format: "click on %u held %.0f ms %@%@", wid, waited, why, front ? "" : ": still covered, sent anyway"))
             }
-            log(String(format: "click on %u held %.0f ms for its window to come to the front%@", wid, waited, front ? "" : ": still covered, sent anyway"))
             post()
             var rest = heldInput ?? []
             heldInput = nil
             while !rest.isEmpty {
-                var (m, s) = rest.removeFirst()
+                let next = rest.removeFirst()
                 // A press in there may wait for a raise of its own: the rest waits behind it.
-                if heldInput != nil { heldInput?.append((m, s)); continue }
-                do { try handle(&m, on: s) } catch { log("held input: \(error)") }
+                if heldInput != nil { heldInput?.append(next); continue }
+                next()
             }
         }
-        check()
+        func look() {
+            guard let win = tracker.windows[wid] else { return release(front: false) }
+            // What isFrontmost needs from the tracker, read here: its state belongs to this queue.
+            let pid = win.pid, snapshot = tracker.windows
+            pressQueue.async { [weak self] in
+                let front = WindowTracker.isFrontmost(wid: wid, pid: pid, point: p, kindOf: { snapshot[$0]?.kind })
+                self?.queue.async {
+                    guard let self, !released else { return }
+                    if front { return release(front: true) }
+                    if !raised, let win = self.tracker.windows[wid] { raised = true; self.raise(win) }
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(16)) { if !released { look() } }
+                }
+            }
+        }
+        // Sent anyway after 0.6 s, whether or not the window server has answered by then.
+        queue.asyncAfter(deadline: .now() + .milliseconds(600)) { release(front: false) }
+        look()
     }
 
     /// While the left button is held in a streamed window, watch for a file drag starting there
@@ -655,6 +745,8 @@ final class Session {
         hitQueue.async { [weak self] in
             let system = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(system, 0.25)
+            // The system-wide timeout holds for the whole process: back to the usual second after.
+            defer { AXUIElementSetMessagingTimeout(system, 1.0) }
             var hit: AXUIElement?
             guard AXUIElementCopyElementAtPosition(system, Float(p.x), Float(p.y), &hit) == .success, let el = hit else { return }
             func attr(_ e: AXUIElement, _ name: String) -> String {
@@ -699,8 +791,11 @@ final class Session {
         pressSpot = nil
         input.button(0, pressed: false, at: input.lastPoint)
         watchDrag(wid, buttonDown: false)
-        if let now = tracker.liveFrame(wid), now.origin != g.frame.origin {
-            ax { $0.setPosition(wid, pid: win.pid, g.frame.origin) }
+        // Back where it was if the app had begun moving it (asked off this queue).
+        let origin = g.frame.origin, pid = win.pid, tracker = tracker
+        pressQueue.async { [weak self] in
+            guard let now = tracker.liveFrame(wid), now.origin != origin else { return }
+            self?.queue.async { self?.ax(pid: pid) { $0.setPosition(wid, pid: pid, origin) } }
         }
         log("window \(wid): moved by Linux from the press")
     }
@@ -708,7 +803,11 @@ final class Session {
     private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
         guard let win = tracker.windows[wid], win.kind == .toplevel else { return }
         if buttonDown || gesture?.wid != wid {
-            gesture = (wid, tracker.liveFrame(wid) ?? win.frame, .now() + .milliseconds(buttonDown ? 10_000 : 400), buttonDown)
+            // Where the window is as the press lands: the tracker's frame when its last look is
+            // recent, else the first look from here (see checkGesture) says. Not asked on this
+            // queue, where every press waited for the window server's answer.
+            gesture = (wid, win.frame, .now() + .milliseconds(buttonDown ? 10_000 : 400), buttonDown)
+            gestureNeedsStart = tracker.lastLookAgeMs > 150
         } else {
             gesture?.buttonDown = false
             gesture?.until = .now() + .milliseconds(400)   // a zoom lands shortly after the release
@@ -722,25 +821,53 @@ final class Session {
         }
     }
 
+    /// A look at the window's frame is on its way (see checkGesture).
+    private var gestureLooking = false
+    /// The gesture's starting frame isn't known yet: the first look gives it.
+    private var gestureNeedsStart = false
+
+    /// Where the window is now is asked off the session queue, one look at a time: the window
+    /// server can take far longer than the 8 ms between looks when many windows are open, and
+    /// asked here the looks filled the queue for as long as the button was held (up to 10 s),
+    /// the button's own release waiting behind them.
     private func checkGesture() {
-        guard let g = gesture, let win = tracker.windows[g.wid], DispatchTime.now() < g.until,
-              let now = tracker.liveFrame(g.wid) else {
+        guard let g = gesture, tracker.windows[g.wid] != nil, DispatchTime.now() < g.until else {
             gesture = nil; gestureTimer?.cancel(); gestureTimer = nil
             return
         }
+        guard !gestureLooking else { return }
+        gestureLooking = true
+        let wid = g.wid, tracker = tracker
+        pressQueue.async { [weak self] in
+            let now = tracker.liveFrame(wid)
+            self?.queue.async {
+                self?.gestureLooking = false
+                self?.gestureLooked(wid, now)
+            }
+        }
+    }
+
+    private func gestureLooked(_ wid: UInt32, _ now: CGRect?) {
+        // Still the same press, and the window still there.
+        guard let g = gesture, g.wid == wid, let win = tracker.windows[wid] else { return }
+        guard let now else {
+            gesture = nil; gestureTimer?.cancel(); gestureTimer = nil
+            return
+        }
+        if gestureNeedsStart { gestureNeedsStart = false; gesture?.frame = now; return }
         if now == g.frame { return }
         gesture = nil; gestureTimer?.cancel(); gestureTimer = nil
         if now.size == g.frame.size && g.buttonDown {
             // The app started dragging its window: end the drag on the Mac, put the window back,
             // and let KWin move the Linux window instead (the button is still held there).
             input.button(0, pressed: false, at: input.lastPoint)
-            ax { $0.setPosition(g.wid, pid: win.pid, g.frame.origin) }
+            ax(pid: win.pid) { $0.setPosition(g.wid, pid: win.pid, g.frame.origin) }
             log("window \(g.wid): title-bar drag → handing move to Linux")
             learnDragSpot(g.wid)
             var m = MsgWriter(.moveStarted); m.u32(g.wid); control?.send(m)
         } else if now.size != g.frame.size && !g.buttonDown {
             // Double-click zoom: undo it on the Mac and maximise the Linux window instead.
-            ax { $0.setPosition(g.wid, pid: win.pid, g.frame.origin); $0.setSize(g.wid, pid: win.pid, g.frame.size) }
+            ax(pid: win.pid) { $0.setPosition(g.wid, pid: win.pid, g.frame.origin); $0.setSize(g.wid, pid: win.pid, g.frame.size) }
             log("window \(g.wid): zoom → toggling maximise on Linux")
             var m = MsgWriter(.toggleMaximize); m.u32(g.wid); control?.send(m)
         }
@@ -781,6 +908,10 @@ final class Session {
             origin.y = max(area.minY, min(origin.y, area.maxY - size.height))
         }
         let moved = origin != win.frame.origin
+        // Already that size where it is (a relayout sends every window's size again): nothing
+        // to ask the app. Not while a resize is under way, which may yet change it.
+        if !moved, !resizing.contains(win.wid),
+           abs(win.frame.width - size.width) <= 1, abs(win.frame.height - size.height) <= 1 { return }
         resizeTargets[win.wid] = (win.pid, moved ? origin : nil, size)
         applyResize(win.wid)
     }
@@ -812,13 +943,28 @@ final class Session {
             control.setSize(wid, pid: t.pid, t.size)
             let ms = Date().timeIntervalSince(t0) * 1000
             if ms > 100 { log(String(format: "resize of %u took %.0f ms", wid, ms)) }
+            // What the app made of it: some keep a size of their own (a minimum, a step).
+            let got = self?.tracker.liveFrame(wid)
             // Capture at the new size as soon as the app has resized (not on the next slow look).
             self?.tracker.burst(everyMs: 16, for: 0.5)
             self?.queue.async {
-                self?.resizing.remove(wid)
-                self?.applyResize(wid)
+                guard let self else { return }
+                if let got, abs(got.width - t.size.width) > 2 || abs(got.height - t.size.height) > 2 {
+                    self.refusedResize(wid, t.size, at: t.origin ?? got.origin, got: got.size)
+                }
+                self.resizing.remove(wid)
+                self.applyResize(wid)
             }
         }
+    }
+
+    /// The size each window last refused (logged once, not on every try).
+    private var refusedSizes: [UInt32: CGSize] = [:]
+
+    private func refusedResize(_ wid: UInt32, _ size: CGSize, at origin: CGPoint, got: CGSize) {
+        guard refusedSizes[wid] != size else { return }
+        refusedSizes[wid] = size
+        log("resize of \(wid): asked \(Int(size.width))x\(Int(size.height)) at \(Int(origin.x)),\(Int(origin.y)), the app made it \(Int(got.width))x\(Int(got.height))")
     }
 
     /// Keeps a streamed window (or floating panel) fully on the virtual display: input is injected
@@ -832,8 +978,11 @@ final class Session {
         // Clamp so the whole window is visible (as far as it fits).
         origin.x = min(max(origin.x, area.minX), max(area.minX, area.maxX - w.frame.width))
         origin.y = min(max(origin.y, area.minY), max(area.minY, area.maxY - w.frame.height))
-        if w.kind == .toplevel { origin = uncovered(w, at: origin, in: area) }
-        if origin != w.frame.origin { ax { $0.setPosition(w.wid, pid: w.pid, origin) } }
+        // Moved less than 1.5 s ago (see justMoved): it may not have got there yet, so what
+        // covers it where it seems to be says nothing.
+        let recentlyMoved = justMoved[w.wid].map { DispatchTime.now().uptimeNanoseconds - $0.at.uptimeNanoseconds < 1_500_000_000 } ?? false
+        if w.kind == .toplevel && !recentlyMoved { origin = uncovered(w, at: origin, in: area) }
+        if origin != w.frame.origin { ax(pid: w.pid) { $0.setPosition(w.wid, pid: w.pid, origin) } }
     }
 
     /// Nobody sees the virtual display, but macOS still works out which windows are hidden
@@ -863,14 +1012,17 @@ final class Session {
         return best
     }
 
+    /// Checks whether closed windows' Accessibility elements are gone, or the windows only
+    /// minimised (any app's; several at a time, so one slow app doesn't hold the others up).
+    private let axQueue = DispatchQueue(label: "sweeflow.ax", qos: .userInteractive, attributes: .concurrent)
+
     /// Accessibility actions wait on the app (Finder can take a second to close a window): run
     /// them off the session's queue so frames, input and window checks carry on meanwhile, then
-    /// look for the change they make straight away.
-    private let axQueue = DispatchQueue(label: "sweeflow.ax", qos: .userInteractive)
-
-    private func ax(burstFor seconds: Double = 0.5, _ action: @escaping (WindowControl) -> Void) {
+    /// look for the change they make straight away. On the app's own queue: one slow app
+    /// doesn't hold up raises and moves for the others.
+    private func ax(pid: pid_t, burstFor seconds: Double = 0.5, _ action: @escaping (WindowControl) -> Void) {
         let control = control_
-        axQueue.async { [weak self] in
+        appQueue(pid).async { [weak self] in
             let t0 = Date()
             action(control)
             let ms = Date().timeIntervalSince(t0) * 1000
@@ -884,11 +1036,16 @@ final class Session {
     func debugPointer(wid: UInt32, x: Double, y: Double, click: Bool, right: Bool) -> String {
         guard let win = tracker.windows[wid] else { return "no window \(wid)" }
         let p = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
-        ensureFront(wid, at: p)
+        // As the client's own messages (the reply doesn't wait for a held press to land).
+        if !click, wid != raisedWid { ensureFrontSoon(wid, at: p) }
         input.move(to: p)
         if click {
-            input.button(right ? 1 : 0, pressed: true, at: p)
-            input.button(right ? 1 : 0, pressed: false, at: p)
+            // In line behind a press that's being held, as the client's messages are.
+            let b = right ? 1 : 0
+            afterHeld { [self] in
+                press(wid, at: p) { [self] in input.button(b, pressed: true, at: p); userDidSomething(click: true) }
+                afterHeld { [self] in input.button(b, pressed: false, at: p) }
+            }
         }
         return "ok \(p)"
     }
@@ -902,8 +1059,35 @@ final class Session {
 
     func debugClose(_ wid: UInt32) -> String {
         guard let w = tracker.windows[wid] else { return "no window \(wid)" }
-        ax(burstFor: 2) { $0.close(wid, pid: w.pid) }
+        ax(pid: w.pid, burstFor: 2) { $0.close(wid, pid: w.pid) }
         return "ok"
+    }
+
+    /// What the two ways of telling whether a window is in front say at a point in it, and how
+    /// long the window server took to answer.
+    func debugFront(wid: UInt32, x: Double, y: Double, reply: @escaping (String) -> Void) {
+        guard let win = tracker.windows[wid] else { return reply("no window \(wid)") }
+        let p = CGPoint(x: win.frame.minX + x, y: win.frame.minY + y)
+        let last = tracker.frontmostAtLastLook(wid, at: p, maxAgeMs: .infinity, since: DispatchTime(uptimeNanoseconds: 0))
+        let age = tracker.lastLookAgeMs, flying = raiseState.pending ? 1 : 0, pid = win.pid, snapshot = tracker.windows
+        pressQueue.async {
+            let t0 = DispatchTime.now()
+            let asked = WindowTracker.isFrontmost(wid: wid, pid: pid, point: p, kindOf: { snapshot[$0]?.kind })
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
+            reply(String(format: "last look (%.0f ms old): %@; asked now: %@ in %.0f ms; %d raises under way; ", age,
+                         last.map { $0 ? "front" : "covered" } ?? "unknown", asked ? "front" : "covered", ms, flying)
+                  + WindowTracker.describeAbove(wid: wid, point: p))
+        }
+    }
+
+    /// As the client resizing a window (points).
+    func debugResize(wid: UInt32, w: Double, h: Double) -> String {
+        clientResized(wid, to: CGSize(width: w, height: h)) ? "ok" : "no window \(wid)"
+    }
+
+    /// As the client focusing a window.
+    func debugFocus(wid: UInt32) -> String {
+        clientFocused(wid) ? "ok" : "no window \(wid)"
     }
 
     func debugBlind() -> String {
@@ -1005,6 +1189,27 @@ final class Session {
         }
     }
 
+    /// The client focused one of the windows (`focus`): it comes to the front here too.
+    /// Whether the window is known.
+    @discardableResult
+    private func clientFocused(_ wid: UInt32) -> Bool {
+        setClientFocus(wid)
+        guard let win = tracker.windows[wid] else { return false }
+        raise(win)   // which focuses it too
+        return true
+    }
+
+    /// The client shows a window at a new size (`resize`): the Mac window and its capture
+    /// follow. Whether the window is known.
+    @discardableResult
+    private func clientResized(_ wid: UInt32, to size: CGSize) -> Bool {
+        guard let win = tracker.windows[wid] else { return false }
+        requestedSizes[wid] = size
+        for st in streamers.values where st.wid == wid { st.visibleSize = size }
+        resize(win, to: size)
+        return true
+    }
+
     private func sendButtons(_ w: TrackedWindow) {
         guard w.kind == .toplevel else { return }
         // Looked up on the app's own queue: an app busy resizing answers late, and on the
@@ -1054,7 +1259,7 @@ final class Session {
         guard win.kind == .toplevel else { return DispatchQueue.main.async(execute: then) }
         let control = control_
         raisedWid = win.wid
-        axQueue.async {
+        appQueue(win.pid).async {
             control.focus(win.wid, pid: win.pid)
             // A moment for the window server to restack before the drop is replayed.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: then)
@@ -1069,9 +1274,25 @@ final class Session {
     private func raise(_ win: TrackedWindow) {
         log("raising \(win.wid) (\(win.appName))")
         let gen = raiseLock.withLock { raiseGeneration += 1; return raiseGeneration }
-        ax { [weak self] control in
-            guard let self, self.raiseLock.withLock({ self.raiseGeneration == gen }) else { return }
+        // To the front in the window server at once, in the order asked: the rest (below) goes
+        // through the app, behind whatever else it has been asked (a resize can take a second
+        // or two), and a press on the window waited all that time for it to come forward.
+        let control = control_
+        raiseNowQueue.async { control.frontNow(win.wid, pid: win.pid) }
+        ax(pid: win.pid) { [weak self] control in
+            guard let self else { return }
+            let newest = self.raiseLock.withLock { () -> Bool in
+                guard self.raiseGeneration == gen else { return false }
+                self.raisesExecuting += 1
+                return true
+            }
+            guard newest else { return }
             control.focus(win.wid, pid: win.pid)
+            self.raiseLock.withLock {
+                self.raisesExecuting -= 1
+                self.raiseDoneGeneration = max(self.raiseDoneGeneration, gen)
+                self.raiseDoneAt = .now()
+            }
         }
         raisedWid = win.wid
     }
@@ -1093,6 +1314,8 @@ final class Session {
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
             let wid = w.wid
+            self.lastFrames[wid] = nil
+            self.refusedSizes[wid] = nil
             if self.minimized[wid] != nil { return }
             guard w.kind == .toplevel else { self.windowGone(wid); return }
             // Closed: its Accessibility element is gone already, so say so straight away.
@@ -1110,14 +1333,19 @@ final class Session {
             }
             // A minimising window leaves the screen before the minimise animation finishes and
             // AX reports it minimised, so decide a moment later.
-            self.queue.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-                guard let self, self.tracker.windows[wid] == nil else { return }
-                if self.control_.isMinimized(wid, pid: w.pid) {
-                    log("window \(wid) minimised on the Mac → minimised on Linux too")
-                    self.minimized[wid] = w
-                    var m = MsgWriter(.minimize); m.u32(wid); self.control?.send(m)
-                } else {
-                    self.windowGone(wid)
+            // (Asked off this queue: an app closing its windows answers late, and with several
+            // closing at once input waited a second behind each.)
+            self.axQueue.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                let minimised = control.isMinimized(wid, pid: w.pid)
+                self?.queue.async {
+                    guard let self, self.tracker.windows[wid] == nil else { return }
+                    if minimised {
+                        log("window \(wid) minimised on the Mac → minimised on Linux too")
+                        self.minimized[wid] = w
+                        var m = MsgWriter(.minimize); m.u32(wid); self.control?.send(m)
+                    } else {
+                        self.windowGone(wid)
+                    }
                 }
             }
         }
@@ -1154,12 +1382,27 @@ final class Session {
 
     /// What the user does is when windows, menus, the cursor and the clipboard change: check
     /// those then (just in time) rather than on a timer. A click or key looks closely (menus
-    /// open and close), pointer movement less so.
+    /// open and close), pointer movement less so. Motion comes hundreds of times a second:
+    /// it starts a look at most every 50 ms, and the clipboard is looked at at most every
+    /// 250 ms, so they don't flood the queues.
     private func userDidSomething(click: Bool) {
-        tracker.burst(everyMs: click ? 8 : 33)
-        cursor?.activity()
-        if click { clipboard?.0.checkSoon() }
+        let now = DispatchTime.now()
+        if click || now.uptimeNanoseconds - lastActivity.uptimeNanoseconds >= 50_000_000 {
+            lastActivity = now
+            tracker.burst(everyMs: click ? 8 : 33)
+            cursor?.activity()
+        }
+        if click, now.uptimeNanoseconds - lastClipboardCheck.uptimeNanoseconds >= 250_000_000 {
+            lastClipboardCheck = now
+            clipboard?.0.checkSoon()
+        }
     }
+
+    private var lastActivity = DispatchTime(uptimeNanoseconds: 0)
+    private var lastClipboardCheck = DispatchTime(uptimeNanoseconds: 0)
+    /// Return, keypad Enter, Escape, Tab and Space (evdev codes): keys that open, close or
+    /// switch things.
+    private static let actionKeys: Set<UInt32> = [28, 96, 1, 15, 57]
 
     /// A window that refuses capture appeared: read its text and buttons (a moment later, once
     /// it has drawn) and have Linux show a stand-in.
@@ -1372,11 +1615,19 @@ final class Session {
         m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
         m.u8(w.kind.rawValue)
         control?.send(m)
+        lastFrames[w.wid] = w.frame
         sendButtons(w)
     }
 
+    /// Each window's frame as last sent (sendAdded, sendChanged).
+    private var lastFrames: [UInt32: CGRect] = [:]
+
     private func sendChanged(_ w: TrackedWindow) {
-        placeOnVirtualDisplay(w)
+        let last = lastFrames[w.wid]
+        lastFrames[w.wid] = w.frame
+        // Only when it moved or changed size: a title change alone doesn't place it again (with
+        // many windows, every change re-placing them kept them moving round and round).
+        if last != w.frame { placeOnVirtualDisplay(w) }
         for st in streamers.values where st.wid == w.wid {
             st.windowResized(to: w.frame.size)
             st.checkScale()   // it may have moved to another display
@@ -1386,7 +1637,8 @@ final class Session {
         m.f32(w.frame.width); m.f32(w.frame.height)
         m.f32(w.rel.x); m.f32(w.rel.y)
         control?.send(m)
-        sendButtons(w)
+        // The buttons sit where they did unless the size changed (each look asks the app).
+        if last?.size != w.frame.size { sendButtons(w) }
     }
 
     private func sendIcon(_ w: TrackedWindow) {

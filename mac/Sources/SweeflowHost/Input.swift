@@ -9,6 +9,8 @@ final class InputInjector {
     private var keysDown: Set<UInt32> = []
     private var flags: CGEventFlags = []
     private(set) var lastPoint = CGPoint.zero
+    /// ⌘ or Ctrl is held: keys pressed now are shortcuts.
+    var commandOrControlHeld: Bool { flags.contains(.maskCommand) || flags.contains(.maskControl) }
 
     // Click-count tracking so double/triple clicks register.
     private var lastClickAt: TimeInterval = 0

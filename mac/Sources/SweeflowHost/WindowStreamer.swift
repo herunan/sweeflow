@@ -39,6 +39,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// ahead (70–240 ms behind under steady updates). Now the newest capture waits here
     /// instead, replacing older ones, and goes in as soon as the encoder is free.
     private var encoding = false
+    /// Frames handed to the encoder whose call into it hasn't returned yet, and whether an
+    /// encoder is being made: nothing new goes in meanwhile (both happen on `work`).
+    private var inEncoder = 0
+    /// How long the last frame took from its preparation to coming out of the encoder.
+    private var lastEncodeUs: UInt64 = 0
+    private var makingEncoder = false
     private var encodingSince = DispatchTime.now()
     /// The pending buffer has had its overlays painted already (a re-encode of the last one).
     private var pendingPrepared = false
@@ -77,10 +83,99 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         didSet { if active != oldValue { applyFrameRate() } }
     }
     private static let activeFps: Int32 = 120, backgroundFps: Int32 = 30
+    /// While nothing in the window has changed for a second (see differsFromLast): a look often
+    /// enough to catch the first change soon, and the full rate again from then.
+    private static let activeIdleFps: Int32 = 60, backgroundIdleFps: Int32 = 5
+    private var unchanging = false
+
+    private var frameRate: Int32 {
+        active ? (unchanging ? Self.activeIdleFps : Self.activeFps) : (unchanging ? Self.backgroundIdleFps : Self.backgroundFps)
+    }
 
     private func applyFrameRate() {
-        config.minimumFrameInterval = CMTime(value: 1, timescale: active ? Self.activeFps : Self.backgroundFps)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: frameRate)
         stream?.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
+    }
+
+    // MARK: unchanged captures
+
+    /// macOS hands over a "changed" frame of a window whenever anything changes on the part of
+    /// its display the window occupies, whoever drew it: windows share the virtual display and
+    /// overlap there, so one window that keeps drawing (a terminal, a video) made every window
+    /// deliver frames at its full rate, each of them prepared and encoded. With twenty windows
+    /// that kept the encoder, this app and the window server busy all the time, and everything
+    /// that waits on them (clicks, raises, resizes) slow.
+    /// So each capture is compared with the one before, by a hash of every row, and dropped if
+    /// it's the same. When one differs the rows aren't all hashed (it stops at the first that
+    /// differs), so what the last one looked like isn't known again until the hashes are
+    /// rebuilt, at most every 250 ms: a window that keeps changing pays for one rebuild and
+    /// one comparison in that time, one that doesn't for a comparison per capture, and those
+    /// come less often after a second without a change. (All on captureQueue.)
+    private var rowHashes: [UInt64] = []
+    private var rowHashWidth = 0
+    private var rowHashesValid = false
+    private var rowHashesRebuiltAt: UInt64 = 0
+    private var lastChangeAt: UInt64 = 0
+    private var slowedForNoChange = false
+
+    private func differsFromLast(_ pb: CVPixelBuffer) -> Bool {
+        let differs = compareWithLast(pb)
+        let now = DispatchTime.now().uptimeNanoseconds
+        if differs { lastChangeAt = now }
+        let slow = !differs && now - lastChangeAt > 1_000_000_000
+        if slow != slowedForNoChange {
+            slowedForNoChange = slow
+            queue.async { [weak self] in
+                guard let self, !self.stopped, self.unchanging != slow else { return }
+                self.unchanging = slow
+                self.applyFrameRate()
+            }
+        }
+        return differs
+    }
+
+    private func compareWithLast(_ pb: CVPixelBuffer) -> Bool {
+        guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return true }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return true }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
+        let rowBytes = w * 4
+        guard rowHashesValid, rowHashes.count == h, rowHashWidth == w else {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now - rowHashesRebuiltAt > 250_000_000 else { return true }
+            rowHashesRebuiltAt = now
+            if rowHashes.count != h { rowHashes = [UInt64](repeating: 0, count: h) }
+            rowHashes.withUnsafeMutableBufferPointer { out in
+                for y in 0..<h { out[y] = Self.hashRow(base + y * stride, rowBytes) }
+            }
+            rowHashWidth = w
+            rowHashesValid = true
+            return true
+        }
+        let same = rowHashes.withUnsafeBufferPointer { last -> Bool in
+            for y in 0..<h where Self.hashRow(base + y * stride, rowBytes) != last[y] { return false }
+            return true
+        }
+        if !same { rowHashesValid = false }
+        return !same
+    }
+
+    /// A fast hash of one row of pixels (two independent multiply chains, 16 bytes a step).
+    @inline(__always)
+    private static func hashRow(_ p: UnsafeRawPointer, _ n: Int) -> UInt64 {
+        var a: UInt64 = 0x9E37_79B9_7F4A_7C15, b: UInt64 = 0xC2B2_AE3D_27D4_EB4F
+        var i = 0
+        while i + 16 <= n {
+            a = (a ^ p.loadUnaligned(fromByteOffset: i, as: UInt64.self)) &* 0x0000_0100_0000_01B3
+            b = (b ^ p.loadUnaligned(fromByteOffset: i + 8, as: UInt64.self)) &* 0x9E37_79B9_7F4A_7C15
+            i += 16
+        }
+        while i + 4 <= n {
+            a = (a ^ UInt64(p.loadUnaligned(fromByteOffset: i, as: UInt32.self))) &* 0x0000_0100_0000_01B3
+            i += 4
+        }
+        return a ^ (b << 31 | b >> 33)
     }
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
@@ -199,12 +294,21 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         } else if let win {
             filter = SCContentFilter(desktopIndependentWindow: win)
         } else { return }
+        // A new capture's first frame always goes through (expectFirstFrame waits for it),
+        // whatever the last capture's looked like.
+        unchanging = false
+        captureQueue.async { [weak self] in
+            self?.rowHashesValid = false
+            self?.rowHashesRebuiltAt = 0
+            self?.slowedForNoChange = false
+            self?.lastChangeAt = DispatchTime.now().uptimeNanoseconds
+        }
         applySize(to: config)
         // BGRA with alpha so the rounded window corners can be filled in (see fillCorners);
         // the encoder converts to 4:2:0 in hardware.
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
-        config.minimumFrameInterval = CMTime(value: 1, timescale: active ? Self.activeFps : Self.backgroundFps)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: frameRate)
         config.queueDepth = 4
         config.showsCursor = false
         config.ignoreShadowsSingleWindow = true
@@ -487,7 +591,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         refineTimer?.cancel()
         stream?.stopCapture { _ in }
         stream = nil
-        if let e = encoder { VTCompressionSessionInvalidate(e) }
+        // Dropped on the stream's own queue: it waits for a frame still inside the encoder.
+        if let e = encoder { work.async { VTCompressionSessionInvalidate(e) } }
         encoder = nil
     }
 
@@ -500,6 +605,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         // A locked Mac captures as blank: keep showing the last real frame instead.
         guard !ScreenLock.isLocked else { return }
+        guard differsFromLast(pb) else { return }
         // Where the window's content actually is in the buffer: when it doesn't fill it (the
         // configured size is stale), ScreenCaptureKit pads with black.
         let info = attachments.first ?? [:]
@@ -662,9 +768,41 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         inFlight.removeAll { now > $0 && now - $0 > 300_000 }
         // An encoder dropped mid-frame may never call back: don't wait on it for ever.
         if encoding, DispatchTime.now().uptimeNanoseconds - encodingSince.uptimeNanoseconds > 300_000_000 { encoding = false }
-        guard !stopped, !paused, !encoding, inFlight.count < maxInFlight, let pb = pendingBuffer else { return }
+        guard !stopped, !paused, !encoding, !makingEncoder, inEncoder == 0, inFlight.count < maxInFlight,
+              let pb = pendingBuffer else { return }
         pendingBuffer = nil
         if lossless { sendLossless(pb); return }
+        let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
+        let coded = codedSize(w, h)
+        let tenBit = Self.tenBit
+        if encoder == nil || encoderSize != coded || encoderTenBit != tenBit {
+            // Made (and the old one dropped) on this stream's own queue: both wait for the
+            // system's encoder service, which answers late when many windows are encoding, and
+            // on the session queue all input waited with them. The frame goes in once it's there.
+            let old = encoder
+            encoder = nil
+            encoderSize = coded
+            encoderTenBit = tenBit
+            makingEncoder = true
+            pendingBuffer = pb
+            work.async { [weak self] in
+                if let old { VTCompressionSessionInvalidate(old) }
+                let made = Self.makeEncoder(width: coded.0, height: coded.1, tenBit: tenBit)
+                guard let self else { if let made { VTCompressionSessionInvalidate(made) }; return }
+                self.queue.async {
+                    self.makingEncoder = false
+                    if self.stopped {
+                        if let made { self.work.async { VTCompressionSessionInvalidate(made) } }
+                        return
+                    }
+                    self.encoder = made
+                    self.forceKeyframe = true
+                    // Not made (the service refused): the next frame tries again.
+                    if made != nil { self.pump() }
+                }
+            }
+            return
+        }
         let prepare = !pendingPrepared && displayID == nil
         var prep: Prep?
         if prepare {
@@ -679,21 +817,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             prep = Prep(buttons: buttons, badge: badgeRect(), scale: scale, visiblePx: visiblePx(),
                         radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure)
         }
-        let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
-        let coded = codedSize(w, h)
-        if encoder == nil || encoderSize != coded || encoderTenBit != Self.tenBit {
-            if let e = encoder { VTCompressionSessionInvalidate(e) }
-            encoder = makeEncoder(width: coded.0, height: coded.1)
-            encoderSize = coded
-            forceKeyframe = true
-        }
-        guard encoder != nil else { return }
         lastBuffer = pb
         lastEncodeAt = .now()
         encoding = true
         encodingSince = .now()
         let startUs = hostMicros()
-        let tenBit = encoderTenBit
         work.async { [weak self] in
             guard let self else { return }
             let t0 = DispatchTime.now().uptimeNanoseconds
@@ -775,7 +903,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         refineTimer?.cancel()
         guard refinementsLeft > 0, !lossless else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + .milliseconds(130))
+        // Refining is for spare encoder time. When the last frame took long to encode (many
+        // windows changing at once), wait a second instead: three encodes per change kept the
+        // encoder full, and every window's frames came late.
+        t.schedule(deadline: .now() + .milliseconds(lastEncodeUs > 60_000 ? 1000 : 130))
         t.setEventHandler { [weak self] in
             guard let self, !self.stopped, self.refinementsLeft > 0, self.pendingBuffer == nil, let b = self.lastBuffer else { return }
             self.refinementsLeft -= 1
@@ -832,38 +963,55 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         inFlight.append(captureUs)
         let pts = CMTime(value: CMTimeValue(captureUs), timescale: 1_000_000)
-        VTCompressionSessionEncodeFrame(enc, imageBuffer: input, presentationTimeStamp: pts, duration: .invalid,
-                                        frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
-            guard let self else { return }
-            guard status == noErr, let sb else {
-                // No frame and no error: the encoder dropped it (real-time mode) — the stream
-                // stays intact. A real error needs a fresh start (keyframe).
-                if status != noErr { log("encode error \(status)") }
-                self.queue.async {
-                    self.inFlight.removeAll { $0 == captureUs }
-                    if status != noErr { self.forceKeyframe = true }
-                    self.encoded()
-                }
-                return
+        // The call itself waits for the system's encoder service (a round trip per frame, a
+        // second or more when twenty windows are encoding): on the session queue every click
+        // and pointer move waited behind every window's frames. On this stream's own queue only
+        // this stream waits; `inEncoder` keeps further frames from piling up behind it.
+        inEncoder += 1
+        work.async { [weak self] in
+            VTCompressionSessionEncodeFrame(enc, imageBuffer: input, presentationTimeStamp: pts, duration: .invalid,
+                                            frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
+                self?.encoderOutput(status, sb, captureUs: captureUs, w: w, h: h)
             }
-            let (data, key) = annexB(sb)
-            // The low-latency encoder emits full-range YUV whatever the input; tell the client.
-            if !self.loggedFormat, let fd = CMSampleBufferGetFormatDescription(sb) {
-                self.loggedFormat = true
-                let ext = CMFormatDescriptionGetExtensions(fd) as? [String: Any] ?? [:]
-                let keys = ["FullRangeVideo", "BitsPerComponent", "Depth", "CVImageBufferTransferFunction",
-                            "CVImageBufferYCbCrMatrix", "CVImageBufferColorPrimaries"]
-                log("stream \(self.wid): encoded format \(keys.compactMap { k in ext[k].map { "\(k)=\($0)" } })")
+            self?.queue.async {
+                guard let self else { return }
+                self.inEncoder -= 1
+                self.pump()
             }
-            let fullRange = CMSampleBufferGetFormatDescription(sb).flatMap {
-                CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
-            } ?? false
-            let encodeUs = hostMicros() - captureUs
+        }
+    }
+
+    /// What the encoder made of a frame (called on one of its own threads).
+    private func encoderOutput(_ status: OSStatus, _ sb: CMSampleBuffer?, captureUs: UInt64, w: Int32, h: Int32) {
+        guard status == noErr, let sb else {
+            // No frame and no error: the encoder dropped it (real-time mode) — the stream
+            // stays intact. A real error needs a fresh start (keyframe).
+            if status != noErr { log("encode error \(status)") }
             self.queue.async {
-                self.statEncodeSum += encodeUs; self.statEncodeN += 1
-                self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, fullRange: fullRange, data: data)
+                self.inFlight.removeAll { $0 == captureUs }
+                if status != noErr { self.forceKeyframe = true }
                 self.encoded()
             }
+            return
+        }
+        let (data, key) = annexB(sb)
+        // The low-latency encoder emits full-range YUV whatever the input; tell the client.
+        if !self.loggedFormat, let fd = CMSampleBufferGetFormatDescription(sb) {
+            self.loggedFormat = true
+            let ext = CMFormatDescriptionGetExtensions(fd) as? [String: Any] ?? [:]
+            let keys = ["FullRangeVideo", "BitsPerComponent", "Depth", "CVImageBufferTransferFunction",
+                        "CVImageBufferYCbCrMatrix", "CVImageBufferColorPrimaries"]
+            log("stream \(self.wid): encoded format \(keys.compactMap { k in ext[k].map { "\(k)=\($0)" } })")
+        }
+        let fullRange = CMSampleBufferGetFormatDescription(sb).flatMap {
+            CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool
+        } ?? false
+        let encodeUs = hostMicros() - captureUs
+        self.queue.async {
+            self.statEncodeSum += encodeUs; self.statEncodeN += 1
+            self.lastEncodeUs = encodeUs
+            self.sendFrame(captureUs: captureUs, w: w, h: h, key: key, fullRange: fullRange, data: data)
+            self.encoded()
         }
     }
 
@@ -927,8 +1075,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         statBytes += data.count
     }
 
-    private func makeEncoder(width: Int32, height: Int32) -> VTCompressionSession? {
-        encoderTenBit = Self.tenBit
+    private static func makeEncoder(width: Int32, height: Int32, tenBit encoderTenBit: Bool) -> VTCompressionSession? {
         var session: VTCompressionSession?
         let spec: [CFString: Any] = [
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true,
