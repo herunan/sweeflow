@@ -282,12 +282,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Starts again from the same window or display (after a stop, or a capture that never
     /// delivered a frame).
-    private func restartCapture() {
-        if let d = scDisplay { startCapture(nil, display: d) } else if let w = scWindow { startCapture(w) }
+    /// `still`: show a still of it while the capture starts (see startCapture).
+    private func restartCapture(still: Bool = false) {
+        if let d = scDisplay { startCapture(nil, display: d, still: still) } else if let w = scWindow { startCapture(w, still: still) }
     }
 
-    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil) {
+    /// `still`: send a still of the window while the capture starts (always, the first time).
+    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil, still: Bool = false) {
         scWindow = win
+        // Paused (not shown on Linux): no capture at all; resuming starts one with what's
+        // remembered here. Every path that (re)starts a capture comes through here.
+        guard !paused else { return }
         let filter: SCContentFilter
         if let display {
             filter = SCContentFilter(display: display, excludingWindows: [])
@@ -325,11 +330,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             out.close(); return
         }
         stream = s
+        // Counts this capture's frames (the still below only shows while there are none yet).
+        framesSinceStart = 0
         // Starting a capture takes ScreenCaptureKit ~0.4 s; a still of the window takes a fraction
         // of that, so a new window shows straight away and goes live when the capture starts.
         // Not for popups: macOS fades them in, so a still catches one half-drawn and holds it
         // until the capture starts (it pops). Popups' captures start fast enough.
-        if !sentStill && !lossless {
+        if (still || !sentStill) && !lossless {
             sentStill = true
             let t0 = Date()
             SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
@@ -393,13 +400,57 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
 
+    /// When the last resume was asked for (host µs), until its first frame goes out (0: none due).
+    private var resumedUs: UInt64 = 0
+
+    /// Linux isn't showing the window (minimised, on another desktop): stop capturing it
+    /// altogether. Only stopping encoding left ScreenCaptureKit delivering every change, each
+    /// hashed and prepared for nothing: with many windows open, most of them hidden, that kept
+    /// the host near full CPU. A stop rather than a slower capture: a capture started afresh
+    /// always begins with a frame of the window as it is now, at its size and scale now, where
+    /// a reconfigured one sends nothing until the window changes. Starting takes ~0.4 s, so a
+    /// still (a fraction of that) is sent first. Not the Mac being locked: that's `showingPause`.
     func setPaused(_ p: Bool) {
+        guard p != paused, !stopped else { return }
         paused = p
-        if !p {
-            forceKeyframe = true
+        if p {
+            let unshown = resumedUs > 0 ? String(format: " (resumed %.0f ms ago, no frame sent yet)", Double(hostMicros() - resumedUs) / 1000) : ""
+            resumedUs = 0
+            refineTimer?.cancel()
+            // A capture still starting stops itself when it finds it's been replaced.
+            stream?.stopCapture { _ in }
+            stream = nil
+            // Out of date by the time it's shown again. The locked picture stays (it's current).
+            if !showingPause { pendingBuffer = nil }
+            log("stream \(wid): paused, capture stopped\(unshown)")
+            return
+        }
+        // Logged with its first frame (sendFrame, sendLossless).
+        forceKeyframe = true
+        resumedUs = hostMicros()
+        if showingPause {
+            // Locked: captures show nothing, so the locked picture goes back up and the capture
+            // starts at unlock (see setScreenLocked). The colour picture from before the lock
+            // may be out of date by then: forget it, so unlocking starts a fresh capture.
+            colourBeforeLock = nil
             if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b; pendingPrepared = true }
             pump()
+            return
         }
+        // Whatever was waiting is older than the still.
+        pendingBuffer = nil
+        resumeCapture()
+    }
+
+    /// Starts capturing again after a pause, with a still first, at the scale of the display
+    /// the window is on now (it may have moved meanwhile; checkScale leaves a paused one be).
+    /// Its size is already current: windowResized keeps `pointSize` while there's no capture.
+    private func resumeCapture() {
+        if let want = displayScale?(), want > 0, abs(want - scale) > 0.01 {
+            log("stream \(wid): display scale \(scale) → \(want) (while paused)")
+            scale = want
+        }
+        restartCapture(still: true)
     }
 
     /// Re-encode the last capture with fresh overlays (e.g. focus changed the traffic lights).
@@ -553,6 +604,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                         stream.stopCapture { _ in }
                         self.stream = nil
                         self.restartCapture()
+                    } else if !self.paused {
+                        // Resumed while locked (see setPaused): no capture was started then.
+                        self.resumeCapture()
                     }
                     return
                 }
@@ -880,6 +934,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// losing detail.
     func checkScale() {
         queue.async { [weak self] in
+            // Paused, there's no capture: resumeCapture looks the scale up when it starts one
+            // (until then the last picture, at the old scale, may still be sent again).
             guard let self, let want = self.displayScale?(), want > 0, abs(want - self.scale) > 0.01,
                   let stream = self.stream, !self.stopped else { return }
             log("stream \(self.wid): display scale \(self.scale) → \(want)")
@@ -1048,12 +1104,20 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         m.u8(0b11 | (UInt8(min(15, max(1, scale.rounded()))) << 4))   // keyframe | lossless | px/pt
         m.bytes(Data(out[0..<n]))
         out_send(m, bytes: n)
+        logResumedIfDue(captureUs: captureUs)
     }
 
     private func out_send(_ m: MsgWriter, bytes: Int) {
         out.send(m)
         statFrames += 1
         statBytes += bytes
+    }
+
+    /// The first frame since a resume went out (one prepared before the pause doesn't count).
+    private func logResumedIfDue(captureUs: UInt64) {
+        guard resumedUs > 0, captureUs >= resumedUs else { return }
+        log(String(format: "stream %u: resumed, first frame sent %.0f ms after the resume", wid, Double(hostMicros() - resumedUs) / 1000))
+        resumedUs = 0
     }
 
     private func sendFrame(captureUs: UInt64, w: Int32, h: Int32, key: Bool, fullRange: Bool, data: Data) {
@@ -1073,6 +1137,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         statFrames += 1
         statBytes += data.count
+        logResumedIfDue(captureUs: captureUs)
     }
 
     private static func makeEncoder(width: Int32, height: Int32, tenBit encoderTenBit: Bool) -> VTCompressionSession? {
