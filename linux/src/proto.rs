@@ -27,6 +27,9 @@ pub mod t {
     /// The press just made is on a spot that drags the window (title bar, toolbar): start the
     /// move on the first bit of motion instead of waiting for the app to begin dragging.
     pub const MOVE_READY: u8 = 0x2E;
+    /// u32 wid, f32 x, f32 y (window points), u8 drags: what the Mac found under the pointer as
+    /// it hovered the title-bar strip, ahead of any press (see DRAG_SPOT in ui.rs).
+    pub const DRAG_SPOT: u8 = 0x37;
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;

@@ -61,6 +61,9 @@ pub enum UiEvent {
     MoveStarted(u32),
     /// (window, press id): that press can start a window move right away.
     MoveReady(u32, u32),
+    /// (window, x, y, drags): hovering that point (window points) of the title-bar strip, the
+    /// Mac found a spot that drags the window (or not), ahead of any press.
+    DragSpot(u32, f32, f32, bool),
     ToggleMaximize(u32),
     Minimize(u32),
     /// macOS's screenshot selection started (true) or ended: drawn here, as the Mac's can't be captured.
@@ -101,6 +104,7 @@ impl UiEvent {
             UiEvent::WindowButtons(..) => "window buttons",
             UiEvent::MoveStarted(_) => "move started",
             UiEvent::MoveReady(..) => "move ready",
+            UiEvent::DragSpot(..) => "drag spot",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
             UiEvent::Minimize(_) => "minimize",
             UiEvent::ScreenSelect(_) => "screen select",
@@ -956,6 +960,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::MOVE_READY => UiEvent::MoveReady(r.u32()?, r.u32()?),
+        t::DRAG_SPOT => UiEvent::DragSpot(r.u32()?, r.f32()?, r.f32()?, r.u8()? != 0),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
         t::SCREEN_SELECT => UiEvent::ScreenSelect(r.u8()? != 0),

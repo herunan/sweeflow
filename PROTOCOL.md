@@ -38,6 +38,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x17 | S→C | MoveStarted | u32 wid — the app began dragging its window; client should start an interactive move |
 | 0x2E | S→C | MoveReady | u32 wid, u32 pressId — the press with that id is on a spot that drags the window (title bar, toolbar, or a spot that did before): the client starts its move on the first motion |
 | 0x2F | C→S | MoveTaken | u32 wid — the client started moving the window itself: release the press on the Mac |
+| 0x37 | S→C | DragSpot | u32 wid, f32 x, f32 y (window points), u8 drags — what the host found under the pointer as it hovered the window's title-bar strip, before any press: `drags` 1 means a press there drags the window (bare title bar or toolbar, or a spot that did before). A client that then gets a press within a few points of (x, y), and soon, starts its move on the first motion without waiting for MoveReady (and sends MoveTaken as usual) |
 | 0x1A | S→C | Minimize | u32 wid — the window was minimised on the Mac (restored there); client minimises its window |
 | 0x1B | S→C | MenuTree | i32 pid, bytes json — the app's menu bar: `[{t,e,sep?,k?,m?,c?,sub?}]` (Apple menu omitted) |
 | 0x24 | C→S | MenuActivate | i32 pid, u16 n, n × u16 path — press that menu item (indices as in MenuTree) |

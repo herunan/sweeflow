@@ -250,6 +250,11 @@ struct Win {
     video_at: (i32, i32),
     /// Paused (or the Mac away): the still shown instead of the video.
     still: Option<Still>,
+    /// Asked to close, and hidden since then (picture and lights unmapped, no input) while the
+    /// Mac closes it: it goes for good with the Mac's WindowRemoved, and comes back if its app
+    /// shows another window instead (a "Save changes?" sheet) or it's still there after a while
+    /// (see hide / unhide). Frames meanwhile wait in `pending`.
+    hidden: Option<Instant>,
     /// Lossless frame waiting for the first configure.
     pending_raw: Option<(u16, u16, u8, u64, Vec<u8>)>,
     /// Recent shm buffers of lossless frames (kept alive until the compositor is surely done).
@@ -389,6 +394,15 @@ pub struct App {
     /// can move the window (MOVE_READY): then the first bit of motion starts KWin's move.
     press_at: (f64, f64),
     move_ready: bool,
+    /// The Mac's latest word on what's under the pointer in a window's title-bar strip (DRAG_SPOT:
+    /// window, point in window points, whether a press there drags the window, when it came).
+    /// A press close to that point starts the window's move on its first motion, with no wait
+    /// for the Mac: the window is taken hold of where it was pressed (see spot_drags).
+    drag_spot: Option<(u32, f32, f32, bool, Instant)>,
+    /// When the held left press went down, and whether it was known to drag the window as it
+    /// went down (drag_spot) rather than by the Mac's answer to it (for the log in move_here).
+    press_time: Instant,
+    press_known: bool,
     /// The window Linux started moving itself (the Mac's own MOVE_STARTED for it is moot).
     moved_here: Option<u32>,
     /// A pointer button handled locally (traffic light, resize edge): swallow its release.
@@ -502,6 +516,9 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         present_stats: (0, 0, 0, std::time::Instant::now()),
         press_at: (0.0, 0.0),
         move_ready: false,
+        drag_spot: None,
+        press_time: Instant::now(),
+        press_known: false,
         moved_here: None,
         local_press: None,
         edge_cursor: false,
@@ -723,6 +740,10 @@ impl App {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.buttons = rects;
                 }
+                // Its title bar changed: what the Mac saw under the pointer there may be stale.
+                if self.drag_spot.is_some_and(|s| s.0 == wid) {
+                    self.drag_spot = None;
+                }
                 self.update_lights(wid, qh);
             }
             UiEvent::MoveReady(wid, id) => {
@@ -733,6 +754,9 @@ impl App {
                         self.move_here(wid);
                     }
                 }
+            }
+            UiEvent::DragSpot(wid, x, y, drags) => {
+                self.drag_spot = Some((wid, x, y, drags, Instant::now()));
             }
             UiEvent::MoveStarted(wid) if self.moved_here.take() == Some(wid) => {}
             UiEvent::MoveStarted(wid) => {
@@ -813,6 +837,14 @@ impl App {
                    info.app_name, info.kind, info.parent, info.w, info.h, info.rel_x, info.rel_y);
         // Back (after a pause or a reconnect): its video replaces the still.
         self.unfreeze(wid);
+        // A window of the same app while one of its windows is hidden for closing: the app asked
+        // something instead of closing (a "Save changes?" sheet, an alert), or this is that
+        // window announced again. It shows again, under the sheet.
+        let hidden: Vec<u32> =
+            self.windows.values().filter(|w| w.hidden.is_some() && (w.info.pid == info.pid || w.info.wid == wid)).map(|w| w.info.wid).collect();
+        for h in hidden {
+            self.unhide(h, "its app showed another window instead of closing", qh);
+        }
         if let Some(w) = self.windows.get_mut(&wid) {
             // Re-announced after a reconnect: keep the native window, restart the video, and make
             // sure the Mac window still has this window's size.
@@ -989,6 +1021,7 @@ impl App {
                 lights_hover: false,
                 lights_pressed: None,
                 pending: None,
+                hidden: None,
                 pending_raw: None,
                 raw_buffers: Default::default(),
                 stale: false,
@@ -1338,7 +1371,10 @@ impl App {
         let mac = (w.info.w.round().max(1.0) as i32, w.info.h.round().max(1.0) as i32);
         let base = w.base();
         let region = self.compositor.wl_compositor().create_region(qh, ());
-        region.add(0, 0, mac.0.min(w.size.0 as i32), mac.1.min(w.size.1 as i32));
+        // Hidden for closing: nothing of it takes a click (what's behind it does).
+        if w.hidden.is_none() {
+            region.add(0, 0, mac.0.min(w.size.0 as i32), mac.1.min(w.size.1 as i32));
+        }
         base.set_input_region(Some(&region));
         region.destroy();
     }
@@ -1348,6 +1384,12 @@ impl App {
             // Frames still in flight as the Mac lets go (from its own screen by then, at another
             // size): the still stays.
             let _ = self.net.send(NetCmd::Video(wid, W::new(t::FRAME_ACK).u64(frame.capture_us).finish()));
+            return;
+        }
+        if let Some(w) = self.windows.get_mut(&wid).filter(|w| w.hidden.is_some()) {
+            // Hidden for closing: the newest picture waits for the window to come back (if it does).
+            let _ = self.net.send(NetCmd::Video(wid, W::new(t::FRAME_ACK).u64(frame.capture_us).finish()));
+            w.pending = Some(frame);
             return;
         }
         // Moving again: the still goes.
@@ -1444,7 +1486,7 @@ impl App {
     /// followed.
     fn relayout(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get(&wid) else { return };
-        if !w.configured || w.display {
+        if !w.configured || w.display || w.hidden.is_some() {
             return;
         }
         // The buffer itself is needed only to show it on more surfaces (the corner layout's
@@ -1461,6 +1503,9 @@ impl App {
     /// already shown is placed again (relayout).
     fn lay_out(&mut self, wid: u32, buffer: Option<&wl_buffer::WlBuffer>, fresh: bool, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.hidden.is_some() {
+            return; // nothing shows until it's back (unhide lays it out again)
+        }
         let Some(((fw, fh), reported)) = w.picture else { return };
         // Map the frame to the window's size in points (the frame may be 2x Retina pixels; the
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
@@ -1880,6 +1925,21 @@ impl App {
         });
     }
 
+    /// Whether a press at (x, y) (window points) of `wid` is known to drag the window: the Mac
+    /// looked under the pointer as it hovered there (DRAG_SPOT) and found the bare title bar or
+    /// toolbar (or a spot that dragged the window before). Only an answer for about the same
+    /// point counts: a control a few points away (a tab, a toolbar button) must still get its
+    /// own press, and a press elsewhere waits for the Mac's word on it (MOVE_READY). A pointer
+    /// at rest gets no new looks, so an answer holds a good while; a change to the window's
+    /// title bar drops it (WindowButtons).
+    fn spot_drags(&self, wid: u32, x: f32, y: f32) -> bool {
+        const NEAR: f32 = 6.0;
+        const FRESH: Duration = Duration::from_secs(30);
+        self.drag_spot.is_some_and(|(w, sx, sy, drags, at)| {
+            w == wid && drags && (sx - x).abs() <= NEAR && (sy - y).abs() <= NEAR && at.elapsed() <= FRESH
+        })
+    }
+
     /// The pointer has moved far enough from the press to count as a drag (not a click).
     fn moved_enough(&self, x: f64, y: f64) -> bool {
         let (px, py) = self.press_at;
@@ -1899,6 +1959,10 @@ impl App {
         self.mac_drag = None;
         self.moved_here = Some(wid);
         self.send(W::new(t::MOVE_TAKEN).u32(wid).finish());
+        let (_, x, y) = self.pointer_at;
+        log::debug!("window {wid}: move started {:.0} ms after the press, {:+.0},{:+.0} px from it ({})",
+                    self.press_time.elapsed().as_secs_f64() * 1000.0, x - self.press_at.0, y - self.press_at.1,
+                    if self.press_known { "a spot known from the hover" } else { "on the Mac's answer to the press" });
     }
 
     /// A file drag started in a Mac window and the pointer (button still down) has left it:
@@ -2061,13 +2125,80 @@ impl App {
     }
 
     /// Closes a Mac window. With the Mac away (or streaming paused) nothing would answer, so the
-    /// window goes now (and the Mac's is closed once it's back).
-    fn close(&mut self, wid: u32) {
+    /// window goes now (and the Mac's is closed once it's back). Otherwise it's hidden at once
+    /// (see hide): the Mac's own close takes a round trip and a moment of the app's.
+    fn close(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         if self.connected && !self.paused {
             self.send(W::new(t::CLOSE).u32(wid).finish());
+            self.hide(wid, qh);
         } else {
             self.closed_offline.insert(wid);
             self.remove_window(wid);
+        }
+    }
+
+    /// How long a window asked to close stays hidden with no word from the Mac before it shows
+    /// again: its app didn't close it (asked something the Mac didn't show as a window, or is
+    /// slow to), and a window that stays must be seen.
+    const HIDE_FOR: Duration = Duration::from_millis(1500);
+
+    /// A window asked to close goes from the screen at once: its picture, lights and corners
+    /// are unmapped and it takes no input (what's behind it does), while the window itself, and
+    /// its taskbar entry, stay until the Mac says it's gone (remove_window). If instead its app
+    /// shows another window (a "Save changes?" sheet: add_window), or nothing has happened after
+    /// HIDE_FOR, it shows again where it was (unhide). That's why it isn't unmapped: mapping a
+    /// toplevel again takes a new configure cycle and, on most desktops, gives it a new place.
+    fn hide(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        self.unfreeze(wid);
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.hidden.is_some() || !w.configured || w.display || !matches!(w.role, Role::Toplevel(_)) {
+            return;
+        }
+        let since = Instant::now();
+        w.hidden = Some(since);
+        // The picture shown waits for the comeback (a newer one replaces it meanwhile: present).
+        if let Some(frame) = w.shown.take().and_then(|id| self.in_use.remove(&id)) {
+            w.pending = Some(frame);
+        }
+        // The video goes, and with it the corner strips and tiles (its children; on Hyprland the
+        // lights too); elsewhere the lights hang off the base surface.
+        w.video.attach(None, 0, 0);
+        w.video.commit();
+        if let Some(l) = w.lights.as_mut() {
+            l.surface.attach(None, 0, 0);
+            l.surface.commit();
+            l.drawn = None;
+        }
+        self.clip_input(wid, qh);
+        if let Some(w) = self.windows.get(&wid) {
+            w.base().commit();
+        }
+        log::info!("window {wid}: closing: hidden until the Mac confirms");
+        let qh = qh.clone();
+        let _ = self.loop_handle.insert_source(Timer::from_duration(Self::HIDE_FOR), move |_, _, app| {
+            if app.windows.get(&wid).is_some_and(|w| w.hidden == Some(since)) {
+                app.unhide(wid, "its app hasn't closed it", &qh);
+            }
+            TimeoutAction::Drop
+        });
+    }
+
+    /// A window hidden for closing (hide) shows again, where it was, with its latest picture.
+    fn unhide(&mut self, wid: u32, why: &str, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.hidden.take().is_none() {
+            return;
+        }
+        log::info!("window {wid}: back: {why}");
+        self.clip_input(wid, qh);
+        let pending = self.windows.get_mut(&wid).and_then(|w| w.pending.take());
+        match pending {
+            Some(frame) => self.present(wid, frame, qh),
+            None => self.relayout(wid, qh),
+        }
+        self.update_lights(wid, qh);
+        if let Some(w) = self.windows.get(&wid) {
+            w.base().commit();
         }
     }
 
@@ -2240,7 +2371,7 @@ impl App {
         let active = self.kb_focus == Some(wid);
         let pointer_over = self.pointer_focus == Some(wid);
         let Some(w) = self.windows.get_mut(&wid) else { return };
-        if !matches!(w.role, Role::Toplevel(_)) {
+        if !matches!(w.role, Role::Toplevel(_)) || w.hidden.is_some() {
             return;
         }
         // A video player (floated because it keeps its shape): shown only while the pointer is
@@ -2686,9 +2817,9 @@ fn draw_pause(px: &mut [u8], stride_px: usize, cx: f64, cy: f64, r: f64) {
 // --- window management -----------------------------------------------------------------
 
 impl WindowHandler for App {
-    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &Window) {
+    fn request_close(&mut self, _: &Connection, qh: &QueueHandle<Self>, window: &Window) {
         if let Some(wid) = self.wid_for(window.wl_surface()) {
-            self.close(wid);
+            self.close(wid, qh);
         }
     }
 
@@ -2893,7 +3024,14 @@ impl PointerHandler for App {
                         self.press_id = self.press_id.wrapping_add(1);
                         self.press_at = e.position;
                         self.pointer_at = (wid, e.position.0, e.position.1);
-                        self.move_ready = false;
+                        // Known from the hover to be on the bare title bar: the window is
+                        // taken hold of right here, on the first motion, with no round trip.
+                        self.move_ready = self.spot_drags(wid, x, y);
+                        self.press_time = Instant::now();
+                        self.press_known = self.move_ready;
+                        if self.move_ready {
+                            log::debug!("window {wid}: press on a known drag spot at {x:.0},{y:.0}: moves on the first motion");
+                        }
                         self.moved_here = None;
                         if self.screen_select {
                             self.start_selection(wid, e.position.0, e.position.1, qh);
@@ -2909,7 +3047,7 @@ impl PointerHandler for App {
                             // Traffic lights act on the Linux window; on the Mac they would
                             // minimise/fullscreen the window out of the stream.
                             match b {
-                                0 => self.close(wid),
+                                0 => self.close(wid, qh),
                                 1 => {
                                     if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
                                         t.set_minimized();

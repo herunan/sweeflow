@@ -18,6 +18,9 @@ enum Msg: UInt8 {
     /// To Linux: the press just made drags the window; it starts its move on the first motion.
     /// From Linux: it did, let go of the press.
     case moveReady = 0x2E, moveTaken = 0x2F
+    /// To Linux: u32 wid, f32 x, f32 y (window points), u8 drags — what's under the pointer as it
+    /// hovers the title-bar strip, ahead of any press: a press about there moves the window at once.
+    case dragSpot = 0x37
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
     /// To Linux: u32 wid, f32 fx, f32 fy — the app won't let this window be resized: it keeps its
     /// own size there, at the same spot of the screen as on the Mac (fractions; see Session.spot).

@@ -448,13 +448,18 @@ final class Session {
             // Only onto another window: looking at the window list costs a few ms, and motion
             // comes hundreds of times a second (a press still checks every time). And not here:
             // with many windows open the window server answers late, and every move waited.
-            if let p, !DragBridge.replaying { if wid != raisedWid { ensureFrontSoon(wid, at: p) }; input.move(to: p) }
+            if let p, !DragBridge.replaying {
+                if wid != raisedWid { ensureFrontSoon(wid, at: p) }
+                input.move(to: p)
+                probeSpot(wid, at: p)
+            }
             userDidSomething(click: false)
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
             let pressId = (try? m.u32()) ?? 0   // newer clients number their presses
             log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")")
+            if pressed { spotProbe.last = nil }   // the hover after this looks afresh (see probeSpot)
             if let p {
                 let post = { [self] in
                     input.button(b, pressed: pressed, at: p)
@@ -488,7 +493,10 @@ final class Session {
             input.releaseAll()
             setClientFocus(0)
         case .moveTaken:
-            moveTaken(try m.u32())
+            // Linux may start its move from a spot it knew from the hover (dragSpot), right after
+            // the press: in line behind that press if it's being held for a raise (holdInput).
+            let wid = try m.u32()
+            afterHeld { [weak self] in self?.moveTaken(wid) }
 
         default:
             log("unhandled message \(m.type)")
@@ -782,21 +790,42 @@ final class Session {
     /// itself or its toolbar within the title-bar strip (above the controls), or a spot that
     /// dragged this app's window before, tells Linux to move the window on the first motion.
     private func classifyPress(_ wid: UInt32, at p: CGPoint, id: UInt32) {
-        guard let win = tracker.windows[wid], win.kind != .popup else { return }
-        // The traffic lights sit centred in the title bar (or the toolbar merged with it). A
-        // floating panel without them (a reminder) is moved by any bare part of it.
+        guard inTitleStrip(wid, at: p) else { return }
+        hitSpot(wid, at: p) { [weak self] spot, bare in
+            guard let self, let spot, let g = self.gesture, g.wid == wid, g.buttonDown else { return }
+            self.pressSpot = (wid, id, spot)
+            guard bare || self.dragSpots.contains(spot) else { return }
+            var m = MsgWriter(.moveReady); m.u32(wid); m.u32(id); self.control?.send(m)
+        }
+    }
+
+    /// Whether `p` is in the window's title-bar strip: the band the traffic lights sit centred
+    /// in (the title bar, or the toolbar merged with it). A floating panel without them (a
+    /// reminder) is moved by any bare part of it. Not a popup (menus don't move).
+    private func inTitleStrip(_ wid: UInt32, at p: CGPoint) -> Bool {
+        guard let win = tracker.windows[wid], win.kind != .popup else { return false }
         let strip: CGFloat
         if let button = sentButtons[wid]?.first(where: { $0 != .zero }) {
             strip = button.minY + button.maxY + 2
         } else if win.kind == .dialog {
             strip = win.frame.height
         } else {
-            return
+            return false
         }
         let y = p.y - win.frame.minY
-        guard y >= 0, y <= strip else { return }
+        return y >= 0 && y <= strip
+    }
+
+    /// What's under `p` in window `wid`, by an Accessibility hit test off this queue (the app
+    /// answers in a few ms, a busy one later: capped at 250 ms): `then`, on this queue, gets the
+    /// spot ("bundle id|role|subrole|identifier") and whether it's bare window or toolbar, or
+    /// nil when it isn't this window's (one in front of it, or no answer).
+    private func hitSpot(_ wid: UInt32, at p: CGPoint, then: @escaping (_ spot: String?, _ bare: Bool) -> Void) {
+        guard let win = tracker.windows[wid] else { return then(nil, false) }
         let bundle = win.bundleId
         hitQueue.async { [weak self] in
+            var found: (String, Bool)?
+            defer { self?.queue.async { then(found?.0, found?.1 ?? false) } }
             let system = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(system, 0.25)
             // The system-wide timeout holds for the whole process: back to the usual second after.
@@ -810,21 +839,75 @@ final class Session {
             }
             // It must be this window's (not one in front of it).
             var owner: AXUIElement? = el
-            if attr(el, kAXRoleAttribute) != kAXWindowRole {
+            let role = attr(el, kAXRoleAttribute)
+            if role != kAXWindowRole {
                 var w: CFTypeRef?
                 owner = AXUIElementCopyAttributeValue(el, kAXWindowAttribute as CFString, &w) == .success ? (w as! AXUIElement) : nil
             }
             var ownerId: CGWindowID = 0
             guard let owner, _AXUIElementGetWindow(owner, &ownerId) == .success, ownerId == wid else { return }
-            let role = attr(el, kAXRoleAttribute)
             let spot = [bundle, role, attr(el, kAXSubroleAttribute), attr(el, kAXIdentifierAttribute)].joined(separator: "|")
-            self?.queue.async {
-                guard let self, let g = self.gesture, g.wid == wid, g.buttonDown else { return }
-                self.pressSpot = (wid, id, spot)
-                let bare = role == kAXWindowRole || role == kAXToolbarRole
-                guard bare || self.dragSpots.contains(spot) else { return }
-                var m = MsgWriter(.moveReady); m.u32(wid); m.u32(id); self.control?.send(m)
+            found = (spot, role == kAXWindowRole || role == kAXToolbarRole)
+        }
+    }
+
+    /// The hover's hit tests (probeSpot): one at a time, the newest point wanted meanwhile
+    /// (so the last place the pointer stops is always looked at), and the last point looked at.
+    private var spotProbe: (busy: Bool, want: (wid: UInt32, p: CGPoint)?, last: (wid: UInt32, p: CGPoint, at: DispatchTime)?, retries: Int) = (false, nil, nil, 0)
+    /// The last answer sent (window, drags): a change is logged.
+    private var spotAnswer: (wid: UInt32, drags: Bool)?
+
+    /// Looks under the pointer while it hovers a window's title-bar strip, before any press, and
+    /// tells Linux what's there (dragSpot): with that, a press there starts the window's move
+    /// on its first motion with no wait for an answer, so the window is taken hold of exactly
+    /// where it was pressed (classifyPress's answer comes a round trip and a hit test later,
+    /// by when a quick drag has moved the pointer tens of points: the hand slid over the window
+    /// before it caught). A new look every 3 points of travel; an answer "no" matters too (a
+    /// tab or toolbar button next to a bare spot gets its own press).
+    private func probeSpot(_ wid: UInt32, at p: CGPoint) {
+        guard inTitleStrip(wid, at: p) else { spotProbe.last = nil; return }
+        // The same spot again (within 3 points, in the last 2 s) needs no new look. Not across a
+        // press (pointerButton forgets the last look): the window may have moved under the
+        // pointer, on Linux, with it still at the same point of the Mac's screen.
+        if let last = spotProbe.last, last.wid == wid, abs(last.p.x - p.x) < 3, abs(last.p.y - p.y) < 3,
+           DispatchTime.now().uptimeNanoseconds - last.at.uptimeNanoseconds < 2_000_000_000 { return }
+        spotProbe.want = (wid, p)
+        spotProbe.retries = 0
+        runSpotProbe()
+    }
+
+    private func runSpotProbe() {
+        guard !spotProbe.busy, let want = spotProbe.want else { return }
+        let (wid, p) = (want.wid, want.p)
+        spotProbe.want = nil
+        guard let win = tracker.windows[wid] else { return }
+        spotProbe.busy = true
+        spotProbe.last = (wid, p, .now())
+        let origin = win.frame.origin
+        hitSpot(wid, at: p) { [weak self] spot, bare in
+            guard let self else { return }
+            self.spotProbe.busy = false
+            let drags = bare || spot.map { self.dragSpots.contains($0) } == true
+            var m = MsgWriter(.dragSpot)
+            m.u32(wid); m.f32(Float(p.x - origin.x)); m.f32(Float(p.y - origin.y)); m.u8(drags ? 1 : 0)
+            self.control?.send(m)
+            if self.spotAnswer.map({ $0.wid != wid || $0.drags != drags }) ?? true {
+                self.spotAnswer = (wid, drags)
+                let what = spot.map { String($0.split(separator: "|", omittingEmptySubsequences: false).dropFirst().joined(separator: "|")) } ?? "not this window's"
+                log("window \(wid): under the pointer at \(Int(p.x - origin.x)),\(Int(p.y - origin.y)): \(what) → \(drags ? "a press there moves the window" : "no move from there")")
             }
+            // Not this window's: the one over it on the Mac is being moved out of the way
+            // (ensureFrontSoon, asked as the pointer came). Looked at again shortly, while the
+            // pointer stays, a few times.
+            if spot == nil, self.spotProbe.want == nil, self.spotProbe.retries < 4 {
+                self.spotProbe.retries += 1
+                self.queue.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
+                    guard let self, self.spotProbe.want == nil, let last = self.spotProbe.last, last.wid == wid, last.p == p else { return }
+                    self.spotProbe.want = (wid, p)
+                    self.runSpotProbe()
+                }
+            }
+            self.runSpotProbe()
         }
     }
 
