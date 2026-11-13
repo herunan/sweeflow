@@ -124,7 +124,10 @@ pub fn start() {
             let handle: Option<Handle<Tray>> = if widget_installed() {
                 None
             } else {
-                match Tray.spawn() {
+                // The bar that shows tray icons (Omarchy's, waybar, GNOME's extension) may come up a
+                // moment after Sweeflow at login, or restart: the icon waits for it and shows then
+                // (a refused registration was final: no icon until Sweeflow restarted).
+                match Tray.assume_sni_available(true).spawn() {
                     Ok(h) => Some(h),
                     Err(e) => {
                         log::warn!("tray icon: {e}");
