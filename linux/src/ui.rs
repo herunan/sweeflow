@@ -375,7 +375,7 @@ pub struct App {
     cursor_hot: (i32, i32),
     meta_down: u8,
     shift_down: u8,
-    /// The modifiers as the desktop counts them (for Cmd+Opt+M, which must have no others).
+    /// The modifiers as the desktop counts them (for Cmd+Opt+U, which must have no others).
     mods: Modifiers,
     /// Keys we handled locally (e.g. Cmd+Tab) whose release must not reach the Mac either.
     swallowed: Vec<u32>,
@@ -2532,10 +2532,11 @@ fn open_search() {
     });
 }
 
-/// Cmd+Opt+M (Super+Alt+M here), with no other modifier: the key for the Global menu. The
-/// letter the layout puts on the key, so it's the key marked M on any Latin layout.
+/// Cmd+Opt+U (Super+Alt+U here), with no other modifier: the key for the Global menu (M
+/// logs out on Omarchy, G is taken there). The letter the layout puts on the key, so it's the
+/// key marked U on any Latin layout.
 fn is_global_menu_key(mods: &Modifiers, key: Keysym) -> bool {
-    mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::m | Keysym::M)
+    mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::u | Keysym::U)
 }
 
 /// Cmd+Opt+O (Super+Alt+O), with no other modifier: opens Sweeflow itself (its window, or on
@@ -2993,7 +2994,7 @@ impl KeyboardHandler for App {
         self.shift_down = 0;
         self.mods = Modifiers::default();
         self.swallowed.clear();
-        // Whatever is still held (Cmd and Opt, when Cmd+Opt+M has just opened the Global menu,
+        // Whatever is still held (Cmd and Opt, when Cmd+Opt+U has just opened the Global menu,
         // which takes the focus) is let go on the Mac: it gets no release for keys let go elsewhere.
         self.send(W::new(t::RELEASE_ALL).finish());
     }
@@ -3005,7 +3006,7 @@ impl KeyboardHandler for App {
             _ => {}
         }
         if is_global_menu_key(&self.mods, e.keysym) && self.app_window_focused() {
-            // Cmd+Opt+M: the Global menu, for the app of this window (menus::focused). The desktop
+            // Cmd+Opt+U: the Global menu, for the app of this window (menus::focused). The desktop
             // never sees the key while a Mac window has focus (they pass every shortcut through
             // to the Mac), so it's caught here, on every desktop alike.
             open_global_menu();
@@ -3450,16 +3451,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn global_menu_key_is_cmd_opt_m_alone() {
+    fn global_menu_key_is_cmd_opt_u_alone() {
         let mods = |logo, alt, ctrl, shift| Modifiers { logo, alt, ctrl, shift, ..Default::default() };
-        assert!(is_global_menu_key(&mods(true, true, false, false), Keysym::m));
+        assert!(is_global_menu_key(&mods(true, true, false, false), Keysym::u));
         // Caps lock on.
-        assert!(is_global_menu_key(&Modifiers { caps_lock: true, ..mods(true, true, false, false) }, Keysym::M));
-        assert!(!is_global_menu_key(&mods(true, false, false, false), Keysym::m));
-        assert!(!is_global_menu_key(&mods(false, true, false, false), Keysym::m));
-        assert!(!is_global_menu_key(&mods(true, true, true, false), Keysym::m));
-        assert!(!is_global_menu_key(&mods(true, true, false, true), Keysym::M));
-        assert!(!is_global_menu_key(&mods(true, true, false, false), Keysym::n));
+        assert!(is_global_menu_key(&Modifiers { caps_lock: true, ..mods(true, true, false, false) }, Keysym::U));
+        assert!(!is_global_menu_key(&mods(true, false, false, false), Keysym::u));
+        assert!(!is_global_menu_key(&mods(false, true, false, false), Keysym::u));
+        assert!(!is_global_menu_key(&mods(true, true, true, false), Keysym::u));
+        assert!(!is_global_menu_key(&mods(true, true, false, true), Keysym::U));
+        assert!(!is_global_menu_key(&mods(true, true, false, false), Keysym::m));
     }
 
     #[test]

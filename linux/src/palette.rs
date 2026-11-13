@@ -5,7 +5,7 @@
 //! once. A process of its own, like the pairing wizard and the prompts, so its event loop never
 //! shares a thread with the streaming client's. It asks the running client for the menu and has
 //! it run the chosen item (panel.rs, menus.rs), which presses it on the Mac exactly as Plasma's
-//! Global Menu does. Cmd+Opt+M in a Mac window opens it (ui.rs), and so does the tray.
+//! Global Menu does. Cmd+Opt+U in a Mac window opens it (ui.rs), and so does the tray.
 
 use std::cell::RefCell;
 

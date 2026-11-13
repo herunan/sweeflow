@@ -615,8 +615,8 @@ slint::slint! {
                 for k in [
                     { key: "⌘⌥O", what: "Open Sweeflow" },
                     { key: "⌘⌥P", what: "Pause or resume" },
-                    { key: "⌘⌥K", what: "Stop or start" },
-                    { key: "⌘⌥M", what: "Mac app's global menu" },
+                    { key: "⌘⌥X", what: "Stop or start" },
+                    { key: "⌘⌥U", what: "Mac app's global menu" },
                 ]: HorizontalLayout {
                     spacing: 10px;
                     Rectangle {

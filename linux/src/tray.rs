@@ -352,7 +352,7 @@ impl ksni::Tray for Tray {
         }
         items.push(MenuItem::Separator);
         items.push(StandardItem { label: "Open Sweeflow".into(), activate: Box::new(|_| open_panel()), ..Default::default() }.into());
-        // (The Global menu opens with Cmd+Opt+M in a Mac window, on every desktop: no item here.)
+        // (The Global menu opens with Cmd+Opt+U in a Mac window, on every desktop: no item here.)
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {

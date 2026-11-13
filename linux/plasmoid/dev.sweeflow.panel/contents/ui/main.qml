@@ -118,8 +118,8 @@ PlasmoidItem {
     // The streaming actions, as they're named and drawn.
     readonly property var actionLabels: ({ start: "Start", pause: "Pause", resume: "Resume", stop: "Stop" })
     // What each sign does, said on hover.
-    readonly property var actionTips: ({ start: "Start streaming (Meta+Alt+K)", pause: "Pause streaming (Meta+Alt+P)",
-                                         resume: "Resume streaming (Meta+Alt+P)", stop: "Stop streaming (Meta+Alt+K)" })
+    readonly property var actionTips: ({ start: "Start streaming (Meta+Alt+X)", pause: "Pause streaming (Meta+Alt+P)",
+                                         resume: "Resume streaming (Meta+Alt+P)", stop: "Stop streaming (Meta+Alt+X)" })
     readonly property var actionIcons: ({ start: "media-playback-start", pause: "media-playback-pause",
                                           resume: "media-playback-start", stop: "media-playback-stop" })
 
@@ -305,7 +305,7 @@ PlasmoidItem {
                             spacing: Kirigami.Units.smallSpacing
                             Kirigami.Heading { level: 5; text: "Keyboard shortcuts" }
                             Repeater {
-                                model: [["⌘⌥O", "Open Sweeflow"], ["⌘⌥P", "Pause or resume"], ["⌘⌥K", "Stop or start"], ["⌘⌥M", "Mac app's global menu"]]
+                                model: [["⌘⌥O", "Open Sweeflow"], ["⌘⌥P", "Pause or resume"], ["⌘⌥X", "Stop or start"], ["⌘⌥U", "Mac app's global menu"]]
                                 delegate: RowLayout {
                                     required property var modelData
                                     spacing: Kirigami.Units.largeSpacing
