@@ -45,7 +45,8 @@ pub enum UiEvent {
     WindowRemoved(u32),
     /// The app won't let this window be resized; where its app put it on the Mac's screen
     /// (fractions of the room there: 0 left/top, 1 right/bottom), if said.
-    WindowFixed(u32, Option<(f32, f32)>),
+    /// The bool: fixed (false: a floating panel that can be resized, floated all the same).
+    WindowFixed(u32, Option<(f32, f32)>, bool),
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
     Focused,
@@ -874,7 +875,8 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         t::WINDOW_FIXED => {
             let wid = r.u32()?;
             let spot = r.f32().and_then(|x| Ok((x, r.f32()?))).ok();
-            UiEvent::WindowFixed(wid, spot)
+            let fixed = r.u8().map_or(true, |f| f != 0);
+            UiEvent::WindowFixed(wid, spot, fixed)
         }
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },

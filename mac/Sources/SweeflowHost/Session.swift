@@ -1718,9 +1718,9 @@ final class Session {
     private var fixedSpots: [UInt32: (Float, Float)] = [:]
 
     /// The window is fixed-size, and the spot its app put it at: Linux shows it there too.
-    private func sendFixed(_ wid: UInt32) {
+    private func sendFixed(_ wid: UInt32, fixed: Bool = true) {
         let (fx, fy) = fixedSpots[wid] ?? (0.5, 0.5)
-        var f = MsgWriter(.windowFixed); f.u32(wid); f.f32(fx); f.f32(fy); control?.send(f)
+        var f = MsgWriter(.windowFixed); f.u32(wid); f.f32(fx); f.f32(fy); f.u8(fixed ? 1 : 0); control?.send(f)
     }
 
     /// Where a window is on its screen, as fractions of the room it has there: 0 flush with the
@@ -1770,7 +1770,8 @@ final class Session {
 
     private func announce(_ w: TrackedWindow, fixed: Bool) {
         sendIcon(w)
-        if fixed { sendFixed(w.wid) }
+        // A floating panel (picture in picture, a palette) floats on Linux too, resizable.
+        if fixed || w.kind == .dialog { sendFixed(w.wid, fixed: fixed) }
         var m = MsgWriter(.windowAdded)
         m.u32(w.wid); m.i32(w.pid)
         m.str(w.bundleId); m.str(w.appName); m.str(w.title)

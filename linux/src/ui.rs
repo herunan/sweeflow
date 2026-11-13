@@ -203,6 +203,11 @@ struct Win {
     /// The app won't let it be resized (WINDOW_FIXED): it keeps exactly the Mac's size here
     /// (declared as both its smallest and its largest), on every desktop.
     fixed: bool,
+    /// Made a dialog so it floats (fixed, a floating panel, or one that keeps its shape).
+    floated: bool,
+    /// Its shape (width / height) when it first came: one that keeps it whatever it's asked is
+    /// a video player (see adopt_mac_size).
+    first_shape: Option<f64>,
     /// Where its app put it on the Mac's screen (fractions), for a fixed one: placed there again
     /// when its app changes its size (Calculator switching mode), as it was anchored to its corner.
     spot: Option<(f32, f32)>,
@@ -296,7 +301,7 @@ pub struct App {
     /// xdg-dialog-v1: marks a fixed-size Mac window as a dialog (floated, not tiled).
     dialog_mgr: Option<XdgWmDialogV1>,
     /// Windows said to be fixed-size before they were added (WINDOW_FIXED comes first).
-    pending_fixed: HashMap<u32, Option<(f32, f32)>>,
+    pending_fixed: HashMap<u32, (Option<(f32, f32)>, bool)>,
     icon_mgr: Option<XdgToplevelIconManagerV1>,
     cursor_mgr: Option<WpCursorShapeManagerV1>,
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
@@ -656,11 +661,13 @@ impl App {
                 let _ = self.net.send(NetCmd::Unsubscribe(wid));
             }
             UiEvent::WindowRemoved(wid) => self.remove_window(wid),
-            UiEvent::WindowFixed(wid, spot) if !self.windows.contains_key(&wid) => {
-                // Said before the window is added: it's made a dialog of its size from the start.
-                self.pending_fixed.insert(wid, spot);
+            UiEvent::WindowFixed(wid, spot, fixed) if !self.windows.contains_key(&wid) => {
+                // Said before the window is added: it's made a dialog (of its size, if fixed)
+                // from the start.
+                self.pending_fixed.insert(wid, (spot, fixed));
             }
-            UiEvent::WindowFixed(wid, spot) => {
+            UiEvent::WindowFixed(_, _, false) => {} // a floating panel already shown: as it is
+            UiEvent::WindowFixed(wid, spot, true) => {
                 if let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.display) {
                     w.fixed = true;
                     w.spot = spot;
@@ -816,7 +823,9 @@ impl App {
             self.adopt_mac_size(wid, qh);
             return;
         }
+        let first_shape = Some(info.w as f64 / info.h.max(1.0) as f64);
         let mut fixed_now = false;
+        let mut floated_now = false;
         let mut fixed_spot = None;
         let mac_size = (info.w.round().max(1.0) as u32, info.h.round().max(1.0) as u32);
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
@@ -857,18 +866,22 @@ impl App {
             let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, qh);
             window.set_title(display_title(&info.app_name, &info.title));
             window.set_app_id(format!("sweeflow-{}", info.bundle_id));
-            if let Some(spot) = self.pending_fixed.remove(&info.wid) {
-                // Its app won't let it be resized (a reminder, a dialog): a dialog of exactly its
-                // size from the start, which desktops and tilers (Karousel, Hyprland) float like a
-                // notification instead of tiling; they decide that when a window appears. (Modal:
-                // what tilers go by; with no parent window it holds nothing up.)
-                let size = (info.w.round().max(1.0) as u32, info.h.round().max(1.0) as u32);
-                window.set_min_size(Some(size));
-                window.set_max_size(Some(size));
+            if let Some((spot, fixed)) = self.pending_fixed.remove(&info.wid) {
+                // Its app won't let it be resized (a reminder), or it floats on the Mac (picture
+                // in picture), or keeps its shape (a video player): a dialog from the start, which
+                // desktops and tilers (Karousel, Hyprland) float like a notification instead of
+                // tiling; they decide that when a window appears. A fixed one is exactly its size.
+                // (Modal: what tilers go by; with no parent window it holds nothing up.)
+                if fixed {
+                    let size = (info.w.round().max(1.0) as u32, info.h.round().max(1.0) as u32);
+                    window.set_min_size(Some(size));
+                    window.set_max_size(Some(size));
+                    fixed_now = true;
+                }
                 if let Some(d) = &self.dialog_mgr {
                     d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
                 }
-                fixed_now = true;
+                floated_now = true;
                 fixed_spot = spot;
                 if let Some(spot) = spot {
                     crate::desktop::place_at_spot(
@@ -953,6 +966,8 @@ impl App {
                 min_size: if fixed_now { mac_size } else if info_kind == 2 || info_kind == 3 { (1, 1) } else { MIN_SIZE },
                 max_size: fixed_now.then_some(mac_size),
                 fixed: fixed_now,
+                floated: floated_now,
+                first_shape,
                 spot: fixed_spot,
                 refusal: None,
                 size,
@@ -1208,6 +1223,19 @@ impl App {
             // a reconnect) the Mac lags, and a real refusal comes back the same.
             let size = w.size;
             if !w.followed && w.requested.is_some_and(|(r, _)| r == size) {
+                // The same answer twice, in the shape the window had (a video player keeps its
+                // video's shape): it's opened again as a floating window of the Mac's size, as a
+                // floating panel is, instead of a tile it leaves mostly empty.
+                let shape = |a: (u32, u32)| a.0 as f64 / a.1.max(1) as f64;
+                let kept_shape = w.first_shape.is_some_and(|f| (shape(mac) / f - 1.0).abs() < 0.015);
+                if w.refusal == Some((size, mac)) && !w.floated && kept_shape && (shape(size) / shape(mac) - 1.0).abs() > 0.03 {
+                    log::info!("window {wid}: keeps its shape ({}x{}, asked {}x{}): floating it at that size", mac.0, mac.1, size.0, size.1);
+                    let info = w.info.clone();
+                    self.pending_fixed.insert(wid, (None, false));
+                    self.remove_window(wid);
+                    self.add_window(info, qh);
+                    return;
+                }
                 if w.refusal != Some((size, mac)) {
                     w.refusal = Some((size, mac));
                     w.requested = Some((size, Instant::now()));
@@ -2206,7 +2234,10 @@ impl App {
         if !matches!(w.role, Role::Toplevel(_)) {
             return;
         }
-        let Some(rect) = lights::group_rect(&w.buttons) else {
+        // A video player (floated because it keeps its shape): none drawn here; it shows its
+        // own controls when the pointer is over it, as on the Mac.
+        let video = w.floated && !w.fixed && w.info.kind == 0;
+        let Some(rect) = lights::group_rect(&w.buttons).filter(|_| !video) else {
             if let Some(l) = w.lights.take() {
                 l.viewport.destroy();
                 l.sub.destroy();
