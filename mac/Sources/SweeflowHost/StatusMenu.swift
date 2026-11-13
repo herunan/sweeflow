@@ -84,9 +84,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        let apps = NSMenuItem(title: "Allowed apps", action: nil, keyEquivalent: "")
+        let found = AppList.found()
+        // How many of them stream, out of all: "Allowed apps (85/87)", kept up as they're ticked.
+        let count = { () -> String in
+            let off = Set(settings.config.excludeApps)
+            return "Allowed apps (\(found.filter { !off.contains($0.bundleId) }.count)/\(found.count))"
+        }
+        let apps = NSMenuItem(title: count(), action: nil, keyEquivalent: "")
         let sub = NSMenu()
-        for a in AppList.found() {
+        for a in found {
             // Ticked: its windows stream. A click ticks or unticks it and leaves the menu open, so
             // several can be changed in one go.
             let icon = NSWorkspace.shared.icon(forFile: a.path)
@@ -97,6 +103,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                     c.excludeApps.removeAll { $0 == a.bundleId }
                     if !on { c.excludeApps.append(a.bundleId) }
                 }
+                apps.title = count()
             }
             sub.addItem(i)
         }
