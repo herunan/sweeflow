@@ -59,10 +59,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         status.isEnabled = false
         menu.addItem(status)
         if let fp = client {
-            menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause streaming" : "Resume streaming") { settings.update { $0.enabled.toggle() } })
-            menu.addItem(ClosureMenuItem(title: "Stop streaming") { Self.disconnect(fp) })
+            menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
+            menu.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(fp) })
         } else if let fp = refused.first {
-            menu.addItem(ClosureMenuItem(title: "Allow streaming") { Self.connect(fp) })
+            menu.addItem(ClosureMenuItem(title: "Allow") { Self.connect(fp) })
         }
         menu.addItem(.separator())
 
@@ -119,9 +119,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             let options = NSMenu()
             if p.fingerprint == client {
                 computer.state = .on
-                options.addItem(ClosureMenuItem(title: "Stop streaming") { Self.disconnect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(p.fingerprint) })
             } else if refused.contains(p.fingerprint) {
-                options.addItem(ClosureMenuItem(title: "Allow streaming") { Self.connect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Allow") { Self.connect(p.fingerprint) })
             } else {
                 let idle = NSMenuItem(title: "Not streaming", action: nil, keyEquivalent: "")
                 idle.isEnabled = false

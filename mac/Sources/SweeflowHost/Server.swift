@@ -327,7 +327,7 @@ struct Identity {
     /// What a paired client is called here.
     static func clientName(_ fingerprint: String) -> String {
         let n = pairedClients().first { $0.fingerprint == fingerprint }?.name ?? ""
-        return n.isEmpty ? "Linux \(PairingCode.of(fingerprint: fingerprint))" : n
+        return n.isEmpty ? "Linux computer" : n
     }
 
     // Lists of fingerprints, one per line, beside the clients file.

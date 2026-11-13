@@ -79,9 +79,11 @@ pub fn setup(target: &str) -> Result<()> {
 
     println!("==> pairing");
     let client_fp = config::client_fingerprint()?;
+    // Listed on the Mac by this computer's name (as linking does), not a code.
+    let me: String = crate::pair::this_computer().chars().filter(|c| c.is_alphanumeric() || " -_.".contains(*c)).collect();
     let script = format!(
         "set -e; d={SUPPORT}; mkdir -p \"$d\"; touch \"$d/clients\"; \
-         if grep -q '^{client_fp}' \"$d/clients\"; then echo known; else echo '{client_fp}' >> \"$d/clients\"; echo new; fi; \
+         if grep -q '^{client_fp}' \"$d/clients\"; then echo known; else echo '{client_fp} {me}' >> \"$d/clients\"; echo new; fi; \
          for i in $(seq 1 20); do [ -s \"$d/fingerprint\" ] && break; sleep 0.5; done; cat \"$d/fingerprint\"\n"
     );
     let out = ssh(target, &script)?;

@@ -180,8 +180,13 @@ final class Session {
                 log("client \(fp.prefix(8)) was disconnected here: refused")
                 return sendAndClose(.macDisconnected)
             }
-            // Newer clients say their name.
+            // Newer clients say their name. One linked without a name (the development setup)
+            // takes it, so the menu lists it by name rather than a code from its certificate.
             clientName = (try? m.str()) ?? ""
+            if let fp = clientFingerprint, !clientName.isEmpty,
+               Identity.pairedClients().first(where: { $0.fingerprint == fp })?.name.isEmpty == true {
+                Identity.renameClient(fp, to: clientName)
+            }
             if let claim = onHello, !claim(self) { return }
             DebugPort.session = self
             if !started {
