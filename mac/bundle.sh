@@ -11,7 +11,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/
 cp "$BIN" "$APP/Contents/MacOS/SweeflowHost"
 # Icons (drawn by make-icons.sh): the app's, and the menu-bar item's.
 RES="$(cd "$(dirname "$0")" && pwd)/Resources"
-cp "$RES/MenuIcon.pdf" "$RES/BadgePaused.pdf" "$RES/BadgeDisconnected.pdf" "$APP/Contents/Resources/"
+cp "$RES/MenuIcon.pdf" "$APP/Contents/Resources/"
 iconutil -c icns "$RES/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

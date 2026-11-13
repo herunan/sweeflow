@@ -15,5 +15,3 @@ rsvg-convert -f pdf "$A/sweeflow-mac-menu.svg" -o Resources/MenuIcon.pdf
 # Its state badges: the same symbols as the Linux tray icon's (Breeze, LGPL), paused and not
 # connected.
 B=/usr/share/icons/breeze
-rsvg-convert -f pdf "$B/status/16/media-playback-paused-symbolic.svg" -o Resources/BadgePaused.pdf
-rsvg-convert -f pdf "$B/actions/16/network-disconnect-symbolic.svg" -o Resources/BadgeDisconnected.pdf

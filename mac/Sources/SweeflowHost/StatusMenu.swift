@@ -18,8 +18,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// The logo (a template: macOS draws it in the menu bar's colour). Paused or not connected:
-    /// faded, with a small badge saying which, the same as the Linux tray icon's.
+    /// The logo (a template: macOS draws it in the menu bar's colour): solid while streaming,
+    /// faded otherwise, with no badge (as on Linux; the menu says which).
     private func updateIcon() {
         let connected = host.connected
         let on = settings.config.enabled && connected
@@ -30,28 +30,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         if base.size.height > 0 {
             base.size = NSSize(width: (16 * base.size.width / base.size.height).rounded(), height: 16)
         }
-        let badge = !connected ? "BadgeDisconnected" : !settings.config.enabled ? "BadgePaused" : nil
-        let image = badge.map { Self.badged(base, $0) } ?? base
-        image.isTemplate = true
-        item.button?.image = image
+        base.isTemplate = true
+        item.button?.image = base
         item.button?.appearsDisabled = !on
-        item.button?.toolTip = !connected ? "Sweeflow: not connected" : on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
-    }
-
-    /// The logo with a badge in its bottom-right corner, half its height (as on Linux), cut out
-    /// around it so it reads.
-    private static func badged(_ base: NSImage, _ name: String) -> NSImage {
-        guard let sign = NSImage(named: name) else { return base }
-        return NSImage(size: base.size, flipped: false) { rect in
-            base.draw(in: rect)
-            let side = rect.height / 2 + 1
-            let b = NSRect(x: rect.maxX - side, y: rect.minY, width: side, height: side)
-            NSGraphicsContext.current?.compositingOperation = .destinationOut
-            NSBezierPath(roundedRect: b.insetBy(dx: -1, dy: -1), xRadius: 2, yRadius: 2).fill()
-            NSGraphicsContext.current?.compositingOperation = .sourceOver
-            sign.draw(in: b)
-            return true
-        }
+        item.button?.toolTip = !connected ? "Sweeflow: not streaming" : on ? "Sweeflow: streaming" : "Sweeflow: paused"
     }
 
     /// Built when opened, so it always shows the current state. Only what concerns this Mac:
@@ -71,16 +53,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             let who = !known.isEmpty ? known : !host.clientSaysName.isEmpty ? host.clientSaysName : "a Linux computer"
             statusText = c.enabled ? "Streaming to \(who)" : "Paused · \(who)"
         } else {
-            statusText = refused.isEmpty ? "Not connected" : "Disconnected"
+            statusText = refused.isEmpty ? "Not streaming" : "Stopped"
         }
         let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
         if let fp = client {
-            menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
-            menu.addItem(ClosureMenuItem(title: "Disconnect") { Self.disconnect(fp) })
+            menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause streaming" : "Resume streaming") { settings.update { $0.enabled.toggle() } })
+            menu.addItem(ClosureMenuItem(title: "Stop streaming") { Self.disconnect(fp) })
         } else if let fp = refused.first {
-            menu.addItem(ClosureMenuItem(title: "Connect") { Self.connect(fp) })
+            menu.addItem(ClosureMenuItem(title: "Allow streaming") { Self.connect(fp) })
         }
         menu.addItem(.separator())
 
@@ -137,11 +119,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             let options = NSMenu()
             if p.fingerprint == client {
                 computer.state = .on
-                options.addItem(ClosureMenuItem(title: "Disconnect") { Self.disconnect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Stop streaming") { Self.disconnect(p.fingerprint) })
             } else if refused.contains(p.fingerprint) {
-                options.addItem(ClosureMenuItem(title: "Connect") { Self.connect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Allow streaming") { Self.connect(p.fingerprint) })
             } else {
-                let idle = NSMenuItem(title: "Not connected", action: nil, keyEquivalent: "")
+                let idle = NSMenuItem(title: "Not streaming", action: nil, keyEquivalent: "")
                 idle.isEnabled = false
                 options.addItem(idle)
             }
