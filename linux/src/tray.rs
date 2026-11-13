@@ -343,17 +343,7 @@ impl ksni::Tray for Tray {
         }
         items.push(MenuItem::Separator);
         items.push(StandardItem { label: "Open Sweeflow".into(), activate: Box::new(|_| open_panel()), ..Default::default() }.into());
-        // The way to a Mac app's menu where the desktop shows no app menus (Omarchy has
-        // SUPER + ALT + M for it too); on Plasma the Global Menu has them.
-        items.push(
-            StandardItem {
-                label: "Global menu…".into(),
-                icon_name: menu_icon("application-menu"),
-                activate: Box::new(|_| open_palette()),
-                ..Default::default()
-            }
-            .into(),
-        );
+        // (The Global menu opens with Cmd+Opt+M in a Mac window, on every desktop: no item here.)
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
@@ -873,11 +863,6 @@ pub fn open_wizard() {
 /// second one exits at once.
 fn open_panel() {
     run_window("panel", "Sweeflow's window");
-}
-
-/// The Global menu window (`sweeflow menu`).
-fn open_palette() {
-    run_window("menu", "the Global menu");
 }
 
 /// Opens one of Sweeflow's own windows: this binary again, with `arg`.
