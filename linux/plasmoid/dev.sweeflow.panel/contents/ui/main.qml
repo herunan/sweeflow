@@ -289,6 +289,44 @@ PlasmoidItem {
             position: PlasmaComponents3.ToolBar.Footer
             RowLayout {
                 anchors.fill: parent
+                // The keyboard shortcuts, in a popup above this button.
+                PlasmaComponents3.ToolButton {
+                    id: keysButton
+                    icon.name: "input-keyboard-symbolic"
+                    text: "Shortcuts"
+                    checkable: true
+                    checked: keysPopup.visible
+                    onClicked: keysPopup.visible ? keysPopup.close() : keysPopup.open()
+                    QQC2.Popup {
+                        id: keysPopup
+                        y: -height - Kirigami.Units.smallSpacing
+                        padding: Kirigami.Units.largeSpacing
+                        contentItem: ColumnLayout {
+                            spacing: Kirigami.Units.smallSpacing
+                            Kirigami.Heading { level: 5; text: "Keyboard shortcuts" }
+                            Repeater {
+                                model: [["⌘⌥O", "Open Sweeflow"], ["⌘⌥P", "Pause or resume"], ["⌘⌥K", "Stop or start"], ["⌘⌥M", "Mac app's global menu"]]
+                                delegate: RowLayout {
+                                    required property var modelData
+                                    spacing: Kirigami.Units.largeSpacing
+                                    Rectangle {
+                                        implicitWidth: Kirigami.Units.gridUnit * 2.6
+                                        implicitHeight: keyText.implicitHeight + Kirigami.Units.smallSpacing
+                                        radius: Kirigami.Units.cornerRadius
+                                        color: Qt.alpha(Kirigami.Theme.textColor, 0.1)
+                                        PlasmaComponents3.Label { id: keyText; anchors.centerIn: parent; text: modelData[0] }
+                                    }
+                                    PlasmaComponents3.Label { text: modelData[1] }
+                                }
+                            }
+                            PlasmaComponents3.Label {
+                                text: "⌘ is the Meta key. Change these in System Settings → Shortcuts."
+                                font: Kirigami.Theme.smallFont
+                                opacity: 0.7
+                            }
+                        }
+                    }
+                }
                 Item { Layout.fillWidth: true }
                 PlasmaComponents3.ToolButton {
                     icon.name: "application-exit"
@@ -517,30 +555,6 @@ PlasmoidItem {
                         buttonText: "Show"
                         available: root.streaming
                         onAsked: { root.act("display"); root.expanded = false; }
-                    }
-                    // The keys, for people to know them (set in Plasma's shortcut settings, where
-                    // they can be changed; Meta is the Mac keyboard's ⌘).
-                    PlasmaComponents3.Label {
-                        text: "Keyboard shortcuts"
-                        font.bold: true
-                        Layout.topMargin: Kirigami.Units.smallSpacing * 2
-                    }
-                    Repeater {
-                        model: [["Open Sweeflow", "Meta + Alt + O"], ["Pause or resume streaming", "Meta + Alt + P"],
-                                ["Stop or start streaming", "Meta + Alt + K"], ["Mac app's menu (in a Mac window)", "Meta + Alt + M"]]
-                        delegate: RowLayout {
-                            required property var modelData
-                            Layout.fillWidth: true
-                            PlasmaComponents3.Label { text: modelData[0]; elide: Text.ElideRight; Layout.fillWidth: true }
-                            PlasmaComponents3.Label { text: modelData[1]; opacity: 0.7 }
-                        }
-                    }
-                    PlasmaComponents3.Label {
-                        text: "Meta is ⌘ on a Mac keyboard. Change them in System Settings → Keyboard → Shortcuts."
-                        font: Kirigami.Theme.smallFont
-                        opacity: 0.7
-                        wrapMode: Text.WordWrap
-                        Layout.fillWidth: true
                     }
                     Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                 }

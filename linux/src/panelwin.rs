@@ -192,6 +192,8 @@ slint::slint! {
         in property <bool> dimmed;
         in property <[MacItem]> macs;
         in-out property <int> tab: 0;
+        // The keyboard shortcuts' popover is showing (the ⌘ button in the header).
+        in-out property <bool> show-keys: false;
         // The Mac being renamed, or asked about forgetting (fingerprints).
         in-out property <string> editing;
         in-out property <string> confirming;
@@ -422,26 +424,6 @@ slint::slint! {
                                 Chip { text: "Show"; enabled: root.dim-enabled || root.dimmed; clicked => { root.act("display", ""); } }
                             }
                         }
-                        // The keys, for people to know them (set in the desktop's own shortcut
-                        // settings, where they can be changed; Super is the Mac keyboard's ⌘).
-                        VerticalLayout {
-                            padding-left: 8px;
-                            padding-right: 6px;
-                            padding-top: 10px;
-                            spacing: 4px;
-                            Text { text: "Keyboard shortcuts"; color: Look.fg; font-size: 13px; font-weight: 600; }
-                            for k in [
-                                { what: "Open Sweeflow", key: "Super + Alt + O" },
-                                { what: "Pause or resume streaming", key: "Super + Alt + P" },
-                                { what: "Stop or start streaming", key: "Super + Alt + K" },
-                                { what: "Mac app's menu (in a Mac window)", key: "Super + Alt + M" },
-                            ]: HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: k.what; color: Look.fg; font-size: 12px; horizontal-stretch: 1; overflow: elide; }
-                                Text { text: k.key; color: Look.muted; font-size: 12px; horizontal-stretch: 0; }
-                            }
-                            Text { text: "Super is ⌘ on a Mac keyboard. Change them in your desktop's keyboard settings."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
-                        }
                     }
                 }
 
@@ -596,11 +578,54 @@ slint::slint! {
                     }
                 }
 
+                // The keyboard shortcuts (a popover above, see below) at the left, Quit at the right.
                 if root.running && root.paired: HorizontalLayout {
-                    alignment: end;
                     vertical-stretch: 0;
+                    Btn { text: "⌘  Shortcuts"; clicked => { root.show-keys = !root.show-keys; } }
+                    Rectangle { horizontal-stretch: 1; }
                     Btn { text: "Quit Sweeflow"; clicked => { root.quit-all(); } }
                 }
+            }
+        }
+
+        // The keyboard shortcuts, above the Shortcuts button; a click anywhere else closes it.
+        if root.show-keys: TouchArea {
+            width: root.width;
+            height: root.height;
+            clicked => { root.show-keys = false; }
+        }
+        if root.show-keys: Rectangle {
+            x: 12px;
+            y: root.height - self.height - 58px;
+            width: 270px;
+            height: key-list.preferred-height;
+            border-radius: Look.radius;
+            border-width: 1px;
+            border-color: Look.line;
+            background: Look.surface;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000055;
+            key-list := VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                Text { text: "Keyboard shortcuts"; color: Look.fg; font-size: 13px; font-weight: 600; }
+                for k in [
+                    { key: "⌘⌥O", what: "Open Sweeflow" },
+                    { key: "⌘⌥P", what: "Pause or resume" },
+                    { key: "⌘⌥K", what: "Stop or start" },
+                    { key: "⌘⌥M", what: "Mac app's global menu" },
+                ]: HorizontalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        width: 46px;
+                        height: 20px;
+                        border-radius: 5px;
+                        background: Look.fg.transparentize(0.9);
+                        Text { text: k.key; color: Look.fg; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Text { text: k.what; color: Look.fg; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                }
+                Text { text: "⌘ is the Super key. Change these in your desktop's keyboard settings."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
             }
         }
 
