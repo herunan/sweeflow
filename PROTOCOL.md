@@ -112,70 +112,111 @@ turns this off.
 
 ## Linking
 
-How a Linux client and a Mac host get each other's certificate fingerprint. Started from Linux;
-the person compares one short code on the two screens and clicks Allow on the Mac. Nothing is
-typed, and nothing has to be opened on the Mac first.
+How a Linux client and a Mac host get each other's certificate fingerprint, and how either one
+unlinks. Started from Linux: the person picks the Mac, the Mac shows a 4-digit code, the person
+types it on Linux, and that's it. Nothing has to be opened on the Mac first.
 
-Transport: a second QUIC listener on the host, ALPN `sweeflow-pair/2`, port 44121/udp, up
+Transport: a second QUIC listener on the host, ALPN `sweeflow-pair/3`, port 44121/udp, up
 whenever the host runs and advertised as `_sweeflow-pair._udp` (TXT: `id` = first 16 hex digits
 of the host certificate's fingerprint, `port` = the streaming port, `v`). TLS 1.3 with a
 certificate from each side, as for streaming, but any certificate is accepted in the handshake:
 each side only notes the SHA-256 fingerprint of the certificate the other one proved it holds.
-Messages are framed as everywhere else, on one bidirectional stream the client opens.
+Messages are framed as everywhere else, on a bidirectional stream the client opens (one per
+request).
 
 | type | dir | name | payload |
 |------|-----|------|---------|
-| 0x70 | C→S | PairRequest | u16 linkVersion (2), str computerName, u8 known (1 = the client already holds this host's fingerprint) |
-| 0x72 | S→C | PairCommit | bytes commitment = SHA-256(hostNonce) |
-| 0x73 | C→S | PairNonce | bytes clientNonce (32 random bytes) |
-| 0x74 | S→C | PairReveal | bytes hostNonce (32 random bytes) |
-| 0x71 | S→C | PairResult | u8 status, str hostName, u16 streamPort, u16 linkVersion (the host's) |
+| 0x70 | C→S | PairRequest | u16 linkVersion (3), str computerName |
+| 0x75 | S→C | PairShare | u8 triesLeft, bytes hostShare (32) — the host is showing its code |
+| 0x76 | C→S | PairGuess | bytes clientShare (32), bytes clientTag (32) |
+| 0x77 | C→S | PairUnlink | — the client unlinked the host: the host forgets the client's certificate |
+| 0x78 | C→S | PairCheck | — is the client still linked here? |
+| 0x71 | S→C | PairResult | u8 status, str hostName, u16 streamPort, u16 linkVersion (the host's), bytes hostTag (32 with status 0 after a PairGuess, else empty) |
 
-The exchange:
+(0x72–0x74 were version 2's nonce exchange, where both screens showed a code to compare.)
 
-1. The client sends PairRequest. The host answers with PairResult straight away when there is
-   nothing to ask its person (status 2 to 6 below), otherwise with PairCommit.
-2. The client sends PairNonce. The host answers with PairReveal and shows its prompt
-   ("‹computerName› wants to link to this Mac", the code, Allow / Don't Allow), or with
-   PairResult status 2 if another prompt went up meanwhile.
-3. The client checks that SHA-256(hostNonce) is the commitment (if not, it stops), and shows the
-   code.
-4. The host sends PairResult once its person has answered. On status 0 the host has added the
-   client's fingerprint to its paired clients, and the client stores the host's with
-   `hostName` and `streamPort`. The client gives up after two minutes; closing the connection
-   takes the host's prompt down.
+### Linking
 
-The code, worked out by each side on its own:
+1. The client sends PairRequest. The host answers with PairResult straight away when it won't
+   show a code (status 2 to 6 below). Otherwise it picks a random 4-digit code, shows it ("Enter
+   this code on ‹computerName›"), and sends PairShare.
+2. The person types the code on the client, which sends PairGuess.
+3. The host checks clientTag. Right: it adds the client's fingerprint to its linked clients and
+   answers PairResult status 0 with hostTag; the client checks hostTag and only then stores the
+   host's fingerprint with `hostName` and `streamPort`. Wrong: the host sends a new PairShare
+   (fresh scalar, `triesLeft` one less), and the client asks the person again; after the third
+   wrong code the host answers status 7 and takes the code down.
+4. The code is shown for five minutes (status 8 after that); the person at the host can cancel it
+   (status 1). Closing the connection takes it down.
+
+The host shows one code at a time. Wrong codes in a row (counted across codes, reset by a
+successful link) make it wait before showing another: nothing for the first three, then 30 s after
+the last wrong one, doubling with every three more, up to an hour (status 3 meanwhile).
+
+### The key exchange
+
+CPace over X25519, with the code as the password and both fingerprints bound in. Fingerprints go in
+as 64 lowercase hex characters (ASCII), each side using its own certificate's and the one the
+other side proved it holds in this connection's handshake. `H(a, b, …)` is SHA-256 over the parts,
+each preceded by its length as one byte. `label` = `"sweeflow-link/3"`.
 
 ```
-d    = SHA-256( "sweeflow-link/2" ‖ clientFingerprint ‖ hostFingerprint ‖ clientNonce ‖ hostNonce )
-n    = (first 8 bytes of d, as a big-endian integer) mod 31^6
-code = n as 6 digits in base 31, most significant first, each an index into
-       "ABCDEFGHJKMNPQRSTUVWXYZ23456789", shown as XXX-XXX
+r     = H(label, "generator", code, clientFingerprint, hostFingerprint), top bit (bit 255) cleared,
+        as a little-endian integer mod p = 2^255 − 19
+G     = Elligator 2 of r onto Curve25519 (RFC 9380 §6.7.1, Z = 2), the u-coordinate:
+          x1 = −A / (1 + 2r²)   (x1 = −A if that's 0; A = 486662)
+          G  = x1 if x1³ + A·x1² + x1 is a square mod p, else −x1 − A
+share = X25519(random 32-byte scalar, G)          (clientShare, hostShare)
+K     = X25519(own scalar, other side's share)    refused if all zeroes
+key   = H(label, "key", clientFingerprint, hostFingerprint, clientShare, hostShare, K)
+clientTag = HMAC-SHA256(key, label ‖ "client")
+hostTag   = HMAC-SHA256(key, label ‖ "host")
 ```
 
-The fingerprints go in as 64 lowercase hex characters (ASCII): the SHA-256 of each certificate
-as the side computing the code knows it, its own from its own certificate and the other's from
-this connection's handshake. A computer in between has to hold a certificate of its own on each
-side, so the two sides hash different fingerprints. The order of the nonces keeps it from
-picking a nonce that makes the codes agree anyway: the host commits to its nonce before it sees
-the client's, and the client sends its nonce before it sees the host's. Each attempt shows one
-code, and the host shows one prompt at a time (after a prompt is taken down because its client
-left, the next one waits 3 seconds).
+Why it holds up with only four digits: someone without the code (a computer asking to link, a fake
+Mac, or a computer relaying between the two) gets to test one guess per PairShare/PairGuess run,
+and only by talking to the other side. Nothing on the wire lets it test codes offline: G's discrete
+log to any other code's G is unknown, and Elligator 2 always lands on the curve itself rather than
+its twist, so shares (clamped scalars times G) are points of the prime-order subgroup whatever the
+code is. A relay holds its own certificate on each side, so the two sides derive different
+generators and keys: relaying counts as a wrong guess. Three guesses per code, a code window on the
+Mac's screen for each, and the growing wait make guessing one code a 3-in-10,000 chance per window
+shown. Shares received may be anything (also twist or small-order points): X25519's clamping makes
+scalars multiples of 8, which clears the small-order part, Curve25519 is twist-secure, and an
+all-zero K is refused. Each side keeps the other's certificate only after checking the other's tag.
+
+### Linked once, unlinked on both sides
+
+- The host answers a PairRequest from a client it already has with status 5, and the client
+  doesn't ask a host it already has (it shows it as linked). Linking again takes unlinking first.
+- Unlinking on Linux: the client sends PairUnlink (pinning the host's certificate) and the host
+  forgets it and answers status 9. If the host can't be reached, the client notes it and sends
+  PairUnlink once it sees the host advertised again, or before a PairRequest to that host.
+- Unlinking on the Mac: a connected client is told with Forgotten (0x04) on its streaming
+  connection; one that isn't connected is told on its next streaming connection, or when it next
+  sees the host advertised: the client sends PairCheck to each linked host it sees (at most every
+  ten minutes, pinning its certificate), and on status 10 forgets it too and says so.
+- PairUnlink and PairCheck act on the certificate of the connection they come on, as the TLS
+  handshake proved it, so a computer can only unlink itself.
 
 `status`:
 
 | status | meaning |
 |--------|---------|
-| 0 | linked: the person clicked Allow. Only valid after PairReveal |
-| 1 | not allowed: the person clicked Don't Allow. That client's certificate is answered with 3 for the next five minutes |
-| 2 | busy: a prompt for another request is showing |
-| 3 | wait: refused a few minutes ago |
+| 0 | linked: the code was right (with hostTag); or, to PairCheck, still linked |
+| 1 | cancelled: the person at the host closed the code window |
+| 2 | busy: a code is showing for another computer |
+| 3 | wait: too many wrong codes lately |
 | 4 | locked: the Mac's screen is locked |
-| 5 | linked already: the host has this client and the request said `known`. No prompt. (A client that lost the host's fingerprint sends `known` 0 and goes through the prompt again: the code is all it has to know the host by) |
+| 5 | linked already: the host has this client. No code |
 | 6 | the host doesn't speak the request's `linkVersion`; its own is in the result |
+| 7 | three wrong codes: the host stopped |
+| 8 | the code expired |
+| 9 | unlinked (answer to PairUnlink) |
+| 10 | not linked (answer to PairCheck) |
 
-Versions: the ALPN names the exchange, so an older client or host (`sweeflow-pair/1`, where the
-Mac showed a code to type on Linux, and listened only while that window was open) fails the
-handshake instead of waiting. A client that can't connect tries `sweeflow-pair/1` once: if that
-handshake works, the Mac's Sweeflow is too old.
+Versions: the ALPN names the exchange. The host also accepts `sweeflow-pair/2`, only to answer a
+version 2 client's request with status 6, so it says to update rather than failing the handshake;
+the client offers `sweeflow-pair/2` too, so a version 2 host answers status 6 likewise. A client
+that can't connect tries `sweeflow-pair/1` once: if that handshake works, the Mac's Sweeflow is
+from before both (it showed a code only while its window was open).

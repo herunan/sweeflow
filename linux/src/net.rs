@@ -1172,6 +1172,11 @@ fn make_endpoint(cfg: &Config) -> Result<quinn::Endpoint> {
 
 /// A QUIC client endpoint with our client certificate, accepting the Mac `check` approves.
 pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint> {
+    client_endpoint_offering(check, &[alpn])
+}
+
+/// The same, offering several ALPNs (the server picks one).
+pub fn client_endpoint_offering(check: HostCheck, alpns: &[&[u8]]) -> Result<quinn::Endpoint> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let (cert, key) = crate::config::client_identity()?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -1179,7 +1184,7 @@ pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint>
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedHost { check, provider }))
         .with_client_auth_cert(vec![cert], PrivateKeyDer::Pkcs8(key.into()))?;
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.alpn_protocols = alpns.iter().map(|a| a.to_vec()).collect();
 
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));

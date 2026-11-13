@@ -131,7 +131,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                 options.addItem(idle)
             }
             options.addItem(ClosureMenuItem(title: "Rename…") { Self.rename(p.fingerprint) })
-            options.addItem(ClosureMenuItem(title: "Forget…") { Self.confirmForget(name, p.fingerprint) })
+            options.addItem(ClosureMenuItem(title: "Unlink…") { Self.confirmForget(name, p.fingerprint) })
             computer.submenu = options
             list.addItem(computer)
         }
@@ -193,13 +193,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// Asks once: to use it again, it has to be linked again. The Linux machine forgets this Mac
-    /// too (now, or the next time it connects).
+    /// Asks once: to use it again, it has to be linked again. The Linux machine unlinks this Mac
+    /// too (now if it's connected, otherwise once it next connects or sees this Mac online).
     private static func confirmForget(_ label: String, _ fingerprint: String) {
         let alert = NSAlert()
-        alert.messageText = "Forget \(label)?"
-        alert.informativeText = "It forgets this Mac too. To use it again, link it again from the Linux machine."
-        alert.addButton(withTitle: "Forget")
+        alert.messageText = "Unlink \(label)?"
+        alert.informativeText = "It's unlinked on \(label) too. To use it again, link it again from there."
+        alert.addButton(withTitle: "Unlink")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }

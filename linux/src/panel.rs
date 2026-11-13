@@ -35,7 +35,7 @@ impl Iface {
     }
 
     /// One of: wake, pair, stream, stop (stop streaming), show (pop the widget open), display (show the Mac's display in a window), gather (Mac windows
-    /// back onto the Mac desktop), switch <fingerprint>,
+    /// back onto the Mac desktop), switch <fingerprint>, use <fingerprint> (a Mac just linked),
     /// forget <fingerprint>, launch <bundle id>, quit-app <bundle id>, pin|unpin <bundle id>,
     /// login on|off (open at login), square on|off (square window corners),
     /// global-menu on|off,
