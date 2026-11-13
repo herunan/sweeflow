@@ -65,6 +65,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var buttons: [CGRect] = []
     /// Where macOS's capture badge overlaps this window (window points), looked up per frame.
     var badgeRect: () -> CGRect? = { nil }
+    /// The window's top-left corner as it looks without the badge (see CleanCorner).
+    private lazy var cleanCorner = CleanCorner.of(wid)
+    /// Whether the window server has just said the window has no badge (WindowTracker.badgeAbsent).
+    var badgeAbsent: () -> Bool = { false }
     /// The size Linux shows this window at (points). When the Mac window can't shrink that far
     /// (app minimum size), Linux crops it, so the bottom/right corners must be cut at the
     /// visible edge rather than the window's real edge.
@@ -282,12 +286,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Starts again from the same window or display (after a stop, or a capture that never
     /// delivered a frame).
-    private func restartCapture() {
-        if let d = scDisplay { startCapture(nil, display: d) } else if let w = scWindow { startCapture(w) }
+    /// `still`: show a still of it while the capture starts (see startCapture).
+    private func restartCapture(still: Bool = false) {
+        if let d = scDisplay { startCapture(nil, display: d, still: still) } else if let w = scWindow { startCapture(w, still: still) }
     }
 
-    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil) {
+    /// `still`: send a still of the window while the capture starts (always, the first time).
+    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil, still: Bool = false) {
         scWindow = win
+        // Paused (not shown on Linux): no capture at all; resuming starts one with what's
+        // remembered here. Every path that (re)starts a capture comes through here.
+        guard !paused else { return }
         let filter: SCContentFilter
         if let display {
             filter = SCContentFilter(display: display, excludingWindows: [])
@@ -325,11 +334,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             out.close(); return
         }
         stream = s
+        // Counts this capture's frames (the still below only shows while there are none yet).
+        framesSinceStart = 0
         // Starting a capture takes ScreenCaptureKit ~0.4 s; a still of the window takes a fraction
         // of that, so a new window shows straight away and goes live when the capture starts.
         // Not for popups: macOS fades them in, so a still catches one half-drawn and holds it
         // until the capture starts (it pops). Popups' captures start fast enough.
-        if !sentStill && !lossless {
+        if (still || !sentStill) && !lossless {
             sentStill = true
             let t0 = Date()
             SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
@@ -393,13 +404,57 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
 
+    /// When the last resume was asked for (host µs), until its first frame goes out (0: none due).
+    private var resumedUs: UInt64 = 0
+
+    /// Linux isn't showing the window (minimised, on another desktop): stop capturing it
+    /// altogether. Only stopping encoding left ScreenCaptureKit delivering every change, each
+    /// hashed and prepared for nothing: with many windows open, most of them hidden, that kept
+    /// the host near full CPU. A stop rather than a slower capture: a capture started afresh
+    /// always begins with a frame of the window as it is now, at its size and scale now, where
+    /// a reconfigured one sends nothing until the window changes. Starting takes ~0.4 s, so a
+    /// still (a fraction of that) is sent first. Not the Mac being locked: that's `showingPause`.
     func setPaused(_ p: Bool) {
+        guard p != paused, !stopped else { return }
         paused = p
-        if !p {
-            forceKeyframe = true
+        if p {
+            let unshown = resumedUs > 0 ? String(format: " (resumed %.0f ms ago, no frame sent yet)", Double(hostMicros() - resumedUs) / 1000) : ""
+            resumedUs = 0
+            refineTimer?.cancel()
+            // A capture still starting stops itself when it finds it's been replaced.
+            stream?.stopCapture { _ in }
+            stream = nil
+            // Out of date by the time it's shown again. The locked picture stays (it's current).
+            if !showingPause { pendingBuffer = nil }
+            log("stream \(wid): paused, capture stopped\(unshown)")
+            return
+        }
+        // Logged with its first frame (sendFrame, sendLossless).
+        forceKeyframe = true
+        resumedUs = hostMicros()
+        if showingPause {
+            // Locked: captures show nothing, so the locked picture goes back up and the capture
+            // starts at unlock (see setScreenLocked). The colour picture from before the lock
+            // may be out of date by then: forget it, so unlocking starts a fresh capture.
+            colourBeforeLock = nil
             if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b; pendingPrepared = true }
             pump()
+            return
         }
+        // Whatever was waiting is older than the still.
+        pendingBuffer = nil
+        resumeCapture()
+    }
+
+    /// Starts capturing again after a pause, with a still first, at the scale of the display
+    /// the window is on now (it may have moved meanwhile; checkScale leaves a paused one be).
+    /// Its size is already current: windowResized keeps `pointSize` while there's no capture.
+    private func resumeCapture() {
+        if let want = displayScale?(), want > 0, abs(want - scale) > 0.01 {
+            log("stream \(wid): display scale \(scale) → \(want) (while paused)")
+            scale = want
+        }
+        restartCapture(still: true)
     }
 
     /// Re-encode the last capture with fresh overlays (e.g. focus changed the traffic lights).
@@ -407,7 +462,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     func requestRepaint() {
         if encoding { repaintAfter = true; return }   // that buffer is being worked on
         guard pendingBuffer == nil, let b = lastBuffer else { return }
-        eraseCaptureBadge(b, buttons: buttons, badge: badgeRect(), scale: scale)
+        eraseCaptureBadge(b, buttons: buttons, badge: badgeRect(), scale: scale, clean: cleanCorner)
         pendingBuffer = b
         pendingPrepared = true
         refinementsLeft = 2
@@ -553,6 +608,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                         stream.stopCapture { _ in }
                         self.stream = nil
                         self.restartCapture()
+                    } else if !self.paused {
+                        // Resumed while locked (see setPaused): no capture was started then.
+                        self.resumeCapture()
                     }
                     return
                 }
@@ -663,6 +721,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private struct Prep {
         let buttons: [CGRect], badge: CGRect?, scale: CGFloat, visiblePx: CGSize?, radiusPx: Int
         let detect: Bool, measure: Bool
+        let clean: CleanCorner
+        let noBadge: Bool
     }
 
     /// And what it found, applied back on `queue`.
@@ -685,7 +745,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             r.detected = found
             buttons = found
         }
-        r.dark = eraseCaptureBadge(pb, buttons: buttons, badge: p.badge, scale: p.scale)
+        r.dark = eraseCaptureBadge(pb, buttons: buttons, badge: p.badge, scale: p.scale, clean: p.clean, fresh: true,
+                                   noBadge: p.noBadge)
         // A few radius measurements per window (not every frame) feed the shared vote.
         if p.measure { r.radiusPx = measureCornerRadius(pb, scale: p.scale) }
         r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, visible: p.visiblePx)
@@ -814,8 +875,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             measureCountdown -= 1
             let measure = radiusSamples < 5 && measureCountdown <= 0
             if measure { measureCountdown = 15 }
-            prep = Prep(buttons: buttons, badge: badgeRect(), scale: scale, visiblePx: visiblePx(),
-                        radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure)
+            let badge = badgeRect()
+            prep = Prep(buttons: buttons, badge: badge, scale: scale, visiblePx: visiblePx(),
+                        radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure,
+                        clean: cleanCorner, noBadge: badge == nil && badgeAbsent())
         }
         lastBuffer = pb
         lastEncodeAt = .now()
@@ -880,6 +943,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// losing detail.
     func checkScale() {
         queue.async { [weak self] in
+            // Paused, there's no capture: resumeCapture looks the scale up when it starts one
+            // (until then the last picture, at the old scale, may still be sent again).
             guard let self, let want = self.displayScale?(), want > 0, abs(want - self.scale) > 0.01,
                   let stream = self.stream, !self.stopped else { return }
             log("stream \(self.wid): display scale \(self.scale) → \(want)")
@@ -1048,12 +1113,20 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         m.u8(0b11 | (UInt8(min(15, max(1, scale.rounded()))) << 4))   // keyframe | lossless | px/pt
         m.bytes(Data(out[0..<n]))
         out_send(m, bytes: n)
+        logResumedIfDue(captureUs: captureUs)
     }
 
     private func out_send(_ m: MsgWriter, bytes: Int) {
         out.send(m)
         statFrames += 1
         statBytes += bytes
+    }
+
+    /// The first frame since a resume went out (one prepared before the pause doesn't count).
+    private func logResumedIfDue(captureUs: UInt64) {
+        guard resumedUs > 0, captureUs >= resumedUs else { return }
+        log(String(format: "stream %u: resumed, first frame sent %.0f ms after the resume", wid, Double(hostMicros() - resumedUs) / 1000))
+        resumedUs = 0
     }
 
     private func sendFrame(captureUs: UInt64, w: Int32, h: Int32, key: Bool, fullRange: Bool, data: Data) {
@@ -1073,6 +1146,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         statFrames += 1
         statBytes += data.count
+        logResumedIfDue(captureUs: captureUs)
     }
 
     private static func makeEncoder(width: Int32, height: Int32, tenBit encoderTenBit: Bool) -> VTCompressionSession? {
@@ -1373,49 +1447,185 @@ func fillCorners(_ pb: CVPixelBuffer, radiusPx: Int) {
     }
 }
 
+/// What a window's top-left corner looks like without macOS's capture badge on it, learnt pixel
+/// by pixel from the captures. In apps that move their own buttons the badge sits now in one
+/// place, now in another, and at the lower one it lies over whatever comes right after the
+/// buttons (an app's logo, a toolbar button): covered with plain background, that lost a bite
+/// each time. The corner shows whole in the first captures after a capture starts (macOS puts
+/// the badge up a moment later), and what one place hides shows while the badge sits at the
+/// other: those pixels are kept here and put back under the badge instead. Kept per window
+/// for as long as the host runs: across resizes (the corner doesn't move) and reconnects.
+final class CleanCorner {
+    private static var all: [UInt32: CleanCorner] = [:]
+    private static let allLock = NSLock()
+    static func of(_ wid: UInt32) -> CleanCorner {
+        allLock.lock(); defer { allLock.unlock() }
+        if let c = all[wid] { return c }
+        let c = CleanCorner(); all[wid] = c; return c
+    }
+
+    fileprivate let lock = NSLock()
+    fileprivate var shape = (0, 0)   // the corner's width and height in pixels
+    fileprivate var px: [UInt8] = []
+    fileprivate var known: [Bool] = []
+    private var badge: CGRect?
+    private var since: UInt64 = 0
+
+    /// Whether the badge has been at `rect` for a second: only then is the rest of the corner
+    /// taken as clear of it (while it moves, the capture and its position can disagree).
+    fileprivate func settled(at rect: CGRect) -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if badge != rect { badge = rect; since = now; return false }
+        return now - since > 1_000_000_000
+    }
+}
+
 /// While a window is captured, macOS draws a purple "being shared" badge where its traffic lights
 /// are. Erase it to the title-bar colour; the client composites the real buttons over the spot.
 /// Returns whether the title bar is dark (nil when there are no buttons), for the client's
 /// inactive traffic-light colour.
+/// `clean`: the window's remembered corner (see CleanCorner); `fresh`: this is a new capture,
+/// nothing painted on it yet, so the corner can be learnt from it; `noBadge`: the window
+/// server has just said there is no badge on the window.
 @discardableResult
-func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, scale: CGFloat) -> Bool? {
+func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, scale: CGFloat,
+                       clean: CleanCorner? = nil, fresh: Bool = false, noBadge: Bool = false) -> Bool? {
     let rects = buttons.filter { $0.width > 0 }
-    // Erase where the badge is, plus a margin around the buttons it may cover.
-    var region: CGRect?
-    if rects.count == 3 { region = rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5) }
-    if let badge { region = region.map { $0.union(badge.insetBy(dx: -1, dy: -1)) } ?? badge.insetBy(dx: -1, dy: -1) }
-    guard let union = region, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+    // Two places, each covered with the background around it: where the badge is, and the
+    // buttons it may cover (with a margin). Not one box around both: an app that keeps its
+    // buttons away from the badge's place (its own title bar: a browser, an Electron-style
+    // app) has other things between the two, and the colour around such a box isn't the
+    // colour around the badge, so pieces of the badge stayed.
+    var regions: [CGRect] = []
+    // First the corner above and to the left of the buttons, whether or not the badge was
+    // found there: that is where macOS puts it on a window with buttons (at 16,17 on a tall
+    // toolbar, 12,4 or even partly above the window on others), and where pieces of a badge
+    // missed for any reason showed. No further right or down than the buttons' own cover
+    // below: an app's logo or toolbar can start right after them.
+    if rects.count == 3, let right = rects.map(\.maxX).max(), let bottom = rects.map(\.maxY).max() {
+        regions.append(CGRect(x: 0, y: 0, width: right + 6, height: bottom + 5))
+    }
+    // (Only when the whole badge is on the window: cut off by its edge, the piece that shows
+    // isn't that shape, and is covered as a box.)
+    let badgeRegion = badge.flatMap { $0.width >= 60 && $0.height >= 17 ? $0.insetBy(dx: -1, dy: -1) : nil }
+    if let badge { regions.append(badgeRegion ?? badge.insetBy(dx: -1, dy: -1)) }
+    if rects.count == 3 { regions.append(rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5)) }
+    guard !regions.isEmpty, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
 
-    // The badge is a pill around all three buttons; clear it to the surrounding title bar.
-    let x0 = max(0, Int(union.minX * scale)), x1 = min(w, Int(union.maxX * scale))
-    let y0 = max(0, Int(union.minY * scale)), y1 = min(h, Int(union.maxY * scale))
-    guard x1 > x0, y1 > y0 else { return nil }
-    // Fill colour: median of the pixels just outside the region (robust to a logo or text next
-    // to the buttons, which a single sample would pick up).
-    var samples: [(UInt8, UInt8, UInt8)] = []
-    let pad = max(2, Int(scale * 1.5))
-    func sample(_ x: Int, _ y: Int) {
-        guard x >= 0, x < w, y >= 0, y < h else { return }
-        let p = base + y * stride + x * 4
-        if p[3] > 250 { samples.append((p[0], p[1], p[2])) }
+    /// Whether a pixel lies in the bar with round ends that fills `region` (the badge's shape).
+    func inPill(_ region: CGRect, _ x: Int, _ y: Int) -> Bool {
+        let radius = Double(region.height * scale) / 2
+        let leftX = Double(region.minX * scale) + radius, rightX = Double(region.maxX * scale) - radius
+        let px = Double(x) + 0.5, dy = Double(y) + 0.5 - Double(region.midY * scale)
+        let dx = px < leftX ? leftX - px : px > rightX ? px - rightX : 0
+        return dx * dx + dy * dy <= radius * radius
     }
-    for x in Swift.stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
-    for y in Swift.stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
-    guard !samples.isEmpty else { return nil }
-    let mid = samples.count / 2
-    let bb = samples.map { $0.0 }.sorted()[mid]
-    let bgc = samples.map { $0.1 }.sorted()[mid]
-    let br = samples.map { $0.2 }.sorted()[mid]
-    for y in y0..<y1 {
-        let row = base + y * stride
-        for x in x0..<x1 { let p = row + x * 4; p[0] = bb; p[1] = bgc; p[2] = br; p[3] = 255 }
+
+    // The remembered corner: learnt from a fresh capture wherever the badge (with a margin)
+    // isn't, once the badge has stayed put; and held for the covering below.
+    let cornerW = min(w, Int(112 * scale)), cornerH = min(h, Int(50 * scale))
+    clean?.lock.lock()
+    defer { clean?.lock.unlock() }
+    if let clean {
+        if clean.shape != (cornerW, cornerH) {
+            clean.shape = (cornerW, cornerH)
+            clean.px = [UInt8](repeating: 0, count: cornerW * cornerH * 4)
+            clean.known = [Bool](repeating: false, count: cornerW * cornerH)
+        }
+        // What is remembered must still be what the app shows there (its toolbar may have
+        // changed): where the corner is in plain view now, away from the badge and the
+        // buttons, it has to match, or the lot is forgotten and learnt again.
+        let hidden = (badge.map { [$0.insetBy(dx: -3, dy: -3)] } ?? []) + rects.map { $0.insetBy(dx: -8, dy: -8) }
+        if fresh {
+            var seen = 0, differ = 0
+            for y in Swift.stride(from: 0, to: cornerH, by: 2) {
+                let row = base + y * stride
+                for x in Swift.stride(from: 0, to: cornerW, by: 2) where clean.known[y * cornerW + x] {
+                    let pt = CGPoint(x: CGFloat(x) / scale, y: CGFloat(y) / scale)
+                    if hidden.contains(where: { $0.contains(pt) }) { continue }
+                    seen += 1
+                    let i = (y * cornerW + x) * 4
+                    if abs(Int(row[x * 4]) - Int(clean.px[i])) > 40 || abs(Int(row[x * 4 + 1]) - Int(clean.px[i + 1])) > 40
+                        || abs(Int(row[x * 4 + 2]) - Int(clean.px[i + 2])) > 40 { differ += 1 }
+                }
+            }
+            if seen > 50, differ * 5 > seen {
+                clean.known = [Bool](repeating: false, count: cornerW * cornerH)
+            }
+        }
+        // Learnt from a fresh capture: all of the corner while there is no badge, and
+        // otherwise wherever the badge (with a margin) isn't, once it has stayed put.
+        let around = badge?.insetBy(dx: -3, dy: -3)
+        if fresh, (badge == nil && noBadge) || (badge.map { clean.settled(at: $0) } ?? false) {
+            for y in 0..<cornerH {
+                let row = base + y * stride
+                for x in 0..<cornerW where around.map({ !inPill($0, x, y) }) ?? true {
+                    let i = y * cornerW + x
+                    for c in 0..<4 { clean.px[i * 4 + c] = row[x * 4 + c] }
+                    clean.known[i] = true
+                }
+            }
+        }
     }
-    let luminance = (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10
-    return luminance < 128
+
+    /// Fills one region with the colour around it; whether that colour is dark, nil when
+    /// there was nothing around it to go by. `pill`: only the badge's own shape within the
+    /// region (a bar with round ends), so what sits beside those ends stays: as a plain box
+    /// it took the edge off a logo right after the buttons.
+    func cover(_ region: CGRect, pill: Bool = false) -> Bool? {
+        let x0 = max(0, Int(region.minX * scale)), x1 = min(w, Int(region.maxX * scale))
+        let y0 = max(0, Int(region.minY * scale)), y1 = min(h, Int(region.maxY * scale))
+        guard x1 > x0, y1 > y0 else { return nil }
+
+        // Fill colour: median of the pixels just outside the region (robust to a logo or text
+        // next to it, which a single sample would pick up).
+        var samples: [(UInt8, UInt8, UInt8)] = []
+        let pad = max(2, Int(scale * 1.5))
+        func sample(_ x: Int, _ y: Int) {
+            guard x >= 0, x < w, y >= 0, y < h else { return }
+            let p = base + y * stride + x * 4
+            if p[3] > 250 { samples.append((p[0], p[1], p[2])) }
+        }
+        for x in Swift.stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
+        for y in Swift.stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
+        guard !samples.isEmpty else { return nil }
+        let mid = samples.count / 2
+        let bb = samples.map { $0.0 }.sorted()[mid]
+        let bgc = samples.map { $0.1 }.sorted()[mid]
+        let br = samples.map { $0.2 }.sorted()[mid]
+        for y in y0..<y1 {
+            let row = base + y * stride
+            for x in x0..<x1 {
+                if pill, !inPill(region, x, y) { continue }
+                let p = row + x * 4
+                // Under the badge: what was there when the badge wasn't, where that's known.
+                if pill, let clean, x < cornerW, y < cornerH, clean.known[y * cornerW + x] {
+                    let i = (y * cornerW + x) * 4
+                    for c in 0..<4 { p[c] = clean.px[i + c] }
+                    continue
+                }
+                // The window's own shape stays: where its rounded corner is see-through (the
+                // badge can reach into it), the pixel keeps its alpha and takes the colour
+                // through it (the buffer is premultiplied).
+                let a = Int(p[3])
+                if a == 255 {
+                    p[0] = bb; p[1] = bgc; p[2] = br
+                } else if a > 0 {
+                    p[0] = UInt8(Int(bb) * a / 255); p[1] = UInt8(Int(bgc) * a / 255); p[2] = UInt8(Int(br) * a / 255)
+                }
+            }
+        }
+        return (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10 < 128
+    }
+
+    // The buttons' surroundings say whether the title bar is dark (the last region, when there).
+    var dark: Bool?
+    for region in regions { if let d = cover(region, pill: region == badgeRegion) { dark = d } }
+    return dark
 }
 
 /// Converts a length-prefixed HEVC sample to Annex B, prepending VPS/SPS/PPS on keyframes.

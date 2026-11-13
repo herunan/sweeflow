@@ -83,9 +83,15 @@ final class WindowTracker {
                 self?.queue.async {
                     guard let self else { return }
                     self.askingApp.remove(wid)
-                    guard let c = self.appWindowSeen[wid] else { return }   // gone meanwhile
-                    self.appWindowSeen[wid] = (isApp, c.first)
-                    if c.isApp != isApp { self.poll() }
+                    // Kept even when the entry is gone: the look that asked drops it again at its
+                    // end (a window still waiting for its answer isn't among the live ones), and
+                    // with the answer thrown away for that, no untitled window ever got one: a
+                    // sheet on an app's window (a prompt in the TV app) was never shown, the app
+                    // left dimmed behind it and deaf to clicks. The next look uses the answer;
+                    // if the window has gone meanwhile, that look drops it.
+                    let was = self.appWindowSeen[wid]
+                    self.appWindowSeen[wid] = (isApp, was?.first ?? .now())
+                    if was?.isApp != isApp { self.poll() }
                 }
             }
         }
@@ -439,11 +445,54 @@ final class WindowTracker {
     /// Where macOS's capture badge overlaps `wid`, relative to the window (points).
     func badgeRect(_ wid: UInt32) -> CGRect? {
         guard let w = windows[wid] else { return nil }
-        for b in badges[w.pid] ?? [] {
-            let i = b.intersection(w.frame)
+        if let r = Self.badge(among: badges[w.pid] ?? [], over: w.frame) { return r }
+        // Not there at the last look at the window list. macOS puts the badge up a moment after
+        // a capture starts, and that changes the picture: the capture with the badge in it gets
+        // here before the next look, and for a window that then stays as it is, that picture
+        // (badge and all) was the one Linux kept showing. So ask the window server now, every
+        // two seconds at most per window (the question takes a few milliseconds, on the queue
+        // input goes through).
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let asked = badgeAsked[wid], now - asked < 2_000_000_000 { return nil }
+        badgeAsked[wid] = now
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return nil }
+        var frame = w.frame
+        var found: [CGRect] = []
+        for info in list {
+            guard (info[kCGWindowOwnerPID as String] as? pid_t) == w.pid, (info[kCGWindowLayer as String] as? Int) == 0,
+                  let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd) else { continue }
+            if (info[kCGWindowNumber as String] as? UInt32) == wid {
+                frame = b
+            } else if (60...72).contains(b.width), (17...23).contains(b.height) {
+                found.append(b)   // the badge's fixed size (see update)
+            }
+        }
+        guard let r = Self.badge(among: found, over: frame) else {
+            badgeAbsentAt[wid] = now   // asked just now, and it isn't there
+            return nil
+        }
+        badges[w.pid, default: []].append(contentsOf: found)   // until the next look, which lists them itself
+        return r
+    }
+
+    /// Whether the window server said, within the last moment, that `wid` has no badge on it
+    /// (as right after its capture starts): what is captured then is the window as it is.
+    func badgeAbsent(_ wid: UInt32) -> Bool {
+        guard let at = badgeAbsentAt[wid] else { return false }
+        return DispatchTime.now().uptimeNanoseconds - at < 150_000_000
+    }
+    private var badgeAbsentAt: [UInt32: UInt64] = [:]
+
+    /// When the window server was last asked for a window's badge (badgeRect).
+    private var badgeAsked: [UInt32: UInt64] = [:]
+
+    private static func badge(among badges: [CGRect], over frame: CGRect) -> CGRect? {
+        for b in badges {
+            let i = b.intersection(frame)
             // The badge sits at the window's top-left corner.
-            guard !i.isNull, i.width > 0, i.height > 0, b.minX - w.frame.minX < 40, b.minY - w.frame.minY < 40 else { continue }
-            return i.offsetBy(dx: -w.frame.minX, dy: -w.frame.minY)
+            guard !i.isNull, i.width > 0, i.height > 0, b.minX - frame.minX < 40, b.minY - frame.minY < 40 else { continue }
+            return i.offsetBy(dx: -frame.minX, dy: -frame.minY)
         }
         return nil
     }
