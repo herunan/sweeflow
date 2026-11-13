@@ -59,6 +59,10 @@ final class WindowTracker {
     /// Whether a window lacks working window buttons (all zero-size): set by the session.
     var hasNoButtons: ((UInt32, pid_t) -> Bool)?
     private var noButtonsSeen: [UInt32: Bool] = [:]
+    /// Whether a window is a sheet ("Save changes?"), hanging from one of its app's windows: set
+    /// by the session, asked with hasNoButtons.
+    var isSheet: ((UInt32, pid_t) -> Bool)?
+    private var sheetSeen: [UInt32: Bool] = [:]
     /// Untitled windows' answers, looked at for their first second (the list can lag a new
     /// window), then kept.
     private var appWindowSeen: [UInt32: (isApp: Bool?, first: DispatchTime)] = [:]
@@ -100,13 +104,15 @@ final class WindowTracker {
 
     private func askNoButtons(_ wid: UInt32, pid: pid_t) {
         guard askingButtons.insert(wid).inserted else { return }
-        let ask = hasNoButtons
+        let ask = hasNoButtons, sheet = isSheet
         askQueue.async { [weak self] in
-            let none = ask?(wid, pid) ?? false
+            let isSheet = sheet?(wid, pid) ?? false
+            let none = isSheet || (ask?(wid, pid) ?? false)
             self?.queue.async {
                 guard let self else { return }
                 self.askingButtons.remove(wid)
                 self.noButtonsSeen[wid] = none
+                self.sheetSeen[wid] = isSheet
                 self.poll()
             }
         }
@@ -357,7 +363,10 @@ final class WindowTracker {
             }
             guard none else { continue }
             var p = w
-            p.kind = .popup
+            // A sheet is the app asking something of that window: a dialog of it (desktops
+            // keep a modal dialog over its window; GNOME attaches it like a sheet), not a
+            // popover, which a tiler may never show while its window is still being set up.
+            p.kind = sheetSeen[wid] == true ? .dialog : .popup
             popups.append(p)
             seen[wid] = nil
             order.removeAll { $0 == wid }
@@ -366,7 +375,7 @@ final class WindowTracker {
             }
         }
         let appWindows = Array(seen.values)
-        for i in popups.indices where popups[i].kind == .dialog && popups[i].title.isEmpty {
+        for i in popups.indices where popups[i].kind == .dialog && popups[i].title.isEmpty && sheetSeen[popups[i].wid] != true {
             let p = popups[i]
             if appWindows.contains(where: { $0.pid == p.pid && $0.frame.intersects(p.frame) }) {
                 popups[i].kind = .popup
@@ -416,6 +425,7 @@ final class WindowTracker {
         closing = closing.filter { id in popups.contains { $0.wid == id } }
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         noButtonsSeen = noButtonsSeen.filter { live.contains($0.key) }
+        sheetSeen = sheetSeen.filter { live.contains($0.key) }
         for (wid, old) in windows where seen[wid] == nil {
 
             windows[wid] = nil

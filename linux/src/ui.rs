@@ -920,9 +920,24 @@ impl App {
                 if let Some(d) = &self.dialog_mgr {
                     d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
                 }
+                // A dialog of one of its app's windows (a "Save changes?" sheet): its parent
+                // here too, so the desktop keeps it over that window (GNOME attaches it to it
+                // like a sheet) instead of at the spot it had on the Mac's screen.
+                // Only one lying inside that window on the Mac: a reminder or a video's floating
+                // panel keeps its own place.
+                let parent = self.windows.get(&info.parent).filter(|p| {
+                    info.rel_x >= -1.0 && info.rel_y >= -1.0
+                        && info.rel_x + info.w <= p.info.w + 1.0 && info.rel_y + info.h <= p.info.h + 1.0
+                }).and_then(|p| match &p.role {
+                    Role::Toplevel(t) => Some(t.xdg_toplevel().clone()),
+                    _ => None,
+                });
+                if let Some(p) = &parent {
+                    window.xdg_toplevel().set_parent(Some(p));
+                }
                 floated_now = true;
                 fixed_spot = spot;
-                if let Some(spot) = spot {
+                if let (Some(spot), None) = (spot, &parent) {
                     crate::desktop::place_at_spot(
                         format!("sweeflow-{}", info.bundle_id),
                         display_title(&info.app_name, &info.title),
@@ -2929,7 +2944,7 @@ impl PopupHandler for App {
 
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
         // The compositor dismissed it; the Mac decides when menus really close.
-        let _ = popup;
+        log::info!("popup {:?}: dismissed by the desktop", self.wid_for(popup.wl_surface()));
     }
 }
 
