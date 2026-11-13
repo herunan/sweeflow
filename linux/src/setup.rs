@@ -613,7 +613,8 @@ fn plasma_action_key(k: &StreamKey, remapped: bool) -> Result<OpenKey> {
     }
     // KDE's app database has to know the entry's actions first.
     let _ = Command::new("kbuildsycoca6").stdout(Stdio::null()).stderr(Stdio::null()).status();
-    let id = [LAUNCHER, k.id, "Sweeflow", k.name];
+    // A string list (as), not four strings: a Vec, which zvariant sends as an array.
+    let id: Vec<&str> = vec![LAUNCHER, k.id, "Sweeflow", k.name];
     let told = || -> zbus::Result<bool> {
         kglobalaccel(&bus, "doRegister", &(&id,))?;
         kglobalaccel(&bus, "setForeignShortcutKeys", &(&id, vec![&key]))?;
@@ -859,11 +860,20 @@ pub(crate) fn gnome_bindings() -> [Option<String>; 3] {
 pub(crate) fn plasma_bindings() -> [Option<crate::keys::Key>; 3] {
     let Ok(bus) = zbus::blocking::Connection::session() else { return Default::default() };
     let keys_of = |component: &str, action: &str| -> Option<crate::keys::Key> {
-        let id = [component, action, "", ""];
+        let id: Vec<&str> = vec![component, action, "", ""];
         let keys: Vec<(Vec<i32>,)> = kglobalaccel(&bus, "shortcutKeys", &(&id,)).ok()?.body().deserialize().ok()?;
         keys.into_iter().find_map(|k| k.0.first().copied().filter(|&c| c != 0)).and_then(crate::keys::Key::from_qt)
     };
-    let widgets = plasma_widgets().unwrap_or_default();
+    // The widgets come from a script in Plasma's shell: asked at most every 5 minutes (each
+    // script is work for plasmashell, and this is read every few seconds).
+    static WIDGETS: std::sync::Mutex<Option<(std::time::Instant, Vec<(i64, String, String)>)>> = std::sync::Mutex::new(None);
+    let widgets = {
+        let mut cache = WIDGETS.lock().unwrap();
+        if !cache.as_ref().is_some_and(|c| c.0.elapsed() < std::time::Duration::from_secs(300)) {
+            *cache = Some((std::time::Instant::now(), plasma_widgets().unwrap_or_default()));
+        }
+        cache.as_ref().map(|c| c.1.clone()).unwrap_or_default()
+    };
     let open = main_widget(&widgets).and_then(|(_, id, text)| {
         // Its config's key as the fallback, for a shell that hasn't registered it yet.
         keys_of("plasmashell", &widget_action(id)).or_else(|| crate::keys::Key::from_qt_text(text))

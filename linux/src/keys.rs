@@ -1,5 +1,5 @@
 //! The keys the desktop has now for Sweeflow's shortcuts (open, pause or resume, stop or
-//! start), for the tray menu and the panels to show: `sweeflow install` sets Cmd+Opt+O / P / K
+//! start), for the tray menu and the panels to show: `sweeflow install` sets Cmd+Opt+O / P / X
 //! (setup.rs, hyprland.rs), and the user may have changed or removed them since in the
 //! desktop's own settings. Read off the caller's thread, at most every few seconds.
 
@@ -117,7 +117,7 @@ pub struct Keys {
 }
 
 impl Keys {
-    /// What `sweeflow install` sets (Cmd+Opt+O / P / K): shown until the desktop has been asked.
+    /// What `sweeflow install` sets (Cmd+Opt+O / P / X): shown until the desktop has been asked.
     fn defaults(remapped: bool) -> Keys {
         Keys { open: Some(Key::cmd_opt('O', remapped)), pause: Some(Key::cmd_opt('P', remapped)), stop: Some(Key::cmd_opt('X', remapped)) }
     }
