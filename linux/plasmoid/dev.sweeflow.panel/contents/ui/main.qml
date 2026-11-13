@@ -68,6 +68,10 @@ PlasmoidItem {
     // What can be done about the Mac in use (Do actions), as the client lists it: pause and stop
     // while streaming, resume and stop while paused, start while stopped, stop while waiting.
     readonly property var streamActions: actionsKey === "" ? [] : actionsKey.split(",")
+    // The Mac is streaming to another computer: Start is shown but can't be chosen until it's
+    // stopped there.
+    readonly property string elsewhere: st.elsewhere || ""
+    readonly property bool canStart: st.canStart !== false
     readonly property string appsJson: JSON.stringify(st.apps || [])
     readonly property var allApps: JSON.parse(appsJson)
     readonly property string macsJson: JSON.stringify((st.macs || []).map(m => ({
@@ -240,10 +244,13 @@ PlasmoidItem {
                     model: root.streamActions
                     delegate: SignButton {
                         required property string modelData
+                        readonly property bool blocked: modelData === "start" && !root.canStart
                         icon.name: root.actionIcons[modelData] || ""
                         text: root.actionLabels[modelData] || modelData
-                        tip: root.actionTips[modelData] || text
-                        onClicked: root.act(modelData)
+                        tip: blocked ? "Stop streaming on " + root.elsewhere + " first" : (root.actionTips[modelData] || text)
+                        // Faded rather than disabled, so the tip still shows on hover.
+                        opacity: blocked ? 0.45 : 1
+                        onClicked: if (!blocked) root.act(modelData)
                     }
                 }
             }
@@ -566,8 +573,15 @@ PlasmoidItem {
                                             required property string modelData
                                             icon.name: root.actionIcons[modelData] || ""
                                             text: root.actionLabels[modelData] || modelData
-                                            tip: mac.modelData.active ? root.actionTips[modelData] : "Start streaming from this Mac"
-                                            onClicked: mac.modelData.active ? root.act(modelData) : root.act("switch", mac.modelData.fingerprint)
+                                            readonly property bool blocked: mac.modelData.active && modelData === "start" && !root.canStart
+                                            tip: blocked ? "Stop streaming on " + root.elsewhere + " first"
+                                               : mac.modelData.active ? root.actionTips[modelData] : "Start streaming from this Mac"
+                                            opacity: blocked ? 0.45 : 1
+                                            onClicked: {
+                                                if (blocked) return
+                                                if (mac.modelData.active) root.act(modelData)
+                                                else root.act("switch", mac.modelData.fingerprint)
+                                            }
                                         }
                                     }
                                     PlasmaComponents3.ToolButton {

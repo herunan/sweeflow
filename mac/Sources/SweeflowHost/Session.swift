@@ -58,11 +58,32 @@ final class Session {
     /// It said goodbye: leaving on purpose, so no grace period for it to come back.
     private var leaving = false
 
+    /// What the client calls itself (its Hello; empty from older clients).
+    private(set) var clientName = ""
+    /// Asked on hello, before anything is served: may this client have the session? False: it
+    /// has been answered already (Busy).
+    var onHello: ((Session) -> Bool)?
+    /// Hello was answered with the session (and it hasn't been ended since).
+    var serving: Bool { started && !ended }
+    /// Ended (turned away, refused): anything more from the client is ignored while the last
+    /// message gets there.
+    private var ended = false
+    /// When the client last said anything (it pings every 2 s): a connection that went quiet
+    /// is taken to be gone.
+    private var lastHeard = DispatchTime.now()
+    var silentFor: TimeInterval { Double(DispatchTime.now().uptimeNanoseconds - lastHeard.uptimeNanoseconds) / 1e9 }
+
     /// Says something and ends the connection (a moment later, so it gets there).
     func sendAndClose(_ msg: Msg) {
-        control?.send(MsgWriter(msg))
+        sendAndClose(MsgWriter(msg))
+    }
+
+    func sendAndClose(_ w: MsgWriter) {
+        ended = true
+        control?.send(w)
         queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.shutdown() }
     }
+
 
     init(group: NWConnectionGroup, queue: DispatchQueue) {
         self.group = group
@@ -123,6 +144,8 @@ final class Session {
     // MARK: messages
 
     private func handle(_ m: inout MsgReader, on s: MsgStream) throws {
+        lastHeard = .now()
+        guard !ended else { return }
         // Input that comes while a press waits for its window to come to the front (see
         // holdInput) waits too, so it all lands in order.
         if heldInput != nil, [.pointerMove, .pointerButton, .scroll, .key, .releaseAll].contains(m.type) {
@@ -157,6 +180,9 @@ final class Session {
                 log("client \(fp.prefix(8)) was disconnected here: refused")
                 return sendAndClose(.macDisconnected)
             }
+            // Newer clients say their name.
+            clientName = (try? m.str()) ?? ""
+            if let claim = onHello, !claim(self) { return }
             DebugPort.session = self
             if !started {
                 started = true

@@ -64,12 +64,34 @@ final class MsgStream {
     }
 }
 
-/// QUIC listener. Accepts one client session at a time (a new one replaces the old).
+/// What to do with a hello while another client has the session.
+enum Claim: Equatable {
+    /// The one holding it is the same computer (a reconnect) or has gone quiet: replaced silently.
+    case replace
+    /// Another computer: told who has it, and turned away (it checks again now and then). The
+    /// session is only ever let go of from the computer that has it (Stop there), so two
+    /// computers never take the Mac back and forth.
+    case busy
+
+    /// A held session that hasn't been heard from for this long (the client pings every 2 s)
+    /// counts as gone.
+    static let quietFor: TimeInterval = 8
+
+    static func decide(sameComputer: Bool, heldSilentFor: TimeInterval) -> Claim {
+        sameComputer || heldSilentFor >= quietFor ? .replace : .busy
+    }
+}
+
+/// QUIC listener. One client has the session at a time: another one gets it once that one has
+/// stopped (see Claim).
 final class Server {
     let queue = DispatchQueue(label: "sweeflow.net", qos: .userInteractive)
     private let identity: Identity
     private var listener: NWListener?
+    /// The session being served.
     private var session: Session?
+    /// Every connection's session, served or not yet (kept alive here).
+    private var sessions: [ObjectIdentifier: Session] = [:]
     private var groups: [ObjectIdentifier: NWConnectionGroup] = [:]
     /// The client certificate of the latest handshake (one client connects at a time).
     private var lastVerified: String?
@@ -132,20 +154,50 @@ final class Server {
         groups[key] = group
         let s = makeSession(group, queue)
         s.clientFingerprint = lastVerified
+        sessions[key] = s
+        s.onHello = { [weak self] s in self?.claim(s) ?? true }
         group.stateUpdateHandler = { [weak self, weak s] state in
             log("connection: \(state)")
             switch state {
             case .failed, .cancelled:
                 s?.shutdown()
                 self?.groups[key] = nil
+                self?.sessions[key] = nil
                 if self?.session === s { self?.session = nil }
             default: break
             }
         }
         group.newConnectionHandler = { [weak s] conn in s?.addStream(conn) }
-        session?.shutdown()
-        session = s
         group.start(queue: queue)
+    }
+
+    /// A client said hello: it gets the session, or is told who has it (see Claim).
+    private func claim(_ s: Session) -> Bool {
+        guard let held = session, held !== s, held.serving else {
+            session = s
+            return true
+        }
+        // The certificate alone doesn't tell computers apart (one can be copied to another).
+        let same = held.clientFingerprint == s.clientFingerprint && held.clientName == s.clientName
+        switch Claim.decide(sameComputer: same, heldSilentFor: held.silentFor) {
+        case .replace:
+            log("client replaces its earlier connection")
+            held.shutdown()
+        case .busy:
+            log("\(Self.name(of: s)) connected while \(Self.name(of: held)) has the session: busy")
+            var w = MsgWriter(.busy)
+            w.str(Self.name(of: held))
+            s.sendAndClose(w)
+            return false
+        }
+        session = s
+        return true
+    }
+
+    /// A client as the other one is told about it: what it calls itself, else its name here.
+    private static func name(of s: Session) -> String {
+        if !s.clientName.isEmpty { return s.clientName }
+        return s.clientFingerprint.map(Identity.clientName) ?? "another computer"
     }
 }
 

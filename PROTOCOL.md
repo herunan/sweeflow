@@ -22,11 +22,12 @@ The first bidirectional stream the client opens. Carries everything except video
 
 | type | dir | name | payload |
 |------|-----|------|---------|
-| 0x01 | C→S | Hello | u16 version, f32 clientScale, f32 captureScale (0 = window's native backing scale) |
+| 0x01 | C→S | Hello | u16 version, f32 clientScale, f32 captureScale (0 = window's native backing scale), str computerName (newer clients; see One computer at a time) |
 | 0x02 | S→C | Welcome | u16 version, str hostName, str kind ("laptop", "imac", "desktop"; newer hosts) |
 | 0x03 | S→C | MacDisconnected | — the Mac disconnected this client (its menu); refused until connected there again |
 | 0x05 | C→S | Goodbye | — leaving on purpose (switching Macs, disconnecting, quitting): the Mac tidies up at once |
 | 0x04 | S→C | Forgotten | — the Mac forgot this client; it forgets the Mac too |
+| 0x06 | S→C | Busy | str computerName — the host is streaming to that computer: this one is turned away (closed half a second later; what it sends meanwhile is ignored) |
 | 0x10 | S→C | WindowAdded | u32 wid, i32 pid, str bundleId, str appName, str title, f32 w, f32 h, u32 parent, f32 relX, f32 relY, u8 kind |
 | 0x11 | S→C | WindowChanged | u32 wid, str title, f32 w, f32 h, f32 relX, f32 relY |
 | 0x12 | S→C | WindowRemoved | u32 wid |
@@ -73,6 +74,24 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x4B | C→S | DragDropLocal | u32 wid, f32 x, f32 y — a drag out of a Mac window was dropped on another Mac window: drop the dragged files there |
 | 0x43 | C→S | ClipboardSubscribe | — (opens the clipboard stream, a new bidirectional stream) |
 | 0x41 | both | Ping | u64 t (echoed back unchanged as Pong 0x42) |
+
+### One computer at a time
+
+The host serves one client's session, and only the client being served lets go of it (Stop
+there, quitting, or its connection dropping). A hello from another client while one is served:
+
+- the same computer reconnecting (same certificate fingerprint and same `computerName`; a
+  certificate alone doesn't tell computers apart, as one can be copied), or a served client the
+  host hasn't heard from for 8 s (clients ping every 2 s): the old connection is closed and the
+  new one served;
+- any other: Busy, naming the computer served, and nothing else. The served computer doesn't
+  notice.
+
+A client told Busy shows "In use by ‹computerName›" with Start unavailable ("Stop streaming on
+‹computerName› first"), and looks again with a fresh hello after 5 s, 10 s, 20 s, then every
+30 s; once it is let in it streams (unless Stop was chosen there meanwhile). Older clients (no
+`computerName`) are turned away the same way and just see the connection close. A host older
+than Busy replaces the session on every new connection.
 
 `kind`: 0 = normal toplevel, 1 = popup/menu (child of `parent`), 2 = sheet/dialog, 3 = the Mac display view.
 
