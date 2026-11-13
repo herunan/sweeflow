@@ -188,43 +188,63 @@ pub fn watch_tiling() {
 }
 
 /// A Mac window's tile is smaller than its app allows (`min`, logical px; 0: no limit that
-/// way): its split is moved until the tile is that big, the way dragging the divider would. If
-/// the layout can't give it that (other tiles in the way, a layout without splits), it floats
-/// at that size, centred, instead: nothing is scaled or cut off for long. Hyprland ignores a
-/// tiled window's own minimum size, so this is how the minimum holds.
+/// way): its split is moved until the tile is that big, the way dragging the divider would.
+/// Hyprland ignores a tiled window's own minimum size, so this is how the minimum holds. A grow
+/// can take more than one step (the split that moves may give only part of it): tried a few
+/// times. Where the layout has no room for it, the window keeps what it got (its picture shows
+/// 1:1 from its corner, the rest cut off), rather than jumping out of the tiling.
 pub fn hold_tile(class: String, title: String, min: (u32, u32)) {
     std::thread::spawn(move || {
-        let Some((address, size)) = find(&class, &title) else { return };
-        let (dx, dy) = (min.0.saturating_sub(size.0), min.1.saturating_sub(size.1));
-        if dx == 0 && dy == 0 {
-            return;
+        for _ in 0..4 {
+            let Some(found) = find(&class, &title) else { return };
+            let (size, (at_right, at_bottom)) = (found.size, found.edges);
+            let (dx, dy) = (min.0.saturating_sub(size.0) as i64, min.1.saturating_sub(size.1) as i64);
+            if dx <= 2 && dy <= 2 {
+                return;
+            }
+            // A relative resize moves the shared divider towards +x / +y, whichever side the
+            // window is on: one on the right (or bottom) of its split grows the other way.
+            let (dx, dy) = (if at_right { -dx } else { dx }, if at_bottom { -dy } else { dy });
+            let address = found.address;
+            lua(&format!(r#"hl.dsp.window.resize({{ x = {dx}, y = {dy}, relative = true, window = "address:{address}" }})"#));
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        let window = format!("address:{address}");
-        lua(&format!(r#"hl.dsp.window.resize({{ x = {dx}, y = {dy}, relative = true, window = "{window}" }})"#));
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let Some((_, now)) = find(&class, &title) else { return };
-        if now.0 + 2 >= min.0 && now.1 + 2 >= min.1 {
-            log::info!("{class}: its tile grown to {}x{} (the app goes no smaller than {}x{})", now.0, now.1, min.0, min.1);
-            return;
+        if let Some(f) = find(&class, &title) {
+            log::info!("{class}: its tile is {}x{}, the app goes no smaller than {}x{}", f.size.0, f.size.1, min.0, min.1);
         }
-        // No room in the layout: floating at its own size.
-        let (w, h) = (min.0.max(now.0), min.1.max(now.1));
-        log::info!("{class}: no room for {}x{} in its tile ({}x{}): floating it", min.0, min.1, now.0, now.1);
-        lua(&format!(r#"hl.dsp.window.float({{ action = "enable", window = "{window}" }})"#));
-        lua(&format!(r#"hl.dsp.window.resize({{ x = {w}, y = {h}, window = "{window}" }})"#));
-        lua(&format!(r#"hl.dsp.window.center({{ window = "{window}" }})"#));
     });
 }
 
-/// This process's window of that class (and title, if several share it): its address and size.
-fn find(class: &str, title: &str) -> Option<(String, (u32, u32))> {
-    let out = Command::new("hyprctl").args(["-j", "clients"]).output().ok()?;
-    let serde_json::Value::Array(clients) = serde_json::from_slice(&out.stdout).ok()? else { return None };
+/// One of this process's windows as Hyprland has it.
+struct Found {
+    address: String,
+    size: (u32, u32),
+    /// It reaches the right, and the bottom, of its monitor's usable area (so it's on the far
+    /// side of the split it shares).
+    edges: (bool, bool),
+}
+
+/// This process's window of that class (and title, if several share it).
+fn find(class: &str, title: &str) -> Option<Found> {
+    let json = |args: &[&str]| -> Option<serde_json::Value> {
+        serde_json::from_slice(&Command::new("hyprctl").args(args).output().ok()?.stdout).ok()
+    };
+    let serde_json::Value::Array(clients) = json(&["-j", "clients"])? else { return None };
     let pid = u64::from(std::process::id());
     let ours: Vec<_> = clients.iter().filter(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class)).collect();
     let c = ours.iter().find(|c| c["title"].as_str() == Some(title)).or(ours.first())?;
-    let size = (c["size"][0].as_u64()? as u32, c["size"][1].as_u64()? as u32);
-    Some((c["address"].as_str()?.to_string(), size))
+    let n = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
+    let (x, y, w, h) = (n(&c["at"][0]), n(&c["at"][1]), n(&c["size"][0]), n(&c["size"][1]));
+    let edges = json(&["-j", "monitors"])
+        .and_then(|m| m.as_array()?.iter().find(|m| m["id"] == c["monitor"]).cloned())
+        .map_or((false, false), |m| {
+            let scale = n(&m["scale"]).max(0.1);
+            let right = n(&m["x"]) + n(&m["width"]) / scale - n(&m["reserved"][2]);
+            let bottom = n(&m["y"]) + n(&m["height"]) / scale - n(&m["reserved"][3]);
+            // Within the outer gap of the edge.
+            (x + w >= right - 40.0, y + h >= bottom - 40.0)
+        });
+    Some(Found { address: c["address"].as_str()?.to_string(), size: (w as u32, h as u32), edges })
 }
 
 /// Runs one of Hyprland's Lua dispatchers.

@@ -263,6 +263,9 @@ struct Win {
     /// bigger than its Hyprland tile twice; 0: none known that way). The tile is held at least
     /// this big (hyprland::hold_tile).
     app_min: (u32, u32),
+    /// When its tile was last grown (hold_tile): a few in a row at most, so two windows whose
+    /// minimums don't both fit don't take the room back and forth for ever.
+    holds: std::collections::VecDeque<Instant>,
 }
 
 impl Win {
@@ -926,6 +929,7 @@ impl App {
                 settling: None,
                 shown_told: None,
                 app_min: (0, 0),
+                holds: Default::default(),
                 popup_settled: false,
             },
         );
@@ -1041,10 +1045,15 @@ impl App {
     }
 
     /// The window's tile is smaller than its app allows: grown (or the window floated).
-    fn hold_tile(w: &Win) {
+    fn hold_tile(w: &mut Win) {
         if w.app_min == (0, 0) {
             return;
         }
+        w.holds.retain(|t| t.elapsed() < Duration::from_secs(10));
+        if w.holds.len() >= 3 {
+            return;
+        }
+        w.holds.push_back(Instant::now());
         let class = format!("sweeflow-{}", w.info.bundle_id);
         crate::hyprland::hold_tile(class, display_title(&w.info.app_name, &w.info.title), w.app_min);
     }
