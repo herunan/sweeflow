@@ -220,6 +220,7 @@ final class Session {
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
+            st.badgeAbsent = { [weak tracker] in tracker?.badgeAbsent(wid) ?? false }
             st.visibleSize = requestedSizes[wid]
             st.displayScale = { [weak tracker] in
                 if settings.config.quality == "light" { return 1 }
@@ -1238,12 +1239,67 @@ final class Session {
     private var buttonLookups: Set<UInt32> = []
     private var buttonsAgain: Set<UInt32> = []
 
+    /// Apps that place their buttons themselves (Tauri- and Electron-style title bars) get them
+    /// put back at the standard place by AppKit whenever it lays the title bar out again, and
+    /// move them down again with their next drawing. Asked in between, such a window gives the
+    /// standard place, higher up, and can stay there while nothing redraws it: Linux then drew
+    /// the buttons too high. So a window whose buttons went to a place and straight back (same
+    /// sizes and spacing, within a few seconds) keeps them at the lower of the two from then
+    /// on, which is where the app puts them; and the app is remembered for it (across
+    /// restarts), so its windows get the lower place straight away next time.
+    private var buttonHistory: [UInt32: [(at: DispatchTime, rects: [CGRect])]] = [:]
+    private var buttonsKept: [UInt32: [CGRect]] = [:]
+    /// "bundle id|the standard place as reported" → how far down and right the app really has
+    /// its buttons ("dx,dy").
+    private var buttonShifts = UserDefaults.standard.dictionary(forKey: "buttonShifts") as? [String: String] ?? [:]
+
+    private func settledButtons(_ w: TrackedWindow, _ rects: [CGRect]) -> [CGRect] {
+        let wid = w.wid
+        guard rects.count == 3, rects.allSatisfy({ $0.width > 0 }) else { return rects }
+        func sameShape(_ a: [CGRect], _ b: [CGRect]) -> Bool {
+            a.count == 3 && b.count == 3 && zip(a, b).allSatisfy { $0.size == $1.size }
+                && abs((a[1].minX - a[0].minX) - (b[1].minX - b[0].minX)) < 0.5
+        }
+        func key(_ r: [CGRect]) -> String {
+            w.bundleId + "|" + r.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" }.joined(separator: " ")
+        }
+        // Known from before: this app's buttons, reported at the standard place.
+        if let shift = buttonShifts[key(rects)]?.split(separator: ",").compactMap({ Double($0) }), shift.count == 2 {
+            return rects.map { $0.offsetBy(dx: shift[0], dy: shift[1]) }
+        }
+        if let kept = buttonsKept[wid] {
+            if sameShape(kept, rects) {
+                if rects[0].minY > kept[0].minY { buttonsKept[wid] = rects; return rects }
+                return kept
+            }
+            // Other buttons altogether (another title bar style): start over.
+            buttonsKept[wid] = nil
+            buttonHistory[wid] = nil
+        }
+        var history = buttonHistory[wid] ?? []
+        if history.last?.rects != rects { history.append((.now(), rects)) }
+        history = Array(history.suffix(3))
+        buttonHistory[wid] = history
+        if history.count == 3, history[0].rects == history[2].rects, sameShape(history[0].rects, history[1].rects),
+           history[2].at.uptimeNanoseconds - history[0].at.uptimeNanoseconds < 5_000_000_000 {
+            let (a, b) = (history[0].rects, history[1].rects)
+            let (lower, higher) = a[0].minY >= b[0].minY ? (a, b) : (b, a)
+            buttonsKept[wid] = lower
+            buttonShifts[key(higher)] = "\(lower[0].minX - higher[0].minX),\(lower[0].minY - higher[0].minY)"
+            UserDefaults.standard.set(buttonShifts, forKey: "buttonShifts")
+            log("window \(wid) (\(w.appName)): its buttons went to a place and straight back: kept at the lower one, and remembered for the app")
+            return lower
+        }
+        return rects
+    }
+
     private func applyButtons(_ w: TrackedWindow, _ rects: [CGRect]) {
         guard tracker.windows[w.wid] != nil else { return }
         // A transient failure (window mid-move) must not wipe known-good positions.
         if rects.allSatisfy({ $0 == .zero }), sentButtons[w.wid]?.contains(where: { $0 != .zero }) == true {
             return
         }
+        let rects = settledButtons(w, rects)
         guard sentButtons[w.wid] != rects else { return }
         sentButtons[w.wid] = rects
         for st in streamers.values where st.wid == w.wid { st.buttons = rects }
@@ -1578,6 +1634,8 @@ final class Session {
         guard goneWindows.insert(wid).inserted else { return }
         control_.forget(wid)
         sentButtons[wid] = nil
+        buttonHistory[wid] = nil
+        buttonsKept[wid] = nil
         var m = MsgWriter(.windowRemoved); m.u32(wid); control?.send(m)
     }
 
@@ -1616,7 +1674,21 @@ final class Session {
         m.u8(w.kind.rawValue)
         control?.send(m)
         lastFrames[w.wid] = w.frame
+        sendButtonsNowAndSettled(w)
+    }
+
+    /// The window's buttons now, and again shortly. An app that places them itself (an
+    /// Electron-style title bar) puts them back a moment after its window opens or changes
+    /// size; asked right then, it still gives the standard place, higher up, and that was
+    /// where Linux drew them from then on. (A look that finds nothing new sends nothing.)
+    private func sendButtonsNowAndSettled(_ w: TrackedWindow) {
         sendButtons(w)
+        for delay in [0.4, 1.5] {
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, let now = self.tracker.windows[w.wid] else { return }
+                self.sendButtons(now)
+            }
+        }
     }
 
     /// Each window's frame as last sent (sendAdded, sendChanged).
@@ -1638,6 +1710,9 @@ final class Session {
         m.f32(w.rel.x); m.f32(w.rel.y)
         control?.send(m)
         // The buttons sit where they did unless the size changed (each look asks the app).
+        // (Once, not the three looks a new window gets: every look asks the app, on the queue its
+        // resizes wait on, and a relayout changes every window's size at once. Where the app
+        // really keeps its buttons is remembered per app by now, see settledButtons.)
         if last?.size != w.frame.size { sendButtons(w) }
     }
 
