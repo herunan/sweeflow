@@ -266,6 +266,10 @@ struct Win {
     /// When its tile was last grown (hold_tile): a few in a row at most, so two windows whose
     /// minimums don't both fit don't take the room back and forth for ever.
     holds: std::collections::VecDeque<Instant>,
+    /// The tile sizes it was grown from lately. Three grows in a row: it's being taken back
+    /// (another window's minimum needs the same room), so it's left alone at these sizes; a
+    /// tile size not among them (a drag, a window opened or closed) starts afresh.
+    held_from: Vec<(u32, u32)>,
 }
 
 impl Win {
@@ -930,6 +934,7 @@ impl App {
                 shown_told: None,
                 app_min: (0, 0),
                 holds: Default::default(),
+                held_from: Vec::new(),
                 popup_settled: false,
             },
         );
@@ -1049,11 +1054,25 @@ impl App {
         if w.app_min == (0, 0) {
             return;
         }
-        w.holds.retain(|t| t.elapsed() < Duration::from_secs(10));
-        if w.holds.len() >= 3 {
-            return;
+        if w.holds.back().is_some_and(|t| t.elapsed() > Duration::from_secs(30)) {
+            // Grown a while ago, once in a while: not a fight.
+            w.holds.clear();
+            w.held_from.clear();
+        }
+        if !w.held_from.contains(&w.size) {
+            // A layout it wasn't grown from before: a fresh start.
+            if w.holds.len() >= 3 {
+                w.holds.clear();
+                w.held_from.clear();
+            }
+        } else if w.holds.len() >= 3 {
+            return; // taken back each time: no room for both
         }
         w.holds.push_back(Instant::now());
+        w.held_from.push(w.size);
+        if w.holds.len() == 3 {
+            log::info!("window {}: its tile keeps being taken back (no room for both minimums): left as it is", w.info.wid);
+        }
         let class = format!("sweeflow-{}", w.info.bundle_id);
         crate::hyprland::hold_tile(class, display_title(&w.info.app_name, &w.info.title), w.app_min);
     }
