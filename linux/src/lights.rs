@@ -53,10 +53,24 @@ pub fn group_rect(buttons: &[[f32; 4]; 3]) -> Option<[f64; 4]> {
     Some([x0.floor(), y0.floor(), (x1 - x0.floor()).ceil(), (y1 - y0.floor()).ceil()])
 }
 
+/// How big to draw the buttons, against the current macOS ones (1.0). Apps built for an older
+/// macOS keep its smaller buttons (Herdr's are, on the Mac itself), and apps that draw their own
+/// choose a size: all of them sit closer together than today's 23 points. The spacing says the
+/// size: the buttons have always been spaced in proportion.
+pub fn size(buttons: &[[f32; 4]; 3]) -> f64 {
+    const PITCH: f64 = 23.0;
+    let centre = |b: &[f32; 4]| b[0] as f64 + b[2] as f64 / 2.0;
+    let pitch = (centre(&buttons[1]) - centre(&buttons[0])).min(centre(&buttons[2]) - centre(&buttons[1]));
+    if pitch <= 0.0 { 1.0 } else { (pitch / PITCH).clamp(0.6, 1.0) }
+}
+
 /// Renders the group into premultiplied ARGB8888 (wl_shm byte order: B, G, R, A) at the
 /// sprites' native 2x; returns (pixel width, pixel height, pixels).
 pub fn render(buttons: &[[f32; 4]; 3], rect: [f64; 4], st: State) -> (u32, u32, Vec<u8>) {
     let s = SPRITE_SCALE;
+    let k = size(buttons);
+    // The sprite's box at this size.
+    let boxed = ((BOX as f64 * k).round() as usize).max(2);
     let pw = (rect[2] * s).round().max(1.0) as usize;
     let ph = (rect[3] * s).round().max(1.0) as usize;
     let mut out = vec![0u8; pw * ph * 4];
@@ -73,19 +87,37 @@ pub fn render(buttons: &[[f32; 4]; 3], rect: [f64; 4], st: State) -> (u32, u32, 
         };
         let cx = ((b[0] as f64 + b[2] as f64 / 2.0 - rect[0]) * s).round() as isize;
         let cy = ((b[1] as f64 + b[3] as f64 / 2.0 - rect[1]) * s).round() as isize;
-        let (ox, oy) = (cx - BOX as isize / 2, cy - BOX as isize / 2);
-        for y in 0..BOX {
+        let (ox, oy) = (cx - boxed as isize / 2, cy - boxed as isize / 2);
+        let sprite = |x: usize, y: usize| -> [u8; 4] {
+            let si = ((row * BOX + y) * sh.w + i * BOX + x) * 4;
+            [sh.rgba[si], sh.rgba[si + 1], sh.rgba[si + 2], sh.rgba[si + 3]]
+        };
+        for y in 0..boxed {
             let dy = oy + y as isize;
             if dy < 0 || dy >= ph as isize {
                 continue;
             }
-            for x in 0..BOX {
+            for x in 0..boxed {
                 let dx = ox + x as isize;
                 if dx < 0 || dx >= pw as isize {
                     continue;
                 }
-                let si = ((row * BOX + y) * sh.w + i * BOX + x) * 4;
-                let [r, g, bl, a] = [sh.rgba[si], sh.rgba[si + 1], sh.rgba[si + 2], sh.rgba[si + 3]];
+                let [r, g, bl, a] = if boxed == BOX {
+                    sprite(x, y)
+                } else {
+                    // A smaller button: each pixel between its four neighbours in the sprite
+                    // (premultiplied, so they mix as they are).
+                    let (fx, fy) = ((x as f64 + 0.5) / k - 0.5, (y as f64 + 0.5) / k - 0.5);
+                    let (x0, y0) = (fx.floor().clamp(0.0, BOX as f64 - 1.0) as usize, fy.floor().clamp(0.0, BOX as f64 - 1.0) as usize);
+                    let (x1, y1) = ((x0 + 1).min(BOX - 1), (y0 + 1).min(BOX - 1));
+                    let (tx, ty) = ((fx - x0 as f64).clamp(0.0, 1.0), (fy - y0 as f64).clamp(0.0, 1.0));
+                    let (p00, p10, p01, p11) = (sprite(x0, y0), sprite(x1, y0), sprite(x0, y1), sprite(x1, y1));
+                    std::array::from_fn(|c| {
+                        let top = p00[c] as f64 * (1.0 - tx) + p10[c] as f64 * tx;
+                        let bottom = p01[c] as f64 * (1.0 - tx) + p11[c] as f64 * tx;
+                        (top * (1.0 - ty) + bottom * ty).round() as u8
+                    })
+                };
                 if a == 0 {
                     continue;
                 }
@@ -111,6 +143,19 @@ mod tests {
     fn renders_all_states() {
         let buttons = [[8.0, 8.0, 16.0, 16.0], [31.0, 8.0, 16.0, 16.0], [54.0, 8.0, 16.0, 16.0]];
         let rect = group_rect(&buttons).unwrap();
+        assert_eq!(size(&buttons), 1.0, "today's spacing: full size");
+        // Herdr's (an older toolkit's buttons, 20 points apart): smaller, as on the Mac.
+        let older = [[13.0, 17.0, 12.0, 14.0], [33.0, 17.0, 12.0, 14.0], [53.0, 17.0, 12.0, 14.0]];
+        assert!((size(&older) - 20.0 / 23.0).abs() < 1e-6);
+        // Spaced tightly (a browser's compact toolbar): smaller still, and a clear gap stays,
+        // nothing drawn half way between the first two.
+        let tight = [[6.0, 9.0, 16.0, 16.0], [23.5, 9.0, 16.0, 16.0], [41.0, 9.0, 16.0, 16.0]];
+        assert!((size(&tight) - 17.5 / 23.0).abs() < 1e-6);
+        let tight_rect = group_rect(&tight).unwrap();
+        let (w, h, px) = render(&tight, tight_rect, State { active: true, hover: false, pressed: None, dark_titlebar: true });
+        assert_eq!(px.len(), (w * h * 4) as usize);
+        let gap_x = ((22.75 - tight_rect[0]) * SPRITE_SCALE) as usize;
+        assert!((0..h as usize).all(|y| px[(y * w as usize + gap_x) * 4 + 3] == 0), "tightly spaced buttons touch");
         let states = [
             State { active: true, hover: false, pressed: None, dark_titlebar: true },
             State { active: true, hover: true, pressed: None, dark_titlebar: true },

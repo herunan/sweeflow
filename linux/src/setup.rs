@@ -174,6 +174,9 @@ pub fn install() -> Result<()> {
     if !run(&["enable", "sweeflow.service"])?.success() {
         bail!("could not enable the sweeflow service");
     }
+    // Before the service starts: a bar that looks an icon up before its file is there (Omarchy's)
+    // keeps showing a placeholder.
+    write_icons(&home)?;
     run(&["restart", "sweeflow.service"])?;
     install_icon_and_widget(&home)?;
     install_mac_dmg(&home)?;
@@ -182,7 +185,7 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
-/// Puts the Mac app's installer where the "Add a Mac" window serves it from (installer.rs).
+/// Puts the Mac app's installer where the "Link a Mac" window serves it from (installer.rs).
 fn install_mac_dmg(home: &std::path::Path) -> Result<()> {
     let Some(dmg) = MAC_DMG else {
         println!("    (no Mac installer in this build: run ./release-mac.sh first to include one)");
@@ -194,7 +197,7 @@ fn install_mac_dmg(home: &std::path::Path) -> Result<()> {
     if std::fs::read(&path).ok().as_deref() != Some(dmg) {
         std::fs::write(&path, dmg)?;
     }
-    println!("    Mac installer ready for \"Add a Mac\" ({} MB)", dmg.len() / 1_000_000);
+    println!("    Mac installer ready for \"Link a Mac\" ({} MB)", dmg.len() / 1_000_000);
     Ok(())
 }
 
@@ -242,6 +245,9 @@ fn append_tar(out: &mut Vec<u8>, path: &str, data: &[u8], mode: u32) {
 
 /// The logo as a plain silhouette in the theme's text colour: the tray widget's.
 const LOGO: &str = include_str!("../../assets/sweeflow.svg");
+/// The logo for trays outside Plasma (GNOME with AppIndicator, Omarchy's bar…): in one colour, so
+/// the bar draws it in its own text colour, as Plasma's widget does.
+const TRAY_ICON: &str = include_str!("../../assets/sweeflow-symbolic.svg");
 /// The app icon (white on a violet rounded square): app menu, Sweeflow's windows.
 const APP_ICON: &str = include_str!("../../assets/sweeflow-app.svg");
 /// The Plasma widgets' files (published path inside ~/.local/share/plasma/plasmoids, contents),
@@ -254,8 +260,8 @@ const WIDGET_FILES: &[(&str, &str)] = &[
     ("dev.sweeflow.panel/contents/icons/sweeflow-tray.svg", LOGO),
     ("dev.sweeflow.panel/contents/icons/sweeflow-app.svg", APP_ICON),
     ("dev.sweeflow.panel/contents/icons/dock.svg", include_str!("../plasmoid/dev.sweeflow.panel/contents/icons/dock.svg")),
-    ("dev.sweeflow.dock/metadata.json", include_str!("../plasmoid/dev.sweeflow.dock/metadata.json")),
-    ("dev.sweeflow.dock/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.dock/contents/ui/main.qml")),
+    ("dev.sweeflow.running/metadata.json", include_str!("../plasmoid/dev.sweeflow.running/metadata.json")),
+    ("dev.sweeflow.running/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.running/contents/ui/main.qml")),
 ];
 
 /// Sweeflow in the app menu: opens it (see `open`). Also how desktops match Sweeflow's own
@@ -291,10 +297,10 @@ fn service_active() -> bool {
 }
 
 /// `sweeflow open`, what the app menu entry runs: installs Sweeflow the first time, starts it if
-/// it isn't running, and shows it: the tray widget's popup, or "Add a Mac" while none is paired.
+/// it isn't running, and shows it: the tray widget's popup, or "Link a Mac" while none is paired.
 pub fn open() -> Result<()> {
     if !service_installed() {
-        // The service opens "Add a Mac" itself when there's no Mac yet.
+        // The service opens "Link a Mac" itself when there's no Mac yet.
         install()?;
     } else if Config::load_or_default()?.host.is_empty() {
         if !service_active() {
@@ -306,6 +312,11 @@ pub fn open() -> Result<()> {
     } else if !service_active() {
         let ok = Command::new("systemctl").args(["--user", "start", "sweeflow"]).status()?.success();
         anyhow::ensure!(ok, "couldn't start sweeflow (see `journalctl --user -u sweeflow`)");
+    }
+    // Without the Plasma widget (GNOME, Hyprland): Sweeflow's own window, which waits for the
+    // client to answer by itself.
+    if !crate::tray::widget_installed() {
+        return crate::panelwin::run();
     }
     // Pop the tray widget open, once the client is there to ask.
     let bus = zbus::blocking::Connection::session()?;
@@ -320,22 +331,61 @@ pub fn open() -> Result<()> {
     }
 }
 
+/// A widget Plasma already has on a panel changed. Plasma keeps running the copy it loaded when
+/// it started (the taskbar icons went without the Sweeflow badge that way, until the next
+/// login), so its shell is restarted: the panels are gone for a second or two, nothing else.
+fn reload_widgets() {
+    let systemctl = |args: &[&str]| Command::new("systemctl").arg("--user").args(args).status().is_ok_and(|s| s.success());
+    if systemctl(&["is-active", "--quiet", "plasma-plasmashell.service"]) {
+        if systemctl(&["restart", "plasma-plasmashell.service"]) {
+            println!("    (Plasma's panels restarted to load the updated Sweeflow widgets)");
+            return;
+        }
+    }
+    println!("    (the Sweeflow widgets were updated: log out and in again to see the changes)");
+}
+
+/// The icons, into the user's icon theme folder: the logo ("sweeflow") and the tray's
+/// ("sweeflow-symbolic").
+fn write_icons(home: &std::path::Path) -> Result<()> {
+    let icons = home.join(".local/share/icons/hicolor/scalable/apps");
+    std::fs::create_dir_all(&icons)?;
+    std::fs::write(icons.join("sweeflow.svg"), APP_ICON)?;
+    let symbolic = home.join(".local/share/icons/hicolor/symbolic/apps");
+    std::fs::create_dir_all(&symbolic)?;
+    std::fs::write(symbolic.join("sweeflow-symbolic.svg"), TRAY_ICON)?;
+    // Desktops look again at a theme folder when its date changes (a new file deeper in doesn't
+    // change it): what `touch` on it does.
+    if let Ok(f) = std::fs::File::open(home.join(".local/share/icons/hicolor")) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+    Ok(())
+}
+
 /// The logo (icon theme name "sweeflow"), and on Plasma the tray widget (linux/plasmoid), added
 /// to every system tray. Plasma keeps its own copy of the panel config, so the tray is changed
 /// through its scripting interface rather than the file.
 fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
-    let icons = home.join(".local/share/icons/hicolor/scalable/apps");
-    std::fs::create_dir_all(&icons)?;
-    std::fs::write(icons.join("sweeflow.svg"), APP_ICON)?;
+    write_icons(home)?;
     write_launcher(home)?;
     if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") {
         return Ok(());
     }
+    crate::placement::retire_old_choices();
     let plasmoids = home.join(".local/share/plasma/plasmoids");
+    let mut updated = false;
     for (path, contents) in WIDGET_FILES {
         let file = plasmoids.join(path);
         std::fs::create_dir_all(file.parent().context("widget path")?)?;
+        match std::fs::read_to_string(&file) {
+            Ok(old) if old == *contents => continue,
+            Ok(_) => updated = true,
+            Err(_) => {}
+        }
         std::fs::write(file, contents)?;
+    }
+    if updated {
+        reload_widgets();
     }
     let script = r#"panels().forEach(function(p){ p.widgets("org.kde.plasma.systemtray").forEach(function(w){
         w.currentConfigGroup = ["General"];
@@ -349,5 +399,6 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     if !ok {
         println!("    (couldn't add the Sweeflow widget to the system tray: add it from the tray's settings)");
     }
+    crate::placement::first_install();
     Ok(())
 }

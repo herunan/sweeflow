@@ -1,6 +1,6 @@
-//! Where Mac apps show up on the Linux desktop besides their windows: the task manager, the Mac
-//! Dock widget (linux/plasmoid/dev.sweeflow.dock) and the Global Menu bar. KDE Plasma only: a
-//! KWin rule for the task manager, Plasma's scripting interface for panels and widgets.
+//! Where Mac apps show up on the Linux desktop besides their windows: the task manager (with the
+//! widget for apps running with no window, linux/plasmoid/dev.sweeflow.running) and the Global
+//! Menu bar. KDE Plasma only, through its scripting interface for panels and widgets.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -8,6 +8,7 @@ use zbus::blocking::Connection;
 
 const TASKBAR_RULE: &str = "sweeflow-taskbar";
 const DOCK: &str = "dev.sweeflow.dock";
+const RUNNING: &str = "dev.sweeflow.running";
 const APPMENU: &str = "org.kde.plasma.appmenu";
 
 #[derive(Serialize, Clone, Copy, Default, Debug, PartialEq)]
@@ -15,10 +16,6 @@ const APPMENU: &str = "org.kde.plasma.appmenu";
 pub struct Placement {
     /// Plasma is running here (the rest only applies then).
     pub plasma: bool,
-    /// Mac windows listed in the task manager (no rule hiding them).
-    pub taskbar: bool,
-    /// A Mac Dock widget is on some panel.
-    pub dock: bool,
     /// A Global Menu widget is on some panel.
     pub global_menu: bool,
 }
@@ -45,48 +42,85 @@ pub fn query() -> Placement {
     let has = |id: &str| widgets.split(',').any(|w| w.trim() == id);
     Placement {
         plasma: true,
-        taskbar: !crate::desktop::has_rule(TASKBAR_RULE),
-        dock: has(DOCK),
         global_menu: has(APPMENU),
     }
 }
 
-/// Mac windows in the task manager, or not (a KWin rule skipping it for them; the Mac display
-/// view stays, like any window you opened yourself).
-pub fn set_taskbar(on: bool) -> Result<()> {
+/// The Mac apps running with no window here, which the task manager can't list (it only knows
+/// windows and pinned apps): a widget right after each task manager's tasks, drawn like them.
+/// The task manager stops filling the panel and the widget takes the free room instead, its
+/// icons at its start: so they follow the tasks, with no gap. The task manager's old setting is
+/// kept in the widget's own config, and put back when switched off. (No panel properties are
+/// read: on a panel whose screen is unplugged some of them crash plasmashell.)
+pub fn set_running(on: bool) -> Result<()> {
     if on {
-        crate::desktop::set_rule(TASKBAR_RULE, None)
+        plasma(&format!(
+            "panels().forEach(function(p){{\n\
+               if (p.widgets('{RUNNING}').length) return;\n\
+               p.widgets().filter(function(w){{ return w.type == 'org.kde.plasma.icontasks' || w.type == 'org.kde.plasma.taskmanager'; }})\n\
+                 .forEach(function(t){{\n\
+                   t.currentConfigGroup = ['General'];\n\
+                   var fill = t.readConfig('fill', true);\n\
+                   var w = p.addWidget('{RUNNING}'); w.index = t.index + 1;\n\
+                   w.currentConfigGroup = ['General'];\n\
+                   w.writeConfig('taskManager', String(t.id)); w.writeConfig('restoreFill', String(fill));\n\
+                   w.reloadConfig();\n\
+                   t.writeConfig('fill', false); t.reloadConfig();\n\
+                 }});\n\
+             }});"
+        ))?;
     } else {
-        crate::desktop::set_rule(
-            TASKBAR_RULE,
-            Some(&[
-                ("Description", "Mac apps out of the task manager (sweeflow)"),
-                ("wmclass", "^sweeflow-(?!display$)"),
-                ("wmclassmatch", "3"),
-                ("wmclasscomplete", "false"),
-                ("skiptaskbar", "true"),
-                ("skiptaskbarrule", "2"),
-            ]),
-        )
+        plasma(&format!(
+            "panels().forEach(function(p){{ p.widgets('{RUNNING}').forEach(function(w){{\n\
+               w.currentConfigGroup = ['General'];\n\
+               var tm = w.readConfig('taskManager', ''), fill = w.readConfig('restoreFill', '');\n\
+               p.widgets().forEach(function(o){{\n\
+                 if (String(o.id) == String(tm) && fill !== '') {{ o.currentConfigGroup = ['General']; o.writeConfig('fill', String(fill) != 'false'); o.reloadConfig(); }}\n\
+               }});\n\
+               w.remove();\n\
+             }}); }});"
+        ))?;
     }
-}
-
-/// Adds the Mac Dock: a floating dock panel of its own at the bottom, centred, which gets out of
-/// the way when a window comes near it.
-pub fn add_dock() -> Result<()> {
-    let out = plasma(&format!(
-        "var p = new Panel('org.kde.panel');\n\
-         p.location = 'bottom'; p.height = 64; p.lengthMode = 'fit'; p.alignment = 'center';\n\
-         p.floating = true; p.hiding = 'dodgewindows';\n\
-         p.addWidget('{DOCK}');\n\
-         print('ok');"
-    ))?;
-    anyhow::ensure!(out.contains("ok"), "couldn't add the Mac Dock: {out}");
     Ok(())
 }
 
-/// Removes every Mac Dock, and any panel left with nothing else on it.
-pub fn remove_dock() -> Result<()> {
+/// On the first install (a marker in the config dir says it's been done), the widget for Mac
+/// apps with no window, unless Mac apps are kept out of the task manager. Only once: removed by
+/// hand, it stays removed.
+pub fn first_install() {
+    let marker = crate::config::dir().join("running-widget-added");
+    if marker.exists() || crate::desktop::has_rule(TASKBAR_RULE) {
+        return;
+    }
+    match set_running(true) {
+        Ok(()) => {
+            let _ = std::fs::create_dir_all(crate::config::dir());
+            let _ = std::fs::write(marker, "");
+        }
+        Err(e) => println!("    (couldn't add the widget for Mac apps with no window: {e:#})"),
+    }
+}
+
+/// The Mac Dock widget is gone (Mac apps are in the task manager, and that's it): takes every
+/// one left from before off the panels (and any panel left with nothing else on it), and its
+/// files out of Plasma's widgets. Mac windows are put back in the task manager too, for anyone
+/// who had switched that off, and the own-desktop rule goes: neither exists any more.
+pub fn retire_old_choices() {
+    crate::desktop::retire_own_desktop();
+    if let Err(e) = remove_dock() {
+        log::debug!("removing the Mac Dock: {e:#}");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&home).join(".local/share/plasma/plasmoids").join(DOCK));
+    }
+    if crate::desktop::has_rule(TASKBAR_RULE) {
+        if let Err(e) = set_running(true).and_then(|()| crate::desktop::set_rule(TASKBAR_RULE, None)) {
+            log::warn!("putting Mac windows back in the task manager: {e:#}");
+        }
+    }
+}
+
+fn remove_dock() -> Result<()> {
     plasma(&format!(
         "panels().forEach(function(p){{\n\
            var docks = p.widgets('{DOCK}');\n\

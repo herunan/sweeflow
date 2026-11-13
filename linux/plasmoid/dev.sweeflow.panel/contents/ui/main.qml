@@ -1,7 +1,7 @@
 // The Sweeflow tray widget: the client's state over D-Bus (src/panel.rs), shown as a popup.
 //
-// Layout: the header says where things stand and holds every connection control (Pause /
-// Resume, Wake, Connect, Disconnect); below, three tabs: Options (every setting, in sections),
+// Layout: the header says where things stand and holds its actions (Pause / Resume, Start,
+// Stop); below, three tabs: Options (every setting, in sections),
 // Linked Macs and Apps. Settings can always be changed: with the Mac away the
 // client keeps them and applies them once it's back.
 
@@ -45,10 +45,13 @@ PlasmoidItem {
     }
     readonly property bool paired: running && !!st.paired
     readonly property bool connected: running && !!st.connected
-    readonly property bool offline: running && !!st.offline
+    // Stop was chosen: no connection to the Mac (st.online still says whether it's there).
+    readonly property bool stopped: running && !!st.offline
     // Always there: the Mac's, or (while it's away) the last known with the changes made since.
     readonly property var settings: st.settings || ({ exclude: [] })
     readonly property bool streaming: connected && !!settings.enabled
+    // Connected, but the Mac's screen is locked: its windows are paused until it's unlocked.
+    readonly property bool locked: streaming && !!st.locked
     readonly property string macName: st.mac || "Mac"
     readonly property var placement: st.placement || {}
 
@@ -56,21 +59,17 @@ PlasmoidItem {
     readonly property real showAt: st.showAt || 0
     onShowAtChanged: if (showAt > 0 && Math.abs(Date.now() - showAt) < 10000) root.expanded = true
 
-    // One of: stopped, unpaired, offline, away, streaming, paused.
-    readonly property string phase: !running ? "stopped" : !paired ? "unpaired" : offline ? "offline"
-                                  : !connected ? "away" : settings.enabled ? "streaming" : "paused"
+    // One of: notRunning, unpaired, stopped, away (streaming wanted, the Mac not there), locked,
+    // streaming, paused.
+    readonly property string phase: !running ? "notRunning" : !paired ? "unpaired" : stopped ? "stopped"
+                                  : !connected ? "away" : locked ? "locked" : settings.enabled ? "streaming" : "paused"
 
-    readonly property string statusText: {
-        switch (phase) {
-        case "stopped": return "Not running";
-        case "unpaired": return "No Mac linked yet";
-        case "offline": return "Disconnected";
-        case "away": return st.macRefused ? "Disconnected on the Mac"
-                          : st.pending ? "Can't reach the Mac · changes wait for it" : "Can't reach the Mac";
-        case "streaming": return "Streaming";
-        default: return "Paused";
-        }
-    }
+    // The client words it (the same line as its tray icon and its own window).
+    readonly property string statusText: !running ? "Not running" : !paired ? "No Mac linked yet" : st.status || ""
+    // The streaming actions (Do actions), as they're shown.
+    readonly property var actionLabels: ({ start: "Start", pause: "Pause", resume: "Resume", stop: "Stop" })
+    readonly property var actionIcons: ({ start: "media-playback-start", pause: "media-playback-pause",
+                                          resume: "media-playback-start", stop: "media-playback-stop" })
 
     function call(member, args) {
         DBus.SessionBus.asyncCall({
@@ -96,7 +95,7 @@ PlasmoidItem {
     Plasmoid.icon: logo
     Plasmoid.status: running ? PlasmaCore.Types.ActiveStatus : PlasmaCore.Types.PassiveStatus
     toolTipMainText: "Sweeflow"
-    toolTipSubText: paired ? macName + " · " + statusText : statusText
+    toolTipSubText: statusText
 
     compactRepresentation: MouseArea {
         onClicked: root.expanded = !root.expanded
@@ -109,37 +108,16 @@ PlasmoidItem {
             color: Kirigami.Theme.textColor
             active: parent.containsMouse
             // Paused or away: faded, with a small badge saying which.
-            opacity: root.streaming ? 1 : 0.55
+            opacity: root.streaming && !root.locked ? 1 : 0.55
             Kirigami.Icon {
-                visible: !root.streaming
+                visible: !root.streaming || root.locked
                 anchors { right: parent.right; bottom: parent.bottom }
                 width: parent.width / 2
                 height: width
-                source: root.connected ? "media-playback-paused-symbolic" : "network-disconnect-symbolic"
+                source: root.locked ? "system-lock-screen-symbolic"
+                      : root.connected ? "media-playback-paused-symbolic"
+                      : root.stopped ? "media-playback-stop-symbolic" : "network-disconnect-symbolic"
             }
-        }
-    }
-
-    // A section's start: a dividing line, then its title (small capitals, as Plasma's own
-    // applets title their sections).
-    component Section: ColumnLayout {
-        property alias text: title.text
-        // The first under the tabs: no line of its own.
-        property bool first: false
-        spacing: Kirigami.Units.smallSpacing
-        Layout.fillWidth: true
-        Layout.topMargin: Kirigami.Units.largeSpacing
-        Layout.bottomMargin: Kirigami.Units.smallSpacing
-        Kirigami.Separator { Layout.fillWidth: true; visible: !parent.first }
-        PlasmaComponents3.Label {
-            id: title
-            Layout.leftMargin: Kirigami.Units.largeSpacing
-            Layout.topMargin: Kirigami.Units.smallSpacing
-            font.capitalization: Font.AllUppercase
-            font.weight: Font.DemiBold
-            font.pointSize: Kirigami.Theme.smallFont.pointSize
-            font.letterSpacing: 0.5
-            opacity: 0.6
         }
     }
 
@@ -213,7 +191,9 @@ PlasmoidItem {
                             height: width
                             radius: width / 2
                             color: root.phase === "streaming" ? Kirigami.Theme.positiveTextColor
-                                 : root.phase === "paused" ? Kirigami.Theme.neutralTextColor
+                                 : root.phase === "paused" || root.phase === "locked" ? Kirigami.Theme.neutralTextColor
+                                 // Not streaming, but the Mac is there to stream from.
+                                 : root.phase === "stopped" && root.st.online === true ? Kirigami.Theme.neutralTextColor
                                  : Kirigami.Theme.disabledTextColor
                         }
                         PlasmaComponents3.Label {
@@ -225,31 +205,25 @@ PlasmoidItem {
                         }
                     }
                 }
-                // The one thing to do next.
+                // Before there's a Mac to stream from: the one thing to do.
                 PlasmaComponents3.Button {
-                    // Refused by the Mac: nothing to do here (Connect is in the Mac's menu).
-                    visible: !(root.phase === "away" && !!root.st.macRefused)
-                    icon.name: ({ stopped: "media-playback-start", unpaired: "list-add", offline: "network-connect",
-                                  away: "system-reboot", streaming: "media-playback-pause", paused: "media-playback-start" })[root.phase]
-                    text: ({ stopped: "Start", unpaired: "Link a Mac…", offline: "Connect", away: "Wake Mac",
-                             streaming: "Pause", paused: "Resume" })[root.phase]
-                    onClicked: {
-                        switch (root.phase) {
-                        case "stopped": shell.connectSource("systemctl --user start sweeflow"); break;
-                        case "unpaired": root.act("pair"); break;
-                        case "offline": root.act("connect"); break;
-                        case "away": root.act("wake"); break;
-                        default: root.set({ enabled: !root.streaming });
-                        }
-                    }
+                    visible: root.phase === "notRunning" || root.phase === "unpaired"
+                    icon.name: root.phase === "unpaired" ? "list-add" : "media-playback-start"
+                    text: root.phase === "unpaired" ? "Link a Mac…" : "Start Sweeflow"
+                    onClicked: root.phase === "unpaired" ? root.act("pair") : shell.connectSource("systemctl --user start sweeflow")
                 }
-                // Stops connecting (the Mac's windows close here) without unlinking it.
-                PlasmaComponents3.Button {
-                    visible: ["away", "streaming", "paused"].includes(root.phase)
-                    icon.name: "network-disconnect"
-                    text: "Disconnect"
-                    flat: true
-                    onClicked: root.act("disconnect")
+                // What can be done about the Mac in use, as the client lists it: Pause and Stop
+                // while streaming, Resume and Stop while paused, Start while stopped, Stop while
+                // waiting for the Mac.
+                Repeater {
+                    model: root.paired ? (root.st.actions || []) : []
+                    delegate: PlasmaComponents3.Button {
+                        required property string modelData
+                        icon.name: root.actionIcons[modelData] || ""
+                        text: root.actionLabels[modelData] || modelData
+                        flat: modelData === "stop"
+                        onClicked: root.act(modelData)
+                    }
                 }
             }
         }
@@ -295,30 +269,7 @@ PlasmoidItem {
                     width: parent.width
                     spacing: 0
 
-                    Section { text: "Where Mac apps appear"; first: true }
-                    ToggleRow {
-                        label: "Their own desktop"
-                        hint: "A desktop just for Mac windows"
-                        on: !!root.settings.desktop
-                        onFlipped: (v) => root.set({ desktop: v })
-                        actionText: root.connected ? "Gather" : ""
-                        actionTip: "Bring every Mac window back to the Mac desktop"
-                        onExtraClicked: root.act("gather")
-                    }
-                    ToggleRow {
-                        visible: !!root.placement.plasma
-                        label: "Task Manager"
-                        hint: "Mac apps listed with your Linux apps in the taskbar"
-                        on: !!root.placement.taskbar
-                        onFlipped: (v) => root.act("taskbar", v ? "on" : "off")
-                    }
-                    ToggleRow {
-                        visible: !!root.placement.plasma
-                        label: "Mac Dock"
-                        hint: "A dock of Mac apps, with window previews"
-                        on: !!root.placement.dock
-                        onFlipped: (v) => root.act("dock", v ? "own" : "off")
-                    }
+                    Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                     ToggleRow {
                         visible: !!root.placement.plasma
                         label: "Global Menu"
@@ -328,12 +279,16 @@ PlasmoidItem {
                     }
                     ToggleRow {
                         label: "Application launcher"
-                        hint: "Mac apps in the app menu, alongside your Linux apps"
+                        hint: "Mac apps in the app launcher, alongside your Linux apps"
                         on: !!root.settings.launcher
                         onFlipped: (v) => root.set({ launcher: v })
                     }
-
-                    Section { text: "Streaming" }
+                    ToggleRow {
+                        label: "Square window corners"
+                        hint: "Mac windows end in square corners instead of the Mac's rounded ones"
+                        on: !!root.st.square
+                        onFlipped: (v) => root.act("square", v ? "on" : "off")
+                    }
                     Repeater {
                         model: [
                             { key: "sound", label: "Play Mac sound here", hint: "Mac audio plays on Linux" },
@@ -408,12 +363,14 @@ PlasmoidItem {
                             name: modelData.name
                             active: modelData.active
                             kind: modelData.kind || ""
-                            offline: root.offline
-                            onConnectAsked: root.act("connect")
-                            onDisconnectAsked: root.act("disconnect")
-                            onActivated: root.act("switch", modelData.fingerprint)
+                            // true, false, or null while not known yet.
+                            online: modelData.online === undefined ? null : modelData.online
+                            // The Mac in use: its state's actions; another: Start (switches to it).
+                            actions: modelData.active ? (root.st.actions || []) : ["start"]
+                            actionLabels: root.actionLabels
+                            onActionAsked: (action) => modelData.active ? root.act(action) : root.act("switch", modelData.fingerprint)
                             onRenamed: (n) => root.rename(modelData.fingerprint, n)
-                            onForgotten: root.act("forget", modelData.fingerprint)
+                            onUnlinked: root.act("forget", modelData.fingerprint)
                         }
                     }
                 }
@@ -482,7 +439,7 @@ PlasmoidItem {
                                         icon.name: appRow.modelData.pinned ? "window-unpin" : "window-pin"
                                         opacity: appRow.modelData.pinned || hovered ? 1 : 0.35
                                         onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
-                                        PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin" : "First here, and kept in the Mac Dock"
+                                        PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin" : "Pin: first in this list"
                                         PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }

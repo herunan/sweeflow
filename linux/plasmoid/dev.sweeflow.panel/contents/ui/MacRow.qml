@@ -1,5 +1,6 @@
-// A linked Mac: click its name to rename it (in place). The Mac in use has Disconnect (Connect
-// once disconnected), the others Connect (switching to them); every Mac has Forget (asks once).
+// A linked Mac: its name (click it to rename it in place), Online / Not online, its stream
+// actions (for the Mac in use those of its state; for another, Start, which switches to it),
+// Rename, and Unlink last (asks once).
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
@@ -11,15 +12,16 @@ PlasmaComponents3.ItemDelegate {
     /// "laptop", "imac" or "desktop" (Mac mini, Studio, Pro); "" until it has said.
     property string kind
     property bool active
-    /// Disconnected (Disconnect): the Mac in use isn't streaming.
-    property bool offline: false
+    /// Reachable on the network: true, false, or null while not known yet.
+    property var online: null
+    /// Do actions ("start", "pause", "resume", "stop"), in order.
+    property var actions: []
+    property var actionLabels: ({})
     property bool editing: false
     property bool confirming: false
-    signal activated()
+    signal actionAsked(string action)
     signal renamed(string name)
-    signal forgotten()
-    signal connectAsked()
-    signal disconnectAsked()
+    signal unlinked()
 
     // Nothing happens on a stray click on the row: the buttons do things, the name renames.
     hoverEnabled: false
@@ -44,26 +46,37 @@ PlasmaComponents3.ItemDelegate {
             Layout.preferredWidth: Kirigami.Units.iconSizes.medium
             Layout.preferredHeight: Kirigami.Units.iconSizes.medium
         }
-        PlasmaComponents3.Label {
-            id: nameLabel
+        ColumnLayout {
             visible: !row.editing
-            text: row.confirming ? "Forget " + row.name + "? Linking it again needs a new code." : row.name
-            font.bold: row.active && !row.confirming
-            font.underline: nameArea.containsMouse && !row.confirming
-            wrapMode: row.confirming ? Text.Wrap : Text.NoWrap
-            elide: Text.ElideRight
+            spacing: 0
             Layout.fillWidth: true
-            MouseArea {
-                id: nameArea
-                anchors.fill: parent
-                enabled: !row.confirming
-                hoverEnabled: true
-                cursorShape: Qt.IBeamCursor
-                onClicked: row.startEdit()
+            PlasmaComponents3.Label {
+                id: nameLabel
+                text: row.confirming ? "Unlink " + row.name + "? Linking it again needs a new code." : row.name
+                font.bold: row.active && !row.confirming
+                font.underline: nameArea.containsMouse && !row.confirming
+                wrapMode: row.confirming ? Text.Wrap : Text.NoWrap
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+                MouseArea {
+                    id: nameArea
+                    anchors.fill: parent
+                    enabled: !row.confirming
+                    hoverEnabled: true
+                    cursorShape: Qt.IBeamCursor
+                    onClicked: row.startEdit()
+                }
+                PlasmaComponents3.ToolTip.text: "Click to rename"
+                PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
+                PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
             }
-            PlasmaComponents3.ToolTip.text: "Click to rename"
-            PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
-            PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+            // A status, never an action.
+            PlasmaComponents3.Label {
+                visible: !row.confirming && row.online !== null
+                text: row.online ? "Online" : "Not online"
+                font: Kirigami.Theme.smallFont
+                opacity: 0.7
+            }
         }
         PlasmaComponents3.TextField {
             id: field
@@ -73,25 +86,27 @@ PlasmaComponents3.ItemDelegate {
             Keys.onEscapePressed: row.editing = false
             onActiveFocusChanged: if (!activeFocus) row.finishEdit()
         }
-        PlasmaComponents3.ToolButton {
-            visible: !row.editing && !row.confirming && !row.active
-            icon.name: "network-connect"
-            text: "Connect"
-            onClicked: row.activated()
-            PlasmaComponents3.ToolTip.text: "Stream from this Mac instead"
-            PlasmaComponents3.ToolTip.visible: hovered
-            PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+        Repeater {
+            model: !row.editing && !row.confirming ? row.actions : []
+            delegate: PlasmaComponents3.ToolButton {
+                required property string modelData
+                text: row.actionLabels[modelData] || modelData
+                onClicked: row.actionAsked(modelData)
+                PlasmaComponents3.ToolTip.text: row.active ? "" : "Stream from this Mac instead"
+                PlasmaComponents3.ToolTip.visible: hovered && !row.active
+                PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+            }
         }
         PlasmaComponents3.ToolButton {
-            visible: !row.editing && !row.confirming && row.active
-            icon.name: row.offline ? "network-connect" : "network-disconnect"
-            text: row.offline ? "Connect" : "Disconnect"
-            onClicked: row.offline ? row.connectAsked() : row.disconnectAsked()
+            visible: !row.editing && !row.confirming
+            icon.name: "edit-rename"
+            text: "Rename"
+            onClicked: row.startEdit()
         }
         PlasmaComponents3.ToolButton {
             visible: !row.editing && !row.confirming
             icon.name: "edit-delete-remove"
-            text: "Forget"
+            text: "Unlink"
             onClicked: row.confirming = true
             PlasmaComponents3.ToolTip.text: "Unlink this Mac (linking it again needs a new code)"
             PlasmaComponents3.ToolTip.visible: hovered
@@ -106,8 +121,8 @@ PlasmaComponents3.ItemDelegate {
         PlasmaComponents3.ToolButton {
             visible: row.confirming
             icon.name: "edit-delete-remove"
-            text: "Forget"
-            onClicked: { row.confirming = false; row.forgotten(); }
+            text: "Unlink"
+            onClicked: { row.confirming = false; row.unlinked(); }
         }
         PlasmaComponents3.ToolButton {
             visible: row.confirming

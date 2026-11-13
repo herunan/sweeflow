@@ -46,6 +46,11 @@ pub enum UiEvent {
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
     Focused,
+    /// Square or rounded corners was switched (the tray): open windows follow now.
+    CornersSetting,
+    /// Hyprland's view of this client's windows: (class, title, floating) each. It doesn't tell
+    /// a window that it's tiled, as other desktops do (see hyprland::watch_tiling).
+    Tiling(Vec<(String, String, bool)>),
     /// Close / minimise / zoom button rects (x, y, w, h) in window points.
     WindowButtons(u32, [[f32; 4]; 3]),
     MoveStarted(u32),
@@ -85,6 +90,8 @@ impl UiEvent {
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
             UiEvent::Focused => "focused",
+            UiEvent::CornersSetting => "corners setting",
+            UiEvent::Tiling(_) => "tiling",
             UiEvent::WindowButtons(..) => "window buttons",
             UiEvent::MoveStarted(_) => "move started",
             UiEvent::MoveReady(..) => "move ready",
@@ -114,7 +121,7 @@ pub enum NetCmd {
     Clipboard(Vec<crate::clipboard::ClipItem>),
     /// A framed message for the clipboard stream (drag and drop data).
     ClipStream(Vec<u8>),
-    /// "Disconnect" or "Connect" was chosen (see `set_offline`): look again.
+    /// Stop or Start was chosen (see `set_offline`): look again.
     Recheck,
     /// Leaving on purpose (switching Macs, quitting): say so to the Mac, then close (the sender
     /// is told when that's done).
@@ -123,10 +130,22 @@ pub enum NetCmd {
 
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
 
+/// The way to the window side, for the few things that start elsewhere (a setting in the tray).
+static UI: std::sync::Mutex<Option<UiTx>> = std::sync::Mutex::new(None);
+
+pub fn tell_ui(event: UiEvent) {
+    if let Some(ui) = UI.lock().unwrap().as_ref() {
+        let _ = ui.send(event);
+    }
+}
+
 pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
+    *UI.lock().unwrap() = Some(ui.clone());
     let (tx, rx) = mpsc::unbounded_channel();
     let _ = NET_TX.set(tx.clone());
     listen_local(tx.clone());
+    let fingerprint = cfg.host_fingerprint.clone();
+    std::thread::Builder::new().name("presence".into()).spawn(move || watch_presence(&fingerprint)).unwrap();
     // A ping on the control stream every 2 s: the round trip through QUIC and the Mac's
     // session queue, logged now and then (latency figures).
     let ping_tx = tx.clone();
@@ -164,19 +183,116 @@ fn request_keyframe(wid: u32) {
     }
 }
 
-/// Local socket for `sweeflow launch <bundle id>` (used by the Mac app launchers).
+/// Local socket for `sweeflow launch <bundle id>` and `sweeflow quit <bundle id>` (used by the
+/// Mac app launchers).
 /// Launch requests made while the Mac is offline, delivered on (re)connect.
 static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
 /// The Mac's lock state as last reported (kept across reconnects).
 static MAC_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Disconnected on purpose (the tray's Disconnect): no connection until Connect. Kept across
-/// restarts, in a file beside the config.
+/// Stopped on purpose (Stop): no connection until Start, so the Mac is free for another
+/// computer. Kept across restarts, in a file beside the config.
 static OFFLINE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
     std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(offline_file().exists()));
+/// Whether the Mac in use can be reached: 0 not known yet, 1 no, 2 yes. Apart from streaming:
+/// it is shown while stopped too (see `watch_presence`).
+static REACHABLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The Mac in use (its fingerprint): the others are only ever looked for on the network.
+static IN_USE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The other linked Macs found online (true) or not (false), by fingerprint; missing: not known yet.
+static OTHERS_ONLINE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
 
 fn offline_file() -> std::path::PathBuf {
+    // The file's name is from when Stop was called Disconnect: kept, so the choice made then
+    // still holds.
     crate::config::dir().join("disconnected")
+}
+
+/// The Mac in use is online (reachable on the network): None until known.
+pub fn mac_online() -> Option<bool> {
+    match REACHABLE.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        n => Some(n == 2),
+    }
+}
+
+/// Whether a linked Mac is online: None until known.
+pub fn online(fingerprint: &str) -> Option<bool> {
+    if IN_USE.get().is_some_and(|f| f == fingerprint) {
+        return mac_online();
+    }
+    OTHERS_ONLINE.lock().unwrap().get(fingerprint).copied()
+}
+
+fn set_reachable(online: bool) {
+    let n = if online { 2 } else { 1 };
+    if REACHABLE.swap(n, std::sync::atomic::Ordering::SeqCst) != n {
+        log::info!("the Mac is {}", if online { "online" } else { "not online" });
+        crate::tray::refresh();
+    }
+}
+
+/// Looks of one Mac on the network, in a row: it counts as online once seen, and as not online
+/// only after two looks in a row miss it (Wi-Fi drops multicast now and then).
+#[derive(Default)]
+struct Looks {
+    misses: u32,
+}
+
+impl Looks {
+    /// What one more look says: online, not online, or nothing new yet.
+    fn after(&mut self, found: bool) -> Option<bool> {
+        self.misses = if found { 0 } else { self.misses + 1 };
+        if found {
+            Some(true)
+        } else if self.misses >= 2 {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether each linked Mac is online, for the list of Macs and for the Mac in use while stopped.
+/// While stopped, Sweeflow holds no connection to the Mac: it serves one computer at a time, and
+/// even a connection closed straight after its handshake would end another computer's session
+/// there (and the other linked Macs may well be serving another computer). A running Mac host
+/// always advertises its streaming service on the local network (Bonjour, with the start of its
+/// certificate's fingerprint), so every few seconds Sweeflow looks for that instead, which asks
+/// nothing of any Mac's session. While started, the connection says for the Mac in use.
+fn watch_presence(in_use: &str) {
+    let _ = IN_USE.set(in_use.to_string());
+    let mut looks: HashMap<String, Looks> = HashMap::new();
+    loop {
+        // Read each time: Macs are linked and unlinked while Sweeflow runs.
+        let linked: Vec<String> =
+            crate::config::Config::load_or_default().map(|c| c.macs.into_iter().map(|m| m.fingerprint).collect()).unwrap_or_default();
+        let wanted: Vec<&String> = linked.iter().filter(|f| *f != in_use || offline()).collect();
+        if wanted.is_empty() {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        let seen = crate::pair::seen_on_network(Duration::from_secs(2));
+        let mut changed = false;
+        for fp in wanted {
+            let found = fp.get(..16).is_some_and(|id| seen.contains(id));
+            let Some(now) = looks.entry(fp.clone()).or_default().after(found) else { continue };
+            if fp == in_use {
+                // Started meanwhile: then the connection says, not this.
+                if offline() {
+                    set_reachable(now);
+                }
+            } else if OTHERS_ONLINE.lock().unwrap().insert(fp.clone(), now) != Some(now) {
+                changed = true;
+            }
+        }
+        looks.retain(|f, _| linked.contains(f));
+        OTHERS_ONLINE.lock().unwrap().retain(|f, _| linked.contains(f));
+        if changed {
+            crate::tray::refresh();
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
 }
 
 /// Tells the Mac this computer is leaving on purpose (so it tidies up at once, without waiting
@@ -196,12 +312,19 @@ pub fn offline() -> bool {
     OFFLINE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Disconnects from the Mac (its windows go) and stays so, or connects again.
+/// Connected, and the Mac's screen is locked (its windows are paused until it's unlocked). The
+/// Mac says on every connect and on every change, so this is current while connected.
+pub fn mac_locked() -> bool {
+    CONNECTED.load(std::sync::atomic::Ordering::SeqCst) && MAC_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Stops (the Mac's windows go, the connection closes and the Mac is free for another computer)
+/// and stays so, or starts again.
 pub fn set_offline(on: bool) {
     if OFFLINE.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
         return;
     }
-    log::info!("{}", if on { "disconnecting, as asked" } else { "connecting again, as asked" });
+    log::info!("{}", if on { "stopping, as asked" } else { "starting again, as asked" });
     let _ = if on { std::fs::write(offline_file(), "") } else { std::fs::remove_file(offline_file()) };
     if let Some(tx) = NET_TX.get() {
         let _ = tx.send(NetCmd::Recheck);
@@ -286,6 +409,15 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
                         if CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
                             log::info!("launching {bid} on the Mac");
                             let _ = tx.send(NetCmd::Control(W::new(t::LAUNCH_APP).str(&bid).finish()));
+                            if mac_locked() {
+                                let name = crate::tray::app_name(&bid);
+                                std::thread::spawn(move || {
+                                    notify(
+                                        "Your Mac is locked",
+                                        &format!("{name} opens here once you unlock it (Touch ID or password on the Mac)."),
+                                    )
+                                });
+                            }
                         } else {
                             // Hold it until we reconnect; tell the user if that takes too long.
                             log::info!("Mac offline; holding launch of {bid}");
@@ -299,6 +431,16 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
                                     notify("Mac not connected", &format!("Couldn't open {bid}: sweeflow can't reach your Mac."));
                                 }
                             });
+                        }
+                    } else if let Some(bid) = line.strip_prefix("quit ") {
+                        // A launcher's Quit action. Not held for later like launches: quitting
+                        // an app some time after asking would only surprise.
+                        let bid = bid.trim();
+                        if CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
+                            log::info!("quitting {bid} on the Mac");
+                            let _ = tx.send(NetCmd::Control(W::new(t::QUIT_APP).str(bid).finish()));
+                        } else {
+                            log::info!("Mac offline; not quitting {bid}");
                         }
                     }
                 }
@@ -319,8 +461,8 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
     let mut backoff = Duration::from_millis(250);
     loop {
         if offline() {
-            let _ = ui.send(UiEvent::Disconnected("disconnected, as asked".into()));
-            // Any command wakes this to look again; only Connect (a Recheck) changes anything.
+            let _ = ui.send(UiEvent::Disconnected("stopped, as asked".into()));
+            // Any command wakes this to look again; only Start (a Recheck) changes anything.
             while offline() {
                 if cmds.recv().await.is_none() {
                     return;
@@ -331,8 +473,14 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         match session(&cfg, &endpoint, &ui, &mut cmds).await {
             Ok(()) => return, // UI went away
             Err(e) => {
-                log::warn!("connection lost: {e:#}");
                 let _ = ui.send(UiEvent::Disconnected(format!("{e:#}")));
+                // Stopped on purpose, the Mac was there a moment ago: still online.
+                if offline() {
+                    log::info!("connection closed: {e:#}");
+                } else {
+                    log::warn!("connection lost: {e:#}");
+                    set_reachable(false);
+                }
             }
         }
         // Drop commands meant for the dead connection.
@@ -382,6 +530,7 @@ async fn session(
         }
     }
     set_online(true);
+    set_reachable(true);
     let _online = Online;
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
@@ -484,7 +633,7 @@ async fn session(
                         let _ = ctl_tx.write_all(&W::new(t::GOODBYE).finish()).await;
                         let _ = ctl_tx.finish();
                         tokio::time::sleep(Duration::from_millis(150)).await;
-                        break Err(anyhow::anyhow!("disconnected, as asked"));
+                        break Err(anyhow::anyhow!("stopped, as asked"));
                     }
                     NetCmd::Recheck => {}
                     NetCmd::Goodbye(done) => {
@@ -655,6 +804,9 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             // Once per lock, not on every reconnect while it stays locked (a sleeping Mac wakes
             // briefly now and then), and not at all while streaming is switched off.
             let was = MAC_LOCKED.swap(locked, std::sync::atomic::Ordering::SeqCst);
+            if locked != was {
+                crate::tray::refresh();
+            }
             if locked && !was && crate::tray::streaming() {
                 std::thread::spawn(|| {
                     notify("Your Mac is locked", "Mac windows are paused until you unlock it (Touch ID or password on the Mac).")
@@ -1041,4 +1193,21 @@ pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint>
     let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
     ep.set_default_client_config(client);
     Ok(ep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mac_is_not_online_only_after_two_missed_looks() {
+        let mut looks = Looks::default();
+        assert_eq!(looks.after(false), None);
+        assert_eq!(looks.after(false), Some(false));
+        assert_eq!(looks.after(false), Some(false));
+        assert_eq!(looks.after(true), Some(true));
+        // One look missed after being seen: still online, as far as anyone can tell.
+        assert_eq!(looks.after(false), None);
+        assert_eq!(looks.after(true), Some(true));
+    }
 }

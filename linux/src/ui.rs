@@ -123,6 +123,10 @@ struct Corners {
     pending: Option<(u32, Vec<u8>)>,
     /// The tiles in use (size, pixels): their alpha shapes a paused window's still too.
     last_tiles: Option<(u32, Vec<u8>)>,
+    /// The tiles as the Mac sent them (rounded), and whether the ones in use were squared: the
+    /// setting can change while the window is open.
+    raw_tiles: Option<(u32, Vec<u8>)>,
+    squared: bool,
     /// Whether the split layout was used for the last frame.
     split: bool,
     /// Middle strip's offset from the window's top edge (logical px).
@@ -146,7 +150,8 @@ struct Lights {
     sub: wl_subsurface::WlSubsurface,
     viewport: WpViewport,
     buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
-    drawn: Option<(lights::State, [f64; 4])>,
+    /// What is drawn: the state, where, and the video's offset it was placed against.
+    drawn: Option<(lights::State, [f64; 4], i32)>,
 }
 
 /// Work finished on a helper thread that must continue on the Wayland thread.
@@ -199,6 +204,9 @@ struct Win {
     requested: Option<((u32, u32), Instant)>,
     floating: bool,
     maximized: bool,
+    /// Hyprland has it tiled (it doesn't say so through the window's state; see UiEvent::Tiling):
+    /// such a window isn't maximised from its own green button.
+    tiled: bool,
     suspended: bool,
     /// Traffic lights (close, minimise, zoom) in window points.
     buttons: [[f32; 4]; 3],
@@ -304,6 +312,8 @@ pub struct App {
     in_use: HashMap<wayland_client::backend::ObjectId, GpuFrame>,
     icons: HashMap<String, (XdgToplevelIconV1, wl_buffer::WlBuffer)>,
     icon_pngs: HashMap<String, Vec<u8>>,
+    /// Apps looked at for a taskbar entry (see note_app).
+    noted_apps: std::collections::HashSet<String>,
     background: Option<wl_buffer::WlBuffer>,
     /// Fully transparent 1x1 buffer: base for popups (menus have rounded, translucent edges).
     clear: Option<wl_buffer::WlBuffer>,
@@ -329,6 +339,8 @@ pub struct App {
     cursor_hot: (i32, i32),
     meta_down: u8,
     shift_down: u8,
+    /// The modifiers as the desktop counts them (for Cmd+Opt+M, which must have no others).
+    mods: Modifiers,
     /// Keys we handled locally (e.g. Cmd+Tab) whose release must not reach the Mac either.
     swallowed: Vec<u32>,
     /// Serial of the last button press forwarded to the Mac (for handing drags to KWin).
@@ -375,7 +387,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let scale = net_cfg.scale;
     let host = net_cfg.host.clone();
     let net = crate::net::spawn(net_cfg, ui_tx);
-    crate::tray::start(net.clone());
+    crate::tray::set_net(net.clone());
+    crate::hyprland::watch_tiling();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -424,6 +437,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         in_use: HashMap::new(),
         icons: HashMap::new(),
         icon_pngs: HashMap::new(),
+        noted_apps: std::collections::HashSet::new(),
         background: None,
         clear: None,
         screen_select: false,
@@ -442,6 +456,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_hot: (0, 0),
         meta_down: 0,
         shift_down: 0,
+        mods: Modifiers::default(),
         swallowed: Vec::new(),
         press_serial: 0,
         press_id: 0,
@@ -562,11 +577,13 @@ impl App {
                 self.end_selection();
                 // Windows wait for the Mac to come back; menus and popovers don't (nothing would
                 // close them meanwhile, and they sit above everything else).
-                // Disconnected on purpose (the tray), nothing waits.
+                // Stopped on purpose (Stop here, or the Mac's menu), nothing waits: paused
+                // stills go too.
+                let on_purpose = crate::net::offline() || crate::tray::mac_refused();
                 let gone: Vec<u32> = self
                     .windows
                     .values()
-                    .filter(|w| crate::net::offline() || matches!(w.role, Role::Popup(_)))
+                    .filter(|w| on_purpose || matches!(w.role, Role::Popup(_)))
                     .map(|w| w.info.wid)
                     .collect();
                 for wid in gone {
@@ -610,6 +627,25 @@ impl App {
             }
             UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png, qh),
             UiEvent::Focused => {}
+            UiEvent::CornersSetting => self.apply_corners_setting(qh),
+            UiEvent::Tiling(seen) => {
+                for (wid, w) in self.windows.iter_mut().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))) {
+                    let class = if w.display { "sweeflow-display".to_string() } else { format!("sweeflow-{}", w.info.bundle_id) };
+                    let title = display_title(&w.info.app_name, &w.info.title);
+                    // By class and title; windows of one app with the same title go together.
+                    let same_class: Vec<_> = seen.iter().filter(|(c, _, _)| *c == class).collect();
+                    let same_title: Vec<_> = same_class.iter().copied().filter(|(_, t, _)| *t == title).collect();
+                    let of = if same_title.is_empty() { &same_class } else { &same_title };
+                    if of.is_empty() {
+                        continue; // not listed yet
+                    }
+                    let tiled = of.iter().any(|(_, _, floating)| !floating);
+                    if w.tiled != tiled {
+                        log::info!("window {wid}: {} on Hyprland", if tiled { "tiled" } else { "floating" });
+                        w.tiled = tiled;
+                    }
+                }
+            }
             UiEvent::WindowButtons(wid, rects) => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.buttons = rects;
@@ -778,8 +814,14 @@ impl App {
         let is_video = !matches!(role, Role::Popup(_));
         // BT.709 YUV; the range is declared per frame from what the stream signals.
         let color = self.color_rep.as_ref().filter(|_| is_video).map(|m| m.get_surface(&video, qh, ()));
+        // The Mac gets every shortcut while one of its windows has focus (Super as Cmd), where
+        // the desktop allows it. Not on Hyprland: there the desktop's own keys win (the owner's
+        // call for Omarchy: its menu on Super+Space, workspaces, closing and moving windows),
+        // and whatever Hyprland has no binding for still reaches the Mac. `SWEEFLOW_KEYS=mac`
+        // gives the Mac everything there too.
+        let desktop_keys_win = crate::hyprland::running() && std::env::var("SWEEFLOW_KEYS").as_deref() != Ok("mac");
         let inhibitor = match (&role, &self.inhibit_mgr, &self.seat) {
-            (Role::Toplevel(_), Some(m), Some(seat)) => Some(m.inhibit_shortcuts(&base, seat, qh, ())),
+            (Role::Toplevel(_), Some(m), Some(seat)) if !desktop_keys_win => Some(m.inhibit_shortcuts(&base, seat, qh, ())),
             _ => None,
         };
 
@@ -794,9 +836,6 @@ impl App {
         self.surfaces.insert(base.id(), wid);
         self.surfaces.insert(video.id(), wid);
         let display = info.kind == 3;
-        if matches!(role, Role::Toplevel(_)) {
-            crate::desktop::check();
-        }
         // The display opens at a comfortable fraction of its size (it's as big as the screen).
         let size = if display {
             ((info.w * 0.6).max(320.0) as u32, (info.h * 0.6).max(160.0) as u32)
@@ -826,6 +865,7 @@ impl App {
                 requested: None,
                 floating: true,
                 maximized: false,
+                tiled: false,
                 suspended: false,
                 buttons: [[0.0; 4]; 3],
                 lights: None,
@@ -879,6 +919,9 @@ impl App {
         }
         if self.kb_focus == Some(wid) {
             self.kb_focus = None;
+        }
+        if !self.windows.values().any(|o| o.info.pid == w.info.pid) {
+            crate::menus::app_gone(w.info.pid);
         }
         // Children first: a popup must not outlive its parent.
         let children: Vec<u32> = self.windows.values().filter(|c| c.info.parent == wid).map(|c| c.info.wid).collect();
@@ -1141,7 +1184,8 @@ impl App {
         }
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let full_range = frame.full_range;
-        if w.color_full_range != Some(full_range) {
+        // (An RGB picture has neither; telling the compositor of them would be an error.)
+        if !frame.rgb && w.color_full_range != Some(full_range) {
             let range = if full_range { crs::Range::Full } else { crs::Range::Limited };
             // Every surface showing this video (middle and the corner layout's strips) must
             // agree, or the strips show as bars in a different brightness.
@@ -1230,11 +1274,22 @@ impl App {
         let (sw, sh) = ((vis_w * px_per_pt) as f64, (vis_h * px_per_pt) as f64);
         let middle_y = if split { l } else { 0 };
         let base = w.base().clone();
+        let mut relight = false;
         if let Some(c) = w.corners.as_mut() {
+            // The corners setting changed: the tiles again, from the Mac's own.
+            if c.squared != crate::config::square_corners() {
+                c.squared = !c.squared;
+                if let Some((t, raw)) = c.raw_tiles.clone() {
+                    let px = if c.squared { square_tiles(t as usize, raw) } else { raw };
+                    c.last_tiles = Some((t, px.clone()));
+                    c.pending = Some((t, px));
+                }
+            }
             if c.middle_y != middle_y {
                 c.middle_y = middle_y;
                 w.video_sub.set_position(0, middle_y);
                 base.commit(); // subsurface positions apply with the parent's commit
+                relight = true; // where the lights hang off the video, they moved with it
             }
             if split {
                 let t = t_px as f64;
@@ -1314,10 +1369,18 @@ impl App {
         w.video.commit();
         w.shown = Some(buffer.id());
         self.in_use.insert(buffer.id(), frame);
+        if relight {
+            self.update_lights(wid, qh);
+        }
     }
 
     /// States sRGB on the surfaces showing the window's video (the middle and the strips).
     fn describe_srgb(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        // RGB pictures are left untagged, like the corner tiles beside them: tagged, Hyprland
+        // drew the two in different shades.
+        if crate::decode::rgb_output() {
+            return;
+        }
         let (Some(cm), Some(desc)) = (&self.color_mgr, &self.srgb) else { return };
         if !self.srgb_ready {
             return;
@@ -1335,6 +1398,47 @@ impl App {
             let cms = cm.get_surface(&surf, qh, ());
             cms.set_image_description(desc, wp_color_manager_v1::RenderIntent::Perceptual);
             self.srgb_tagged.insert(surf.id(), cms);
+        }
+    }
+
+    /// Square or rounded corners was switched: every window's corner tiles again, from the
+    /// Mac's own, without waiting for its next picture (an idle window may not send one soon).
+    fn apply_corners_setting(&mut self, qh: &QueueHandle<Self>) {
+        let square = crate::config::square_corners();
+        for w in self.windows.values_mut() {
+            let (video, base) = (w.video.clone(), w.base().clone());
+            let Some(c) = w.corners.as_mut() else { continue };
+            if c.squared == square {
+                continue;
+            }
+            c.squared = square;
+            let Some((t, raw)) = c.raw_tiles.clone() else { continue };
+            let px = if square { square_tiles(t as usize, raw) } else { raw };
+            c.last_tiles = Some((t, px.clone()));
+            if !c.split {
+                // Not showing tiles now: with the next picture that does.
+                c.pending = Some((t, px));
+                continue;
+            }
+            let Ok(mut pool) = RawPool::new(px.len(), &self.shm) else { continue };
+            pool.mmap().copy_from_slice(&px);
+            let n = (t * t * 4) as usize;
+            let bufs: Vec<_> =
+                (0..4).map(|i| pool.create_buffer((i * n) as i32, t as i32, t as i32, (t * 4) as i32, wl_shm::Format::Argb8888, (), qh)).collect();
+            for (i, (_, surf, _)) in c.tiles.iter().enumerate() {
+                surf.attach(Some(&bufs[i]), 0, 0);
+                surf.damage_buffer(0, 0, t as i32, t as i32);
+                surf.commit();
+            }
+            c.tile_buffers.push_back((bufs, pool));
+            while c.tile_buffers.len() > 3 {
+                if let Some((old, _)) = c.tile_buffers.pop_front() {
+                    old.iter().for_each(|b| b.destroy());
+                }
+            }
+            // The tiles are synchronised children of the video: shown with its commit.
+            video.commit();
+            base.commit();
         }
     }
 
@@ -1378,11 +1482,17 @@ impl App {
                 tile_buffers: Default::default(),
                 pending: None,
                 last_tiles: None,
+                raw_tiles: None,
+                squared: false,
                 split: false,
                 middle_y: 0,
                 colors,
             };
             if let Some(w) = self.windows.get_mut(&wid) {
+                // The lights stay the topmost child of the video (where they are one).
+                if let (Some(l), Some((_, last, _)), true) = (&w.lights, corners.tiles.last(), crate::hyprland::running()) {
+                    l.sub.place_above(last);
+                }
                 w.corners = Some(corners);
             }
         }
@@ -1405,6 +1515,11 @@ impl App {
             }
             dump_bgra(&format!("/tmp/sweeflow-corners-{wid}.png"), t_px * 4, t_px, &sheet);
         }
+        // Square corners (the setting; by default where the desktop frames every window as a
+        // plain rectangle and rounded corners would leave gaps inside the frame): filled in.
+        c.raw_tiles = (t_px > 0).then(|| (t_px, tile_px.clone()));
+        c.squared = crate::config::square_corners();
+        let tile_px = if t_px > 0 && c.squared { square_tiles(t_px as usize, tile_px) } else { tile_px };
         c.last_tiles = (t_px > 0).then(|| (t_px, tile_px.clone()));
         c.pending = (t_px > 0).then_some((t_px, tile_px));
     }
@@ -1447,13 +1562,36 @@ impl App {
         }
     }
 
+    /// An app with a window here needs a taskbar entry for its badged icon (see
+    /// launchers::seen): looked at once per app, when its window and its icon are both here.
+    fn note_app(&mut self, wid: u32) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        if !matches!(w.role, Role::Toplevel(_)) || w.display {
+            return;
+        }
+        let bid = w.info.bundle_id.clone();
+        let Some(png) = self.icon_pngs.get(&bid) else { return };
+        if !self.noted_apps.insert(bid.clone()) {
+            return;
+        }
+        let (name, png) = (w.info.app_name.clone(), png.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = crate::launchers::seen(&bid, &name, &png) {
+                log::warn!("taskbar entry for {bid}: {e:#}");
+            }
+        });
+    }
+
     fn apply_icon(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        self.note_app(wid);
         let Some(mgr) = &self.icon_mgr else { return };
         let Some(w) = self.windows.get(&wid) else { return };
         let Role::Toplevel(t) = &w.role else { return };
         let bid = w.info.bundle_id.clone();
         if !self.icons.contains_key(&bid) {
             let Some(png) = self.icon_pngs.get(&bid) else { return };
+            // Plain: the Sweeflow badge is for the taskbar only, which takes the icon from the
+            // window's launcher entry (see launchers.rs), not this one (Alt+Tab, title bars).
             let Ok((wid_px, hgt_px, argb)) = decode_png_argb(png) else { return };
             let stride = wid_px * 4;
             let Ok(mut pool) = RawPool::new((stride * hgt_px) as usize, &self.shm) else { return };
@@ -1753,8 +1891,9 @@ impl App {
         surface.attach(Some(&buffer), 0, 0);
         surface.damage_buffer(0, 0, fw as i32, fh as i32);
         surface.commit();
-        // Our traffic lights stay on top (closing a paused window works).
-        if let Some(l) = &w.lights {
+        // Our traffic lights stay on top (closing a paused window works). On Hyprland they
+        // hang off the video and are drawn above this anyway (see update_lights).
+        if let Some(l) = w.lights.as_ref().filter(|_| !crate::hyprland::running()) {
             l.sub.place_above(&surface);
         }
         base.commit();
@@ -1777,6 +1916,17 @@ impl App {
     fn toggle_maximize(&self, wid: u32) {
         let Some(w) = self.windows.get(&wid) else { return };
         let Role::Toplevel(t) = &w.role else { return };
+        // Only a floating window is maximised (and a maximised one put back): one the desktop
+        // has tiled or put in a scrolling row stays in its place.
+        // (Hyprland's tiled windows are known by `tiled`; elsewhere the window's own state
+        // says it, and a maximised one isn't "floating" by that state.)
+        if w.tiled || !(w.floating || w.maximized) {
+            return;
+        }
+        // Hyprland is asked directly: Omarchy has it ignore a window's own request.
+        if crate::hyprland::toggle_maximise() {
+            return;
+        }
         if w.maximized {
             t.unset_maximized();
         } else {
@@ -1843,13 +1993,22 @@ impl App {
             pressed: w.lights_pressed.and_then(|(i, inside)| inside.then_some(i)),
             dark_titlebar: w.dark_titlebar,
         };
-        if w.lights.as_ref().and_then(|l| l.drawn) == Some((state, rect)) {
+        // Hyprland draws a window's surfaces level by level, so the strips and corner tiles
+        // (children of the video) land on top of anything that is the video's sibling: the top
+        // of the lights was cut off wherever they reach into the top strip. There the lights are
+        // a child of the video too, the last one, and placed relative to it.
+        let nested = crate::hyprland::running();
+        let video_y = if nested { w.corners.as_ref().map_or(0, |c| c.middle_y) } else { 0 };
+        if w.lights.as_ref().and_then(|l| l.drawn) == Some((state, rect, video_y)) {
             return;
         }
         if w.lights.is_none() {
-            let (sub, surface) = self.subcompositor.create_subsurface(w.base().clone(), qh);
+            let parent = if nested { w.video.clone() } else { w.base().clone() };
+            let (sub, surface) = self.subcompositor.create_subsurface(parent, qh);
             sub.set_desync();
-            sub.place_above(&w.video);
+            if !nested {
+                sub.place_above(&w.video);
+            }
             let viewport = self.viewporter.get().expect("wp_viewporter").get_viewport(&surface, qh, ());
             // Input goes to the video surface below; this layer is purely visual.
             let region = self.compositor.wl_compositor().create_region(qh, ());
@@ -1864,7 +2023,7 @@ impl App {
         let buf = pool.create_buffer(0, pw as i32, ph as i32, (pw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
         let l = w.lights.as_mut().unwrap();
         let s = self.scale;
-        l.sub.set_position((rect[0] * s).round() as i32, (rect[1] * s).round() as i32);
+        l.sub.set_position((rect[0] * s).round() as i32, (rect[1] * s).round() as i32 - video_y);
         l.viewport.set_destination((rect[2] * s).round() as i32, (rect[3] * s).round() as i32);
         l.surface.attach(Some(&buf), 0, 0);
         l.surface.damage_buffer(0, 0, pw as i32, ph as i32);
@@ -1874,7 +2033,7 @@ impl App {
             }
         }
         l.surface.commit();
-        l.drawn = Some((state, rect));
+        l.drawn = Some((state, rect, video_y));
         l.buffers.push_back((buf, pool));
         while l.buffers.len() > 3 {
             if let Some((b, _)) = l.buffers.pop_front() {
@@ -1882,6 +2041,9 @@ impl App {
             }
         }
         // Subsurface position changes apply on the parent's next commit.
+        if nested {
+            w.video.commit();
+        }
         w.base().commit();
     }
 
@@ -1975,6 +2137,14 @@ impl App {
     fn wid_for(&self, s: &wl_surface::WlSurface) -> Option<u32> {
         self.surfaces.get(&s.id()).copied()
     }
+
+    /// The keyboard focus is on a Mac app's own window: not a popup, nor the Mac's display
+    /// (no one app's, so it has no menu of its own).
+    fn app_window_focused(&self) -> bool {
+        self.kb_focus
+            .and_then(|wid| self.windows.get(&wid))
+            .is_some_and(|w| w.info.kind != 3 && matches!(w.role, Role::Toplevel(_)))
+    }
 }
 
 /// Pixels per point of a frame: as reported by the Mac, else inferred from the window width.
@@ -2039,6 +2209,37 @@ fn open_search() {
     });
 }
 
+/// Cmd+Opt+M (Super+Alt+M here), with no other modifier: the key for the Global menu. The
+/// letter the layout puts on the key, so it's the key marked M on any Latin layout.
+fn is_global_menu_key(mods: &Modifiers, key: Keysym) -> bool {
+    mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::m | Keysym::M)
+}
+
+/// Cmd+Opt+O (Super+Alt+O), with no other modifier: opens Sweeflow itself (its window, or on
+/// Plasma its tray popup), as `sweeflow open` does.
+fn is_open_sweeflow_key(mods: &Modifiers, key: Keysym) -> bool {
+    mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::o | Keysym::O)
+}
+
+/// Opens the Global menu (`sweeflow menu`, palette.rs): a process of its own, as from the tray.
+fn open_global_menu() {
+    run_own("menu", "the Global menu");
+}
+
+/// Runs this program with one argument (`menu`, `open`): started off the UI thread, and waited
+/// for there, so it doesn't stay behind as a dead process.
+fn run_own(arg: &'static str, what: &'static str) {
+    std::thread::spawn(move || {
+        let started = std::env::current_exe().and_then(|me| std::process::Command::new(me).arg(arg).spawn());
+        match started {
+            Ok(mut child) => {
+                let _ = child.wait();
+            }
+            Err(e) => log::warn!("couldn't open {what}: {e}"),
+        }
+    });
+}
+
 /// Diagnostics: writes premultiplied BGRA as an RGBA PNG.
 fn dump_bgra(path: &str, w: u32, h: u32, bgra: &[u8]) {
     let rgba: Vec<u8> = bgra.chunks(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
@@ -2071,7 +2272,7 @@ fn display_title(app: &str, title: &str) -> String {
     }
 }
 
-fn decode_png_argb(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+pub(crate) fn decode_png_argb(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(png));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info()?;
@@ -2091,6 +2292,27 @@ fn decode_png_argb(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         out.extend_from_slice(&[pm(b), pm(g), pm(r), a]);
     }
     Ok((w, h, out))
+}
+
+/// The four corner tiles (TL, TR, BL, BR; premultiplied BGRA, `t` pixels square each) made
+/// opaque: what the rounded corner leaves see-through takes the colour its row has at the
+/// tile's inner edge, so the window ends in square corners that continue its own edge.
+fn square_tiles(t: usize, mut px: Vec<u8>) -> Vec<u8> {
+    for (i, tile) in px.chunks_exact_mut(t * t * 4).take(4).enumerate() {
+        // Left tiles meet the window at their right edge, right tiles at their left.
+        let inner = if i % 2 == 0 { t - 1 } else { 0 };
+        for row in tile.chunks_exact_mut(t * 4) {
+            let fill = [row[inner * 4], row[inner * 4 + 1], row[inner * 4 + 2]];
+            for p in row.chunks_exact_mut(4) {
+                let rest = 255 - p[3] as u32;
+                for (c, f) in p[..3].iter_mut().zip(fill) {
+                    *c = (*c as u32 + f as u32 * rest / 255).min(255) as u8;
+                }
+                p[3] = 255;
+            }
+        }
+    }
+    px
 }
 
 /// A pause sign (a dark disc with two white bars) drawn into an opaque BGRA picture.
@@ -2402,6 +2624,11 @@ impl KeyboardHandler for App {
         if let Some(wid) = self.wid_for(surface) {
             log::debug!("keyboard focus → {wid}: focusing it on the Mac");
             self.kb_focus = Some(wid);
+            // Remembered past this focus for the Global menu, which takes the focus to open
+            // (not the Mac's display: it's no one app's).
+            if let Some(info) = self.windows.get(&wid).map(|w| &w.info).filter(|i| i.kind != 3) {
+                crate::menus::focused(info.pid, &info.app_name);
+            }
             self.send(W::new(t::FOCUS).u32(wid).finish());
             self.update_lights(wid, qh);
         }
@@ -2417,7 +2644,10 @@ impl KeyboardHandler for App {
         self.schedule_menu_panel();
         self.meta_down = 0;
         self.shift_down = 0;
+        self.mods = Modifiers::default();
         self.swallowed.clear();
+        // Whatever is still held (Cmd and Opt, when Cmd+Opt+M has just opened the Global menu,
+        // which takes the focus) is let go on the Mac: it gets no release for keys let go elsewhere.
         self.send(W::new(t::RELEASE_ALL).finish());
     }
 
@@ -2426,6 +2656,22 @@ impl KeyboardHandler for App {
             KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down += 1,
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down += 1,
             _ => {}
+        }
+        if is_global_menu_key(&self.mods, e.keysym) && self.app_window_focused() {
+            // Cmd+Opt+M: the Global menu, for the app of this window (menus::focused). The desktop
+            // never sees the key while a Mac window has focus (they pass every shortcut through
+            // to the Mac), so it's caught here, on every desktop alike.
+            open_global_menu();
+            self.swallowed.push(e.raw_code);
+            return;
+        }
+        if is_open_sweeflow_key(&self.mods, e.keysym) {
+            // Cmd+Opt+O: Sweeflow's own window. Caught here for the same reason (on Hyprland its
+            // binding gets the key first, see hyprland.rs; elsewhere this is the way while a
+            // Mac window has focus).
+            run_own("open", "Sweeflow");
+            self.swallowed.push(e.raw_code);
+            return;
         }
         if e.raw_code == KEY_TAB && self.meta_down > 0 {
             // Cmd+Tab switches between *all* desktop windows, like it does everywhere else.
@@ -2470,10 +2716,11 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        mods: Modifiers,
         _: RawModifiers,
         _: u32,
     ) {
+        self.mods = mods;
     }
 }
 
@@ -2846,5 +3093,23 @@ impl Dispatch<ExtDataControlSourceV1, ClipData> for App {
 impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
     fn event(_: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, e: zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         log::debug!("shortcut inhibitor: {e:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_menu_key_is_cmd_opt_m_alone() {
+        let mods = |logo, alt, ctrl, shift| Modifiers { logo, alt, ctrl, shift, ..Default::default() };
+        assert!(is_global_menu_key(&mods(true, true, false, false), Keysym::m));
+        // Caps lock on.
+        assert!(is_global_menu_key(&Modifiers { caps_lock: true, ..mods(true, true, false, false) }, Keysym::M));
+        assert!(!is_global_menu_key(&mods(true, false, false, false), Keysym::m));
+        assert!(!is_global_menu_key(&mods(false, true, false, false), Keysym::m));
+        assert!(!is_global_menu_key(&mods(true, true, true, false), Keysym::m));
+        assert!(!is_global_menu_key(&mods(true, true, false, true), Keysym::M));
+        assert!(!is_global_menu_key(&mods(true, true, false, false), Keysym::n));
     }
 }

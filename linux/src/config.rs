@@ -36,6 +36,45 @@ pub struct Config {
     pub capture_scale: f64,
     /// DRM render node of the GPU the compositor uses (decode there for zero-copy).
     pub render_node: String,
+    /// Mac windows with square corners (true) or the Mac's rounded ones (false). Not set: what
+    /// suits the desktop (see `square_corners`).
+    pub square_corners: Option<bool>,
+}
+
+/// Whether Mac windows are shown with square corners: the setting, or without one what suits
+/// the desktop (square where it frames every window as a plain rectangle, as Omarchy does;
+/// rounded elsewhere). Read once, then kept by `set_square_corners`.
+static SQUARE_CORNERS: std::sync::LazyLock<std::sync::atomic::AtomicBool> = std::sync::LazyLock::new(|| {
+    let set = Config::load_or_default().ok().and_then(|c| c.square_corners);
+    std::sync::atomic::AtomicBool::new(set.unwrap_or_else(crate::hyprland::square_windows))
+});
+
+pub fn square_corners() -> bool {
+    SQUARE_CORNERS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Switches square corners on or off, and saves it. Open windows follow at once.
+pub fn set_square_corners(on: bool) {
+    if SQUARE_CORNERS.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
+        return;
+    }
+    log::info!("Mac windows: {} corners", if on { "square" } else { "rounded" });
+    crate::net::tell_ui(crate::net::UiEvent::CornersSetting);
+    std::thread::spawn(|| {
+        // One save at a time, each with the setting as it is by then: switched twice in a row,
+        // two saves side by side could leave the older choice in the file.
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = SAVING.lock().unwrap();
+        match Config::load_or_default() {
+            Ok(mut c) => {
+                c.square_corners = Some(square_corners());
+                if let Err(e) = c.save() {
+                    log::warn!("saving config: {e:#}");
+                }
+            }
+            Err(e) => log::warn!("config: {e:#}"),
+        }
+    });
 }
 
 pub fn dir() -> PathBuf {
@@ -55,6 +94,7 @@ impl Default for Config {
             scale: 1.0,
             capture_scale: 0.0,
             render_node: default_render_node(),
+            square_corners: None,
         }
     }
 }
@@ -119,6 +159,7 @@ impl Config {
                 "scale" => c.scale = v.parse().context("scale")?,
                 "capture_scale" => c.capture_scale = v.parse().context("capture_scale")?,
                 "render_node" => c.render_node = v,
+                "square_corners" => c.square_corners = Some(v != "false"),
                 _ => {}
             }
         }
@@ -189,6 +230,9 @@ impl Config {
              capture_scale = {}\nrender_node = \"{}\"\n",
             self.host_fingerprint, self.scale, self.capture_scale, self.render_node
         );
+        if let Some(square) = self.square_corners {
+            out += &format!("square_corners = {square}\n");
+        }
         for m in &self.macs {
             out += &format!(
                 "\n[mac]\nname = \"{}\"\nservice = \"{}\"\nhost = \"{}\"\nfingerprint = \"{}\"\n",
@@ -271,6 +315,16 @@ mod tests {
         assert_eq!(c.macs.len(), 1);
         assert_eq!(c.macs[0].name, "MAC1");
         assert_eq!(c.render_node, "/dev/dri/renderD129");
+    }
+
+    #[test]
+    fn the_corners_setting_round_trips() {
+        // (A line from a version with the icon badge, "badge = false", is read past.)
+        let mut c = Config::parse(&format!("host = \"MAC1.local:44120\"\nhost_fingerprint = \"{FP_A}\"\nbadge = false\n")).unwrap();
+        assert!(!c.render().contains("badge"));
+        assert_eq!(Config::parse(&c.render()).unwrap().square_corners, None, "not set unless chosen");
+        c.square_corners = Some(false);
+        assert_eq!(Config::parse(&c.render()).unwrap().square_corners, Some(false));
     }
 
     #[test]

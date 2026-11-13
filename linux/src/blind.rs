@@ -1,7 +1,7 @@
 //! Stand-ins for Mac windows that refuse to be captured (security prompts, sign-in verifiers): their
-//! text and buttons, read on the Mac through Accessibility, shown as a plain dialog (prompt.qml:
-//! text and buttons, no icons, as macOS shows them; kdialog where Qt's `qml` runner isn't
-//! installed). The button clicked here is pressed there. Ones without buttons (Touch ID /
+//! text and buttons, read on the Mac through Accessibility, shown as a plain dialog (prompt.rs:
+//! text and buttons, no icons, as macOS shows them; kdialog if that can't come up). The button
+//! clicked here is pressed there. Ones without buttons (Touch ID /
 //! password prompts, which must be answered on the Mac itself) become a notification.
 
 use std::{collections::HashMap, process::Command, sync::Mutex};
@@ -49,7 +49,7 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
             let index = match status.code() {
                 Some(code) if code >= 10 => Some((code - 10) as usize),
                 Some(0) => cancel,
-                // It didn't come up (no such style, a Qt without Quick Controls): kdialog instead.
+                // It didn't come up (no display for it, a failed start): kdialog instead.
                 Some(code) => {
                     log::warn!("stand-in dialog: the plain prompt failed ({code}), using kdialog");
                     return show_kdialog(id, &app, &title, &texts, &buttons, net);
@@ -67,28 +67,18 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
     show_kdialog(id, app, title, texts, buttons, net);
 }
 
-/// The plain prompt (prompt.qml), run by Qt's `qml` tool, whatever this system calls it.
-/// None when it isn't installed.
+/// The plain prompt: this program again, as `sweeflow prompt` (prompt.rs). None when it can't
+/// be started.
 fn spawn_prompt(heading: &str, text: &str, shown: &[(usize, &String)], cancel: Option<usize>) -> Option<std::process::Child> {
-    static QML: &str = include_str!("prompt.qml");
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let file = dir.join("sweeflow-prompt.qml");
-    std::fs::write(&file, QML).ok()?;
     // The Mac's default button is its last.
     let default = shown.last().map(|(i, _)| *i as i64).unwrap_or(-1);
-    for tool in ["qml6", "qml-qt6", "/usr/lib/qt6/bin/qml", "/usr/lib64/qt6/bin/qml"] {
-        let mut cmd = Command::new(tool);
-        // A widgets application, so the desktop's own style (Breeze) draws the buttons.
-        cmd.args(["--apptype", "widget"]).arg(&file).arg("--");
-        cmd.args([default.to_string(), cancel.map_or(-1, |c| c as i64).to_string(), heading.to_string(), text.to_string()]);
-        for (i, label) in shown {
-            cmd.args([i.to_string(), label.to_string()]);
-        }
-        if let Ok(child) = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
-            return Some(child);
-        }
+    let mut cmd = Command::new(std::env::current_exe().ok()?);
+    cmd.arg("prompt");
+    cmd.args([default.to_string(), cancel.map_or(-1, |c| c as i64).to_string(), heading.to_string(), text.to_string()]);
+    for (i, label) in shown {
+        cmd.args([i.to_string(), label.to_string()]);
     }
-    None
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()
 }
 
 /// The same with kdialog, whose dialogs always carry an icon and icons on their buttons.

@@ -162,6 +162,23 @@ pub fn locate(fingerprint: &str, wait: Duration) -> Option<SocketAddr> {
     rx.recv_timeout(wait).ok()
 }
 
+/// The Macs advertising streaming on the network within `wait`: the start of each one's
+/// certificate fingerprint (16 hex digits, as `locate` matches them).
+pub fn seen_on_network(wait: Duration) -> std::collections::HashSet<String> {
+    let seen: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
+    let s2 = seen.clone();
+    let browser = browse(STREAM_SERVICE, move |f| {
+        if let Found::Up(m) = f {
+            s2.lock().unwrap().insert(m.id);
+        }
+    });
+    if browser.is_ok() {
+        std::thread::sleep(wait);
+    }
+    drop(browser);
+    std::mem::take(&mut *seen.lock().unwrap())
+}
+
 pub enum Outcome {
     Paired(PairedMac),
     Denied,

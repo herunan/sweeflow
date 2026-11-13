@@ -1,5 +1,7 @@
-//! The D-Bus side of the KDE tray widget (linux/plasmoid): everything its popup shows, as one JSON
-//! property (`State`, with change signals), and the calls it makes back (`Set`, `Do`).
+//! The D-Bus side of the KDE tray widget (linux/plasmoid) and of Sweeflow's own window for other
+//! desktops (panelwin.rs): everything they show, as one JSON
+//! property (`State`, with change signals), and the calls they make back (`Set`, `Do`). Also what
+//! the Global menu window asks for (`Menu`, `MenuActivate`).
 //! Bus name dev.sweeflow.Client, object /dev/sweeflow/Panel, interface dev.sweeflow.Panel.
 
 use serde_json::json;
@@ -26,27 +28,37 @@ impl Iface {
         crate::tray::panel_set(&json);
     }
 
-    /// The answer of desktop.rs's KWin script: the desktop to use ("" for none) and, when it's
-    /// one of the user's own empty desktops being reused, its name.
-    #[zbus(name = "DesktopFound")]
-    fn desktop_found(&self, id: String, adopted_name: String) {
-        crate::desktop::found(id, adopted_name);
-    }
-
     /// Renames a linked Mac (here only: it's what this computer calls it).
     #[zbus(name = "Rename")]
     fn rename(&self, fingerprint: String, name: String) {
         crate::tray::rename(&fingerprint, &name);
     }
 
-    /// One of: wake, pair, disconnect, connect, show (pop the widget open), display (show the Mac's display in a window), gather (Mac windows
+    /// One of: wake, pair, stream, stop (stop streaming), show (pop the widget open), display (show the Mac's display in a window), gather (Mac windows
     /// back onto the Mac desktop), switch <fingerprint>,
     /// forget <fingerprint>, launch <bundle id>, quit-app <bundle id>, pin|unpin <bundle id>,
-    /// login on|off (open at login), taskbar on|off, dock own|panel|off, global-menu on|off,
+    /// login on|off (open at login), square on|off (square window corners),
+    /// global-menu on|off,
     /// placement (look again at those), quit.
     #[zbus(name = "Do")]
     fn act(&self, action: String, arg: String) {
         crate::tray::panel_do(&action, &arg);
+    }
+
+    /// For `sweeflow menu` (palette.rs): the menu of the Mac app whose window last had keyboard
+    /// focus, as JSON {app, pid, revision, items: [{id, label, enabled, separator, checked,
+    /// submenu, shortcut, children}]}. `refresh` also asks the Mac for its current state, which
+    /// comes in as a later revision.
+    #[zbus(name = "Menu")]
+    fn menu(&self, refresh: bool) -> String {
+        crate::menus::palette_menu(refresh)
+    }
+
+    /// Runs an item from `Menu` as choosing it in the Global Menu does. False when that app's
+    /// menu has changed since `revision` (and the id may mean another item now): ask again.
+    #[zbus(name = "MenuActivate")]
+    fn menu_activate(&self, pid: i32, revision: u32, id: i32) -> bool {
+        crate::menus::palette_activate(pid, revision, id)
     }
 }
 
@@ -66,10 +78,12 @@ impl Panel {
 
 /// The app entry the popup lists, with the icon the launchers saved (when there is one).
 pub fn app(bundle_id: &str, name: &str) -> serde_json::Value {
-    let icon = crate::launchers::icon_path(bundle_id);
+    let url = |p: std::path::PathBuf| if p.exists() { format!("file://{}", p.display()) } else { String::new() };
     json!({
         "id": bundle_id,
         "name": name,
-        "icon": if icon.exists() { format!("file://{}", icon.display()) } else { String::new() },
+        // Plain everywhere, but badged in taskbars (the Sweeflow badge, when it's on).
+        "icon": url(crate::launchers::original_path(bundle_id)),
+        "taskIcon": url(crate::launchers::task_icon_path(bundle_id)),
     })
 }

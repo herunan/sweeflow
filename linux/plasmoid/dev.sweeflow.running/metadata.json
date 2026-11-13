@@ -1,8 +1,8 @@
 {
     "KPlugin": {
-        "Id": "dev.sweeflow.dock",
-        "Name": "Mac Dock",
-        "Description": "Your Mac's apps, like its Dock: open, minimised or running",
+        "Id": "dev.sweeflow.running",
+        "Name": "Mac Apps Without Windows",
+        "Description": "Mac apps still running with no window here, beside your task manager",
         "Icon": "sweeflow",
         "Category": "Windows and Tasks",
         "Version": "1.0"

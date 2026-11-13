@@ -1,4 +1,4 @@
-//! Hands the Mac its installer: while the "Add a Mac" wizard is open, Sweeflow.dmg is served on
+//! Hands the Mac its installer: while the "Link a Mac" wizard is open, Sweeflow.dmg is served on
 //! the local network, so the Mac only needs Safari and an address (no USB stick, no Terminal).
 
 use std::{
@@ -14,6 +14,9 @@ pub const PORT: u16 = 44130;
 pub struct Server {
     /// What to type into Safari on the Mac.
     pub url: String,
+    /// The same page over Tailscale, when this computer is on a tailnet: a Mac that isn't on
+    /// this network can't reach the address above.
+    pub tailscale_url: Option<String>,
 }
 
 /// Where a packaged or locally built Sweeflow.dmg lives.
@@ -41,6 +44,15 @@ fn lan_ip() -> Option<std::net::IpAddr> {
     Some(s.local_addr().ok()?.ip())
 }
 
+/// This computer's Tailscale address, when it has one (Tailscale hands them out of 100.64.0.0/10).
+pub fn tailscale_ip() -> Option<std::net::Ipv4Addr> {
+    let out = std::process::Command::new("ip").args(["-o", "-4", "addr", "show"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        let ip: std::net::Ipv4Addr = l.split_whitespace().nth(3)?.split('/').next()?.parse().ok()?;
+        (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64).then_some(ip)
+    })
+}
+
 /// Starts serving; stops when the process exits.
 pub fn serve() -> Result<Server> {
     let dmg = find_dmg().context("no Sweeflow.dmg found")?;
@@ -57,7 +69,7 @@ pub fn serve() -> Result<Server> {
             });
         }
     })?;
-    Ok(Server { url: format!("http://{ip}:{PORT}") })
+    Ok(Server { url: format!("http://{ip}:{PORT}"), tailscale_url: tailscale_ip().map(|ip| format!("http://{ip}:{PORT}")) })
 }
 
 fn answer(mut conn: TcpStream, dmg: &PathBuf) -> Result<()> {
