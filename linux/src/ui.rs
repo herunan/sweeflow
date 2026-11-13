@@ -2615,9 +2615,11 @@ fn gnome_allow_shortcuts(bundle_id: &str) {
     {
         static BUS: std::sync::OnceLock<Option<zbus::blocking::Connection>> = std::sync::OnceLock::new();
         let Some(bus) = BUS.get_or_init(|| zbus::blocking::Connection::session().ok()) else { return };
-        // GNOME looks it up by the app's desktop entry; the bare app id covers a window it
+        // GNOME looks it up by the desktop entry it matched the window to: the app menu's
+        // entry (sweeflow-menu-<bundle id>, launchers.rs), which claims the app's windows too and
+        // is the one GNOME picks, or the window's own; the bare app id covers a window it
         // couldn't match to one.
-        for id in [format!("{app}.desktop"), app.clone()] {
+        for id in [format!("sweeflow-menu-{bundle_id}.desktop"), format!("{app}.desktop"), app.clone()] {
             let r = bus.call_method(
                 Some("org.freedesktop.impl.portal.PermissionStore"),
                 "/org/freedesktop/impl/portal/PermissionStore",
