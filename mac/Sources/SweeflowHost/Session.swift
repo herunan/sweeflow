@@ -1714,6 +1714,17 @@ final class Session {
         control?.send(m)
         lastFrames[w.wid] = w.frame
         sendButtonsNowAndSettled(w)
+        // Whether it can be resized at all: looked at once, off this queue (Accessibility
+        // waits on the app), and said only when it can't.
+        guard w.kind != .popup else { return }
+        let control = control_, wid = w.wid, pid = w.pid
+        appQueue(pid).async { [weak self] in
+            guard control.fixedSize(wid, pid: pid) == true else { return }
+            self?.queue.async {
+                guard let self, self.tracker.windows[wid] != nil else { return }
+                var f = MsgWriter(.windowFixed); f.u32(wid); self.control?.send(f)
+            }
+        }
     }
 
     /// The window's buttons now, and again shortly. An app that places them itself (an

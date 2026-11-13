@@ -43,6 +43,8 @@ pub enum UiEvent {
     WindowAdded(WinInfo),
     WindowChanged { wid: u32, title: String, w: f32, h: f32, rel_x: f32, rel_y: f32 },
     WindowRemoved(u32),
+    /// The app won't let this window be resized.
+    WindowFixed(u32),
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
     Focused,
@@ -88,6 +90,7 @@ impl UiEvent {
             UiEvent::WindowAdded(_) => "window added",
             UiEvent::WindowChanged { .. } => "window changed",
             UiEvent::WindowRemoved(_) => "window removed",
+            UiEvent::WindowFixed(_) => "window fixed",
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
             UiEvent::Focused => "focused",
@@ -867,6 +870,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             rel_y: r.f32()?,
         },
         t::WINDOW_REMOVED => UiEvent::WindowRemoved(r.u32()?),
+        t::WINDOW_FIXED => UiEvent::WindowFixed(r.u32()?),
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
         t::FOCUSED => {

@@ -46,6 +46,15 @@ final class WindowControl {
     func forget(_ wid: UInt32) { lock.withLock { cache[wid] = nil } }
 
     @discardableResult
+    /// The app won't let the window be resized (macOS says its size can't be set): a reminder,
+    /// an About or settings window, a fixed dialog. Nil if the window can't be looked at.
+    func fixedSize(_ wid: UInt32, pid: pid_t) -> Bool? {
+        guard let e = element(wid, pid: pid) else { return nil }
+        var settable: DarwinBoolean = false
+        guard AXUIElementIsAttributeSettable(e, kAXSizeAttribute as CFString, &settable) == .success else { return nil }
+        return !settable.boolValue
+    }
+
     func setSize(_ wid: UInt32, pid: pid_t, _ size: CGSize) -> Bool {
         guard let e = element(wid, pid: pid) else { return false }
         var s = size

@@ -187,6 +187,27 @@ pub fn watch_tiling() {
     });
 }
 
+/// Floats this process's window of that class (and title, if several share it): a Mac window
+/// its app won't let be resized, which a tile would cut off or leave empty around.
+pub fn float_window(class: String, title: String) {
+    std::thread::spawn(move || {
+        let Ok(out) = Command::new("hyprctl").args(["-j", "clients"]).output() else { return };
+        let Ok(serde_json::Value::Array(clients)) = serde_json::from_slice(&out.stdout) else { return };
+        let pid = u64::from(std::process::id());
+        let ours: Vec<_> = clients.iter().filter(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class.as_str())).collect();
+        let Some(c) = ours.iter().find(|c| c["title"].as_str() == Some(title.as_str())).or(ours.first()) else { return };
+        if c["floating"].as_bool() == Some(true) {
+            return;
+        }
+        let Some(address) = c["address"].as_str() else { return };
+        let lua = format!(r#"hl.dsp.window.float({{ action = "enable", window = "address:{address}" }})"#);
+        let done = Command::new("hyprctl").args(["dispatch", &lua]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok");
+        if !done {
+            let _ = Command::new("hyprctl").args(["dispatch", "setfloating", &format!("address:{address}")]).output();
+        }
+    });
+}
+
 /// Hyprland frames every window as a plain rectangle (no rounding set, as on Omarchy): a Mac
 /// window's rounded corners would leave gaps inside that frame. Looked at once.
 pub fn square_windows() -> bool {
