@@ -1,6 +1,6 @@
-//! Where Mac apps show up on the Linux desktop besides their windows: the task manager (with the
-//! widget for apps running with no window, linux/plasmoid/dev.sweeflow.running) and the Global
-//! Menu bar. KDE Plasma only, through its scripting interface for panels and widgets.
+//! Where Mac apps show up on the Linux desktop besides their windows: Plasma's Global Menu bar,
+//! and the tidying away of what earlier versions put on the panels. KDE Plasma only, through
+//! its scripting interface for panels and widgets.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -46,59 +46,27 @@ pub fn query() -> Placement {
     }
 }
 
-/// The Mac apps running with no window here, which the task manager can't list (it only knows
-/// windows and pinned apps): a widget right after each task manager's tasks, drawn like them.
-/// The task manager stops filling the panel and the widget takes the free room instead, its
-/// icons at its start: so they follow the tasks, with no gap. The task manager's old setting is
-/// kept in the widget's own config, and put back when switched off. (No panel properties are
-/// read: on a panel whose screen is unplugged some of them crash plasmashell.)
-pub fn set_running(on: bool) -> Result<()> {
-    if on {
-        plasma(&format!(
-            "panels().forEach(function(p){{\n\
-               if (p.widgets('{RUNNING}').length) return;\n\
-               p.widgets().filter(function(w){{ return w.type == 'org.kde.plasma.icontasks' || w.type == 'org.kde.plasma.taskmanager'; }})\n\
-                 .forEach(function(t){{\n\
-                   t.currentConfigGroup = ['General'];\n\
-                   var fill = t.readConfig('fill', true);\n\
-                   var w = p.addWidget('{RUNNING}'); w.index = t.index + 1;\n\
-                   w.currentConfigGroup = ['General'];\n\
-                   w.writeConfig('taskManager', String(t.id)); w.writeConfig('restoreFill', String(fill));\n\
-                   w.reloadConfig();\n\
-                   t.writeConfig('fill', false); t.reloadConfig();\n\
-                 }});\n\
-             }});"
-        ))?;
-    } else {
-        plasma(&format!(
-            "panels().forEach(function(p){{ p.widgets('{RUNNING}').forEach(function(w){{\n\
-               w.currentConfigGroup = ['General'];\n\
-               var tm = w.readConfig('taskManager', ''), fill = w.readConfig('restoreFill', '');\n\
-               p.widgets().forEach(function(o){{\n\
-                 if (String(o.id) == String(tm) && fill !== '') {{ o.currentConfigGroup = ['General']; o.writeConfig('fill', String(fill) != 'false'); o.reloadConfig(); }}\n\
-               }});\n\
-               w.remove();\n\
-             }}); }});"
-        ))?;
+/// The strip of Mac apps running with no window, which sat right after each task manager's
+/// tasks, is gone: open windows are in the task manager, and what is running (with a window or
+/// not) is seen and quit in Sweeflow's own menu. Takes the widget off the panels and gives each
+/// task manager back the setting it had (the widget kept it in its own config), then removes
+/// its files.
+fn remove_running_strip() -> Result<()> {
+    plasma(&format!(
+        "panels().forEach(function(p){{ p.widgets('{RUNNING}').forEach(function(w){{\n\
+           w.currentConfigGroup = ['General'];\n\
+           var tm = w.readConfig('taskManager', ''), fill = w.readConfig('restoreFill', '');\n\
+           p.widgets().forEach(function(o){{\n\
+             if (String(o.id) == String(tm) && fill !== '') {{ o.currentConfigGroup = ['General']; o.writeConfig('fill', String(fill) != 'false'); o.reloadConfig(); }}\n\
+           }});\n\
+           w.remove();\n\
+         }}); }});"
+    ))?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&home).join(".local/share/plasma/plasmoids").join(RUNNING));
     }
+    let _ = std::fs::remove_file(crate::config::dir().join("running-widget-added"));
     Ok(())
-}
-
-/// On the first install (a marker in the config dir says it's been done), the widget for Mac
-/// apps with no window, unless Mac apps are kept out of the task manager. Only once: removed by
-/// hand, it stays removed.
-pub fn first_install() {
-    let marker = crate::config::dir().join("running-widget-added");
-    if marker.exists() || crate::desktop::has_rule(TASKBAR_RULE) {
-        return;
-    }
-    match set_running(true) {
-        Ok(()) => {
-            let _ = std::fs::create_dir_all(crate::config::dir());
-            let _ = std::fs::write(marker, "");
-        }
-        Err(e) => println!("    (couldn't add the widget for Mac apps with no window: {e:#})"),
-    }
 }
 
 /// The Mac Dock widget is gone (Mac apps are in the task manager, and that's it): takes every
@@ -113,8 +81,11 @@ pub fn retire_old_choices() {
     if let Some(home) = std::env::var_os("HOME") {
         let _ = std::fs::remove_dir_all(std::path::Path::new(&home).join(".local/share/plasma/plasmoids").join(DOCK));
     }
+    if let Err(e) = remove_running_strip() {
+        log::debug!("removing the strip of windowless Mac apps: {e:#}");
+    }
     if crate::desktop::has_rule(TASKBAR_RULE) {
-        if let Err(e) = set_running(true).and_then(|()| crate::desktop::set_rule(TASKBAR_RULE, None)) {
+        if let Err(e) = crate::desktop::set_rule(TASKBAR_RULE, None) {
             log::warn!("putting Mac windows back in the task manager: {e:#}");
         }
     }
