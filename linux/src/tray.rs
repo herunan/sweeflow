@@ -115,6 +115,15 @@ pub fn start() {
     let _ = REFRESH.set(tx);
     // The keys the menu and panels show, as the user changes them.
     crate::keys::watch();
+    // No tray to show the icon in (plain Hyprland, a bar without one): say once that Sweeflow
+    // runs and how to open it, or nothing tells anyone.
+    std::thread::spawn(|| {
+        // A bar may come up a little after Sweeflow at login.
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        if !widget_installed() && !tray_host_present() {
+            tell_no_tray();
+        }
+    });
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
@@ -147,6 +156,36 @@ pub fn start() {
             }
         })
         .unwrap();
+}
+
+/// Whether anything shows tray icons here (a StatusNotifier watcher on the session bus).
+fn tray_host_present() -> bool {
+    let Ok(bus) = zbus::blocking::Connection::session() else { return true };
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&bus) else { return true };
+    dbus.name_has_owner("org.kde.StatusNotifierWatcher".try_into().unwrap()).unwrap_or(true)
+}
+
+/// A desktop notification that Sweeflow is running and which key opens it (when there's no tray).
+fn tell_no_tray() {
+    let key = crate::keys::current().open.map(|k| k.shown(crate::setup::mac_keys_remapped(), "Super"));
+    let body = match key {
+        Some(k) if k.starts_with('⌘') => format!("{} (Super+Alt+{}) opens it; it's in your app launcher too.", k, k.chars().last().unwrap_or('O')),
+        Some(k) => format!("{k} opens it; it's in your app launcher too."),
+        None => "Open it from your app launcher (or run `sweeflow open`).".to_string(),
+    };
+    let Ok(bus) = zbus::blocking::Connection::session() else { return };
+    let hints: std::collections::HashMap<&str, zbus::zvariant::Value> = std::collections::HashMap::new();
+    let r = bus.call_method(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        Some("org.freedesktop.Notifications"),
+        "Notify",
+        &("Sweeflow", 0u32, "sweeflow", "Sweeflow is running", body.as_str(), Vec::<&str>::new(), hints, 10_000i32),
+    );
+    match r {
+        Ok(_) => log::info!("no tray here: told how to open Sweeflow ({body})"),
+        Err(e) => log::info!("no tray here, and no notifications either: {e}"),
+    }
 }
 
 /// Tells the tray (and widget) to redraw: something they show changed.
