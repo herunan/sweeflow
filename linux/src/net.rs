@@ -201,6 +201,14 @@ static REACHABLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new
 static IN_USE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The other linked Macs found online (true) or not (false), by fingerprint; missing: not known yet.
 static OTHERS_ONLINE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+/// Linked Macs this computer isn't streaming from that say they're streaming to a computer
+/// (their network announcement), by fingerprint.
+static BUSY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// A linked Mac this computer isn't connected to is streaming to another computer.
+pub fn busy(fingerprint: &str) -> bool {
+    BUSY.lock().unwrap().contains(fingerprint)
+}
 
 fn offline_file() -> std::path::PathBuf {
     // The file's name is from when Stop was called Disconnect: kept, so the choice made then
@@ -275,7 +283,12 @@ fn watch_presence(in_use: &str) {
         let seen = crate::pair::seen_on_network(Duration::from_secs(2));
         let mut changed = false;
         for fp in wanted {
-            let found = fp.get(..16).is_some_and(|id| seen.contains(id));
+            let id = fp.get(..16).unwrap_or_default();
+            let found = seen.contains_key(id);
+            // Busy: only while this computer isn't the one it streams to (stopped, or another Mac).
+            let busy = seen.get(id).copied().unwrap_or(false);
+            let was = if busy { BUSY.lock().unwrap().insert(fp.clone()) } else { BUSY.lock().unwrap().remove(fp) };
+            changed |= was;
             let Some(now) = looks.entry(fp.clone()).or_default().after(found) else { continue };
             if fp == in_use {
                 // Started meanwhile: then the connection says, not this.
@@ -288,6 +301,8 @@ fn watch_presence(in_use: &str) {
         }
         looks.retain(|f, _| linked.contains(f));
         OTHERS_ONLINE.lock().unwrap().retain(|f, _| linked.contains(f));
+        // The Mac in use while started: the connection says (Busy), not this.
+        BUSY.lock().unwrap().retain(|f| linked.contains(f) && (f != in_use || offline()));
         if changed {
             crate::tray::refresh();
         }

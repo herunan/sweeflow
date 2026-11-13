@@ -353,8 +353,11 @@ final class Pairing {
 
 /// TXT record for both services: which Mac this is (stable across renames and IP changes),
 /// the streaming port and the protocol version.
-func serviceTXT() -> NWTXTRecord {
-    NWTXTRecord(["id": String(identity.fingerprint.prefix(16)), "port": "\(settings.config.port)", "v": "\(protocolVersion)"])
+/// `busy`: streaming to a computer now, so every other linked computer can say so without
+/// connecting (a connection is turned away while another computer is served).
+func serviceTXT(busy: Bool = false) -> NWTXTRecord {
+    NWTXTRecord(["id": String(identity.fingerprint.prefix(16)), "port": "\(settings.config.port)", "v": "\(protocolVersion)",
+                 "busy": busy ? "1" : "0"])
 }
 
 /// The code a computer that's linking has to type, in big digits. A window of its own rather than

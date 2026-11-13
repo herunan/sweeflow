@@ -638,6 +638,7 @@ fn manual_mac(text: &str) -> Option<FoundMac> {
         hostname: if host.parse::<std::net::IpAddr>().is_ok() { String::new() } else { host.to_string() },
         addr,
         stream_port: 44120,
+        busy: false,
     })
 }
 

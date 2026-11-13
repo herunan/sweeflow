@@ -600,7 +600,9 @@ pub fn panel_state() -> serde_json::Value {
             serde_json::json!({ "name": m.name, "fingerprint": m.fingerprint, "active": m.fingerprint == cfg.host_fingerprint,
                                 "kind": kinds.get(&m.fingerprint).map(String::as_str).unwrap_or(""),
                                 // Reachable on the network: null until known.
-                                "online": crate::net::online(&m.fingerprint) })
+                                "online": crate::net::online(&m.fingerprint),
+                                // Streaming to another computer (as its network announcement says).
+                                "busy": crate::net::busy(&m.fingerprint) })
         })
         .collect();
     let mac_name = mac_name(&state, &cfg);

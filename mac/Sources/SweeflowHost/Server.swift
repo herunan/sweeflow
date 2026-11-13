@@ -89,7 +89,15 @@ final class Server {
     private let identity: Identity
     private var listener: NWListener?
     /// The session being served.
-    private var session: Session?
+    private var session: Session? {
+        didSet { if (session != nil) != (oldValue != nil) { advertise() } }
+    }
+
+    /// The streaming service on the network, saying whether a computer is being served (busy).
+    private func advertise() {
+        guard let l = listener else { return }
+        l.service = NWListener.Service(name: macName, type: streamServiceType, domain: nil, txtRecord: serviceTXT(busy: session != nil))
+    }
     /// Every connection's session, served or not yet (kept alive here).
     private var sessions: [ObjectIdentifier: Session] = [:]
     private var groups: [ObjectIdentifier: NWConnectionGroup] = [:]

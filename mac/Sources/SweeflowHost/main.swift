@@ -162,6 +162,8 @@ final class HostState {
     var client: String? {
         didSet { if client != oldValue { NotificationCenter.default.post(name: .sweeflowConnectionChanged, object: nil) } }
     }
+    /// What that computer calls itself (said in its hello; empty from older ones). Main thread.
+    var clientSaysName = ""
     private var teardown: DispatchWorkItem?
 
     private var mutedByUs = false

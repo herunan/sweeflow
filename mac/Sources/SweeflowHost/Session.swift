@@ -186,8 +186,8 @@ final class Session {
             DebugPort.session = self
             if !started {
                 started = true
-                let fp = clientFingerprint
-                DispatchQueue.main.async { host.client = fp; host.sessionStarted() }
+                let fp = clientFingerprint, name = clientName
+                DispatchQueue.main.async { host.clientSaysName = name; host.client = fp; host.sessionStarted() }
             }
             let key = ObjectIdentifier(s)
             if let st = streamers.removeValue(forKey: key) { st.stop() }

@@ -74,8 +74,8 @@ PlasmoidItem {
     readonly property bool canStart: st.canStart !== false
     // Why Start can't be pressed for this Mac ("" if it can): it's streaming to another computer,
     // or it can't be reached (or isn't known to be reachable yet). `online`: true, false or null.
-    function startBlocked(name, online, active) {
-        if (active && !canStart && elsewhere !== "") return "Stop streaming elsewhere first"
+    function startBlocked(name, online, active, busy) {
+        if ((active && !canStart && elsewhere !== "") || busy) return "Stop streaming elsewhere first"
         if (online === false) return name + " is not online"
         if (online === null || online === undefined) return "Checking whether " + name + " is online"
         return ""
@@ -86,6 +86,8 @@ PlasmoidItem {
         name: m.name, fingerprint: m.fingerprint, active: !!m.active,
         // true, false, or null while not known yet.
         online: m.online === undefined ? null : m.online,
+        // Streaming to another computer (as it says on the network).
+        busy: !!m.busy,
     })))
     readonly property var linkedMacs: JSON.parse(macsJson)
     // The Mac being renamed, or asked about unlinking (fingerprints).
@@ -241,7 +243,14 @@ PlasmoidItem {
                         PlasmaComponents3.Label {
                             text: root.statusText
                             font: Kirigami.Theme.smallFont
-                            opacity: 0.7
+                            // Where the Mac in use stands: Online green; Locked or Busy orange;
+                            // Not online grey (as in the Macs tab).
+                            readonly property string macState: !root.running || !root.paired ? ""
+                                : root.st.online === false ? "offline"
+                                : root.elsewhere !== "" || root.linkedMacs.some(m => m.active && m.busy) ? "busy"
+                                : root.st.locked ? "locked"
+                                : root.st.online === true ? "online" : ""
+                            color: macState === "online" ? "#30a46c" : macState === "busy" || macState === "locked" ? "#e8890c" : Kirigami.Theme.disabledTextColor
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                         }
@@ -252,7 +261,7 @@ PlasmoidItem {
                     model: root.streamActions
                     delegate: SignButton {
                         required property string modelData
-                        readonly property string why: modelData === "start" ? root.startBlocked(root.st.mac || "The Mac", root.st.online === undefined ? null : root.st.online, true) : ""
+                        readonly property string why: modelData === "start" ? root.startBlocked(root.st.mac || "The Mac", root.st.online === undefined ? null : root.st.online, true, root.linkedMacs.some(m => m.active && m.busy)) : ""
                         readonly property bool blocked: why !== ""
                         icon.name: root.actionIcons[modelData] || ""
                         text: root.actionLabels[modelData] || modelData
@@ -564,7 +573,7 @@ PlasmoidItem {
                                         id: nameCol
                                         readonly property string macState: mac.modelData.online === null ? ""
                                             : mac.modelData.online === false ? "offline"
-                                            : mac.modelData.active && root.elsewhere !== "" ? "busy"
+                                            : mac.modelData.busy || (mac.modelData.active && root.elsewhere !== "") ? "busy"
                                             : mac.modelData.active && root.st.locked ? "locked" : "online"
                                         Layout.fillWidth: true
                                         spacing: 0
@@ -598,7 +607,7 @@ PlasmoidItem {
                                             required property string modelData
                                             icon.name: root.actionIcons[modelData] || ""
                                             text: root.actionLabels[modelData] || modelData
-                                            readonly property string why: modelData === "start" ? root.startBlocked(mac.modelData.name, mac.modelData.online, mac.modelData.active) : ""
+                                            readonly property string why: modelData === "start" ? root.startBlocked(mac.modelData.name, mac.modelData.online, mac.modelData.active, mac.modelData.busy) : ""
                                             readonly property bool blocked: why !== ""
                                             tip: blocked ? why
                                                : mac.modelData.active ? root.actionTips[modelData] : "Start streaming from this Mac"

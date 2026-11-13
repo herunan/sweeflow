@@ -65,7 +65,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let refused = Identity.disconnectedClients().intersection(Identity.pairedClients().map(\.fingerprint))
         let statusText: String
         if let fp = client {
-            let who = fp.isEmpty ? "Linux machine" : Identity.clientName(fp)
+            // The name it has here (renamed here, or from linking), else what it calls itself,
+            // never a code made from its certificate.
+            let known = fp.isEmpty ? "" : (Identity.pairedClients().first { $0.fingerprint == fp }?.name ?? "")
+            let who = !known.isEmpty ? known : !host.clientSaysName.isEmpty ? host.clientSaysName : "a Linux computer"
             statusText = c.enabled ? "Streaming to \(who)" : "Paused · \(who)"
         } else {
             statusText = refused.isEmpty ? "Not connected" : "Disconnected"
@@ -81,15 +84,20 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        let apps = NSMenuItem(title: "Apps", action: nil, keyEquivalent: "")
+        let apps = NSMenuItem(title: "Allowed apps", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         for a in AppList.found() {
-            let i = toggle(a.name, !c.excludeApps.contains(a.bundleId)) { c in
-                if let n = c.excludeApps.firstIndex(of: a.bundleId) { c.excludeApps.remove(at: n) } else { c.excludeApps.append(a.bundleId) }
-            }
+            // Ticked: its windows stream. A click ticks or unticks it and leaves the menu open, so
+            // several can be changed in one go.
             let icon = NSWorkspace.shared.icon(forFile: a.path)
             icon.size = NSSize(width: 16, height: 16)
-            i.image = icon
+            let i = NSMenuItem()
+            i.view = StayOpenToggle(title: a.name, icon: icon, on: !settings.config.excludeApps.contains(a.bundleId)) { on in
+                settings.update { c in
+                    c.excludeApps.removeAll { $0 == a.bundleId }
+                    if !on { c.excludeApps.append(a.bundleId) }
+                }
+            }
             sub.addItem(i)
         }
         apps.submenu = sub
@@ -231,4 +239,70 @@ private final class ClosureMenuItem: NSMenuItem {
     required init(coder: NSCoder) { fatalError() }
 
     @objc private func fire() { run() }
+}
+
+
+/// A menu row with a tick that changes in place: clicking it doesn't close the menu (a plain
+/// menu item always does), so several can be ticked or unticked in one go.
+private final class StayOpenToggle: NSView {
+    private let title: String
+    private let icon: NSImage
+    private var on: Bool
+    private let changed: (Bool) -> Void
+    private var hovered = false {
+        didSet { needsDisplay = true }
+    }
+
+    init(title: String, icon: NSImage, on: Bool, changed: @escaping (Bool) -> Void) {
+        self.title = title
+        self.icon = icon
+        self.on = on
+        self.changed = changed
+        let width = max(200, (title as NSString).size(withAttributes: [.font: NSFont.menuFont(ofSize: 0)]).width + 64)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
+        autoresizingMask = .width
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(title)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func viewDidMoveToWindow() { hovered = false }
+
+    override func mouseUp(with event: NSEvent) {
+        on.toggle()
+        needsDisplay = true
+        changed(on)
+    }
+
+    override func accessibilityValue() -> Any? { on }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let inner = bounds.insetBy(dx: 5, dy: 1)
+        if hovered {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: inner, xRadius: 4, yRadius: 4).fill()
+        }
+        let ink: NSColor = hovered ? .selectedMenuItemTextColor : .labelColor
+        let font = NSFont.menuFont(ofSize: 0)
+        if on {
+            let tick = "✓" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: font.pointSize, weight: .semibold), .foregroundColor: ink]
+            let sz = tick.size(withAttributes: attrs)
+            tick.draw(at: NSPoint(x: 12, y: (bounds.height - sz.height) / 2), withAttributes: attrs)
+        }
+        icon.draw(in: NSRect(x: 28, y: (bounds.height - 16) / 2, width: 16, height: 16))
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: ink]
+        let text = title as NSString
+        let sz = text.size(withAttributes: attrs)
+        text.draw(at: NSPoint(x: 50, y: (bounds.height - sz.height) / 2), withAttributes: attrs)
+    }
 }

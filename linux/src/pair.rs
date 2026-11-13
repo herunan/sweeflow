@@ -75,6 +75,8 @@ pub struct FoundMac {
     pub addr: SocketAddr,
     /// The streaming port (from the TXT record).
     pub stream_port: u16,
+    /// Streaming to a computer now (from the TXT record; a Mac from before it said so: false).
+    pub busy: bool,
 }
 
 pub enum Found {
@@ -113,6 +115,7 @@ pub fn browse(service: &'static str, mut on: impl FnMut(Found) + Send + 'static)
                         hostname: s.get_hostname().trim_end_matches('.').to_string(),
                         addr: SocketAddr::new(ip, port),
                         stream_port: s.get_property_val_str("port").and_then(|p| p.parse().ok()).unwrap_or(44120),
+                        busy: s.get_property_val_str("busy") == Some("1"),
                     }));
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => on(Found::Gone(instance_name(&fullname, service))),
@@ -145,13 +148,14 @@ pub fn locate(fingerprint: &str, wait: Duration) -> Option<SocketAddr> {
 }
 
 /// The Macs advertising streaming on the network within `wait`: the start of each one's
-/// certificate fingerprint (16 hex digits, as `locate` matches them).
-pub fn seen_on_network(wait: Duration) -> std::collections::HashSet<String> {
-    let seen: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
+/// certificate fingerprint (16 hex digits, as `locate` matches them), and whether it's busy
+/// streaming to a computer.
+pub fn seen_on_network(wait: Duration) -> std::collections::HashMap<String, bool> {
+    let seen: Arc<Mutex<std::collections::HashMap<String, bool>>> = Arc::default();
     let s2 = seen.clone();
     let browser = browse(STREAM_SERVICE, move |f| {
         if let Found::Up(m) = f {
-            s2.lock().unwrap().insert(m.id);
+            s2.lock().unwrap().insert(m.id, m.busy);
         }
     });
     if browser.is_ok() {
@@ -600,7 +604,7 @@ mod tests {
     }
 
     fn found() -> FoundMac {
-        FoundMac { name: "Air".into(), id: String::new(), hostname: "air.local".into(), addr: "192.168.1.20:44121".parse().unwrap(), stream_port: 44120 }
+        FoundMac { name: "Air".into(), id: String::new(), hostname: "air.local".into(), addr: "192.168.1.20:44121".parse().unwrap(), stream_port: 44120, busy: false }
     }
 
     fn result(status: u8, tag: &[u8]) -> Vec<u8> {

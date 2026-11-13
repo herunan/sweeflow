@@ -171,6 +171,8 @@ slint::slint! {
         in property <bool> paired;
         in property <string> mac-name;
         in property <string> status;
+        // Where the Mac in use stands (as MacItem.online): the status line takes its colour.
+        in property <string> status-state;
         // 2 streaming, 1 paused or ready to stream, 0 neither.
         in property <int> dot;
         // What can be done about the Mac in use (Pause and Stop, Resume and Stop, Start, or Stop).
@@ -246,7 +248,7 @@ slint::slint! {
                                     background: root.dot == 2 ? Look.accent : root.dot == 1 ? #d9a520 : Look.muted;
                                 }
                             }
-                            Text { text: root.status; color: Look.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; }
+                            Text { text: root.status; color: root.status-state == "" ? Look.muted : MacState.ink(root.status-state); font-size: 12px; overflow: elide; horizontal-stretch: 1; }
                         }
                     }
                     // What can be done in this state (pause and stop, resume and stop, or start),
@@ -638,6 +640,8 @@ struct Mac {
     active: bool,
     /// Reachable on the network; None while not known yet.
     online: Option<bool>,
+    /// Streaming to another computer (as it says on the network).
+    busy: bool,
 }
 
 fn parse_state(json: &str) -> Option<PanelState> {
@@ -847,8 +851,10 @@ fn start_blocked(s: &PanelState, action: &str) -> Option<String> {
         return None;
     }
     let mac = if s.mac.is_empty() { "The Mac" } else { s.mac.as_str() };
+    let busy = s.macs.iter().any(|m| m.active && m.busy);
     match (&s.elsewhere, s.online) {
         (Some(other), _) => Some(crate::tray::start_hint(other)),
+        (None, Some(true)) if busy => Some(crate::tray::start_hint("")),
         (None, Some(false)) => Some(format!("{mac} is not online")),
         (None, None) => Some(format!("Checking whether {mac} is online")),
         _ => None,
@@ -860,7 +866,7 @@ fn start_blocked(s: &PanelState, action: &str) -> Option<String> {
 /// only of the Mac in use.
 fn mac_state(s: &PanelState, m: &Mac) -> &'static str {
     match online_text(m.online) {
-        "online" if m.active && s.elsewhere.is_some() => "busy",
+        "online" if m.busy || (m.active && s.elsewhere.is_some()) => "busy",
         "online" if m.active && s.locked => "locked",
         other => other,
     }
@@ -883,6 +889,8 @@ fn show(ui: &PanelWin, v: &mut View) {
     ui.set_paired(s.paired);
     ui.set_mac_name(if s.mac.is_empty() { "Mac".into() } else { s.mac.as_str().into() });
     ui.set_status(s.status.as_str().into());
+    let active_state = s.macs.iter().find(|m| m.active).map_or("", |m| mac_state(&s, m));
+    ui.set_status_state(active_state.into());
     let streaming = s.connected && s.settings.enabled;
     ui.set_dot(if streaming {
         2
@@ -1115,7 +1123,7 @@ mod tests {
         assert_eq!(s.settings.exclude, ["com.apple.Notes"]);
         assert_eq!(s.apps.len(), 4);
         assert_eq!(s.apps[1], App { id: "com.apple.Safari".into(), name: "Safari".into(), icon: "file:///nowhere/safari.png".into(), state: 3, pinned: false });
-        assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true) });
+        assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true), busy: false });
         assert_eq!(s.macs[1].online, None);
         assert_eq!(s.macs.iter().map(|m| online_text(m.online)).collect::<Vec<_>>(), ["online", ""]);
         assert_eq!(online_text(Some(false)), "offline");
