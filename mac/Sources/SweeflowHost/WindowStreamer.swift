@@ -402,6 +402,27 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         applySize(to: config)
         stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
+        expectFrameAfterResize()
+    }
+
+    /// A reconfigured capture sends nothing until the window changes. A window that had already
+    /// redrawn at its new size by then (an idle one, resized by a tiling layout swapping tiles)
+    /// stayed at its old picture on Linux, at the old size. So if no frame has come shortly
+    /// after the last resize, the capture is started afresh, which always begins with one.
+    private var resizeChecks = 0
+
+    private func expectFrameAfterResize() {
+        resizeChecks += 1
+        let check = resizeChecks, frames = framesSinceStart
+        queue.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.showingPause, check == self.resizeChecks,
+                  let s = self.stream, self.framesSinceStart == frames else { return }
+            log("stream \(self.wid): no frame since its resize, starting the capture again")
+            s.stopCapture { _ in }
+            self.stream = nil
+            self.forceKeyframe = true
+            self.restartCapture(still: true)
+        }
     }
 
     /// When the last resume was asked for (host µs), until its first frame goes out (0: none due).
