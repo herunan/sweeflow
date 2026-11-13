@@ -77,7 +77,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         for a in found {
             // Ticked: its windows stream. A click ticks or unticks it and leaves the menu open, so
             // several can be changed in one go.
-            let icon = NSWorkspace.shared.icon(forFile: a.path)
+            let icon = NSWorkspace.shared.icon(forFile: URL(fileURLWithPath: a.path).resolvingSymlinksInPath().path)
             icon.size = NSSize(width: 16, height: 16)
             let i = NSMenuItem()
             i.view = StayOpenToggle(title: a.name, icon: icon, on: !settings.config.excludeApps.contains(a.bundleId)) { on in

@@ -37,7 +37,9 @@ enum AppList {
     }
 
     static func scan() -> [App] {
-        found().map { App(bundleId: $0.bundleId, name: $0.name, iconPNG: png(NSWorkspace.shared.icon(forFile: $0.path), size: 128)) }
+        // The app itself, not a link to it: Safari's /Applications entry links into the system's
+        // own folder, and a link's icon carries the alias arrow.
+        found().map { App(bundleId: $0.bundleId, name: $0.name, iconPNG: png(NSWorkspace.shared.icon(forFile: URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path), size: 128)) }
     }
 
     static func png(_ image: NSImage, size: Int) -> Data {
