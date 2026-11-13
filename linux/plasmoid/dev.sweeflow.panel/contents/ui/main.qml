@@ -482,6 +482,12 @@ PlasmoidItem {
                         onFlipped: (v) => root.act("square", v ? "on" : "off")
                     }
                     ToggleRow {
+                        label: "Windows as big as their app needs"
+                        hint: "A Mac window that won't go as small as asked keeps its size here; off, it's cut off at the size it's given"
+                        on: !!root.st.keepSize
+                        onFlipped: (v) => root.act("keep-size", v ? "on" : "off")
+                    }
+                    ToggleRow {
                         label: "High quality"
                         hint: "Turn off for slower connections"
                         on: root.settings.quality !== "light"

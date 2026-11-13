@@ -39,6 +39,11 @@ pub struct Config {
     /// Mac windows with square corners (true) or the Mac's rounded ones (false). Not set: what
     /// suits the desktop (see `square_corners`).
     pub square_corners: Option<bool>,
+    /// Mac windows are kept at least as big as their app allows (true: an app that won't shrink
+    /// to the size asked has that size declared as the window's minimum here, and the desktop
+    /// gives it the room) or left at the desktop's size, the picture cut off (false). Not set:
+    /// what suits the desktop (see `keep_app_size`).
+    pub keep_app_size: Option<bool>,
 }
 
 /// Whether Mac windows are shown with square corners: the setting, or without one what suits
@@ -77,6 +82,44 @@ pub fn set_square_corners(on: bool) {
     });
 }
 
+/// Whether Mac windows are kept at least as big as their app allows (declaring the size an app
+/// keeps as the window's minimum, or its maximum when it stays smaller): the setting, or without
+/// one what suits the desktop. Off on Hyprland, where every window is a tile whose size the
+/// layout alone decides (a declared limit is ignored, and a window drawn bigger than its tile
+/// would lie over its neighbours): there the window is the tile and what doesn't fit is cut
+/// off. On elsewhere: the desktop honours the limit, so the whole window shows.
+static KEEP_APP_SIZE: std::sync::LazyLock<std::sync::atomic::AtomicBool> = std::sync::LazyLock::new(|| {
+    let set = Config::load_or_default().ok().and_then(|c| c.keep_app_size);
+    std::sync::atomic::AtomicBool::new(set.unwrap_or_else(|| !crate::hyprland::running()))
+});
+
+pub fn keep_app_size() -> bool {
+    KEEP_APP_SIZE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Switches keeping Mac windows at their app's size on or off, and saves it. Switched off, the
+/// limits declared so far go at once.
+pub fn set_keep_app_size(on: bool) {
+    if KEEP_APP_SIZE.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
+        return;
+    }
+    log::info!("Mac windows: {} at least as big as their app allows", if on { "kept" } else { "not kept" });
+    crate::net::tell_ui(crate::net::UiEvent::KeepSizeSetting);
+    std::thread::spawn(|| {
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = SAVING.lock().unwrap();
+        match Config::load_or_default() {
+            Ok(mut c) => {
+                c.keep_app_size = Some(keep_app_size());
+                if let Err(e) = c.save() {
+                    log::warn!("saving config: {e:#}");
+                }
+            }
+            Err(e) => log::warn!("config: {e:#}"),
+        }
+    });
+}
+
 pub fn dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -95,6 +138,7 @@ impl Default for Config {
             capture_scale: 0.0,
             render_node: default_render_node(),
             square_corners: None,
+            keep_app_size: None,
         }
     }
 }
@@ -160,6 +204,7 @@ impl Config {
                 "capture_scale" => c.capture_scale = v.parse().context("capture_scale")?,
                 "render_node" => c.render_node = v,
                 "square_corners" => c.square_corners = Some(v != "false"),
+                "keep_app_size" => c.keep_app_size = Some(v != "false"),
                 _ => {}
             }
         }
@@ -232,6 +277,9 @@ impl Config {
         );
         if let Some(square) = self.square_corners {
             out += &format!("square_corners = {square}\n");
+        }
+        if let Some(keep) = self.keep_app_size {
+            out += &format!("keep_app_size = {keep}\n");
         }
         for m in &self.macs {
             out += &format!(
@@ -325,6 +373,9 @@ mod tests {
         assert_eq!(Config::parse(&c.render()).unwrap().square_corners, None, "not set unless chosen");
         c.square_corners = Some(false);
         assert_eq!(Config::parse(&c.render()).unwrap().square_corners, Some(false));
+        assert_eq!(Config::parse(&c.render()).unwrap().keep_app_size, None, "not set unless chosen");
+        c.keep_app_size = Some(false);
+        assert_eq!(Config::parse(&c.render()).unwrap().keep_app_size, Some(false));
     }
 
     #[test]

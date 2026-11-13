@@ -193,8 +193,14 @@ struct Win {
     configured: bool,
     /// Logical size of the window as configured by the compositor.
     size: (u32, u32),
-    /// A first refusal (size asked, size the Mac kept): the Mac may just be lagging behind a
-    /// drag, so it's asked once more; the same refusal twice and it's left alone.
+    /// Smallest size the Mac app turned out to accept (declared to the compositor, so tiling
+    /// gives the window at least that instead of cutting it off).
+    min_size: (u32, u32),
+    /// Largest size the Mac app turned out to accept (it stayed smaller than asked: a video-call app's
+    /// meeting window, a window wider than the Mac's display).
+    max_size: Option<(u32, u32)>,
+    /// A first refusal (size asked, size the Mac kept), not acted on yet: the Mac may just be
+    /// lagging behind a drag. Only the same refusal twice in a row declares a limit.
     refusal: Option<((u32, u32), (u32, u32))>,
     /// The Mac reached the size last asked for (so a later difference is the app's own doing).
     followed: bool,
@@ -328,6 +334,11 @@ pub struct App {
     icon_pngs: HashMap<String, Vec<u8>>,
     /// Apps looked at for a taskbar entry (see note_app).
     noted_apps: std::collections::HashSet<String>,
+    /// The smallest an app's windows of a kind turned out to go (bundle id, kind → logical px),
+    /// from a refusal in this session: the next window of that kind that is at least that big
+    /// gets the limit at once, instead of being cut off until it refuses too. Replaced by the
+    /// app's next answer, dropped when it goes smaller after all.
+    app_mins: HashMap<(String, u8), (u32, u32)>,
     background: Option<wl_buffer::WlBuffer>,
     /// Fully transparent 1x1 buffer: base for popups (menus have rounded, translucent edges).
     clear: Option<wl_buffer::WlBuffer>,
@@ -453,6 +464,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         icons: HashMap::new(),
         icon_pngs: HashMap::new(),
         noted_apps: std::collections::HashSet::new(),
+        app_mins: HashMap::new(),
         background: None,
         clear: None,
         screen_select: false,
@@ -648,6 +660,7 @@ impl App {
             UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png, qh),
             UiEvent::Focused => {}
             UiEvent::CornersSetting => self.apply_corners_setting(qh),
+            UiEvent::KeepSizeSetting => self.apply_keep_size_setting(),
             UiEvent::Tiling(seen) => {
                 let mut changed = Vec::new();
                 for (wid, w) in self.windows.iter_mut().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))) {
@@ -775,6 +788,14 @@ impl App {
             self.adopt_mac_size(wid, qh);
             return;
         }
+        // Its app's windows of this kind are known to go no smaller (one refused a size before):
+        // a new one at least that big gets the limit at once (see app_mins). A smaller one (a
+        // dialog, where the app's main window taught it) is left to answer for itself.
+        let remembered = self
+            .app_mins
+            .get(&(info.bundle_id.clone(), info.kind))
+            .copied()
+            .filter(|m| crate::config::keep_app_size() && info.kind == 0 && info.w >= m.0 as f32 && info.h >= m.1 as f32);
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
             let parent = &self.windows[&info.parent];
             let parent_xdg = match &parent.role {
@@ -815,7 +836,10 @@ impl App {
             window.set_app_id(format!("sweeflow-{}", info.bundle_id));
             // Floating panels (kind 2: reminders, palettes) are ordinary, independent windows
             // here too: own taskbar entry, tiled like the rest.
-            if info.kind != 2 {
+            if let Some(min) = remembered {
+                log::info!("window {}: {} windows go no smaller than {}x{}: that's its minimum size from the start", info.wid, info.app_name, min.0, min.1);
+                window.set_min_size(Some(min));
+            } else if info.kind != 2 {
                 window.set_min_size(Some(MIN_SIZE));
             }
             window.commit();
@@ -870,6 +894,7 @@ impl App {
         } else {
             (info.w.max(1.0) as u32, info.h.max(1.0) as u32)
         };
+        let info_kind = info.kind;
         let is_popup = matches!(role, Role::Popup(_));
         self.windows.insert(
             wid,
@@ -885,6 +910,8 @@ impl App {
                 inhibitor,
                 configured: false,
                 followed: false,
+                min_size: remembered.unwrap_or(if info_kind == 2 || info_kind == 3 { (1, 1) } else { MIN_SIZE }),
+                max_size: None,
                 refusal: None,
                 size,
                 requested: None,
@@ -1105,21 +1132,78 @@ impl App {
                 return;
             }
         }
-        // Asked for this size and the app kept another: the window here keeps the desktop's
-        // size all the same (no limits are declared from it). What fits of the picture shows,
-        // cut off at the window's edge, or the rest of the window is see-through (lay_out).
-        // Seen once, it's asked once more first: during a drag (or right after a reconnect)
-        // the Mac lags, and a real refusal comes back the same.
-        if matches!(w.role, Role::Toplevel(_)) {
+        // Asked for this size and the app stayed bigger: that's as small as it goes (a video-call app's
+        // meeting window). Declare it as the minimum, so the tiling makes room for the whole
+        // window instead of cutting its bottom off.
+        if let Role::Toplevel(win) = &w.role {
             let size = w.size;
-            if !w.followed && w.requested.is_some_and(|(r, _)| r == size) {
-                if w.refusal != Some((size, mac)) {
-                    w.refusal = Some((size, mac));
-                    w.requested = Some((size, Instant::now()));
-                    let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
-                    Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
-                }
+            // The app went below a minimum we declared: it can go smaller after all (the limit
+            // came from a moment the Mac was behind).
+            let default_min = if w.info.kind == 2 { (1, 1) } else { MIN_SIZE };
+            if w.min_size != default_min && (mac.0 + 4 < w.min_size.0 || mac.1 + 4 < w.min_size.1) {
+                log::info!("window {wid}: the Mac made it {}x{}: minimum size {}x{} dropped",
+                           mac.0, mac.1, w.min_size.0, w.min_size.1);
+                w.min_size = default_min;
+                win.set_min_size(Some(default_min));
+                self.app_mins.remove(&(w.info.bundle_id.clone(), w.info.kind));
+            }
+            let mut refused = !w.followed && w.requested.is_some_and(|(r, _)| r == size);
+            // Seen once, ask once more and look again: during a drag (or right after a
+            // reconnect) the Mac lags, and a limit declared from that sticks and wrecks the
+            // tiling. A real refusal comes back the same.
+            if refused && w.refusal != Some((size, mac)) {
+                w.refusal = Some((size, mac));
+                w.requested = Some((size, Instant::now()));
+                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+                refused = false;
+            }
+            if refused && !crate::config::keep_app_size() {
+                // Not kept at the app's size (a Hyprland tile): the app keeps its size and the
+                // window here the desktop's. What fits of the picture shows, cut off at the
+                // window's edge, or the rest of the window is see-through (lay_out). Not asked
+                // again until the size here changes.
                 return;
+            }
+            // Any real overshoot counts: even a few points cut off a toolbar. (Apps that snap to
+            // their own steps, like Terminal's character cells, end up smaller, not bigger.)
+            let min = (
+                if mac.0 > size.0 + 4 { mac.0.max(w.min_size.0) } else { w.min_size.0 },
+                if mac.1 > size.1 + 4 { mac.1.max(w.min_size.1) } else { w.min_size.1 },
+            );
+            if refused && min != w.min_size {
+                log::info!("window {wid}: the Mac keeps it {}x{} (asked {}x{}): minimum size {}x{}",
+                           mac.0, mac.1, size.0, size.1, min.0, min.1);
+                w.min_size = min;
+                win.set_min_size(Some(min));
+                self.app_mins.insert((w.info.bundle_id.clone(), w.info.kind), min);
+                // Drawn at that size, the tiling lays the window out again (the tiling redoes
+                // its layout when a window's size changes) and gives it the room. The picture
+                // shown is placed again for the new size at once (it has the whole window).
+                w.size = (size.0.max(min.0), size.1.max(min.1));
+                self.draw_base(wid, qh);
+                self.relayout(wid, qh);
+                return;
+            }
+            // The other way round: asked for more and the app stayed far smaller. Asking again
+            // won't help, so declare its size as the maximum and shrink to it, instead of
+            // keeping an empty window that size around it.
+            let far_smaller = mac.0 + 40 < size.0 || mac.1 + 40 < size.1;
+            if refused && far_smaller && w.max_size != Some((mac.0.max(w.min_size.0), mac.1.max(w.min_size.1))) {
+                let max = (mac.0.max(w.min_size.0), mac.1.max(w.min_size.1));
+                log::info!("window {wid}: the Mac keeps it {}x{} (asked {}x{}): maximum size {}x{}",
+                           mac.0, mac.1, size.0, size.1, max.0, max.1);
+                w.max_size = Some(max);
+                win.set_max_size(Some(max));
+                w.size = (size.0.min(max.0), size.1.min(max.1));
+                self.draw_base(wid, qh);
+                self.relayout(wid, qh);
+                return;
+            }
+            // The app grew past a maximum we declared: it can go bigger after all.
+            if w.max_size.is_some_and(|m| mac.0 > m.0 || mac.1 > m.1) {
+                w.max_size = None;
+                win.set_max_size(None);
             }
         }
         match &w.role {
@@ -1345,8 +1429,8 @@ impl App {
             (fw, fh)
         };
         // Drawn 1:1 from the window's top-left, never scaled: what doesn't fit (the Mac hasn't
-        // followed a shrink yet, or the app goes no smaller than the window here) is cut off at
-        // the window's edge, and a picture
+        // followed a shrink yet, or the app goes no smaller than the window here: a Hyprland
+        // tile, see config::keep_app_size) is cut off at the window's edge, and a picture
         // smaller than the window leaves the rest see-through.
         let ((sw, sh), (dw, dh), (cut_r, cut_b)) = shown_part((fw, fh), px_per_pt, (bw, bh), s);
 
@@ -1574,6 +1658,33 @@ impl App {
 
     /// Keeping Mac windows at their app's size was switched: off, the limits declared from the
     /// apps' refusals go at once (on, the next refusal declares one).
+    fn apply_keep_size_setting(&mut self) {
+        if crate::config::keep_app_size() {
+            return;
+        }
+        self.app_mins.clear();
+        for w in self.windows.values_mut() {
+            let Role::Toplevel(win) = &w.role else { continue };
+            if w.display {
+                continue;
+            }
+            let default_min = if w.info.kind == 2 { (1, 1) } else { MIN_SIZE };
+            let mut changed = false;
+            if w.min_size != default_min {
+                w.min_size = default_min;
+                win.set_min_size(Some(default_min));
+                changed = true;
+            }
+            if w.max_size.take().is_some() {
+                win.set_max_size(None);
+                changed = true;
+            }
+            if changed {
+                win.commit();
+            }
+        }
+    }
+
     /// New corner tiles from the Mac; shown from the next frame on.
     fn set_corners(&mut self, wid: u32, t_px: u32, tile_px: Vec<u8>, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get(&wid) else { return };
@@ -2555,6 +2666,15 @@ impl WindowHandler for App {
         let size = match cfg.new_size {
             (Some(cw), Some(ch)) => (cw.get(), ch.get()),
             _ => w.size,
+        };
+        // Within the limits declared (the desktop keeps to them; a Hyprland tile is configured
+        // at the tile's size whatever they are, and with them the window keeps the size its
+        // app needs, over the tile's edge: see config::keep_app_size).
+        let size = if w.display {
+            size
+        } else {
+            let max = w.max_size.unwrap_or((u32::MAX, u32::MAX));
+            (size.0.clamp(w.min_size.0.min(max.0), max.0), size.1.clamp(w.min_size.1.min(max.1), max.1))
         };
         let first = !w.configured;
         w.configured = true;
