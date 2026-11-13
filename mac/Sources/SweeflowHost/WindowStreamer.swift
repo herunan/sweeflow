@@ -410,6 +410,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// stayed at its old picture on Linux, at the old size. So if no frame has come shortly
     /// after the last resize, the capture is started afresh, which always begins with one.
     private var resizeChecks = 0
+    /// A shrunk capture was seen (and dropped) since the last proper frame.
+    private var shrunkSeen = false
 
     private func expectFrameAfterResize() {
         resizeChecks += 1
@@ -750,6 +752,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             // Only the current capture's frames (a replaced one can still deliver a few).
             guard let self, !self.stopped, !self.showingPause, stream === self.stream else { return }
+            // The window outgrew the capture's size and macOS shrank it into it, with black
+            // around (a TV window showed a black band at its bottom on Linux). Not sent: the
+            // capture is started afresh at the window's size if no proper frame follows soon.
+            if self.scDisplay == nil && contentScale < 0.98 {
+                if !self.shrunkSeen {
+                    self.shrunkSeen = true
+                    log(String(format: "stream %u: capture shrunk to %.0f%% (window outgrew it): dropped", self.wid, contentScale * 100))
+                    self.expectFrameAfterResize()
+                }
+                return
+            }
+            self.shrunkSeen = false
             self.process(pb, contentRect: contentRect, contentScale: contentScale, scaleFactor: scaleFactor, lagUs: lagUs)
         }
     }

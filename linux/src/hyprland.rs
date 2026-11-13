@@ -187,6 +187,55 @@ pub fn watch_tiling() {
     });
 }
 
+/// A Mac window's tile is smaller than its app allows (`min`, logical px; 0: no limit that
+/// way): its split is moved until the tile is that big, the way dragging the divider would. If
+/// the layout can't give it that (other tiles in the way, a layout without splits), it floats
+/// at that size, centred, instead: nothing is scaled or cut off for long. Hyprland ignores a
+/// tiled window's own minimum size, so this is how the minimum holds.
+pub fn hold_tile(class: String, title: String, min: (u32, u32)) {
+    std::thread::spawn(move || {
+        let Some((address, size)) = find(&class, &title) else { return };
+        let (dx, dy) = (min.0.saturating_sub(size.0), min.1.saturating_sub(size.1));
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let window = format!("address:{address}");
+        lua(&format!(r#"hl.dsp.window.resize({{ x = {dx}, y = {dy}, relative = true, window = "{window}" }})"#));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let Some((_, now)) = find(&class, &title) else { return };
+        if now.0 + 2 >= min.0 && now.1 + 2 >= min.1 {
+            log::info!("{class}: its tile grown to {}x{} (the app goes no smaller than {}x{})", now.0, now.1, min.0, min.1);
+            return;
+        }
+        // No room in the layout: floating at its own size.
+        let (w, h) = (min.0.max(now.0), min.1.max(now.1));
+        log::info!("{class}: no room for {}x{} in its tile ({}x{}): floating it", min.0, min.1, now.0, now.1);
+        lua(&format!(r#"hl.dsp.window.float({{ action = "enable", window = "{window}" }})"#));
+        lua(&format!(r#"hl.dsp.window.resize({{ x = {w}, y = {h}, window = "{window}" }})"#));
+        lua(&format!(r#"hl.dsp.window.center({{ window = "{window}" }})"#));
+    });
+}
+
+/// This process's window of that class (and title, if several share it): its address and size.
+fn find(class: &str, title: &str) -> Option<(String, (u32, u32))> {
+    let out = Command::new("hyprctl").args(["-j", "clients"]).output().ok()?;
+    let serde_json::Value::Array(clients) = serde_json::from_slice(&out.stdout).ok()? else { return None };
+    let pid = u64::from(std::process::id());
+    let ours: Vec<_> = clients.iter().filter(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class)).collect();
+    let c = ours.iter().find(|c| c["title"].as_str() == Some(title)).or(ours.first())?;
+    let size = (c["size"][0].as_u64()? as u32, c["size"][1].as_u64()? as u32);
+    Some((c["address"].as_str()?.to_string(), size))
+}
+
+/// Runs one of Hyprland's Lua dispatchers.
+fn lua(expr: &str) {
+    match Command::new("hyprctl").args(["dispatch", expr]).output() {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {}
+        Ok(o) => log::debug!("hyprctl dispatch {expr}: {}", String::from_utf8_lossy(&o.stdout).trim()),
+        Err(e) => log::debug!("hyprctl: {e}"),
+    }
+}
+
 /// Hyprland frames every window as a plain rectangle (no rounding set, as on Omarchy): a Mac
 /// window's rounded corners would leave gaps inside that frame. Looked at once.
 pub fn square_windows() -> bool {

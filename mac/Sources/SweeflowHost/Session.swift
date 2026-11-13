@@ -484,6 +484,9 @@ final class Session {
             setClientFocus(0)
         case .moveTaken:
             moveTaken(try m.u32())
+        case .shownSize:
+            let wid = try m.u32(), size = CGSize(width: CGFloat(try m.f32()), height: CGFloat(try m.f32()))
+            for st in streamers.values where st.wid == wid { st.visibleSize = size }
 
         default:
             log("unhandled message \(m.type)")

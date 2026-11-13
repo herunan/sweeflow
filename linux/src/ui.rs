@@ -257,6 +257,12 @@ struct Win {
     fitted: Option<(i32, i32)>,
     /// Hyprland gave the tile a new size the Mac hasn't been asked for yet, and when (arm_settle).
     settling: Option<Instant>,
+    /// What the Mac was last told is shown of the window, while it's fitted (SHOWN_SIZE).
+    shown_told: Option<(u32, u32)>,
+    /// The smallest the app lets this window be (logical px, learned when the Mac keeps it
+    /// bigger than its Hyprland tile twice; 0: none known that way). The tile is held at least
+    /// this big (hyprland::hold_tile).
+    app_min: (u32, u32),
 }
 
 impl Win {
@@ -918,6 +924,8 @@ impl App {
                 fit: (1.0, 0.0, 0.0),
                 fitted: None,
                 settling: None,
+                shown_told: None,
+                app_min: (0, 0),
                 popup_settled: false,
             },
         );
@@ -1032,6 +1040,15 @@ impl App {
         });
     }
 
+    /// The window's tile is smaller than its app allows: grown (or the window floated).
+    fn hold_tile(w: &Win) {
+        if w.app_min == (0, 0) {
+            return;
+        }
+        let class = format!("sweeflow-{}", w.info.bundle_id);
+        crate::hyprland::hold_tile(class, display_title(&w.info.app_name, &w.info.title), w.app_min);
+    }
+
     /// A Hyprland tile got a new size: the Mac is asked for it once it has stood for a moment
     /// (SETTLE), not at once. Hyprland lays a whole workspace out again in one go, and often
     /// twice within a moment (a size in between, then the tile's): asked for each, the Mac
@@ -1072,7 +1089,6 @@ impl App {
             // Check it took (a Mac window that can't follow reports no change).
             Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
         }
-        // The wait over, a picture just short of the tile is shown as it is (see tile_fit).
         self.relayout(wid, qh);
     }
 
@@ -1128,13 +1144,21 @@ impl App {
             }
         }
         if w.in_tile() {
-            // In a Hyprland tile the tile is the size: the window can't be drawn at another, so
-            // the Mac's size is never declared as a limit and never becomes the size here (the
-            // picture overflowed the tile, or left part of it empty). The picture is fitted
-            // into the tile while the Mac's size differs (lay_out). The Mac is asked once more,
-            // in case it was only behind (a whole workspace laid out again at once); an app
-            // that keeps its own size after that is left alone, fitted.
+            // In a Hyprland tile the tile is the size: the Mac's size is never declared as a
+            // limit (Hyprland ignores it for tiles) and never becomes the size here. The Mac is
+            // asked once more, in case it was only behind (a whole workspace laid out again at
+            // once); an app that keeps its size after that goes no smaller: its tile is grown
+            // to that size (hold_tile), and meanwhile the picture shows 1:1 from its corner.
             let size = w.size;
+            if w.refusal == Some((size, mac)) {
+                let min = (if mac.0 > size.0 + 2 { mac.0 } else { w.app_min.0 }, if mac.1 > size.1 + 2 { mac.1 } else { w.app_min.1 });
+                if min != w.app_min {
+                    w.app_min = min;
+                    log::info!("window {wid}: the app goes no smaller than {}x{}: holding its tile at that", mac.0, mac.1);
+                }
+                Self::hold_tile(w);
+                return;
+            }
             if w.refusal != Some((size, mac)) {
                 w.refusal = Some((size, mac));
                 w.requested = Some((size, Instant::now()));
@@ -1438,15 +1462,23 @@ impl App {
         // In a Hyprland tile the picture is fitted instead while it isn't the tile's size: all
         // of it, scaled, in the middle of the tile. Everything below is placed by the scaled
         // sizes, so the strips, corner tiles and lights go with it.
-        let fit = if w.in_tile() {
-            tile_fit((fw as f64 / px_per_pt * s, fh as f64 / px_per_pt * s), (bw as f64, bh as f64), w.settling.is_none())
-        } else {
-            None
-        };
+        // Never scaled: a picture not the tile's size (the Mac hasn't followed yet, or the app
+        // goes no smaller and its tile is being grown) shows 1:1 from the corner, the rest of
+        // the tile see-through.
+        let fit: Option<(f64, f64, f64)> = None;
         let (k, ox, oy) = fit.unwrap_or((1.0, 0.0, 0.0));
         let ((sw, sh), (dw, dh)) = shown_part((fw, fh), px_per_pt, (bw, bh), s, k);
         let fitted = fit.map(|_| (dw, dh));
         let refitted = w.fitted != fitted || w.fit != (k, ox, oy);
+        // Scaled into its tile, all of the Mac window shows: the Mac cuts the rounded corners
+        // at its own corners, not at the tile's size it was asked for (they came out notched).
+        // Back at its size, the asked-for size counts again.
+        let shown = fit.map(|_| (w.info.w.round() as u32, w.info.h.round() as u32));
+        if shown != w.shown_told {
+            let tell = shown.unwrap_or(w.size);
+            let _ = self.net.send(NetCmd::Control(W::new(t::SHOWN_SIZE).u32(wid).f32(tell.0 as f32).f32(tell.1 as f32).finish()));
+            w.shown_told = shown;
+        }
         w.fitted = fitted;
         w.fit = (k, ox, oy);
 
@@ -2398,25 +2430,6 @@ fn shown_part(content: (u32, u32), px_per_pt: f64, window: (u32, u32), s: f64, k
     ((vis_w * px_per_pt, vis_h * px_per_pt), ((vis_w * s * k).round().max(1.0) as i32, (vis_h * s * k).round().max(1.0) as i32))
 }
 
-/// How a picture goes into a Hyprland tile that isn't its size: the scale that makes all of it
-/// fit, and where it then starts to sit in the middle. Sizes in logical px, the picture's as
-/// drawn 1:1. None when the picture is the tile's size (to a pixel): drawn as it comes.
-///
-/// `settled`: no newer size is waiting to be asked of the Mac. Then a picture just short of the
-/// tile is kept at its own scale: an app that sizes itself in its own steps (Terminal's
-/// character cells) never gets exactly the tile's size, and stretched by a hair its text would
-/// stay blurred. While sizes keep coming (a tile being dragged) it is always scaled, so the
-/// picture doesn't jump between the two.
-fn tile_fit(pic: (f64, f64), tile: (f64, f64), settled: bool) -> Option<(f64, f64, f64)> {
-    let ((pw, ph), (tw, th)) = (pic, tile);
-    if pw < 1.0 || ph < 1.0 || ((pw - tw).abs() <= 1.0 && (ph - th).abs() <= 1.0) {
-        return None;
-    }
-    let near = |short: f64| (-1.0..=SNAP).contains(&short);
-    let k = if settled && near(tw - pw) && near(th - ph) { 1.0 } else { (tw / pw).min(th / ph) };
-    Some((k, ((tw - pw * k) / 2.0).round().max(0.0), ((th - ph * k) / 2.0).round().max(0.0)))
-}
-
 /// A place in the window → the same place in its picture drawn 1:1 from the window's corner,
 /// for a picture drawn through `fit` (its scale, and where it starts).
 fn unfit(fit: (f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
@@ -2428,9 +2441,6 @@ fn unfit(fit: (f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
 const MIN_SIZE: (u32, u32) = (100, 60);
 /// How long a Hyprland tile's size must stand before the Mac is asked for it (see arm_settle).
 const SETTLE: Duration = Duration::from_millis(120);
-/// How far short of its tile (logical px, either way) a picture may be and still be shown at
-/// its own scale (see tile_fit).
-const SNAP: f64 = 40.0;
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
 const KEY_SPACE: u32 = 57;
@@ -2657,8 +2667,11 @@ impl WindowHandler for App {
             w.size = size;
             w.followed = false;
             if w.in_tile() {
-                // A Hyprland tile: asked of the Mac once the size has stood (arm_settle); the
-                // picture shown is fitted into the tile right away (below).
+                // A Hyprland tile: asked of the Mac once the size has stood (arm_settle). Smaller
+                // than the app allows (known already): grown back at once.
+                if size.0 < w.app_min.0 || size.1 < w.app_min.1 {
+                    Self::hold_tile(w);
+                }
                 Self::arm_settle(&self.loop_handle, &mut w.settling, wid, qh);
                 retiled = true;
             } else {
@@ -3399,55 +3412,6 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_the_tiles_size_is_drawn_as_it_comes() {
-        assert_eq!(tile_fit((781.0, 468.0), (781.0, 468.0), true), None);
-        assert_eq!(tile_fit((781.0, 468.0), (781.0, 468.0), false), None);
-        // Half a pixel of rounding is still the tile's size.
-        assert_eq!(tile_fit((780.5, 468.0), (781.0, 468.0), true), None);
-        // Nothing to fit yet.
-        assert_eq!(tile_fit((0.0, 0.0), (781.0, 468.0), true), None);
-    }
-
-    #[test]
-    fn a_bigger_picture_is_scaled_down_into_the_tile_and_centred() {
-        // The log's case: asked 781x468, the Mac still at 1024x662.
-        let (k, ox, oy) = tile_fit((1024.0, 662.0), (781.0, 468.0), true).unwrap();
-        assert_eq!(k, 468.0 / 662.0); // the height decides
-        assert_eq!((ox, oy), (29.0, 0.0)); // (781 - 1024 * k) / 2 = 28.5…
-        // All of it shows, inside the tile.
-        let (src, dst) = shown_part((2048, 1324), 2.0, (781, 468), 1.0, k);
-        assert_eq!(src, (2048.0, 1324.0));
-        assert_eq!(dst, (724, 468));
-        assert!(ox as i32 + dst.0 <= 781);
-        // Wider than the tile only: the width decides, bars above and below.
-        let (k, ox, oy) = tile_fit((574.0, 468.0), (381.0, 468.0), true).unwrap();
-        assert_eq!(k, 381.0 / 574.0);
-        assert_eq!((ox, oy), (0.0, 79.0));
-    }
-
-    #[test]
-    fn a_smaller_picture_is_scaled_up_to_the_tile() {
-        let (k, ox, oy) = tile_fit((574.0, 468.0), (1148.0, 1000.0), true).unwrap();
-        assert_eq!((k, ox, oy), (2.0, 0.0, 32.0));
-        let (src, dst) = shown_part((1148, 936), 2.0, (1148, 1000), 1.0, k);
-        assert_eq!((src, dst), ((1148.0, 936.0), (1148, 936)));
-    }
-
-    #[test]
-    fn a_picture_just_short_of_the_tile_keeps_its_scale_once_settled() {
-        // Terminal's character cells: 7 and 10 short of the tile.
-        assert_eq!(tile_fit((793.0, 590.0), (800.0, 600.0), true), Some((1.0, 4.0, 5.0)));
-        // While sizes keep coming it is scaled like any other.
-        let (k, _, oy) = tile_fit((793.0, 590.0), (800.0, 600.0), false).unwrap();
-        assert_eq!(k, 800.0 / 793.0);
-        assert_eq!(oy, ((600.0 - 590.0 * k) / 2.0_f64).round());
-        // Further off than an app's own steps: scaled, settled or not.
-        assert_eq!(tile_fit((700.0, 590.0), (800.0, 600.0), true).unwrap().0, 600.0 / 590.0);
-        // Too big for the tile is never left as it is: it would be cut off.
-        assert!(tile_fit((793.0, 620.0), (800.0, 600.0), true).unwrap().0 < 1.0);
-    }
-
-    #[test]
     fn an_unfitted_picture_is_cut_off_at_the_window_as_before() {
         // 1:1: the Mac lags a shrink, the window shows the part that fits.
         assert_eq!(shown_part((2048, 1324), 2.0, (781, 468), 1.0, 1.0), ((1562.0, 936.0), (781, 468)));
@@ -3457,7 +3421,7 @@ mod tests {
 
     #[test]
     fn a_pointer_position_maps_back_through_the_fit() {
-        let fit = tile_fit((1024.0, 662.0), (781.0, 468.0), true).unwrap();
+        let fit = (468.0_f64.min(781.0 * 662.0 / 1024.0) / 662.0, 29.0, 0.0);
         let (_, ox, oy) = fit;
         // Where the picture starts is its top-left corner.
         assert_eq!(unfit(fit, ox, oy), (0.0, 0.0));
@@ -3469,7 +3433,7 @@ mod tests {
         let (x, y) = unfit(fit, 781.0 / 2.0, 468.0 / 2.0);
         assert!((x - 512.0).abs() < 1.0 && (y - 331.0).abs() < 1.0, "{x},{y}");
         // Scaled up: a traffic light at 20,14 in the picture is hit at twice that, past the bar.
-        let fit = tile_fit((574.0, 468.0), (1148.0, 1000.0), true).unwrap();
+        let fit = (1000.0_f64.min(1148.0 * 468.0 / 574.0) / 468.0, 0.0, 32.0);
         assert_eq!(unfit(fit, 40.0, 32.0 + 28.0), (20.0, 14.0));
         // Not fitted: the place itself.
         assert_eq!(unfit((1.0, 0.0, 0.0), 12.5, 7.0), (12.5, 7.0));
