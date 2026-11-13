@@ -257,6 +257,10 @@ struct Win {
     fitted: Option<(i32, i32)>,
     /// Hyprland gave the tile a new size the Mac hasn't been asked for yet, and when (arm_settle).
     settling: Option<Instant>,
+    /// The smallest the app lets this window be on the Mac (learned from refusals; 0: not known
+    /// to be bigger than its tile). A tile smaller than that is asked for at its own shape, scaled
+    /// up until the app takes it (tile_request): the picture, scaled back down, fills the tile.
+    app_min: (u32, u32),
 }
 
 impl Win {
@@ -918,6 +922,7 @@ impl App {
                 fit: (1.0, 0.0, 0.0),
                 fitted: None,
                 settling: None,
+                app_min: (0, 0),
                 popup_settled: false,
             },
         );
@@ -1059,7 +1064,7 @@ impl App {
     /// The tile's size has stood (arm_settle): the Mac is asked for it.
     fn ask_settled_size(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get_mut(&wid) else { return };
-        let size = w.size;
+        let size = tile_request(w.size, w.app_min);
         let mac = (w.info.w.round() as u32, w.info.h.round() as u32);
         if mac == size && w.requested.is_none_or(|(asked, _)| asked == size) {
             // There and back within the moment: the Mac has this size and was asked for no other.
@@ -1110,9 +1115,12 @@ impl App {
             return; // scaled to fit, whatever its size
         }
         let mac = (w.info.w.round() as u32, w.info.h.round() as u32);
-        if mac == w.size || !w.configured {
-            w.followed |= mac == w.size;
-            if mac == w.size && w.in_tile() {
+        // In a tile, what the Mac is asked for: the tile, or its shape scaled up past the app's
+        // minimum.
+        let target = if w.in_tile() { tile_request(w.size, w.app_min) } else { w.size };
+        if mac == target || !w.configured {
+            w.followed |= mac == target;
+            if mac == target && w.in_tile() {
                 // It has the tile's size after all: asked again if it leaves it later (below).
                 w.refusal = None;
             }
@@ -1135,12 +1143,27 @@ impl App {
             // in case it was only behind (a whole workspace laid out again at once); an app
             // that keeps its own size after that is left alone, fitted.
             let size = w.size;
+            let mut ask = None;
             if w.refusal != Some((size, mac)) {
                 w.refusal = Some((size, mac));
-                w.requested = Some((size, Instant::now()));
+                log::info!("window {wid}: {}x{} on the Mac, {}x{} in its tile: asking again", mac.0, mac.1, target.0, target.1);
+                ask = Some(target);
+            } else {
+                // The same answer twice: the app goes no smaller. It's asked for the tile's own
+                // shape at a size it takes, so the picture, scaled down, fills the tile without
+                // dark bands (the Mac's display is taller than this screen to have room).
+                let min = (if mac.0 > target.0 { mac.0 } else { w.app_min.0 }, if mac.1 > target.1 { mac.1 } else { w.app_min.1 });
+                let next = tile_request(size, min);
+                if min != w.app_min && next != target {
+                    w.app_min = min;
+                    log::info!("window {wid}: the app goes no smaller than {}x{}: asking {}x{}, the tile's shape", min.0, min.1, next.0, next.1);
+                    ask = Some(next);
+                }
+            }
+            if let Some(want) = ask {
+                w.requested = Some((want, Instant::now()));
                 w.followed = false;
-                log::info!("window {wid}: {}x{} on the Mac, {}x{} in its tile: asking again", mac.0, mac.1, size.0, size.1);
-                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(want.0 as f32).f32(want.1 as f32).finish()));
                 Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
             }
             return;
@@ -2414,6 +2437,17 @@ fn unfit(fit: (f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
     ((x - ox) / k, (y - oy) / k)
 }
 
+/// What the Mac is asked for, for a tile of `tile` (logical px) whose app goes no smaller than
+/// `min` (0: no limit known): the tile, or its own shape scaled up until both sides reach the
+/// minimum. Scaled back down into the tile, that fills it exactly.
+fn tile_request(tile: (u32, u32), min: (u32, u32)) -> (u32, u32) {
+    let k = (min.0 as f64 / tile.0.max(1) as f64).max(min.1 as f64 / tile.1.max(1) as f64);
+    if k <= 1.0 {
+        return tile;
+    }
+    ((tile.0 as f64 * k).ceil() as u32, (tile.1 as f64 * k).ceil() as u32)
+}
+
 /// Smallest a Mac window gets here, unless its app is known to need more.
 const MIN_SIZE: (u32, u32) = (100, 60);
 /// How long a Hyprland tile's size must stand before the Mac is asked for it (see arm_settle).
@@ -3373,6 +3407,20 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tile_smaller_than_the_app_is_asked_for_at_its_own_shape() {
+        // No minimum known, or one the tile meets: the tile itself.
+        assert_eq!(tile_request((781, 950), (0, 0)), (781, 950));
+        assert_eq!(tile_request((781, 950), (700, 400)), (781, 950));
+        // TV goes no narrower than 980: the tile's shape at 980 wide.
+        let (w, h) = tile_request((781, 950), (980, 0));
+        assert_eq!(w, 980);
+        assert!((h as f64 / w as f64 - 950.0 / 781.0).abs() < 0.01);
+        // And scaled back into the tile, it fills it.
+        let (k, ox, oy) = tile_fit((w as f64, h as f64), (781.0, 950.0), true).unwrap();
+        assert!(ox <= 1.0 && oy <= 1.0 && (w as f64 * k - 781.0).abs() < 1.5 && (h as f64 * k - 950.0).abs() < 1.5);
+    }
+
     use super::*;
 
     #[test]

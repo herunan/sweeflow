@@ -78,6 +78,9 @@ final class VirtualDisplay {
         }
     }
 
+    /// A screen the taller display was refused for: it gets one of its own size instead.
+    private var plainFor: CGSize?
+
     /// Size the client asked for, kept so a failed creation can be retried.
     private var wanted: CGSize = .zero
     private var retries = 0
@@ -94,12 +97,19 @@ final class VirtualDisplay {
         ensure(points: wanted)
     }
 
-    /// Creates or resizes the display to `points` (logical size of the Linux monitor).
-    func ensure(points: CGSize) {
+    /// Creates or resizes the display for `screen` (logical size of the Linux monitor): as wide,
+    /// and half as tall again. A tiling desktop can give a window a tile smaller than its app
+    /// allows (TV goes no narrower than 980 pt); Linux then asks for the tile's own shape scaled
+    /// up past that minimum (taller than the screen, often), and draws it scaled back down into
+    /// the tile. The extra height is the room for that; nothing on Linux shows it.
+    func ensure(points screen: CGSize) {
+        // Taller unless macOS refused that for this screen (a very large one): then the screen's.
+        let points = plainFor == screen ? screen : CGSize(width: screen.width, height: (screen.height * 1.5).rounded())
         let w = UInt32(points.width.rounded()), h = UInt32(points.height.rounded())
         guard w >= 640, h >= 480 else { return }
-        if wanted != points { retries = 0 }
-        wanted = points
+        // `wanted` is the screen asked for (retries pass it back through here).
+        if wanted != screen { retries = 0 }
+        wanted = screen
         if display != nil && size == points { return }
         display = nil   // releasing the object removes the display
 
@@ -116,13 +126,18 @@ final class VirtualDisplay {
         desc.terminationHandler = { _, _ in log("virtual display terminated") }
 
         guard let vd = CGVirtualDisplay(descriptor: desc) else {
+            if points != screen {
+                log("virtual display: \(w)x\(h) refused, using the screen's own size")
+                plainFor = screen
+                return ensure(points: screen)
+            }
             // Fails while the screen is locked, among other transient states: keep trying.
             retries += 1
             log("virtual display: creation failed (attempt \(retries))")
             if retries < 60 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                    guard let self, self.wanted == points else { return }
-                    self.ensure(points: points)
+                    guard let self, self.wanted == screen else { return }
+                    self.ensure(points: screen)
                 }
             }
             return
@@ -134,6 +149,11 @@ final class VirtualDisplay {
         if !vd.apply(settings) {
             settings.modes = [CGVirtualDisplayMode(width: w, height: h, refreshRate: 60)]
             guard vd.apply(settings) else {
+                if points != screen {
+                    log("virtual display: \(w)x\(h) settings refused, using the screen's own size")
+                    plainFor = screen
+                    return ensure(points: screen)
+                }
                 log("virtual display: applySettings failed")
                 return
             }
