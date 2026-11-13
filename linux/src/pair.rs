@@ -375,6 +375,7 @@ fn outcome_of(body: &[u8], found: &FoundMac, host_fingerprint: &str, expected: O
                 service: found.name.clone(),
                 host: format!("{host}:{port}"),
                 fingerprint: host_fingerprint.to_string(),
+                ..Default::default()
             })
         }
         1 => Outcome::CancelledThere,
@@ -432,8 +433,13 @@ async fn ask_full(conn: &quinn::Connection, ty: u8) -> Result<(u8, Option<Presen
 /// isn't seen (a virtual machine's network, or one that drops multicast): what it says of itself
 /// if it answered as this computer's linked Mac; None if it didn't answer.
 pub fn probe(mac: &PairedMac) -> Option<Presence> {
-    let host = mac.host.rsplit_once(':').map_or(mac.host.as_str(), |(h, _)| h).trim_matches(['[', ']']);
-    let addr = (host, PAIR_PORT).to_socket_addrs().ok()?.next()?;
+    // Its last address, then the others it said it has.
+    crate::config::places(mac).iter().find_map(|place| probe_at(mac, place))
+}
+
+fn probe_at(mac: &PairedMac, place: &str) -> Option<Presence> {
+    let host = place.rsplit_once(':').map_or(place, |(h, _)| h).trim_matches(['[', ']']);
+    let addr = (host, PAIR_PORT).to_socket_addrs().ok()?.find(|a| a.is_ipv4())?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
     let want = mac.fingerprint.clone();
     rt.block_on(async move {
@@ -669,7 +675,7 @@ mod tests {
         assert!(outcome_of(&body(0, &[1; 32]), &m, HOST, Some(&[2; 32])).is_err());
         assert!(outcome_of(&body(0, &[]), &m, HOST, Some(&[1; 32])).is_err());
         let Outcome::Linked(p) = outcome_of(&body(0, &[1; 32]), &m, HOST, Some(&[1; 32])).unwrap() else { panic!("not linked") };
-        assert_eq!(p, PairedMac { name: "Sam’s Air".into(), service: "Air".into(), host: "air.local:44120".into(), fingerprint: HOST.into() });
+        assert_eq!(p, PairedMac { name: "Sam’s Air".into(), service: "Air".into(), host: "air.local:44120".into(), fingerprint: HOST.into(), ..Default::default() });
     }
 
     #[test]

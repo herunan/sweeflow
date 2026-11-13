@@ -63,6 +63,9 @@ pub mod t {
     /// reminder, a dialog): it keeps exactly its own size here, at the same spot of the screen
     /// (fractions of the room: 0 left/top, 1 right/bottom; older Macs send only the wid).
     pub const WINDOW_FIXED: u8 = 0x35;
+    /// From the Mac: u16 n, n str — its addresses (each interface's, Tailscale's) and its .local
+    /// name: kept with it, and tried when its last address stops answering (config.rs).
+    pub const ADDRESSES: u8 = 0x36;
     pub const CLIPBOARD: u8 = 0x40;
     #[allow(dead_code)] // part of the protocol; this client measures RTT from QUIC instead
     pub const PING: u8 = 0x41;

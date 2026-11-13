@@ -1,3 +1,4 @@
+import SystemConfiguration
 import AppKit
 import CPrivate
 import IOKit
@@ -201,6 +202,11 @@ final class Session {
             w.str(Host.current().localizedName ?? "Mac")
             w.str(Self.macKind)
             s.send(w)
+            var a = MsgWriter(.addresses)
+            let all = Self.ownAddresses()
+            a.u16(UInt16(all.count))
+            all.forEach { a.str($0) }
+            s.send(a)
             // Accessibility calls wait at most a second for an app (not the default 6 s): a
             // hung app must not hold its queue, and everything behind it, for long.
             AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
@@ -1710,6 +1716,30 @@ final class Session {
                 var m = MsgWriter(.focused); m.u32(wid); self.control?.send(m)
             }
         }
+    }
+
+    /// This Mac's IPv4 addresses on interfaces that are up (not loopback), and its .local name.
+    static func ownAddresses() -> [String] {
+        var out: [String] = []
+        var list: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&list) == 0, let first = list {
+            var p: UnsafeMutablePointer<ifaddrs>? = first
+            while let i = p {
+                let flags = Int32(i.pointee.ifa_flags)
+                if let a = i.pointee.ifa_addr, a.pointee.sa_family == UInt8(AF_INET),
+                   flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 {
+                    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    if getnameinfo(a, socklen_t(a.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        let s = String(cString: host)
+                        if !s.hasPrefix("169.254."), !out.contains(s) { out.append(s) }
+                    }
+                }
+                p = i.pointee.ifa_next
+            }
+            freeifaddrs(first)
+        }
+        if let local = SCDynamicStoreCopyLocalHostName(nil) as String? { out.append(local + ".local") }
+        return out
     }
 
     /// Whether each window's app lets it be resized (looked at once per window).

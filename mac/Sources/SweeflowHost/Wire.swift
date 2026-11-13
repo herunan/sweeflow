@@ -23,6 +23,9 @@ enum Msg: UInt8 {
     /// own size there, at the same spot of the screen as on the Mac (fractions; see Session.spot).
     /// A trailing u8: 1 fixed; 0 a floating panel that can be resized (it floats all the same).
     case windowFixed = 0x35
+    /// To Linux: u16 n, then n str — this Mac's addresses (every interface's, Tailscale's too)
+    /// and its .local name, for finding it again where the network carries no Bonjour.
+    case addresses = 0x36
     case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55

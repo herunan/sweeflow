@@ -99,7 +99,7 @@ pub fn setup(target: &str) -> Result<()> {
     // An update of a Mac already linked leaves alone which Mac is in use (and whether it's
     // stopped); a newly linked one becomes the one in use, as linking does.
     let in_list = cfg.macs.iter().any(|m| m.fingerprint == host_fp);
-    cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp }, !(already_linked && in_list));
+    cfg.add_mac(config::PairedMac { name, host: format!("{host}:44120"), fingerprint: host_fp, ..Default::default() }, !(already_linked && in_list));
     cfg.save()?;
     println!("==> paired. Config written to {}", Config::path().display());
     if already_linked {

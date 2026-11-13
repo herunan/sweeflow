@@ -653,14 +653,30 @@ async fn session(
     let (addr, conn) = match saved.await {
         Ok(c) => c,
         Err(e) => {
-            // The Mac may have a new address: look for it on the network by its certificate.
+            // The Mac may have a new address: look for it on the network by its certificate,
+            // then at the other addresses it said it has (a network with no Bonjour: a VM's).
             let fp = cfg.host_fingerprint.clone();
-            let Some(addr) = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?
-            else {
-                return Err(e);
-            };
-            log::info!("{} not reachable ({e:#}); found the Mac at {addr}", cfg.host);
-            (addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?)
+            let found = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?;
+            let mut reached = None;
+            if let Some(addr) = found {
+                log::info!("{} not reachable ({e:#}); found the Mac at {addr}", cfg.host);
+                reached = Some((addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?));
+            } else if let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint) {
+                for place in crate::config::places(mac).into_iter().skip(1) {
+                    let Ok(Ok(mut addrs)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(place.clone())).await else { continue };
+                    let Some(addr) = addrs.find(|a| a.is_ipv4()) else { continue };
+                    let Ok(connecting) = endpoint.connect(addr, "sweeflow") else { continue };
+                    if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(3), connecting).await {
+                        log::info!("{} not reachable ({e:#}); reached the Mac at {place}", cfg.host);
+                        reached = Some((addr, conn));
+                        break;
+                    }
+                }
+            }
+            let Some(r) = reached else { return Err(e) };
+            // Its address from now on.
+            crate::config::remember_addresses(&cfg.host_fingerprint, Vec::new(), Some(r.0.to_string()));
+            r
         }
     };
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
@@ -860,6 +876,19 @@ async fn session(
 fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     let mut r = R::new(body);
     let ev = match ty {
+        t::ADDRESSES => {
+            let n = r.u16()?;
+            let mut all = Vec::new();
+            for _ in 0..n {
+                all.push(r.str()?);
+            }
+            std::thread::spawn(move || {
+                if let Ok(c) = crate::config::Config::load_or_default() {
+                    crate::config::remember_addresses(&c.host_fingerprint, all, None);
+                }
+            });
+            return Ok(());
+        }
         t::WELCOME => {
             let _v = r.u16()?;
             let name = r.str()?;
