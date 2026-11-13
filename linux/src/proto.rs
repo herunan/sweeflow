@@ -13,6 +13,8 @@ pub mod t {
     pub const FORGOTTEN: u8 = 0x04;
     /// Leaving on purpose (switching Macs, stopping streaming, quitting): the Mac tidies up at once.
     pub const GOODBYE: u8 = 0x05;
+    /// str computer: the Mac is streaming to that computer; turned away until it stops there.
+    pub const BUSY: u8 = 0x06;
     pub const WINDOW_ADDED: u8 = 0x10;
     pub const WINDOW_CHANGED: u8 = 0x11;
     pub const WINDOW_REMOVED: u8 = 0x12;

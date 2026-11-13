@@ -21,7 +21,8 @@ slint::slint! {
 
     export struct AppRow { id: string, name: string, icon: image, has-icon: bool, initial: string, running: bool, pinned: bool, shown: bool, heading: string }
     export struct MacItem { name: string, fingerprint: string, active: bool, online: string }
-    export struct Action { id: string, label: string }
+    // tip: why it can't be chosen now (it's then shown faded, and says so on hover); empty: it can.
+    export struct Action { id: string, label: string, tip: string }
     export struct Toggle { key: string, label: string, on: bool }
 
     // A small button, for the actions on a row.
@@ -31,6 +32,8 @@ slint::slint! {
         in property <bool> danger;
         // A drawn sign instead of the text (see Sign); the text stays as the accessible name.
         in property <string> sign;
+        // Said on hover (why it can't be chosen, say).
+        in property <string> tip;
         callback clicked;
         height: 26px;
         width: root.sign != "" ? 34px : max(44px, label.preferred-width + 18px);
@@ -43,10 +46,19 @@ slint::slint! {
         accessible-role: button;
         accessible-label: root.text;
         accessible-action-default => { if (root.enabled) { root.clicked(); } }
+        // Enabled even when the chip isn't, for the hover tip.
         touch := TouchArea {
-            enabled: root.enabled;
-            mouse-cursor: pointer;
-            clicked => { root.clicked(); }
+            mouse-cursor: root.enabled ? pointer : default;
+            clicked => { if (root.enabled) { root.clicked(); } }
+        }
+        if touch.has-hover && root.tip != "": Rectangle {
+            x: parent.width - self.width;
+            y: parent.height + 4px;
+            width: tip-text.preferred-width + 12px;
+            height: tip-text.preferred-height + 8px;
+            border-radius: Look.radius;
+            background: Look.fg;
+            tip-text := Text { text: root.tip; color: Look.bg; font-size: 11px; }
         }
         label := Text {
             visible: root.sign == "";
@@ -237,7 +249,7 @@ slint::slint! {
                         horizontal-stretch: 0;
                         for a in root.actions: VerticalLayout {
                             alignment: center;
-                            Chip { text: a.label; sign: a.id; clicked => { root.act(a.id, ""); } }
+                            Chip { text: a.label; sign: a.id; enabled: a.tip == ""; tip: a.tip; clicked => { root.act(a.id, ""); } }
                         }
                     }
                 }
@@ -480,6 +492,8 @@ slint::slint! {
                                             for a in root.actions: Chip {
                                                 text: a.label;
                                                 sign: a.id;
+                                                enabled: a.tip == "";
+                                                tip: a.tip;
                                                 clicked => { root.act(a.id, ""); }
                                             }
                                         }
@@ -542,6 +556,8 @@ struct PanelState {
     status: String,
     /// What can be done about the Mac in use (Do actions), in order.
     actions: Vec<String>,
+    /// The Mac is streaming to this other computer: Start can't be chosen.
+    elsewhere: Option<String>,
     mac: String,
     settings: Settings,
     apps: Vec<App>,
@@ -811,7 +827,17 @@ fn show(ui: &PanelWin, v: &mut View) {
         0
     });
     let actions: Vec<Action> =
-        s.actions.iter().map(|a| Action { id: a.as_str().into(), label: crate::tray::action_label(a).into() }).collect();
+        s.actions
+            .iter()
+            .map(|a| Action {
+                id: a.as_str().into(),
+                label: crate::tray::action_label(a).into(),
+                tip: match (&s.elsewhere, a.as_str()) {
+                    (Some(other), "start") => crate::tray::start_hint(other).into(),
+                    _ => Default::default(),
+                },
+            })
+            .collect();
     // Set only when they change: a button rebuilt under the pointer loses the click.
     if actions != v.action_rows {
         v.actions.set_vec(actions.clone());
@@ -1016,6 +1042,9 @@ mod tests {
         let s = parse_state(STATE).unwrap();
         assert!(s.paired && s.connected && !s.offline);
         assert_eq!(s.actions, ["pause", "stop"]);
+        assert_eq!(s.elsewhere, None);
+        let busy = parse_state(&STATE.replace(r#""showAt": 0"#, r#""showAt": 0, "elsewhere": "box", "canStart": false"#)).unwrap();
+        assert_eq!(busy.elsewhere.as_deref(), Some("box"));
         assert_eq!(s.online, Some(true));
         assert_eq!(s.status, "Streaming from Studio");
         assert_eq!(s.mac, "Studio");

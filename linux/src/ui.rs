@@ -600,9 +600,9 @@ impl App {
                 self.end_selection();
                 // Windows wait for the Mac to come back; menus and popovers don't (nothing would
                 // close them meanwhile, and they sit above everything else).
-                // Stopped on purpose (Stop here, or the Mac's menu), nothing waits: paused
-                // stills go too.
-                let on_purpose = crate::net::offline() || crate::tray::mac_refused();
+                // Stopped on purpose (Stop here, or the Mac's menu), or the Mac went to another
+                // computer: nothing waits, paused stills go too.
+                let on_purpose = crate::net::offline() || crate::tray::mac_refused() || crate::tray::elsewhere().is_some();
                 let gone: Vec<u32> = self
                     .windows
                     .values()

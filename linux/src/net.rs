@@ -321,6 +321,8 @@ pub fn mac_locked() -> bool {
 /// Stops (the Mac's windows go, the connection closes and the Mac is free for another computer)
 /// and stays so, or starts again.
 pub fn set_offline(on: bool) {
+    // Stop ends waiting for a Mac in use elsewhere; Start looks afresh.
+    crate::tray::set_elsewhere(None);
     if OFFLINE.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
         return;
     }
@@ -329,6 +331,44 @@ pub fn set_offline(on: bool) {
     if let Some(tx) = NET_TX.get() {
         let _ = tx.send(NetCmd::Recheck);
     }
+}
+
+/// This computer's name, as the Mac tells another computer it's streaming here.
+fn this_computer() -> String {
+    let h = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    let h = h.trim();
+    if h.is_empty() { "a Linux computer".into() } else { h.into() }
+}
+
+/// How long to wait before looking again whether the Mac is still streaming to another
+/// computer, after `checks` looks: 5 s, rising to 30 s. (A look is a hello the Mac turns away:
+/// the other computer doesn't notice.)
+fn busy_wait(checks: u32) -> Duration {
+    Duration::from_secs((5u64 << checks.min(3)).min(30))
+}
+
+/// Busy's payload: the computer the Mac is streaming to.
+fn parse_busy(body: &[u8]) -> Result<String> {
+    R::new(body).str()
+}
+
+/// The notifications: on first finding the Mac in use, and when it's free again.
+fn busy_message(mac: &str, other: &str) -> (String, String) {
+    (format!("{mac} is streaming to {other}"), format!("Stop streaming on {other} first; Sweeflow streams here once {mac} is free."))
+}
+
+fn free_message(mac: &str, other: &str) -> (String, String) {
+    (format!("{mac} is free: streaming here now"), format!("{other} stopped streaming."))
+}
+
+/// The Mac turned this computer away: another one has it. Said once (not at every look).
+fn mac_busy(other: String) {
+    if crate::tray::elsewhere().is_none() {
+        log::info!("the Mac is streaming to {other}: waiting until it's free");
+        let (summary, body) = busy_message(&crate::tray::mac_display_name(), &other);
+        std::thread::spawn(move || notify(&summary, &body));
+    }
+    crate::tray::set_elsewhere(Some(other));
 }
 
 /// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
@@ -459,6 +499,8 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         }
     };
     let mut backoff = Duration::from_millis(250);
+    // Looks at a Mac in use by another computer, in a row.
+    let mut busy_checks = 0;
     loop {
         if offline() {
             let _ = ui.send(UiEvent::Disconnected("stopped, as asked".into()));
@@ -474,8 +516,8 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
             Ok(()) => return, // UI went away
             Err(e) => {
                 let _ = ui.send(UiEvent::Disconnected(format!("{e:#}")));
-                // Stopped on purpose, the Mac was there a moment ago: still online.
-                if offline() {
+                // Stopped on purpose, or turned away (the Mac was there a moment ago): still online.
+                if offline() || crate::tray::elsewhere().is_some() {
                     log::info!("connection closed: {e:#}");
                 } else {
                     log::warn!("connection lost: {e:#}");
@@ -488,6 +530,22 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         if offline() {
             continue;
         }
+        if crate::tray::elsewhere().is_some() {
+            // In use by another computer: look again in a while (Stop here ends the waiting).
+            let until = tokio::time::Instant::now() + busy_wait(busy_checks);
+            busy_checks += 1;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(until) => break,
+                    cmd = cmds.recv() => {
+                        if cmd.is_none() { return; }
+                        if offline() { break; }
+                    }
+                }
+            }
+            continue;
+        }
+        busy_checks = 0;
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(3));
     }
@@ -529,13 +587,19 @@ async fn session(
             crate::tray::connected(None);
         }
     }
-    set_online(true);
+    // A look at a Mac in use by another computer: online only once it lets this one in (the
+    // app menu's Mac apps don't come and go at every look), and launches wait.
+    let busy = crate::tray::elsewhere().is_some();
+    if !busy {
+        set_online(true);
+    }
     set_reachable(true);
     let _online = Online;
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
-    ctl_tx.write_all(&W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(cfg.capture_scale as f32).finish()).await?;
-    let held: Vec<String> = PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect();
+    let hello = W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(cfg.capture_scale as f32);
+    ctl_tx.write_all(&hello.str(&this_computer()).finish()).await?;
+    let held: Vec<String> = if busy { Vec::new() } else { PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect() };
     for bid in held {
         log::info!("launching {bid} (requested while offline)");
         ctl_tx.write_all(&W::new(t::LAUNCH_APP).str(&bid).finish()).await?;
@@ -717,6 +781,13 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             if let Ok(kind) = r.str() {
                 crate::tray::set_mac_kind(&kind);
             }
+            if let Some(other) = crate::tray::elsewhere() {
+                log::info!("the Mac is free again: streaming here");
+                crate::tray::set_elsewhere(None);
+                set_online(true);
+                let (summary, body) = free_message(&crate::tray::mac_display_name(), &other);
+                std::thread::spawn(move || notify(&summary, &body));
+            }
             crate::tray::connected(Some(name.clone()));
             UiEvent::Connected(name)
         }
@@ -786,6 +857,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
                     log::warn!("launcher entries: {e:#}");
                 }
             });
+            return Ok(());
+        }
+        t::BUSY => {
+            mac_busy(parse_busy(body)?);
             return Ok(());
         }
         t::MAC_DISCONNECTED => {
@@ -1198,6 +1273,36 @@ pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_decodes() {
+        let m = W::new(t::BUSY).str("Größe-VM").finish();
+        assert_eq!(m[4], 0x06);
+        assert_eq!(parse_busy(&m[5..]).unwrap(), "Größe-VM");
+        assert!(parse_busy(&[]).is_err(), "Busy names the other computer");
+    }
+
+    #[test]
+    fn hello_ends_with_the_computer_name() {
+        // What the Mac reads after the older fields.
+        let m = W::new(t::HELLO).u16(1).f32(1.0).f32(0.0).str("box").finish();
+        let mut r = R::new(&m[5..]);
+        (r.u16().unwrap(), r.f32().unwrap(), r.f32().unwrap());
+        assert_eq!(r.str().unwrap(), "box");
+    }
+
+    #[test]
+    fn a_busy_mac_is_looked_at_less_and_less_often() {
+        let waits: Vec<u64> = (0..6).map(|n| busy_wait(n).as_secs()).collect();
+        assert_eq!(waits, [5, 10, 20, 30, 30, 30]);
+    }
+
+    #[test]
+    fn the_notifications_name_both_computers() {
+        assert_eq!(busy_message("Studio", "workstation").0, "Studio is streaming to workstation");
+        assert!(busy_message("Studio", "workstation").1.starts_with("Stop streaming on workstation first"));
+        assert_eq!(free_message("Studio", "workstation").0, "Studio is free: streaming here now");
+    }
 
     #[test]
     fn a_mac_is_not_online_only_after_two_missed_looks() {

@@ -79,6 +79,9 @@ struct State {
     show_at: u64,
     /// The Mac stopped this computer from its own menu (it refuses until allowed there again).
     mac_refused: bool,
+    /// The Mac is streaming to another computer (its name): this one waits, looking again now
+    /// and then, and streams once it's free. Start can't be chosen meanwhile.
+    elsewhere: Option<String>,
 }
 
 static STATE: LazyLock<Mutex<State>> =
@@ -324,10 +327,15 @@ impl ksni::Tray for Tray {
         let state = STATE.lock().unwrap();
         let status = status_of(&state).replace('_', "__");
         let actions = stream_actions(standing(&state));
+        let elsewhere = state.elsewhere.clone();
         drop(state);
         // Where streaming stands, and what can be done about it.
         let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, ..Default::default() }.into()];
         for &action in actions {
+            if let (Some(other), "start") = (&elsewhere, action) {
+                items.push(StandardItem { label: start_hint(other).replace('_', "__"), enabled: false, ..Default::default() }.into());
+                continue;
+            }
             items.push(StandardItem { label: action_label(action).into(), activate: Box::new(move |_| panel_do(action, "")), ..Default::default() }.into());
         }
         items.push(MenuItem::Separator);
@@ -449,9 +457,11 @@ fn save_last(s: &Settings) {
 
 /// Where streaming stands: what the status line says.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Standing {
+pub struct Standing<'a> {
     /// Stop was chosen (no connection is held).
     pub stopped: bool,
+    /// The Mac is streaming to that other computer (and turns this one away until it stops).
+    pub elsewhere: Option<&'a str>,
     /// Connected, and the Mac's settings known.
     pub connected: bool,
     /// Not paused (Pause / Resume).
@@ -466,7 +476,10 @@ pub struct Standing {
 
 /// The same status where the Mac's name stands right above it (the widget and Sweeflow's own
 /// window): without the name, which only repeated it.
-pub fn status_short(s: Standing) -> &'static str {
+pub fn status_short(s: Standing) -> String {
+    if let Standing { stopped: false, elsewhere: Some(other), .. } = s {
+        return format!("In use by {other}");
+    }
     match s {
         Standing { stopped: true, online: Some(true), .. } => "Stopped · online",
         Standing { stopped: true, online: Some(false), .. } => "Stopped · not online",
@@ -478,6 +491,7 @@ pub fn status_short(s: Standing) -> &'static str {
         Standing { online: Some(false), .. } => "Waiting · not online",
         _ => "Waiting",
     }
+    .into()
 }
 
 /// The status line where nothing else names the Mac (the tray's menu and tooltip).
@@ -487,6 +501,7 @@ pub fn status_line(mac: &str, s: Standing) -> String {
         Standing { stopped: true, online: Some(false), .. } => format!("Stopped · {mac} is not online"),
         // The first look on the network takes a moment.
         Standing { stopped: true, .. } => format!("Stopped · {mac}"),
+        Standing { elsewhere: Some(other), .. } => format!("In use by {other} · {mac}"),
         Standing { connected: true, enabled: false, .. } => format!("Paused · {mac}"),
         Standing { connected: true, locked: true, .. } => format!("Streaming from {mac} · Mac locked"),
         Standing { connected: true, .. } => format!("Streaming from {mac}"),
@@ -503,10 +518,23 @@ pub fn status_line(mac: &str, s: Standing) -> String {
 pub fn stream_actions(s: Standing) -> &'static [&'static str] {
     match s {
         Standing { stopped: true, .. } => &["start"],
+        // Start shown, but not to be chosen (see can_start); Stop ends the waiting.
+        Standing { elsewhere: Some(_), .. } => &["start", "stop"],
         Standing { connected: false, .. } => &["stop"],
         Standing { enabled: true, .. } => &["pause", "stop"],
         _ => &["resume", "stop"],
     }
+}
+
+/// Start can be chosen: not while the Mac streams to another computer (it has to be stopped
+/// there first).
+pub fn can_start(s: Standing) -> bool {
+    s.elsewhere.is_none()
+}
+
+/// What a Start that can't be chosen says instead.
+pub fn start_hint(other: &str) -> String {
+    format!("Stop streaming on {other} first")
 }
 
 pub fn action_label(action: &str) -> &'static str {
@@ -518,9 +546,10 @@ pub fn action_label(action: &str) -> &'static str {
     }
 }
 
-fn standing(state: &State) -> Standing {
+fn standing(state: &State) -> Standing<'_> {
     Standing {
         stopped: crate::net::offline(),
+        elsewhere: state.elsewhere.as_deref(),
         connected: state.settings.is_some(),
         enabled: state.settings.as_ref().is_none_or(|s| s.enabled),
         locked: crate::net::mac_locked(),
@@ -606,6 +635,10 @@ pub fn panel_state() -> serde_json::Value {
         "status": status_short(standing),
         "actions": stream_actions(standing),
         "macRefused": state.mac_refused,
+        // The Mac is streaming to this other computer (its name), or null; Start can't be chosen
+        // meanwhile ("Stop streaming on <name> first").
+        "elsewhere": state.elsewhere,
+        "canStart": can_start(standing),
         "showAt": state.show_at,
     })
 }
@@ -633,6 +666,7 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
+        "start" if elsewhere().is_some() => log::info!("Start: the Mac is streaming to another computer"),
         "start" | "stop" => set_started(action == "start"),
         // What a widget from before Start / Stop still sends, until Plasma reloads it.
         "connect" | "disconnect" => set_started(action == "connect"),
@@ -731,6 +765,28 @@ fn open_at_login() -> bool {
 /// The Mac stopped this computer from its menu, and hasn't allowed it again.
 pub fn mac_refused() -> bool {
     STATE.lock().unwrap().mac_refused
+}
+
+/// The Mac is streaming to another computer (Some: its name); None once it streams here, or
+/// Stop is chosen.
+pub fn set_elsewhere(other: Option<String>) {
+    let mut s = STATE.lock().unwrap();
+    if s.elsewhere != other {
+        s.elsewhere = other;
+        drop(s);
+        refresh();
+    }
+}
+
+pub fn elsewhere() -> Option<String> {
+    STATE.lock().unwrap().elsewhere.clone()
+}
+
+/// The Mac in use, as this computer shows it.
+pub fn mac_display_name() -> String {
+    let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+    let name = mac_name(&STATE.lock().unwrap(), &cfg);
+    if name.is_empty() { "Your Mac".into() } else { name }
 }
 
 pub fn set_mac_refused(on: bool) {
@@ -897,6 +953,9 @@ mod tests {
         assert_eq!(status_line("Studio", Standing { online: Some(true), ..stopped }), "Stopped · Studio is online");
         assert_eq!(status_line("Studio", Standing { online: Some(false), ..stopped }), "Stopped · Studio is not online");
         assert_eq!(status_line("Studio", stopped), "Stopped · Studio");
+        let elsewhere = Standing { elsewhere: Some("workstation"), online: Some(true), ..Default::default() };
+        assert_eq!(status_line("Studio", elsewhere), "In use by workstation · Studio");
+        assert_eq!(status_short(elsewhere), "In use by workstation");
 
         let waiting = Standing { enabled: true, online: Some(false), ..Default::default() };
         assert_eq!(status_line("Studio", waiting), "Waiting for Studio · not online");
@@ -911,6 +970,12 @@ mod tests {
         assert_eq!(stream_actions(Standing { locked: true, ..streaming }), ["pause", "stop"]);
         assert_eq!(stream_actions(Standing { enabled: false, ..streaming }), ["resume", "stop"]);
         assert_eq!(stream_actions(Standing { stopped: true, online: Some(false), ..Default::default() }), ["start"]);
+        // In use by another computer: Start shown but not to be chosen; Stop ends the waiting.
+        let elsewhere = Standing { elsewhere: Some("box"), online: Some(true), ..Default::default() };
+        assert_eq!(stream_actions(elsewhere), ["start", "stop"]);
+        assert!(!can_start(elsewhere));
+        assert!(can_start(Standing { stopped: true, ..Default::default() }));
+        assert_eq!(start_hint("box"), "Stop streaming on box first");
         assert_eq!(stream_actions(Standing { online: Some(false), ..Default::default() }), ["stop"]);
         let labels: Vec<&str> = ["start", "pause", "resume", "stop"].into_iter().map(action_label).collect();
         assert_eq!(labels, ["Start", "Pause", "Resume", "Stop"]);

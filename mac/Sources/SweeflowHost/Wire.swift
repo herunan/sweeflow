@@ -9,6 +9,9 @@ enum Msg: UInt8 {
     case forgotten = 0x04
     /// From a client leaving on purpose (switching Macs, disconnecting, quitting): tidy up now.
     case goodbye = 0x05
+    /// To a client saying hello while another computer has the session: turned away until
+    /// that one stops.
+    case busy = 0x06
     case windowAdded = 0x10, windowChanged = 0x11, windowRemoved = 0x12, appIcon = 0x13, cursor = 0x14, focused = 0x15
     case windowButtons = 0x16, moveStarted = 0x17, toggleMaximize = 0x18, minimize = 0x1A, menuTree = 0x1B, appList = 0x1C, screenLocked = 0x1D, settings = 0x1E, blindShow = 0x1F, blindGone = 0x19
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23, menuActivate = 0x24, menuRefresh = 0x25, restore = 0x26, launchApp = 0x27, setSettings = 0x28, blindPress = 0x29, showDisplay = 0x2A, quitApp = 0x2B, runningApps = 0x2C, screenSelect = 0x2D
