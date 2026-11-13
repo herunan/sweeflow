@@ -128,17 +128,9 @@ PlasmoidItem {
             isMask: true
             color: Kirigami.Theme.textColor
             active: parent.containsMouse
-            // Paused or away: faded, with a small badge saying which.
+            // Streaming: solid. Paused, stopped, locked or away: translucent, nothing more (the
+            // tooltip and the popup say which).
             opacity: root.streaming && !root.locked ? 1 : 0.4
-            Kirigami.Icon {
-                visible: !root.streaming || root.locked
-                anchors { right: parent.right; bottom: parent.bottom }
-                width: parent.width / 2
-                height: width
-                source: root.locked ? "system-lock-screen-symbolic"
-                      : root.connected ? "media-playback-paused-symbolic"
-                      : root.stopped ? "media-playback-stop-symbolic" : "network-disconnect-symbolic"
-            }
         }
     }
 
