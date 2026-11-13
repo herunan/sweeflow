@@ -81,9 +81,11 @@ pub mod t {
     // Linking listener only (see pair.rs and PROTOCOL.md).
     pub const PAIR_REQUEST: u8 = 0x70;
     pub const PAIR_RESULT: u8 = 0x71;
-    pub const PAIR_COMMIT: u8 = 0x72;
-    pub const PAIR_NONCE: u8 = 0x73;
-    pub const PAIR_REVEAL: u8 = 0x74;
+    // (0x72–0x74 were link version 2's nonce exchange.)
+    pub const PAIR_SHARE: u8 = 0x75;
+    pub const PAIR_GUESS: u8 = 0x76;
+    pub const PAIR_UNLINK: u8 = 0x77;
+    pub const PAIR_CHECK: u8 = 0x78;
 }
 
 /// Builds one framed message.

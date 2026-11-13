@@ -12,6 +12,7 @@ mod look;
 mod menus;
 mod net;
 mod pair;
+mod pake;
 mod palette;
 mod panel;
 mod panelwin;
@@ -33,7 +34,7 @@ USAGE:
     sweeflow                 stream from the linked Mac: its app windows open here
     sweeflow open            start Sweeflow if needed and show its controls (the app menu entry)
     sweeflow panel           Sweeflow's own window: its apps, settings and Macs (without the Plasma widget)
-    sweeflow pair            link a Mac on this network (both show a code, you click Allow on the Mac)
+    sweeflow pair            link a Mac on this network (the Mac shows a code, you type it here)
     sweeflow pair --text     the same, in the terminal
     sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it (development)
     sweeflow launch BUNDLEID open a Mac app (what the Mac app launchers run)

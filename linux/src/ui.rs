@@ -411,6 +411,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let host = net_cfg.host.clone();
     let net = crate::net::spawn(net_cfg, ui_tx);
     crate::tray::set_net(net.clone());
+    crate::pair::watch_links();
     crate::hyprland::watch_tiling();
 
     let mut app = App {

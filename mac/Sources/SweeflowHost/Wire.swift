@@ -23,9 +23,10 @@ enum Msg: UInt8 {
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55
     case audioSubscribe = 0x60, audio = 0x61
-    // Linking listener only (see Pairing.swift): a request, this Mac's commitment to a nonce, the
-    // other computer's nonce, this Mac's nonce, and the answer.
-    case pairRequest = 0x70, pairResult = 0x71, pairCommit = 0x72, pairNonce = 0x73, pairReveal = 0x74
+    // Linking listener only (see Pairing.swift): a request, this Mac's share (its code is up), the
+    // other computer's share and tag, the answer; and a linked computer's unlink and check.
+    // (0x72–0x74 were link version 2's nonce exchange.)
+    case pairRequest = 0x70, pairResult = 0x71, pairShare = 0x75, pairGuess = 0x76, pairUnlink = 0x77, pairCheck = 0x78
 }
 
 let protocolVersion: UInt16 = 1

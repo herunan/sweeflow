@@ -15,34 +15,16 @@ enum PairingCode {
     }
 }
 
-/// The code both screens show while linking, `XXX-XXX`. Each side works it out from what it sees
-/// of the connection itself: both certificates' fingerprints and a fresh nonce from each side. A
-/// computer answering in between holds different certificates on its two sides, so its two codes
-/// differ. The Linux client's `link_code` is the same sum (linux/src/pair.rs).
+/// The one-time code this Mac shows while a computer links: 4 digits. Short, because it can only
+/// be tried by talking to this Mac (LinkPake: nothing seen lets anyone test codes offline), three
+/// times per code, each code needs its own window on this screen, and wrong codes in a row make
+/// this Mac wait longer and longer before it shows another (`Pairing.cooldown`).
 enum LinkCode {
-    /// No 0 or O, no 1, I or L, which read alike.
-    private static let alphabet = Array("ABCDEFGHJKMNPQRSTUVWXYZ23456789")
+    static let digits = 4
 
-    /// SHA-256 over a label, the two fingerprints (hex) and the two nonces; its first 8 bytes as
-    /// a number, written as 6 characters of the alphabet.
-    static func of(client: String, host: String, clientNonce: Data, hostNonce: Data) -> String {
-        var h = SHA256()
-        h.update(data: Data("sweeflow-link/2".utf8))
-        h.update(data: Data(client.lowercased().utf8))
-        h.update(data: Data(host.lowercased().utf8))
-        h.update(data: clientNonce)
-        h.update(data: hostNonce)
-        var v: UInt64 = 0
-        for byte in Array(h.finalize()).prefix(8) { v = v << 8 | UInt64(byte) }
-        let n = UInt64(alphabet.count)
-        v %= n * n * n * n * n * n
-        var chars: [Character] = []
-        for _ in 0..<6 {
-            chars.append(alphabet[Int(v % n)])
-            v /= n
-        }
-        chars.reverse()
-        return String(chars[0..<3]) + "-" + String(chars[3..<6])
+    static func random() -> String {
+        // SystemRandomNumberGenerator: the system's cryptographic generator.
+        (0..<digits).map { _ in String(Int.random(in: 0...9)) }.joined()
     }
 }
 
@@ -54,46 +36,52 @@ let macName = Host.current().localizedName ?? "Mac"
 let streamServiceType = "_sweeflow._udp"
 let pairServiceType = "_sweeflow-pair._udp"
 
-/// How a link request ended, as PAIR_RESULT says it (PROTOCOL.md).
+/// How a request to the linking listener ended, as PAIR_RESULT says it (PROTOCOL.md).
 enum PairStatus: UInt8 {
-    case linked = 0, refused = 1, busy = 2, wait = 3, locked = 4, alreadyLinked = 5, version = 6
+    case linked = 0, cancelled = 1, busy = 2, wait = 3, locked = 4, alreadyLinked = 5, version = 6
+    case tooManyWrong = 7, expired = 8, unlinked = 9, notLinked = 10
 }
 
 /// Linking: a second QUIC listener, up whenever Sweeflow runs, that takes any client certificate.
-/// A computer asks, both sides work out the same code (LinkCode), the person at the Mac is asked
-/// to allow it, and it's added to the paired clients. Apart from the question itself, all of it
-/// happens on this class's own queue, away from a streaming session's.
+/// A computer asks, this Mac shows a code, the person types it there, and the two run LinkPake
+/// with it: once each has proved it has the same key, this Mac adds the computer's certificate to
+/// the linked ones. The same listener takes a linked computer's "unlink me" and "am I still
+/// linked?". All of it happens on this class's own queue, away from a streaming session's.
 final class Pairing {
     static let shared = Pairing()
     static let port: UInt16 = 44121
     /// The exchange's version: in the listener's ALPN, and checked again in each request.
-    static let version: UInt16 = 2
-    /// How long a computer that was refused can't ask again.
-    private static let refusedFor: TimeInterval = 300
+    static let version: UInt16 = 3
+    /// Wrong codes allowed for one code shown.
+    static let tries = 3
+    /// How long a code is shown for.
+    private static let shownFor: TimeInterval = 300
 
     private let queue = DispatchQueue(label: "sweeflow.pairing")
     private var listener: NWListener?
     private var groups: [ObjectIdentifier: NWConnectionGroup] = [:]
-    /// Open request streams (kept here: nothing else holds them while the person decides).
+    /// Open request streams (kept here: nothing else holds them while the person types).
     private var streams: [ObjectIdentifier: MsgStream] = [:]
     /// Fingerprint of the last client certificate seen (fallback if a stream lacks TLS metadata).
-    /// Should it ever be another connection's, the two codes differ and nothing is linked.
+    /// Should it ever be another connection's, the keys differ and nothing is linked; it's never
+    /// used to unlink.
     private var lastPeer: String?
-    /// Requests that have this Mac's commitment and still owe their own nonce, by stream.
-    private var pending: [ObjectIdentifier: Request] = [:]
-    /// The stream whose computer the person at the Mac is being asked about.
-    private var asking: ObjectIdentifier?
-    /// Computers the person refused, and when.
-    private var refused: [String: Date] = [:]
-    /// When a question was last taken down because its computer left. The next one waits a
-    /// moment: each question shows one code, and nobody gets to run through codes quickly.
-    private var withdrawn = Date.distantPast
+    /// The code on screen, and the computer it's for. One at a time.
+    private var attempt: Attempt?
+    /// Wrong codes since the last computer was linked, and when the last one came.
+    private var wrongInARow = 0
+    private var lastWrong = Date.distantPast
 
-    private struct Request {
+    private struct Attempt {
+        let stream: ObjectIdentifier
         let fingerprint: String
         let name: String
-        /// This Mac's nonce: committed to, shown once the computer has sent its own.
-        let nonce: Data
+        let code: String
+        let generator: Data
+        var triesLeft: Int
+        /// This Mac's share for the run under way (a fresh one for each try).
+        var share: LinkPake.Share
+        let id = UUID()
     }
 
     /// Starts taking link requests. Called once, when Sweeflow starts.
@@ -101,18 +89,19 @@ final class Pairing {
 
     private func listen() {
         guard listener == nil else { return }
-        let quic = NWProtocolQUIC.Options(alpn: ["sweeflow-pair/2"])
-        // The computer that asks keeps the connection alive while the person decides; one that
-        // vanished is noticed after this long, and its question taken down.
+        // Version 2 too, only to tell such a computer to update (it would fail the handshake).
+        let quic = NWProtocolQUIC.Options(alpn: ["sweeflow-pair/3", "sweeflow-pair/2"])
+        // The computer keeps the connection alive while the person types; one that vanished is
+        // noticed after this long, and its code taken down.
         quic.idleTimeout = 30_000
-        // The default allows no client streams at all; the client opens one.
+        // The default allows no client streams at all; the client opens them.
         quic.initialMaxStreamsBidirectional = 4
         quic.initialMaxStreamDataBidirectionalRemote = 64 << 10
         quic.initialMaxData = 256 << 10
         let sec = quic.securityProtocolOptions
         sec_protocol_options_set_local_identity(sec, identity.secIdentity)
         sec_protocol_options_set_peer_authentication_required(sec, true)
-        // Anyone may ask; the person at the Mac decides, by the code.
+        // Anyone may ask; only the code links, and it's bound to this certificate (LinkPake).
         sec_protocol_options_set_verify_block(sec, { [weak self] _, trust, complete in
             let t = sec_trust_copy_ref(trust).takeRetainedValue()
             if let leaf = (SecTrustCopyCertificateChain(t) as? [SecCertificate])?.first {
@@ -158,53 +147,52 @@ final class Pairing {
     }
 
     private func handle(_ conn: NWConnection) {
-        log("pairing: stream opened")
         let stream = MsgStream(conn, queue: queue)
         let key = ObjectIdentifier(stream)
         streams[key] = stream
         stream.onClose = { [weak self] in
             guard let self else { return }
             self.streams[key] = nil
-            self.pending[key] = nil
-            // That computer gave up: don't leave the question up for nobody.
-            if self.asking == key {
-                self.asking = nil
-                self.withdrawn = Date()
-                DispatchQueue.main.async { LinkPrompt.shared.withdraw() }
+            // That computer gave up: take its code down.
+            if self.attempt?.stream == key {
+                log("pairing: \(self.attempt!.name) stopped linking")
+                self.attempt = nil
+                DispatchQueue.main.async { CodeWindow.shared.close() }
             }
         }
         stream.onMessage = { [weak self, weak stream] m in
             guard let self, let stream else { return }
             switch m.type {
             case .pairRequest: self.request(m, on: stream, conn)
-            case .pairNonce: self.reveal(m, on: stream)
+            case .pairGuess: self.guess(m, on: stream)
+            case .pairUnlink: self.unlink(on: stream, conn)
+            case .pairCheck: self.check(on: stream, conn)
             default: log("pairing: unexpected message \(m.type)")
             }
         }
         stream.start()
     }
 
-    /// A computer asks to link. Answered at once when there's nothing to ask the person;
-    /// otherwise with this Mac's commitment to a nonce, the first half of settling the code.
+    /// A computer asks to link. Answered at once when it can't (linked already, locked, another
+    /// code up, too many wrong codes lately); otherwise this Mac shows a code and sends its share.
     private func request(_ message: MsgReader, on stream: MsgStream, _ conn: NWConnection) {
         var m = message
         let key = ObjectIdentifier(stream)
-        guard pending[key] == nil, asking != key else { return log("pairing: a second request on one stream") }
+        guard attempt?.stream != key else { return log("pairing: a second request on one stream") }
         guard let version = try? m.u16() else { return log("pairing: malformed request") }
         guard version == Pairing.version else {
             log("pairing: a request in version \(version), this Mac speaks \(Pairing.version)")
             return reply(stream, .version)
         }
-        guard let said = try? m.str(), let known = try? m.u8() else { return log("pairing: malformed request") }
+        guard let said = try? m.str() else { return log("pairing: malformed request") }
         guard let fp = (peerFingerprint(conn) ?? lastPeer)?.lowercased() else {
             log("pairing: no client certificate")
-            return reply(stream, .refused)
+            return reply(stream, .busy)
         }
         let name = Self.shownName(said)
         log("pairing: \(name) (\(fp.prefix(8))) asks to link")
-        // Linked already, and it has this Mac too: nothing to ask, and nothing to add. (One that
-        // lost this Mac is asked about again: the code is all it has to know this Mac by.)
-        if known != 0, Identity.pairedClients().contains(where: { $0.fingerprint == fp }) {
+        // Linking again takes unlinking first (on either side, which tells the other).
+        if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) {
             log("pairing: \(name) is linked already")
             return reply(stream, .alreadyLinked)
         }
@@ -212,71 +200,127 @@ final class Pairing {
             log("pairing: the screen is locked")
             return reply(stream, .locked)
         }
-        let now = Date()
-        refused = refused.filter { now.timeIntervalSince($0.value) < Self.refusedFor }
-        if refused[fp] != nil {
-            log("pairing: \(name) was refused a moment ago")
+        guard attempt == nil else {
+            log("pairing: another code is showing")
+            return reply(stream, .busy)
+        }
+        let wait = Self.cooldown(wrongInARow: wrongInARow) - Date().timeIntervalSince(lastWrong)
+        if wait > 0 {
+            log("pairing: \(wrongInARow) wrong codes in a row, waiting \(Int(wait)) s more")
             return reply(stream, .wait)
         }
-        guard canAsk(now) else { return reply(stream, .busy) }
-        let nonce = Data((0..<32).map { _ in UInt8.random(in: UInt8.min ... UInt8.max) })
-        pending[key] = Request(fingerprint: fp, name: name, nonce: nonce)
-        var w = MsgWriter(.pairCommit)
-        w.bytes(Data(SHA256.hash(data: nonce)))
+        let code = LinkCode.random()
+        let g = LinkPake.generator(code: code, client: fp, host: identity.fingerprint)
+        guard let share = try? LinkPake.Share.random(generator: g) else { return reply(stream, .busy) }
+        let a = Attempt(stream: key, fingerprint: fp, name: name, code: code, generator: g, triesLeft: Self.tries, share: share)
+        attempt = a
+        sendShare(stream, a)
+        log("pairing: showing a code for \(name)")
+        DispatchQueue.main.async {
+            CodeWindow.shared.show(name: name, code: code) { [weak self] in
+                self?.queue.async { self?.end(a.id, .cancelled, "cancelled here") }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + Self.shownFor) { [weak self] in self?.end(a.id, .expired, "the code expired") }
+    }
+
+    /// How long to wait after the last wrong code before showing another: nothing for the first
+    /// three, then 30 s, doubling with every three more, up to an hour.
+    static func cooldown(wrongInARow n: Int) -> TimeInterval {
+        n < 3 ? 0 : min(3600, 30 * pow(2, Double(n / 3 - 1)))
+    }
+
+    private func sendShare(_ stream: MsgStream, _ a: Attempt) {
+        var w = MsgWriter(.pairShare)
+        w.u8(UInt8(a.triesLeft))
+        w.bytes(a.share.pub)
         stream.send(w)
     }
 
-    /// The computer's own nonce, sent without having seen this Mac's. Both sides now have the
-    /// code: this Mac's nonce goes back, and the person is asked.
-    private func reveal(_ message: MsgReader, on stream: MsgStream) {
+    /// The computer's share and tag, made with the code the person typed there.
+    private func guess(_ message: MsgReader, on stream: MsgStream) {
         var m = message
         let key = ObjectIdentifier(stream)
-        guard let r = pending.removeValue(forKey: key) else { return log("pairing: a nonce nobody asked for") }
-        guard let theirs = try? m.bytes(), theirs.count == 32 else { return log("pairing: malformed nonce") }
-        // Another computer got to the question first.
-        guard canAsk(Date()) else { return reply(stream, .busy) }
-        asking = key
-        let code = LinkCode.of(client: r.fingerprint, host: identity.fingerprint, clientNonce: theirs, hostNonce: r.nonce)
-        var w = MsgWriter(.pairReveal)
-        w.bytes(r.nonce)
-        stream.send(w)
-        log("pairing: asking whether to link \(r.name), code \(code)")
+        guard var a = attempt, a.stream == key else { return log("pairing: a guess nobody asked for") }
+        guard let theirs = try? m.bytes(), let tag = try? m.bytes() else { return log("pairing: malformed guess") }
+        let tags = try? LinkPake.hostTags(ours: a.share, clientShare: theirs, client: a.fingerprint, host: identity.fingerprint)
+        if let tags, LinkPake.same(tags.client, tag) {
+            attempt = nil
+            wrongInARow = 0
+            link(a)
+            log("pairing: linked \(a.name)")
+            reply(stream, .linked, tag: tags.host)
+            DispatchQueue.main.async { CodeWindow.shared.finish("Linked to \(a.name).") }
+            return
+        }
+        wrongInARow += 1
+        lastWrong = Date()
+        a.triesLeft -= 1
+        log("pairing: a wrong code from \(a.name), \(a.triesLeft) tries left")
+        guard a.triesLeft > 0, let share = try? LinkPake.Share.random(generator: a.generator) else {
+            return end(a.id, .tooManyWrong, "too many wrong codes")
+        }
+        a.share = share
+        attempt = a
+        sendShare(stream, a)
+        let left = a.triesLeft
+        DispatchQueue.main.async { CodeWindow.shared.note("That wasn't the code. \(left) \(left == 1 ? "try" : "tries") left.") }
+    }
+
+    /// Stops the attempt `id`, if it's still the one under way, telling its computer why.
+    private func end(_ id: UUID, _ status: PairStatus, _ why: String) {
+        guard let a = attempt, a.id == id else { return }
+        attempt = nil
+        log("pairing: stopped linking \(a.name): \(why)")
+        if let stream = streams[a.stream] { reply(stream, status) }
         DispatchQueue.main.async {
-            LinkPrompt.shared.ask(name: r.name, code: code) { allow in
-                self.queue.async {
-                    guard self.asking == key else { return }   // gone meanwhile
-                    self.asking = nil
-                    if allow { self.link(r) } else { self.refused[r.fingerprint] = Date() }
-                    log("pairing: \(r.name) \(allow ? "allowed" : "not allowed")")
-                    self.reply(stream, allow ? .linked : .refused)
-                }
+            switch status {
+            case .tooManyWrong: CodeWindow.shared.finish("Too many wrong codes. Linking \(a.name) stopped.")
+            case .expired: CodeWindow.shared.finish("The code expired. Linking \(a.name) stopped.")
+            default: CodeWindow.shared.close()
             }
         }
     }
 
-    /// The person allowed it: it may connect from now on.
-    private func link(_ r: Request) {
-        // One this Mac still had (unlinked on the Linux side only) keeps the name it has here.
-        if !Identity.pairedClients().contains(where: { $0.fingerprint == r.fingerprint }) {
-            Identity.addClient(r.fingerprint, name: r.name)
-        }
+    /// Both have proved they have the code: it may connect from now on.
+    private func link(_ a: Attempt) {
+        Identity.addClient(a.fingerprint, name: a.name)
         // Left over from before it was linked again: forgotten here but never told so (it would
         // be told on connecting, and forget this Mac), or disconnected from the menu.
-        if Identity.forgottenClients().contains(r.fingerprint) { Identity.setForgotten(r.fingerprint, false) }
-        if Identity.disconnectedClients().contains(r.fingerprint) { Identity.setDisconnected(r.fingerprint, false) }
+        if Identity.forgottenClients().contains(a.fingerprint) { Identity.setForgotten(a.fingerprint, false) }
+        if Identity.disconnectedClients().contains(a.fingerprint) { Identity.setDisconnected(a.fingerprint, false) }
     }
 
-    /// No question is up, and none was taken down just now (see `withdrawn`).
-    private func canAsk(_ now: Date) -> Bool {
-        asking == nil && now.timeIntervalSince(withdrawn) >= 3
+    /// A linked computer unlinked this Mac: it's forgotten here too. Only ever the computer whose
+    /// certificate made this connection (from the handshake itself, never `lastPeer`).
+    private func unlink(on stream: MsgStream, _ conn: NWConnection) {
+        guard let fp = peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
+        if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) {
+            log("pairing: \(Identity.clientName(fp)) unlinked this Mac")
+            Identity.removeClient(fp)
+        }
+        if Identity.forgottenClients().contains(fp) { Identity.setForgotten(fp, false) }
+        if Identity.disconnectedClients().contains(fp) { Identity.setDisconnected(fp, false) }
+        reply(stream, .unlinked)
     }
 
-    private func reply(_ stream: MsgStream, _ status: PairStatus) {
+    /// A computer asks whether it's still linked here (it looks now and then, for a Mac it isn't
+    /// streaming from: one unlinked here then forgets this Mac too).
+    private func check(on stream: MsgStream, _ conn: NWConnection) {
+        guard let fp = peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
+        if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) { return reply(stream, .linked) }
+        // Told now: no need to tell it when it next connects.
+        if Identity.forgottenClients().contains(fp) { Identity.setForgotten(fp, false) }
+        reply(stream, .notLinked)
+    }
+
+    private func reply(_ stream: MsgStream, _ status: PairStatus, tag: Data = Data()) {
         var w = MsgWriter(.pairResult)
         w.u8(status.rawValue)
         w.str(macName)
         w.u16(settings.config.port)
         w.u16(Pairing.version)
+        w.bytes(tag)
         stream.send(w)
     }
 
@@ -313,80 +357,92 @@ func serviceTXT() -> NWTXTRecord {
     NWTXTRecord(["id": String(identity.fingerprint.prefix(16)), "port": "\(settings.config.port)", "v": "\(protocolVersion)"])
 }
 
-/// The question a link request puts to the person at the Mac, laid out like an alert. A window
-/// of its own rather than a modal alert: nothing else in Sweeflow waits on it (a session may be
-/// streaming), and it's taken down when the other computer stops waiting. Main thread only.
-final class LinkPrompt: NSObject {
-    static let shared = LinkPrompt()
+/// The code a computer that's linking has to type, in big digits. A window of its own rather than
+/// a modal alert: nothing else in Sweeflow waits on it (a session may be streaming), and it's
+/// taken down when the other computer stops. Main thread only.
+final class CodeWindow: NSObject {
+    static let shared = CodeWindow()
     private var window: NSWindow?
-    private var done: ((Bool) -> Void)?
+    private var cancelled: (() -> Void)?
+    private let note = NSTextField(wrappingLabelWithString: "")
+    private let button = NSButton(title: "Cancel", target: nil, action: nil)
+    /// Bumped with each window, so a delayed close doesn't take down a newer one.
+    private var shown = 0
 
     var showing: Bool { window != nil }
 
-    /// Asks whether to link the computer called `name`. `done` gets the answer, unless the
-    /// question is withdrawn first.
-    func ask(name: String, code: String, done: @escaping (Bool) -> Void) {
-        withdraw()
+    /// Shows `code` for the computer called `name`. `cancelled` runs if the person here cancels.
+    func show(name: String, code: String, cancelled: @escaping () -> Void) {
+        close()
         // The explanation has done its job once a computer asks.
         PairingWindow.shared.close()
-        let icon = NSImageView(image: NSApp.applicationIconImage)
-        icon.widthAnchor.constraint(equalToConstant: 56).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 56).isActive = true
-        let title = NSTextField(wrappingLabelWithString: "\(name) wants to link to this Mac")
+        shown += 1
+        let title = NSTextField(wrappingLabelWithString: "Enter this code on \(name)")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
         title.alignment = .center
         title.preferredMaxLayoutWidth = 300
-        let shown = NSTextField(labelWithString: code)
-        shown.font = .monospacedSystemFont(ofSize: 36, weight: .medium)
-        let how = NSTextField(wrappingLabelWithString: "Allow only if \(name) shows the same code.")
-        how.alignment = .center
-        how.textColor = .secondaryLabelColor
-        how.preferredMaxLayoutWidth = 300
-        // Allow has no key of its own: a key meant for another app must never link a computer.
-        let no = NSButton(title: "Don't Allow", target: self, action: #selector(clickedDontAllow))
-        no.keyEquivalent = "\u{1b}"
-        let yes = NSButton(title: "Allow", target: self, action: #selector(clickedAllow))
-        let buttons = NSStackView(views: [no, yes])
-        buttons.orientation = .horizontal
-        buttons.spacing = 12
-        let stack = NSStackView(views: [icon, title, shown, how, buttons])
+        // Spaced out, so it reads digit by digit.
+        let digits = NSTextField(labelWithString: code.map(String.init).joined(separator: " "))
+        digits.font = .monospacedDigitSystemFont(ofSize: 48, weight: .semibold)
+        digits.alignment = .center
+        note.stringValue = "It works once, for linking \(name) to this Mac."
+        note.alignment = .center
+        note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = 300
+        button.title = "Cancel"
+        button.target = self
+        button.action = #selector(clickedButton)
+        button.keyEquivalent = "\u{1b}"
+        let stack = NSStackView(views: [title, digits, note, button])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 14
         stack.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 20, right: 28)
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 300), styleMask: [.titled],
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220), styleMask: [.titled],
                          backing: .buffered, defer: false)
-        w.title = "Sweeflow"
+        w.title = "Link a Linux machine"
         w.contentView = stack
         w.isReleasedWhenClosed = false
         // Above other windows, as an alert would be.
         w.level = .modalPanel
         window = w
-        self.done = done
+        self.cancelled = cancelled
         presentToPerson(w)
     }
 
-    /// Takes the question down unanswered (the computer that asked is gone).
-    func withdraw() {
-        done = nil
-        close()
+    /// A line under the code (a wrong try).
+    func note(_ text: String) {
+        guard window != nil else { return }
+        note.stringValue = text
     }
 
-    private func close() {
+    /// Says how it ended, then goes by itself (or on OK).
+    func finish(_ text: String) {
+        guard window != nil else { return }
+        cancelled = nil
+        note.stringValue = text
+        note.textColor = .labelColor
+        button.title = "OK"
+        button.keyEquivalent = "\r"
+        let n = shown
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            if self?.shown == n { self?.close() }
+        }
+    }
+
+    /// Takes the window down, without telling anyone.
+    func close() {
+        cancelled = nil
         guard let w = window else { return }
         window = nil
         w.close()
         BuiltInScreen.resume()
     }
 
-    @objc private func clickedAllow() { answer(true) }
-    @objc private func clickedDontAllow() { answer(false) }
-
-    private func answer(_ allow: Bool) {
-        let done = self.done
-        self.done = nil
+    @objc private func clickedButton() {
+        let cancelled = self.cancelled
         close()
-        done?(allow)
+        cancelled?()
     }
 }
 
@@ -410,10 +466,10 @@ final class PairingWindow: NSObject, NSWindowDelegate {
         let title = NSTextField(labelWithString: "Link a Linux machine")
         title.font = .systemFont(ofSize: 17, weight: .semibold)
         let how = NSTextField(wrappingLabelWithString:
-            "Linking is started from the Linux machine. Open Sweeflow there, choose “Link a Mac…” and pick this Mac. "
-            + "This Mac then asks you to allow it.")
+            "Open Sweeflow on the Linux machine, choose “Link a Mac…” and pick this Mac. "
+            + "This Mac then shows a code to type there.")
         how.preferredMaxLayoutWidth = 340
-        let manual = NSTextField(wrappingLabelWithString: "If this Mac isn't found automatically, type its address there.")
+        let manual = NSTextField(wrappingLabelWithString: "If this Mac isn't found by itself, type its address there.")
         manual.preferredMaxLayoutWidth = 340
         let addresses = Self.addresses()
         let address = addresses.isEmpty ? "none, this Mac isn't on a network" : addresses.joined(separator: " or ")
@@ -449,7 +505,7 @@ final class PairingWindow: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         window = nil
-        // The question, if it's up, keeps the screen lit until it's answered.
-        if !LinkPrompt.shared.showing { BuiltInScreen.resume() }
+        // The code, if it's up, keeps the screen lit until it's done.
+        if !CodeWindow.shared.showing { BuiltInScreen.resume() }
     }
 }

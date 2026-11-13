@@ -1,8 +1,8 @@
 //! "Link a Mac": the pairing wizard (`sweeflow pair`). Its own process, so its event loop never
 //! shares a thread with the streaming client's Wayland one.
 //!
-//! Install Sweeflow on the Mac → pick the Mac (found on the network, or typed by address) → both
-//! show the same code, and someone clicks Allow on the Mac → done.
+//! Install Sweeflow on the Mac → pick the Mac (found on the network, or typed by address) → the
+//! Mac shows a 4-digit code, typed here → linked, and streaming from it straight away.
 
 use std::{
     cell::RefCell,
@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::Result;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 use crate::{
     config::Config,
@@ -106,34 +106,35 @@ slint::slint! {
         }
     }
 
-    // The code both computers show while linking: a box per character, the dash between the
-    // halves only drawn. Only shown, never typed: empty boxes until the code is known.
-    component CodeBoxes inherits Rectangle {
-        in property <[string]> chars;
+    // Where the Mac's code is typed: big digits, centred.
+    component CodeField inherits Rectangle {
+        in-out property <string> text <=> input.text;
+        in property <bool> enabled: true;
+        callback accepted(string);
+        width: 200px;
         height: 60px;
-        HorizontalLayout {
-            alignment: center;
-            spacing: 8px;
-            for c[i] in chars: HorizontalLayout {
-                spacing: 8px;
-                if i == 3: Text { text: "–"; color: Look.muted; font-size: 24px; vertical-alignment: center; }
-                Rectangle {
-                    width: 42px;
-                    height: 56px;
-                    border-radius: Look.radius;
-                    border-width: 1px;
-                    border-color: Look.line;
-                    background: Look.surface;
-                    Text {
-                        text: c;
-                        color: Look.fg;
-                        font-size: 26px;
-                        font-family: Look.mono;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-            }
+        border-radius: Look.radius;
+        border-width: 1px;
+        border-color: input.has-focus ? Look.accent : Look.line;
+        background: Look.surface;
+        forward-focus: input;
+        init => { input.focus(); }
+        input := TextInput {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            single-line: true;
+            enabled: root.enabled;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: Look.fg;
+            font-size: 32px;
+            font-family: Look.mono;
+            letter-spacing: 8px;
+            input-type: number;
+            selection-background-color: Look.accent;
+            selection-foreground-color: Look.on-accent;
+            accepted => { root.accepted(self.text); }
         }
     }
 
@@ -156,16 +157,23 @@ slint::slint! {
         callback open-firewall();
         in property <[MacRow]> macs;
         in property <string> mac-name;
-        // The code to compare with the Mac's, a character each (all empty until it's known).
-        in property <[string]> code-chars: ["", "", "", "", "", ""];
-        in property <bool> code-known;
+        // The Mac is showing its code (until then, it's being asked).
+        in property <bool> code-ready;
+        // A code was sent, and the Mac's answer is awaited.
+        in property <bool> checking;
+        in-out property <string> code-text;
+        // Under the code: a wrong one, or how many digits it has.
+        in property <string> code-note;
+        in property <bool> code-wrong;
         in-out property <string> error;
-        in property <bool> streaming-mac-set;
+        // The Mac that was in use before this one was linked, if any.
+        in property <string> switched-from;
 
         callback pick(int);
         callback manual(string);
         callback cancel-wait();
-        callback finish(bool);
+        callback submit-code(string);
+        callback finish();
 
         VerticalLayout {
             padding: 24px;
@@ -262,7 +270,7 @@ slint::slint! {
                 VerticalLayout {
                     spacing: 4px;
                     Title { text: "Choose your Mac"; }
-                    Dim { text: "These Macs are running Sweeflow on this network. Choose yours, and it will ask you to allow this computer."; }
+                    Dim { text: "These Macs are running Sweeflow on this network. Choose yours, and it will show a code to type here."; }
                 }
                 // The Macs found on this network, or the wait for one.
                 Rectangle {
@@ -304,16 +312,37 @@ slint::slint! {
             }
 
             if page == 2: VerticalLayout {
-                spacing: 18px;
+                spacing: 16px;
                 alignment: center;
-                Title { text: "Link to " + mac-name; horizontal-alignment: center; }
-                CodeBoxes { chars: code-chars; }
-                Dim {
-                    text: code-known ? "Check that your Mac shows this code, then click Allow there." : "Asking " + mac-name + "…";
+                Title {
+                    text: code-ready ? "Enter the code shown on " + mac-name : "Asking " + mac-name + "…";
                     horizontal-alignment: center;
                 }
-                HorizontalLayout { alignment: center; Spin { size: 28px; } }
-                HorizontalLayout { alignment: center; Btn { text: "Cancel"; clicked => { root.cancel-wait(); } } }
+                if !code-ready: HorizontalLayout { alignment: center; Spin { size: 28px; } }
+                if code-ready: HorizontalLayout {
+                    alignment: center;
+                    CodeField {
+                        text <=> root.code-text;
+                        enabled: !checking;
+                        accepted(t) => { root.submit-code(t); }
+                    }
+                }
+                Label {
+                    text: code-note != "" ? code-note : code-ready ? "It's in a window on " + mac-name + "." : "";
+                    color: code-wrong ? Look.danger : Look.muted;
+                    horizontal-alignment: center;
+                }
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    Btn { text: "Cancel"; clicked => { root.cancel-wait(); } }
+                    if code-ready: Btn {
+                        text: "Link";
+                        primary: true;
+                        enabled: !checking && code-text != "";
+                        clicked => { root.submit-code(root.code-text); }
+                    }
+                }
             }
 
             if page == 3: VerticalLayout {
@@ -325,17 +354,14 @@ slint::slint! {
                     Title { text: "Linked to " + mac-name; vertical-alignment: center; }
                 }
                 Dim {
-                    text: streaming-mac-set
-                        ? "This computer is still using your other Mac. You can switch between them from the Sweeflow icon in the system tray."
-                        : "Its apps will open on this desktop in windows of their own.";
+                    text: (switched-from != "" ? "Switched from " + switched-from + ". " : "")
+                        + "Its apps will open on this desktop in windows of their own.";
                 }
                 if error != "": Label { text: error; color: Look.danger; }
                 Rectangle {}
                 HorizontalLayout {
-                    spacing: 8px;
                     alignment: end;
-                    if streaming-mac-set: Btn { text: "Keep the current Mac"; clicked => { root.finish(false); } }
-                    Btn { text: streaming-mac-set ? "Switch to " + mac-name : "Done"; primary: true; clicked => { root.finish(true); } }
+                    Btn { text: "Done"; primary: true; clicked => { root.finish(); } }
                 }
             }
         }
@@ -349,6 +375,8 @@ thread_local! {
     static ATTEMPT: RefCell<u32> = const { RefCell::new(0) };
     /// The link request under way: what cancels it, and its thread.
     static LINKING: RefCell<Option<(Arc<Notify>, JoinHandle<()>)>> = const { RefCell::new(None) };
+    /// Where the code typed goes, while the Mac shows one.
+    static CODES: RefCell<Option<mpsc::UnboundedSender<String>>> = const { RefCell::new(None) };
 }
 
 pub fn run() -> Result<()> {
@@ -367,7 +395,6 @@ pub fn run() -> Result<()> {
     }
     let model = Rc::new(VecModel::<MacRow>::default());
     ui.set_macs(ModelRc::from(model.clone()));
-    ui.set_streaming_mac_set(!Config::load_or_default()?.host.is_empty());
 
     let _server = crate::installer::serve().inspect_err(|e| log::info!("installer not served: {e:#}")).ok();
     if let Some(s) = &_server {
@@ -435,7 +462,7 @@ pub fn run() -> Result<()> {
         let Some(ui) = weak.upgrade() else { return };
         let Some(m) = FOUND.with_borrow(|all| all.get(i as usize).cloned()) else { return };
         if already_linked(&m) {
-            ui.set_error(format!("{} is already linked to this computer. To link it again, unlink it in Sweeflow's list of Macs first.", m.name).into());
+            ui.set_error(format!("{} is already linked to this computer. To link it again, unlink it first.", m.name).into());
             return;
         }
         start_link(&ui, m);
@@ -459,15 +486,26 @@ pub fn run() -> Result<()> {
     });
 
     let weak = ui.as_weak();
-    ui.on_finish(move |use_now| {
-        if use_now {
-            if let Err(e) = use_paired_mac() {
-                if let Some(ui) = weak.upgrade() {
-                    ui.set_error(format!("{e:#}").into());
-                }
-                return;
-            }
+    ui.on_submit_code(move |text| {
+        let Some(ui) = weak.upgrade() else { return };
+        // One code per try: a second Enter while it's checked would spend the next try.
+        if ui.get_checking() {
+            return;
         }
+        let Some(code) = pair::normalize_code(&text) else {
+            ui.set_code_note(format!("The code has {} digits.", pair::CODE_DIGITS).into());
+            ui.set_code_wrong(true);
+            return;
+        };
+        let sent = CODES.with_borrow(|c| c.as_ref().is_some_and(|tx| tx.send(code).is_ok()));
+        if sent {
+            ui.set_checking(true);
+            ui.set_code_wrong(false);
+            ui.set_code_note("Checking…".into());
+        }
+    });
+
+    ui.on_finish(|| {
         let _ = slint::quit_event_loop();
     });
 
@@ -490,17 +528,10 @@ fn already_linked(m: &FoundMac) -> bool {
     !m.id.is_empty() && Config::load_or_default().is_ok_and(|c| c.macs.iter().any(|p| p.fingerprint.starts_with(&m.id)))
 }
 
-/// Shows `code` ("XXX-XXX") in the code boxes, a character each; "" empties them.
-fn show_code(ui: &Wizard, code: &str) {
-    let mut chars: Vec<SharedString> = code.chars().filter(|c| *c != '-').map(|c| c.to_string().into()).collect();
-    chars.resize(6, SharedString::new());
-    ui.set_code_chars(Rc::new(VecModel::from(chars)).into());
-    ui.set_code_known(!code.is_empty());
-}
-
 /// Forgets the link request under way, if any, and tells its thread to stop asking.
 fn cancel_link() -> Option<(Arc<Notify>, JoinHandle<()>)> {
     ATTEMPT.with_borrow_mut(|a| *a += 1);
+    CODES.with_borrow_mut(|c| *c = None);
     let linking = LINKING.with_borrow_mut(Option::take);
     if let Some((cancel, _)) = &linking {
         cancel.notify_one();
@@ -508,11 +539,17 @@ fn cancel_link() -> Option<(Arc<Notify>, JoinHandle<()>)> {
     linking
 }
 
-/// Asks `mac` to link, on the page with the code. The answer leads to the last page, or back to
-/// the list with what went wrong.
+/// Asks `mac` to link, on the page where its code is typed. The answer leads to the last page
+/// (streaming from it already), or back to the list with what went wrong.
 fn start_link(ui: &Wizard, mac: FoundMac) {
     cancel_link();
-    show_code(ui, "");
+    ui.set_code_ready(false);
+    ui.set_checking(false);
+    ui.set_code_text(SharedString::new());
+    ui.set_code_note(SharedString::new());
+    ui.set_code_wrong(false);
+    let (codes_tx, mut codes) = mpsc::unbounded_channel();
+    CODES.with_borrow_mut(|c| *c = Some(codes_tx));
     ui.set_mac_name(mac.name.clone().into());
     ui.set_error(SharedString::new());
     ui.set_page(2);
@@ -521,37 +558,52 @@ fn start_link(ui: &Wizard, mac: FoundMac) {
     let cancelled = cancel.clone();
     let weak = ui.as_weak();
     let thread = std::thread::spawn(move || {
-        let weak_code = weak.clone();
-        let on_code = move |code: &str| {
-            let code = code.to_string();
-            let _ = weak_code.upgrade_in_event_loop(move |ui| {
-                if ATTEMPT.with_borrow(|a| *a == attempt) {
-                    show_code(&ui, &code);
+        let weak_ask = weak.clone();
+        let on_ask = move |tries_left: u8, wrong: bool| {
+            let _ = weak_ask.upgrade_in_event_loop(move |ui| {
+                if ATTEMPT.with_borrow(|a| *a != attempt) {
+                    return;
                 }
+                ui.set_code_ready(true);
+                ui.set_checking(false);
+                ui.set_code_text(SharedString::new());
+                ui.set_code_wrong(wrong);
+                let tries = if tries_left == 1 { "1 try".to_string() } else { format!("{tries_left} tries") };
+                ui.set_code_note(if wrong { format!("That's not the code. {tries} left.").into() } else { SharedString::new() });
             });
         };
         let result = tokio::runtime::Runtime::new()
             .map_err(anyhow::Error::from)
-            .and_then(|rt| rt.block_on(pair::link(&mac, &cancelled, on_code)));
+            .and_then(|rt| rt.block_on(pair::link(&mac, &cancelled, &mut codes, on_ask)));
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if ATTEMPT.with_borrow(|a| *a != attempt) {
                 return; // cancelled meanwhile
             }
             LINKING.with_borrow_mut(|l| *l = None);
+            CODES.with_borrow_mut(|c| *c = None);
             let name = ui.get_mac_name();
             match result {
                 Ok(Outcome::Linked(p)) => {
                     let saved = Config::load_or_default().and_then(|mut cfg| {
-                        let first = cfg.host.is_empty();
-                        cfg.add_mac(p.clone(), first);
-                        cfg.save()
+                        let before = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint).map(|m| m.name.clone());
+                        cfg.add_mac(p.clone(), true);
+                        cfg.save().map(|()| before)
                     });
-                    if let Err(e) = saved {
-                        ui.set_error(format!("Linked, but the settings couldn't be saved: {e:#}").into());
-                        ui.set_page(1);
-                        return;
-                    }
+                    let before = match saved {
+                        Ok(b) => b,
+                        Err(e) => {
+                            ui.set_error(format!("Linked, but the settings couldn't be saved: {e:#}").into());
+                            ui.set_page(1);
+                            return;
+                        }
+                    };
+                    ui.set_switched_from(before.unwrap_or_default().into());
                     ui.set_mac_name(p.name.into());
+                    ui.set_error(SharedString::new());
+                    if let Err(e) = after_first_link(&p.fingerprint) {
+                        log::warn!("starting to stream from the Mac just linked: {e:#}");
+                        ui.set_error(format!("Couldn't start streaming from it: {e:#}").into());
+                    }
                     ui.set_page(3);
                 }
                 Ok(other) => {
@@ -589,13 +641,26 @@ fn manual_mac(text: &str) -> Option<FoundMac> {
     })
 }
 
-/// Makes the newest paired Mac the one to stream from, and (re)starts the client for it.
-fn use_paired_mac() -> Result<()> {
-    let mut cfg = Config::load_or_default()?;
-    if let Some(m) = cfg.macs.last().cloned() {
-        cfg.activate(&m.fingerprint);
-        cfg.save()?;
+/// A Mac was just linked (and made the one to use in the config): streams from it straight away.
+/// A running client switches itself over (telling the Mac it leaves that it's going, see
+/// `tray::use_mac`); otherwise the client is started.
+fn after_first_link(fingerprint: &str) -> Result<()> {
+    const BUS_NAME: &str = "dev.sweeflow.Client";
+    let bus = zbus::blocking::Connection::session().ok();
+    let running = bus.as_ref().is_some_and(|bus| {
+        bus.call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", Some("org.freedesktop.DBus"), "NameHasOwner", &(BUS_NAME,))
+            .ok()
+            .and_then(|r| r.body().deserialize::<bool>().ok())
+            .unwrap_or(false)
+    });
+    if let (true, Some(bus)) = (running, &bus) {
+        // TODO(merge): `use` is where crate::net::request_take_over() goes (tray::use_mac).
+        bus.call_method(Some(BUS_NAME), "/dev/sweeflow/Panel", Some("dev.sweeflow.Panel"), "Do", &("use", fingerprint))?;
+        return Ok(());
     }
+    // TODO(merge): a client started fresh should take the Mac's session over too
+    // (crate::net::request_take_over() once it's running, or a flag it reads on start).
+    crate::net::set_offline(false);
     crate::setup::start_client()
 }
 

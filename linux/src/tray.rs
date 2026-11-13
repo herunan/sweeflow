@@ -681,6 +681,7 @@ pub fn panel_do(action: &str, arg: &str) {
             refresh();
         }
         "switch" => switch_to(arg),
+        "use" => use_mac(arg),
         "forget" => forget(arg),
         "launch" => {
             if let Err(e) = crate::launchers::launch(arg) {
@@ -804,12 +805,18 @@ pub fn set_mac_refused(on: bool) {
 /// The Mac in use forgot this computer (from its menu): forget it here too.
 pub fn mac_forgot_us() {
     let Ok(cfg) = crate::config::Config::load_or_default() else { return };
-    let name = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint).map(|m| m.name.clone()).unwrap_or_else(|| "The Mac".into());
+    mac_unlinked_us(&cfg.host_fingerprint);
+}
+
+/// A linked Mac unlinked this computer (from its menu): unlinked here too, and said so.
+pub fn mac_unlinked_us(fingerprint: &str) {
+    let Ok(cfg) = crate::config::Config::load_or_default() else { return };
+    let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == fingerprint) else { return };
     let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=Sweeflow", "--icon=sweeflow", &format!("{name} unlinked this computer"),
-               "It was unlinked on the Mac, so Sweeflow unlinked it here too. Link it again with Link a Mac…"])
+        .args(["--app-name=Sweeflow", "--icon=sweeflow", &format!("{} unlinked this computer", mac.name),
+               "It was unlinked on the Mac, so it's unlinked here too. Link it again with Link a Mac…"])
         .spawn();
-    forget(&cfg.host_fingerprint);
+    forget_here(fingerprint);
 }
 
 /// What sort of Mac each linked one is ("laptop", "imac", "desktop"), by fingerprint: its icon.
@@ -898,7 +905,38 @@ fn switch_to(fingerprint: &str) {
     restart();
 }
 
+/// A Mac just linked (the Link a Mac window says): streams from it now, switching from the one in
+/// use if there is one, and starting if stopped.
+fn use_mac(fingerprint: &str) {
+    let mut cfg = match crate::config::Config::load_or_default() {
+        Ok(c) => c,
+        Err(e) => return log::warn!("config: {e:#}"),
+    };
+    if !cfg.activate(fingerprint) {
+        return log::warn!("no linked Mac {fingerprint}");
+    }
+    if let Err(e) = cfg.save() {
+        return log::warn!("saving config: {e:#}");
+    }
+    log::info!("streaming from the Mac just linked, {}", cfg.host);
+    crate::net::set_offline(false);
+    // TODO(merge): crate::net::request_take_over() — the Mac just linked may be serving another
+    // Linux computer; this one asked for it, so it takes the session over.
+    restart();
+}
+
+/// Unlink, chosen here: the Mac is told too (now, or once it's seen again), and forgets this
+/// computer.
 fn forget(fingerprint: &str) {
+    let Ok(cfg) = crate::config::Config::load_or_default() else { return };
+    if let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == fingerprint) {
+        crate::pair::tell_unlinked(mac.clone());
+    }
+    forget_here(fingerprint);
+}
+
+/// Forgets a Mac on this side only.
+fn forget_here(fingerprint: &str) {
     let Ok(mut cfg) = crate::config::Config::load_or_default() else { return };
     let was_active = cfg.host_fingerprint == fingerprint;
     cfg.forget(fingerprint);
