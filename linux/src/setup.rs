@@ -316,6 +316,11 @@ pub fn open() -> Result<()> {
     if !crate::tray::widget_installed() {
         return crate::panelwin::run();
     }
+    // As the widget's shortcut does, when it has one (a click on its icon: the Mac window's
+    // Cmd+Opt+O, ui.rs, does just what the key does elsewhere).
+    if press_widget_shortcut() {
+        return Ok(());
+    }
     // Pop the tray widget open, once the client is there to ask.
     let bus = zbus::blocking::Connection::session()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -400,8 +405,9 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Cmd+Opt+O (Super+Alt+O) opens Sweeflow from any window: the desktop's own shortcut for
-/// `sweeflow open`, on Plasma and GNOME. (Hyprland has its binding, hyprland.rs, and while a Mac
+/// Cmd+Opt+O opens Sweeflow from any window, as a click on its tray icon does: on Plasma the
+/// tray widget's popup (the widget's own shortcut), on GNOME Sweeflow's window (a custom
+/// shortcut for `sweeflow open`). (Hyprland has its binding, hyprland.rs, and while a Mac
 /// window has the focus the key is caught there on every desktop, ui.rs.)
 ///
 /// Set once, and only while nothing else has the key. After that it is the user's: a note in
@@ -409,10 +415,12 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
 /// changed or removed (delete the note to have it set again).
 fn register_open_key(home: &std::path::Path) {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let (note, key, set): (&str, &str, fn(&std::path::Path) -> Result<OpenKey>) = if desktop.contains("KDE") {
-        ("open-key.kde", PLASMA_KEY, plasma_open_key)
+    let remapped = mac_keys_remapped();
+    let (note, key, set): (&str, &str, fn(&std::path::Path, bool) -> Result<OpenKey>) = if desktop.contains("KDE") {
+        // (open-key.kde was the note of the app menu entry's shortcut, which this replaces.)
+        ("open-key.plasma-widget", plasma_key(remapped).0, plasma_open_key)
     } else if desktop.contains("GNOME") {
-        ("open-key.gnome", "Super+Alt+O", gnome_open_key)
+        ("open-key.gnome", if remapped { "Ctrl+Alt+O" } else { "Super+Alt+O" }, gnome_open_key)
     } else {
         return;
     };
@@ -420,7 +428,9 @@ fn register_open_key(home: &std::path::Path) {
     if note.exists() {
         return;
     }
-    match set(home) {
+    // What's pressed is Cmd+Opt+O either way.
+    let key = if remapped { format!("Cmd+Opt+O ({key} once your key remapper has turned Cmd into Ctrl)") } else { key.to_string() };
+    match set(home, remapped) {
         Ok(OpenKey::Set { now: true }) => println!("    {key} opens Sweeflow from any window"),
         // No note yet: the next install looks again whether it is still there.
         Ok(OpenKey::Set { now: false }) => return println!("    {key} opens Sweeflow from any window, from the next login"),
@@ -430,6 +440,17 @@ fn register_open_key(home: &std::path::Path) {
     }
     let _ = std::fs::create_dir_all(config::dir());
     let _ = std::fs::write(note, format!("{key}\n"));
+}
+
+/// A Mac-style key remapper is installed (Toshy, Kinto): outside the Mac windows (which it
+/// leaves alone, as a remote desktop) it turns Cmd into Ctrl, so the desktop sees Cmd+Opt+O as
+/// Ctrl+Alt+O, and a shortcut on Super+Alt+O never fires. The shortcut is then put on the key
+/// that arrives.
+pub fn mac_keys_remapped() -> bool {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    config.is_some_and(|c| c.join("toshy/toshy_config.py").exists() || c.join("kinto/kinto.py").exists())
 }
 
 /// How setting the desktop's shortcut went.
@@ -442,11 +463,17 @@ enum OpenKey {
     Taken(String),
 }
 
-const PLASMA_KEY: &str = "Meta+Alt+O";
-/// The same key as Qt counts it (Qt::META | Qt::ALT | Qt::Key_O): how KGlobalAccel is asked.
-const PLASMA_KEY_CODE: i32 = 0x1000_0000 | 0x0800_0000 | 0x4f;
-/// The app menu entry (see `write_launcher`): the shortcut is its "launch" action.
+/// The key on Plasma, as written in its config and as Qt counts it (Qt::META or Qt::CTRL, |
+/// Qt::ALT | Qt::Key_O): how KGlobalAccel is asked.
+fn plasma_key(remapped: bool) -> (&'static str, i32) {
+    if remapped { ("Ctrl+Alt+O", 0x0400_0000 | 0x0800_0000 | 0x4f) } else { ("Meta+Alt+O", 0x1000_0000 | 0x0800_0000 | 0x4f) }
+}
+/// The app menu entry (see `write_launcher`), whose "launch" action earlier versions gave the
+/// key.
 const LAUNCHER: &str = "sweeflow.desktop";
+/// The keys earlier versions gave the app menu entry.
+const OLD_LAUNCH_KEYS: [&str; 2] = ["Meta+Alt+O", "Ctrl+Alt+O"];
+const WIDGET: &str = "dev.sweeflow.panel";
 
 /// A call to Plasma's shortcut service (KGlobalAccel; inside KWin on Wayland).
 fn kglobalaccel<B>(bus: &zbus::blocking::Connection, method: &str, body: &B) -> zbus::Result<zbus::Message>
@@ -456,55 +483,137 @@ where
     bus.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), method, body)
 }
 
-/// Plasma 6 keeps an application's shortcuts by its desktop file: kglobalshortcutsrc, group
-/// [services][sweeflow.desktop], key _launch. It reads that file when the session starts, so
-/// the running shortcut service is told too, the way System Settings adds an application.
-fn plasma_open_key(_home: &std::path::Path) -> Result<OpenKey> {
-    let entry = ["--file", "kglobalshortcutsrc", "--group", "services", "--group", LAUNCHER, "--key", "_launch"];
-    let there = Command::new("kreadconfig6").args(entry).output().context("kreadconfig6")?;
-    // Ours from an earlier install, the user's own key, or "none" (they took the key away).
-    if !String::from_utf8_lossy(&there.stdout).trim().is_empty() {
+/// Runs a script in Plasma's shell (its scripting interface) and gives what it printed.
+fn plasma_script(script: &str) -> Result<String> {
+    let out = Command::new("qdbus6")
+        .args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
+        .stderr(Stdio::null())
+        .output()
+        .context("qdbus6")?;
+    anyhow::ensure!(out.status.success(), "Plasma's shell didn't run the script");
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The Sweeflow widgets in the system trays, as (screen, applet id, its shortcut). A tray's
+/// widgets are kept inside the tray's own config, under Applets/<id>.
+fn plasma_widgets() -> Result<Vec<(i64, String, String)>> {
+    let script = format!(
+        r#"panels().forEach(function(p){{ p.widgets("org.kde.plasma.systemtray").forEach(function(w){{
+        w.currentConfigGroup = ["Applets"]; var ids = w.configGroups.slice();
+        for (var i = 0; i < ids.length; i++) {{ var id = String(ids[i]); w.currentConfigGroup = ["Applets", id];
+            if (String(w.readConfig("plugin", "")) == "{WIDGET}") {{ w.currentConfigGroup = ["Applets", id, "Shortcuts"];
+                print(p.screen + "\t" + id + "\t" + w.readConfig("global", "") + "\n"); }} }} }}); }});"#
+    );
+    Ok(parse_widgets(&plasma_script(&script)?))
+}
+
+fn parse_widgets(printed: &str) -> Vec<(i64, String, String)> {
+    printed
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let screen = f.next()?.trim().parse().ok()?;
+            let id = f.next()?.trim();
+            (!id.is_empty() && id.chars().all(|c| c.is_ascii_digit())).then(|| (screen, id.to_string(), f.next().unwrap_or("").trim().to_string()))
+        })
+        .collect()
+}
+
+/// The widget a single key opens: the one on the first screen, or else the first one found.
+fn main_widget(widgets: &[(i64, String, String)]) -> Option<&(i64, String, String)> {
+    widgets.iter().find(|w| w.0 == 0).or(widgets.first())
+}
+
+/// The shortcut Plasma gives a widget that has one ("activate widget <id>", in plasmashell's
+/// shortcuts): what pressing the key does, a click on the tray icon (it opens the popup, and
+/// closes it when open).
+fn widget_action(id: &str) -> String {
+    format!("activate widget {id}")
+}
+
+/// The Sweeflow tray widget's own shortcut, which Plasma gives to the widget's popup like a
+/// click on its icon. Kept in the widget's config ([Shortcuts] global), which Plasma's shell
+/// reads as it starts: the shell is restarted for it (the panels are gone for a second).
+/// Earlier versions gave the key to the app menu entry instead (`sweeflow open`): that one is
+/// taken away when it still has the key they gave it.
+fn plasma_open_key(_home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
+    let widgets = plasma_widgets()?;
+    let Some((_, id, _)) = main_widget(&widgets) else {
+        bail!("the Sweeflow widget isn't in a system tray yet");
+    };
+    // One the user gave it (or an earlier install did).
+    if widgets.iter().any(|w| !w.2.is_empty()) {
         return Ok(OpenKey::Kept);
     }
+    let (key_text, code) = plasma_key(remapped);
     // A key sequence on D-Bus: up to four keys, the unused ones 0.
-    let key = (vec![PLASMA_KEY_CODE, 0, 0, 0],);
+    let key = (vec![code, 0, 0, 0],);
     let bus = zbus::blocking::Connection::session()?;
-    let free: bool = kglobalaccel(&bus, "globalShortcutAvailable", &(&key, LAUNCHER))?.body().deserialize()?;
-    if !free {
-        // (action, its name, component, its name, context, its name, keys, default keys);
-        // 0: the shortcuts with exactly this key.
-        type Info = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
-        let by = kglobalaccel(&bus, "globalShortcutsByKey", &(&key, (0i32,)))
-            .and_then(|r| r.body().deserialize::<Vec<Info>>())
-            .ok()
-            .and_then(|all| all.into_iter().next())
-            .map(|i| if i.1 == i.3 { i.3 } else { format!("{} ({})", i.3, i.1) })
-            .unwrap_or_else(|| "another shortcut".into());
-        return Ok(OpenKey::Taken(by));
+    // (action, its name, component, its name, context, its name, keys, default keys);
+    // 0: the shortcuts with exactly this key. Not counting the app menu entry's, ours.
+    type Info = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
+    let others: Vec<Info> = kglobalaccel(&bus, "globalShortcutsByKey", &(&key, (0i32,)))?.body().deserialize()?;
+    if let Some(i) = others.into_iter().find(|i| i.2 != LAUNCHER) {
+        return Ok(OpenKey::Taken(if i.1 == i.3 { i.3 } else { format!("{} ({})", i.3, i.1) }));
     }
-    let wrote = Command::new("kwriteconfig6").args(entry).arg(PLASMA_KEY).status().context("kwriteconfig6")?;
-    anyhow::ensure!(wrote.success(), "kwriteconfig6 failed");
 
-    // Now, for this session. The shortcut service finds the launcher in the applications
-    // cache, which is brought up to date first (the launcher may have been written a moment
-    // ago). Then, as System Settings does it: registering an action with no name makes the
-    // service read the launcher (it does nothing if it can't find it), that action is dropped
-    // again, and the launch action is given the key.
-    let _ = Command::new("kbuildsycoca6").stdout(Stdio::null()).stderr(Stdio::null()).status();
-    let action = |action: &'static str, name: &'static str| vec![LAUNCHER, action, "Sweeflow", name];
-    let launch = action("_launch", "Sweeflow");
-    let told = || -> zbus::Result<bool> {
-        kglobalaccel(&bus, "doRegister", &(action("", ""),))?;
-        kglobalaccel(&bus, "unregister", &(LAUNCHER, ""))?;
-        kglobalaccel(&bus, "setForeignShortcutKeys", &(&launch, vec![&key]))?;
-        let keys: Vec<(Vec<i32>,)> = kglobalaccel(&bus, "shortcutKeys", &(&launch,))?.body().deserialize()?;
-        Ok(keys.iter().any(|k| k.0.first() == Some(&PLASMA_KEY_CODE)))
+    let launch = ["--file", "kglobalshortcutsrc", "--group", "services", "--group", LAUNCHER, "--key", "_launch"];
+    let there = Command::new("kreadconfig6").args(launch).output().context("kreadconfig6")?;
+    if old_launch_keys(&String::from_utf8_lossy(&there.stdout)) {
+        if let Err(e) = kglobalaccel(&bus, "unregister", &(LAUNCHER, "_launch")) {
+            log::warn!("taking the key from the app menu entry: {e}");
+        }
+        let _ = Command::new("kwriteconfig6").args(launch).arg("--delete").status();
+    }
+
+    let script = format!(
+        r#"panels().forEach(function(p){{ p.widgets("org.kde.plasma.systemtray").forEach(function(w){{
+        w.currentConfigGroup = ["Applets", "{id}"]; if (String(w.readConfig("plugin", "")) != "{WIDGET}") return;
+        w.currentConfigGroup = ["Applets", "{id}", "Shortcuts"]; w.writeConfig("global", "{key_text}"); print("ok"); }}); }});"#
+    );
+    anyhow::ensure!(plasma_script(&script)?.contains("ok"), "Plasma's shell didn't take the widget's shortcut");
+    // The shell writes its config a moment later; it must be on disk when it restarts.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let restarted = Command::new("systemctl")
+        .args(["--user", "restart", "plasma-plasmashell.service"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if restarted {
+        println!("    (Plasma's panels restarted to take the Sweeflow widget's shortcut)");
+    }
+    Ok(OpenKey::Set { now: restarted })
+}
+
+/// The app menu entry's shortcut (as kreadconfig6 prints it, several keys a tab apart) is the
+/// one earlier versions gave it: nothing but those keys.
+fn old_launch_keys(value: &str) -> bool {
+    let keys: Vec<&str> = value.trim().split('\t').map(str::trim).filter(|k| !k.is_empty()).collect();
+    !keys.is_empty() && keys.iter().all(|k| OLD_LAUNCH_KEYS.contains(k))
+}
+
+/// Opens the tray widget's popup the way its shortcut does, when it has one: as a click on the
+/// icon would (on the widget the key belongs to). False when there is none to use.
+pub fn press_widget_shortcut() -> bool {
+    let Ok(widgets) = plasma_widgets() else { return false };
+    let Some((_, id, _)) = main_widget(&widgets).filter(|w| !w.2.is_empty()) else { return false };
+    let action = widget_action(id);
+    let pressed = || -> zbus::Result<bool> {
+        let bus = zbus::blocking::Connection::session()?;
+        let shell = |method: &str, body: &(&str,)| {
+            bus.call_method(Some("org.kde.kglobalaccel"), "/component/plasmashell", Some("org.kde.kglobalaccel.Component"), method, body)
+        };
+        // Plasma's shell registers the shortcut as it loads the widget: not there yet, none.
+        let names: Vec<String> = shell("shortcutNames", &("default",))?.body().deserialize()?;
+        if !names.contains(&action) {
+            return Ok(false);
+        }
+        shell("invokeShortcut", &(action.as_str(),))?;
+        Ok(true)
     };
-    let now = told().unwrap_or_else(|e| {
-        log::warn!("telling Plasma about {PLASMA_KEY}: {e}");
+    pressed().unwrap_or_else(|e| {
+        log::debug!("the widget's shortcut: {e}");
         false
-    });
-    Ok(OpenKey::Set { now })
+    })
 }
 
 const GNOME_KEYS: &str = "org.gnome.settings-daemon.plugins.media-keys";
@@ -512,6 +621,8 @@ const GNOME_KEYS: &str = "org.gnome.settings-daemon.plugins.media-keys";
 /// custom1…).
 const GNOME_KEY_PATH: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sweeflow/";
 const GNOME_KEY: &str = "<Super><Alt>o";
+/// The key with a Mac-style key remapper (see `mac_keys_remapped`): Cmd+Opt+O as it arrives.
+const GNOME_REMAPPED_KEY: &str = "<Control><Alt>o";
 
 fn gsettings(args: &[&str]) -> Result<String> {
     let out = Command::new("gsettings").args(args).stderr(Stdio::null()).output().context("gsettings")?;
@@ -521,7 +632,8 @@ fn gsettings(args: &[&str]) -> Result<String> {
 
 /// A custom shortcut as GNOME's Settings → Keyboard makes them: its name, command and key under
 /// a path of its own, and that path in the list of custom shortcuts. GNOME takes it up at once.
-fn gnome_open_key(home: &std::path::Path) -> Result<OpenKey> {
+fn gnome_open_key(home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
+    let key = if remapped { GNOME_REMAPPED_KEY } else { GNOME_KEY };
     let list = gsettings(&["get", GNOME_KEYS, "custom-keybindings"])?;
     let paths = quoted(&list);
     // Ours from an earlier install, whatever key the user has given it since.
@@ -532,7 +644,7 @@ fn gnome_open_key(home: &std::path::Path) -> Result<OpenKey> {
     // looked at: a key is written the same way wherever it is kept).
     for path in &paths {
         let other = format!("{GNOME_KEYS}.custom-keybinding:{path}");
-        if gsettings(&["get", &other, "binding"]).is_ok_and(|b| binds(&b, GNOME_KEY)) {
+        if gsettings(&["get", &other, "binding"]).is_ok_and(|b| binds(&b, key)) {
             let name = gsettings(&["get", &other, "name"]).ok().and_then(|n| quoted(&n).into_iter().next());
             return Ok(OpenKey::Taken(name.filter(|n| !n.is_empty()).unwrap_or_else(|| "another custom shortcut".into())));
         }
@@ -541,7 +653,7 @@ fn gnome_open_key(home: &std::path::Path) -> Result<OpenKey> {
         // "schema key value"
         let mut words = line.splitn(3, ' ');
         if let (Some(_), Some(name), Some(value)) = (words.next(), words.next(), words.next()) {
-            if binds(value, GNOME_KEY) {
+            if binds(value, key) {
                 return Ok(OpenKey::Taken(name.to_string()));
             }
         }
@@ -551,7 +663,7 @@ fn gnome_open_key(home: &std::path::Path) -> Result<OpenKey> {
     let command = format!("{} open", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
     gsettings(&["set", &ours, "name", &gvariant_str("Sweeflow")])?;
     gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
-    gsettings(&["set", &ours, "binding", &gvariant_str(GNOME_KEY)])?;
+    gsettings(&["set", &ours, "binding", &gvariant_str(key)])?;
     if let Some(list) = with_path(&list, GNOME_KEY_PATH) {
         gsettings(&["set", GNOME_KEYS, "custom-keybindings", &list])?;
     }
@@ -694,6 +806,35 @@ mod tests {
         assert_eq!(gnome_key("<Alt><Super>O"), Some((vec!["alt".to_string(), "super".to_string()], "o".to_string())));
         assert_eq!(gnome_key("<Super>"), None);
         assert_eq!(gnome_key("<Super"), None);
+    }
+
+    #[test]
+    fn finds_the_tray_widgets_plasma_printed() {
+        let printed = "1\t80\t\n0\t55\tCtrl+Alt+O\nnot a line\n0\tx1\t\n";
+        let widgets = parse_widgets(printed);
+        assert_eq!(widgets, [(1, "80".to_string(), String::new()), (0, "55".to_string(), "Ctrl+Alt+O".to_string())]);
+        // The first screen's, wherever it was listed.
+        assert_eq!(main_widget(&widgets).unwrap().1, "55");
+        assert_eq!(main_widget(&widgets[..1]).unwrap().1, "80");
+        assert!(main_widget(&[]).is_none());
+        assert_eq!(widget_action("55"), "activate widget 55");
+    }
+
+    #[test]
+    fn the_app_menu_entry_keeps_a_key_the_user_gave_it() {
+        assert!(old_launch_keys("Meta+Alt+O\n"));
+        assert!(old_launch_keys("Ctrl+Alt+O\tMeta+Alt+O\n"));
+        assert!(!old_launch_keys(""));
+        assert!(!old_launch_keys("none"));
+        assert!(!old_launch_keys("Meta+Alt+S"));
+        assert!(!old_launch_keys("Meta+Alt+O\tMeta+S"));
+    }
+
+    #[test]
+    fn plasma_keys_as_qt_counts_them() {
+        assert_eq!(plasma_key(false), ("Meta+Alt+O", 0x1800_004f));
+        assert_eq!(plasma_key(true), ("Ctrl+Alt+O", 0x0c00_004f));
+        assert!(binds("['<Primary><Alt>o']", GNOME_REMAPPED_KEY));
     }
 
     #[test]

@@ -123,9 +123,13 @@ fn bind_open_key() {
     // Once per Hyprland config (its Lua globals go with a reload, as the binding does): added
     // again by every start of the client, the key ran `sweeflow open` twice, which opens the
     // window and closes it again.
-    let lua = format!(r#"if not sweeflow_open_key then sweeflow_open_key = true; hl.bind("SUPER + ALT + O", hl.dsp.exec_cmd("{command}")) end"#);
+    // With a Mac-style key remapper (Toshy, Kinto), Cmd+Opt+O arrives as CTRL + ALT + O outside
+    // the Mac windows: that key too.
+    let keys: &[&str] = if crate::setup::mac_keys_remapped() { &["SUPER + ALT + O", "CTRL + ALT + O"] } else { &["SUPER + ALT + O"] };
+    let binds: String = keys.iter().map(|k| format!(r#"hl.bind("{k}", hl.dsp.exec_cmd("{command}")); "#)).collect();
+    let lua = format!("if not sweeflow_open_key then sweeflow_open_key = true; {binds}end");
     match Command::new("hyprctl").args(["eval", &lua]).output() {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => log::info!("Hyprland: SUPER + ALT + O opens Sweeflow"),
+        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => log::info!("Hyprland: {} opens Sweeflow", keys.join(" or ")),
         Ok(o) => log::warn!("Hyprland didn't take the key for Sweeflow's window ({lua}): {}", String::from_utf8_lossy(&o.stdout).trim()),
         Err(e) => log::debug!("hyprctl: {e}"),
     }
