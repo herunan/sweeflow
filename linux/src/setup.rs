@@ -96,7 +96,10 @@ pub fn setup(target: &str) -> Result<()> {
 
     let mut cfg = Config::load_or_default()?;
     let name = host.trim_end_matches(".local").to_string();
-    cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp }, true);
+    // An update of a Mac already linked leaves alone which Mac is in use (and whether it's
+    // stopped); a newly linked one becomes the one in use, as linking does.
+    let in_list = cfg.macs.iter().any(|m| m.fingerprint == host_fp);
+    cfg.add_mac(config::PairedMac { name, service: String::new(), host: format!("{host}:44120"), fingerprint: host_fp }, !(already_linked && in_list));
     cfg.save()?;
     println!("==> paired. Config written to {}", Config::path().display());
     if already_linked {
