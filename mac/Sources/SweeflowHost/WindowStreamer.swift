@@ -458,6 +458,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// The capture service was restarted (CaptureHealth): this capture belonged to the old one.
+    func restartAfterServiceReset() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.showingPause, let s = self.stream else { return }
+            s.stopCapture { _ in }
+            self.stream = nil
+            self.forceKeyframe = true
+            self.startRetries = 0
+            self.restartCapture(still: true)
+        }
+    }
+
     /// When the last resume was asked for (host µs), until its first frame goes out (0: none due).
     private var resumedUs: UInt64 = 0
 
@@ -976,7 +988,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self?.startRetries = 0
                 return
             }
-            guard self.startRetries < 3 else { log("stream \(self.wid): still no frame after 3 restarts"); return }
+            guard self.startRetries < 3 else {
+                log("stream \(self.wid): still no frame after 3 restarts")
+                CaptureHealth.captureGaveNothing()
+                return
+            }
             self.startRetries += 1
             log("stream \(self.wid): no first frame, starting the capture again")
             s.stopCapture { _ in }

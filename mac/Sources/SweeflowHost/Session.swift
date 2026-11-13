@@ -142,6 +142,10 @@ final class Session {
             clientScale = try m.f32()
             captureScale = (try? m.f32()) ?? 0
             log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
+            // A stuck capture service, once restarted, takes every window's capture afresh.
+            CaptureHealth.restartAll = { [weak self] in
+                self?.queue.async { self?.streamers.values.forEach { $0.restartAfterServiceReset() } }
+            }
             control = s
             // Forgotten here: told once, so it forgets this Mac too. Disconnected here: refused.
             if let fp = clientFingerprint, Identity.forgottenClients().contains(fp) {
