@@ -344,6 +344,10 @@ fn watch_presence(in_use: &str) {
             let mut found = seen.contains_key(id);
             // Busy: only while this computer isn't the one it streams to (stopped, or another Mac).
             let mut said = seen.get(id).copied().unwrap_or_default();
+            // Whether this round learnt anything: an announcement seen, or the Mac asked now. A
+            // failed ask is kept for 10 s; counted again each round, one dropped answer made
+            // the Mac "not online" (Looks wants two misses in a row).
+            let mut fresh = found;
             if !found {
                 // Not seen announcing itself: asked at its last address instead (a virtual
                 // machine's network carries no announcements, some Wi-Fi drops them).
@@ -352,6 +356,7 @@ fn watch_presence(in_use: &str) {
                     let mac = crate::config::Config::load_or_default().ok().and_then(|c| c.macs.into_iter().find(|m| &m.fingerprint == fp));
                     let answer = mac.as_ref().and_then(crate::pair::probe);
                     probed.insert(fp.clone(), (Instant::now(), answer));
+                    fresh = true;
                 }
                 if let Some((_, Some(p))) = probed.get(fp.as_str()) {
                     found = true;
@@ -361,6 +366,9 @@ fn watch_presence(in_use: &str) {
             for (set, on) in [(&BUSY, said.busy), (&LOCKED, said.locked)] {
                 let mut set = set.lock().unwrap();
                 changed |= if on { set.insert(fp.clone()) } else { set.remove(fp) };
+            }
+            if !fresh && !found {
+                continue;
             }
             let Some(now) = looks.entry(fp.clone()).or_default().after(found) else { continue };
             if fp == in_use {

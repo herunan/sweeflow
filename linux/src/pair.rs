@@ -433,8 +433,15 @@ async fn ask_full(conn: &quinn::Connection, ty: u8) -> Result<(u8, Option<Presen
 /// isn't seen (a virtual machine's network, or one that drops multicast): what it says of itself
 /// if it answered as this computer's linked Mac; None if it didn't answer.
 pub fn probe(mac: &PairedMac) -> Option<Presence> {
-    // Its last address, then the others it said it has.
-    crate::config::places(mac).iter().find_map(|place| probe_at(mac, place))
+    // Its addresses as numbers first (a name ending in .local is looked up over the very
+    // announcements that are missing when it comes to this, and that wait was spent before
+    // any address was tried), then its names.
+    let mut places = crate::config::places(mac);
+    places.sort_by_key(|p| {
+        let host = p.rsplit_once(':').map_or(p.as_str(), |(h, _)| h).trim_matches(['[', ']']);
+        host.parse::<std::net::IpAddr>().is_err()
+    });
+    places.iter().find_map(|place| probe_at(mac, place))
 }
 
 fn probe_at(mac: &PairedMac, place: &str) -> Option<Presence> {
