@@ -1,8 +1,9 @@
 # sweeflow wire protocol (v1)
 
 Transport: QUIC, ALPN `sweeflow/1`, port 44120/udp. The Mac host is the server and
-presents a self-signed certificate; the Linux client pins its SHA-256 fingerprint
-(obtained at pairing time).
+presents a self-signed certificate; the Linux client pins its SHA-256 fingerprint, and
+the host only lets in client certificates whose fingerprint it has (both obtained when the
+two are linked, see Linking).
 
 All integers are little-endian. Every message on every stream is framed as:
 
@@ -108,3 +109,73 @@ index, u16 piece count` (little-endian). The client reassembles, orders by seque
 missing frame after 40 ms and sends REQUEST_KEYFRAME (0x52) on the window's stream. The host
 forgets unacknowledged frames after 300 ms. `videoDatagrams: false` in the host's config.json
 turns this off.
+
+## Linking
+
+How a Linux client and a Mac host get each other's certificate fingerprint. Started from Linux;
+the person compares one short code on the two screens and clicks Allow on the Mac. Nothing is
+typed, and nothing has to be opened on the Mac first.
+
+Transport: a second QUIC listener on the host, ALPN `sweeflow-pair/2`, port 44121/udp, up
+whenever the host runs and advertised as `_sweeflow-pair._udp` (TXT: `id` = first 16 hex digits
+of the host certificate's fingerprint, `port` = the streaming port, `v`). TLS 1.3 with a
+certificate from each side, as for streaming, but any certificate is accepted in the handshake:
+each side only notes the SHA-256 fingerprint of the certificate the other one proved it holds.
+Messages are framed as everywhere else, on one bidirectional stream the client opens.
+
+| type | dir | name | payload |
+|------|-----|------|---------|
+| 0x70 | C→S | PairRequest | u16 linkVersion (2), str computerName, u8 known (1 = the client already holds this host's fingerprint) |
+| 0x72 | S→C | PairCommit | bytes commitment = SHA-256(hostNonce) |
+| 0x73 | C→S | PairNonce | bytes clientNonce (32 random bytes) |
+| 0x74 | S→C | PairReveal | bytes hostNonce (32 random bytes) |
+| 0x71 | S→C | PairResult | u8 status, str hostName, u16 streamPort, u16 linkVersion (the host's) |
+
+The exchange:
+
+1. The client sends PairRequest. The host answers with PairResult straight away when there is
+   nothing to ask its person (status 2 to 6 below), otherwise with PairCommit.
+2. The client sends PairNonce. The host answers with PairReveal and shows its prompt
+   ("‹computerName› wants to link to this Mac", the code, Allow / Don't Allow), or with
+   PairResult status 2 if another prompt went up meanwhile.
+3. The client checks that SHA-256(hostNonce) is the commitment (if not, it stops), and shows the
+   code.
+4. The host sends PairResult once its person has answered. On status 0 the host has added the
+   client's fingerprint to its paired clients, and the client stores the host's with
+   `hostName` and `streamPort`. The client gives up after two minutes; closing the connection
+   takes the host's prompt down.
+
+The code, worked out by each side on its own:
+
+```
+d    = SHA-256( "sweeflow-link/2" ‖ clientFingerprint ‖ hostFingerprint ‖ clientNonce ‖ hostNonce )
+n    = (first 8 bytes of d, as a big-endian integer) mod 31^6
+code = n as 6 digits in base 31, most significant first, each an index into
+       "ABCDEFGHJKMNPQRSTUVWXYZ23456789", shown as XXX-XXX
+```
+
+The fingerprints go in as 64 lowercase hex characters (ASCII): the SHA-256 of each certificate
+as the side computing the code knows it, its own from its own certificate and the other's from
+this connection's handshake. A computer in between has to hold a certificate of its own on each
+side, so the two sides hash different fingerprints. The order of the nonces keeps it from
+picking a nonce that makes the codes agree anyway: the host commits to its nonce before it sees
+the client's, and the client sends its nonce before it sees the host's. Each attempt shows one
+code, and the host shows one prompt at a time (after a prompt is taken down because its client
+left, the next one waits 3 seconds).
+
+`status`:
+
+| status | meaning |
+|--------|---------|
+| 0 | linked: the person clicked Allow. Only valid after PairReveal |
+| 1 | not allowed: the person clicked Don't Allow. That client's certificate is answered with 3 for the next five minutes |
+| 2 | busy: a prompt for another request is showing |
+| 3 | wait: refused a few minutes ago |
+| 4 | locked: the Mac's screen is locked |
+| 5 | linked already: the host has this client and the request said `known`. No prompt. (A client that lost the host's fingerprint sends `known` 0 and goes through the prompt again: the code is all it has to know the host by) |
+| 6 | the host doesn't speak the request's `linkVersion`; its own is in the result |
+
+Versions: the ALPN names the exchange, so an older client or host (`sweeflow-pair/1`, where the
+Mac showed a code to type on Linux, and listened only while that window was open) fails the
+handshake instead of waiting. A client that can't connect tries `sweeflow-pair/1` once: if that
+handshake works, the Mac's Sweeflow is too old.

@@ -100,7 +100,7 @@ setvbuf(stderr, nil, _IOLBF, 0)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
-// `SweeflowHost --pair`: ask the running Sweeflow to open pairing, then quit.
+// `SweeflowHost --pair`: ask the running Sweeflow to show how to link a Linux machine, then quit.
 if CommandLine.arguments.contains("--pair") {
     DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.pair"), object: nil,
                                                                  userInfo: nil, deliverImmediately: true)
@@ -274,6 +274,8 @@ if settings.config.dimMacScreenWhileStreaming { settings.update { $0.dimMacScree
 
 let server = Server(identity: identity) { group, queue in Session(group: group, queue: queue) }
 do { try server.start(port: settings.config.port) } catch { log("listen failed: \(error)"); exit(1) }
+// Link requests are taken for as long as Sweeflow runs (nothing has to be opened here first).
+Pairing.shared.start()
 
 let debugPort = DebugPort()
 if settings.config.debugPort != 0 { debugPort.start(port: settings.config.debugPort) }
@@ -287,7 +289,7 @@ if Identity.pairedClients().isEmpty {
 } else if !Onboarding.complete {
     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { if !Onboarding.complete { Onboarding.shared.show() } }
 }
-// Opens pairing from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
+// Shows how to link from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
 DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.pair"), object: nil, queue: .main) { _ in
     PairingWindow.shared.show()
 }

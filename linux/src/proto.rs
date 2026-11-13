@@ -76,9 +76,12 @@ pub mod t {
     pub const CORNERS: u8 = 0x55;
     pub const AUDIO_SUBSCRIBE: u8 = 0x60;
     pub const AUDIO: u8 = 0x61;
-    // Pairing listener only.
+    // Linking listener only (see pair.rs and PROTOCOL.md).
     pub const PAIR_REQUEST: u8 = 0x70;
     pub const PAIR_RESULT: u8 = 0x71;
+    pub const PAIR_COMMIT: u8 = 0x72;
+    pub const PAIR_NONCE: u8 = 0x73;
+    pub const PAIR_REVEAL: u8 = 0x74;
 }
 
 /// Builds one framed message.
