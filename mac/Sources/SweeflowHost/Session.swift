@@ -1405,6 +1405,7 @@ final class Session {
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
         tracker.onRemoved = { [weak self] w in
             guard let self else { return }
+            self.fixedKnown[w.wid] = nil
             let now = DispatchTime.now()
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
@@ -1703,8 +1704,45 @@ final class Session {
         }
     }
 
+    /// Whether each window's app lets it be resized (looked at once per window).
+    private var fixedKnown: [UInt32: Bool] = [:]
+
+    /// Tells Linux about a new window. Whether its app lets it be resized is looked at first
+    /// (Accessibility, off this queue), so a fixed one (a reminder, a dialog) is said to be
+    /// fixed before it's added: Linux then shows it as a dialog of its own size from the start,
+    /// which desktops and tilers (Karousel) float instead of tiling, and they decide that only
+    /// when a window appears. An app slow to answer doesn't hold the window up: after 60 ms it's
+    /// added anyway, and said to be fixed when the answer comes.
     private func sendAdded(_ w: TrackedWindow) {
+        if w.kind == .popup { return announce(w, fixed: false) }
+        if let fixed = fixedKnown[w.wid] { return announce(w, fixed: fixed) }
+        final class Once { var sent = false }
+        let once = Once(), control = control_, wid = w.wid, pid = w.pid
+        appQueue(pid).async { [weak self] in
+            let fixed = control.fixedSize(wid, pid: pid) == true
+            self?.queue.async {
+                guard let self, let now = self.tracker.windows[wid] else { return }
+                self.fixedKnown[wid] = fixed
+                if !once.sent {
+                    once.sent = true
+                    self.announce(now, fixed: fixed)
+                } else if fixed {
+                    var f = MsgWriter(.windowFixed); f.u32(wid); self.control?.send(f)
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self, !once.sent, let now = self.tracker.windows[wid] else { return }
+            once.sent = true
+            self.announce(now, fixed: false)
+        }
+    }
+
+    private func announce(_ w: TrackedWindow, fixed: Bool) {
         sendIcon(w)
+        if fixed {
+            var f = MsgWriter(.windowFixed); f.u32(w.wid); control?.send(f)
+        }
         var m = MsgWriter(.windowAdded)
         m.u32(w.wid); m.i32(w.pid)
         m.str(w.bundleId); m.str(w.appName); m.str(w.title)
@@ -1714,17 +1752,6 @@ final class Session {
         control?.send(m)
         lastFrames[w.wid] = w.frame
         sendButtonsNowAndSettled(w)
-        // Whether it can be resized at all: looked at once, off this queue (Accessibility
-        // waits on the app), and said only when it can't.
-        guard w.kind != .popup else { return }
-        let control = control_, wid = w.wid, pid = w.pid
-        appQueue(pid).async { [weak self] in
-            guard control.fixedSize(wid, pid: pid) == true else { return }
-            self?.queue.async {
-                guard let self, self.tracker.windows[wid] != nil else { return }
-                var f = MsgWriter(.windowFixed); f.u32(wid); self.control?.send(f)
-            }
-        }
     }
 
     /// The window's buttons now, and again shortly. An app that places them itself (an

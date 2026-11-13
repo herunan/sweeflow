@@ -85,6 +85,7 @@ use wayland_protocols::{
     },
 };
 
+use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::ExtDataControlManagerV1,
@@ -289,6 +290,10 @@ pub struct App {
     single_pixel: SimpleGlobal<WpSinglePixelBufferManagerV1, 1>,
     color_rep: Option<WpColorRepresentationManagerV1>,
     inhibit_mgr: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    /// xdg-dialog-v1: marks a fixed-size Mac window as a dialog (floated, not tiled).
+    dialog_mgr: Option<XdgWmDialogV1>,
+    /// Windows said to be fixed-size before they were added (WINDOW_FIXED comes first).
+    pending_fixed: std::collections::HashSet<u32>,
     icon_mgr: Option<XdgToplevelIconManagerV1>,
     cursor_mgr: Option<WpCursorShapeManagerV1>,
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
@@ -427,6 +432,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         inhibit_mgr: bind_opt("zwp_keyboard_shortcuts_inhibit_manager_v1")
             .then(|| globals.bind(&qh, 1..=1, ()).ok())
             .flatten(),
+        dialog_mgr: bind_opt("xdg_wm_dialog_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        pending_fixed: Default::default(),
         icon_mgr: bind_opt("xdg_toplevel_icon_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
@@ -646,6 +653,10 @@ impl App {
                 let _ = self.net.send(NetCmd::Unsubscribe(wid));
             }
             UiEvent::WindowRemoved(wid) => self.remove_window(wid),
+            UiEvent::WindowFixed(wid) if !self.windows.contains_key(&wid) => {
+                // Said before the window is added: it's made a dialog of its size from the start.
+                self.pending_fixed.insert(wid);
+            }
             UiEvent::WindowFixed(wid) => {
                 if let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.display) {
                     w.fixed = true;
@@ -798,6 +809,8 @@ impl App {
             self.adopt_mac_size(wid, qh);
             return;
         }
+        let mut fixed_now = false;
+        let mac_size = (info.w.round().max(1.0) as u32, info.h.round().max(1.0) as u32);
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
             let parent = &self.windows[&info.parent];
             let parent_xdg = match &parent.role {
@@ -836,9 +849,21 @@ impl App {
             let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, qh);
             window.set_title(display_title(&info.app_name, &info.title));
             window.set_app_id(format!("sweeflow-{}", info.bundle_id));
-            // Floating panels (kind 2: reminders, palettes) are ordinary, independent windows
-            // here too: own taskbar entry, tiled like the rest.
-            if info.kind != 2 {
+            if self.pending_fixed.remove(&info.wid) {
+                // Its app won't let it be resized (a reminder, a dialog): a dialog of exactly its
+                // size from the start, which desktops and tilers (Karousel, Hyprland) float like a
+                // notification instead of tiling; they decide that when a window appears. (Modal:
+                // what tilers go by; with no parent window it holds nothing up.)
+                let size = (info.w.round().max(1.0) as u32, info.h.round().max(1.0) as u32);
+                window.set_min_size(Some(size));
+                window.set_max_size(Some(size));
+                if let Some(d) = &self.dialog_mgr {
+                    d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
+                }
+                fixed_now = true;
+            } else if info.kind != 2 {
+                // Floating panels (kind 2: palettes) are ordinary, independent windows here too:
+                // own taskbar entry, tiled like the rest.
                 window.set_min_size(Some(MIN_SIZE));
             }
             window.commit();
@@ -909,9 +934,9 @@ impl App {
                 inhibitor,
                 configured: false,
                 followed: false,
-                min_size: if info_kind == 2 || info_kind == 3 { (1, 1) } else { MIN_SIZE },
-                max_size: None,
-                fixed: false,
+                min_size: if fixed_now { mac_size } else if info_kind == 2 || info_kind == 3 { (1, 1) } else { MIN_SIZE },
+                max_size: fixed_now.then_some(mac_size),
+                fixed: fixed_now,
                 refusal: None,
                 size,
                 requested: None,
@@ -3251,6 +3276,8 @@ wayland_client::delegate_noop!(App: ignore wl_region::WlRegion);
 wayland_client::delegate_noop!(App: ignore WpColorRepresentationManagerV1);
 wayland_client::delegate_noop!(App: ignore WpColorRepresentationSurfaceV1);
 wayland_client::delegate_noop!(App: ignore ZwpKeyboardShortcutsInhibitManagerV1);
+wayland_client::delegate_noop!(App: ignore XdgWmDialogV1);
+wayland_client::delegate_noop!(App: ignore XdgDialogV1);
 wayland_client::delegate_noop!(App: ignore XdgToplevelIconManagerV1);
 wayland_client::delegate_noop!(App: ignore XdgToplevelIconV1);
 wayland_client::delegate_noop!(App: ignore WpCursorShapeManagerV1);
