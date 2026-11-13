@@ -186,7 +186,12 @@ final class Server {
             return true
         }
         // The certificate alone doesn't tell computers apart (one can be copied to another).
-        let same = held.clientFingerprint == s.clientFingerprint && held.clientName == s.clientName
+        // A computer reconnecting (after a restart here, or a Wi-Fi blip) says the same name; the
+        // certificate a session is recorded with can be another connection's, when two arrive
+        // close together, so it settles nothing alone.
+        let same = held.clientName.isEmpty || s.clientName.isEmpty
+            ? held.clientFingerprint == s.clientFingerprint && held.clientName == s.clientName
+            : held.clientName == s.clientName
         switch Claim.decide(sameComputer: same, heldSilentFor: held.silentFor) {
         case .replace:
             log("client replaces its earlier connection")
