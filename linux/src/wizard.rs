@@ -1,8 +1,8 @@
 //! "Link a Mac": the pairing wizard (`sweeflow pair`). Its own process, so its event loop never
 //! shares a thread with the streaming client's Wayland one.
 //!
-//! Install Sweeflow on the Mac → pick the Mac (found on the network) → type the code it shows →
-//! wait while someone clicks Allow there → done.
+//! Install Sweeflow on the Mac → pick the Mac (found on the network, or typed by address) → both
+//! show the same code, and someone clicks Allow on the Mac → done.
 
 use std::{
     cell::RefCell,
@@ -11,10 +11,12 @@ use std::{
     process::{Child, Command, Stdio},
     rc::Rc,
     sync::{Arc, Mutex},
+    thread::JoinHandle,
 };
 
 use anyhow::Result;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use tokio::sync::Notify;
 
 use crate::{
     config::Config,
@@ -104,28 +106,23 @@ slint::slint! {
         }
     }
 
-    // The pairing code: a box per character, the dash between the halves only drawn. One hidden
-    // text field on top takes the typing (and pasting); Rust cleans it and fills the boxes.
+    // The code both computers show while linking: a box per character, the dash between the
+    // halves only drawn. Only shown, never typed: empty boxes until the code is known.
     component CodeBoxes inherits Rectangle {
         in property <[string]> chars;
-        in property <int> filled;
-        in-out property <string> text <=> input.text;
-        callback edited(string);
-        callback accepted(string);
-        forward-focus: input;
         height: 60px;
         HorizontalLayout {
             alignment: center;
             spacing: 8px;
             for c[i] in chars: HorizontalLayout {
                 spacing: 8px;
-                if i == 4: Text { text: "–"; color: Look.muted; font-size: 24px; vertical-alignment: center; }
+                if i == 3: Text { text: "–"; color: Look.muted; font-size: 24px; vertical-alignment: center; }
                 Rectangle {
                     width: 42px;
                     height: 56px;
                     border-radius: Look.radius;
-                    border-width: input.has-focus && i == min(filled, 7) ? 2px : 1px;
-                    border-color: input.has-focus && i == min(filled, 7) ? Look.accent : Look.line;
+                    border-width: 1px;
+                    border-color: Look.line;
                     background: Look.surface;
                     Text {
                         text: c;
@@ -137,18 +134,6 @@ slint::slint! {
                     }
                 }
             }
-        }
-        input := TextInput {
-            x: 0;
-            y: 0;
-            width: parent.width;
-            height: parent.height;
-            single-line: true;
-            color: transparent;
-            selection-background-color: transparent;
-            text-cursor-width: 0px;
-            edited => { root.edited(self.text); }
-            accepted => { root.accepted(self.text); }
         }
     }
 
@@ -171,17 +156,14 @@ slint::slint! {
         callback open-firewall();
         in property <[MacRow]> macs;
         in property <string> mac-name;
-        in property <string> our-code;
-        in property <[string]> code-chars: ["", "", "", "", "", "", "", ""];
-        in property <int> code-filled;
-        in-out property <string> code-text;
-        callback code-edited(string);
+        // The code to compare with the Mac's, a character each (all empty until it's known).
+        in property <[string]> code-chars: ["", "", "", "", "", ""];
+        in property <bool> code-known;
         in-out property <string> error;
         in property <bool> streaming-mac-set;
 
         callback pick(int);
         callback manual(string);
-        callback submit(string);
         callback cancel-wait();
         callback finish(bool);
 
@@ -266,7 +248,7 @@ slint::slint! {
                 Step {
                     n: "3";
                     title: "Follow its setup";
-                    detail: "Sweeflow asks for the permissions it needs and then shows a code. You'll type that code here in the next step.";
+                    detail: "Sweeflow asks for the permissions it needs. Leave it running on your Mac and continue here.";
                 }
                 Rectangle {}
                 HorizontalLayout {
@@ -280,7 +262,7 @@ slint::slint! {
                 VerticalLayout {
                     spacing: 4px;
                     Title { text: "Choose your Mac"; }
-                    Dim { text: "On your Mac, open the Sweeflow menu in the menu bar and choose “Link a Linux machine…” under Linux machines."; }
+                    Dim { text: "These Macs are running Sweeflow on this network. Choose yours, and it will ask you to allow this computer."; }
                 }
                 // The Macs found on this network, or the wait for one.
                 Rectangle {
@@ -322,37 +304,19 @@ slint::slint! {
             }
 
             if page == 2: VerticalLayout {
-                spacing: 16px;
-                Title { text: "Type the code shown on " + mac-name; }
-                code := CodeBoxes {
-                    chars: code-chars;
-                    filled: code-filled;
-                    text <=> code-text;
-                    edited(t) => { root.code-edited(t); }
-                    accepted(t) => { root.submit(t); }
-                    init => { self.focus(); }
-                }
-                if error != "": Label { text: error; color: Look.danger; }
-                Dim { text: mac-name + " will then ask you to allow this computer. Check that the code it shows for this computer is " + our-code + "."; }
-                Rectangle {}
-                HorizontalLayout {
-                    spacing: 8px;
-                    Btn { text: "Back"; clicked => { error = ""; page = 1; } }
-                    Rectangle {}
-                    Btn { text: "Link"; primary: true; enabled: code-filled == 8; clicked => { root.submit(code-text); } }
-                }
-            }
-
-            if page == 3: VerticalLayout {
-                spacing: 16px;
+                spacing: 18px;
                 alignment: center;
-                HorizontalLayout { alignment: center; Spin { size: 36px; } }
-                Title { text: "Click Allow on " + mac-name; horizontal-alignment: center; }
-                Dim { text: mac-name + " is asking whether to allow this computer. The code it shows should be " + our-code + "."; horizontal-alignment: center; }
+                Title { text: "Link to " + mac-name; horizontal-alignment: center; }
+                CodeBoxes { chars: code-chars; }
+                Dim {
+                    text: code-known ? "Check that your Mac shows this code, then click Allow there." : "Asking " + mac-name + "…";
+                    horizontal-alignment: center;
+                }
+                HorizontalLayout { alignment: center; Spin { size: 28px; } }
                 HorizontalLayout { alignment: center; Btn { text: "Cancel"; clicked => { root.cancel-wait(); } } }
             }
 
-            if page == 4: VerticalLayout {
+            if page == 3: VerticalLayout {
                 spacing: 16px;
                 HorizontalLayout {
                     spacing: 14px;
@@ -379,11 +343,12 @@ slint::slint! {
 }
 
 thread_local! {
-    /// Macs in pairing mode right now (UI thread only).
+    /// Macs that take link requests right now (UI thread only).
     static FOUND: RefCell<Vec<FoundMac>> = const { RefCell::new(Vec::new()) };
-    static CHOSEN: RefCell<Option<FoundMac>> = const { RefCell::new(None) };
-    /// Bumped to forget a pairing attempt the person cancelled.
+    /// Bumped to forget a link request the person cancelled.
     static ATTEMPT: RefCell<u32> = const { RefCell::new(0) };
+    /// The link request under way: what cancels it, and its thread.
+    static LINKING: RefCell<Option<(Arc<Notify>, JoinHandle<()>)>> = const { RefCell::new(None) };
 }
 
 pub fn run() -> Result<()> {
@@ -402,7 +367,6 @@ pub fn run() -> Result<()> {
     }
     let model = Rc::new(VecModel::<MacRow>::default());
     ui.set_macs(ModelRc::from(model.clone()));
-    ui.set_our_code(pair::our_code()?.into());
     ui.set_streaming_mac_set(!Config::load_or_default()?.host.is_empty());
 
     let _server = crate::installer::serve().inspect_err(|e| log::info!("installer not served: {e:#}")).ok();
@@ -474,83 +438,23 @@ pub fn run() -> Result<()> {
             ui.set_error(format!("{} is already linked to this computer. To link it again, unlink it in Sweeflow's list of Macs first.", m.name).into());
             return;
         }
-        choose(&ui, m);
+        start_link(&ui, m);
     });
 
     let weak = ui.as_weak();
     ui.on_manual(move |text| {
         let Some(ui) = weak.upgrade() else { return };
         match manual_mac(&text) {
-            Some(m) => choose(&ui, m),
+            Some(m) => start_link(&ui, m),
             None => ui.set_error(format!("Couldn't find “{text}”. Type the Mac's name, such as my-mac.local, or its IP address.").into()),
         }
     });
 
     let weak = ui.as_weak();
-    ui.on_code_edited(move |typed| {
-        let Some(ui) = weak.upgrade() else { return };
-        ui.set_error(SharedString::new());
-        // All 8 there: pair straight away.
-        if show_code(&ui, &typed).len() == 8 {
-            let code = ui.get_code_text();
-            ui.invoke_submit(code);
-        }
-    });
-
-    let weak = ui.as_weak();
-    ui.on_submit(move |code| {
-        let Some(ui) = weak.upgrade() else { return };
-        if pair::normalize_code(&code).is_none() {
-            ui.set_error("The code has 8 letters and digits, such as K7QF-M2XA.".into());
-            return;
-        }
-        let Some(mac) = CHOSEN.with_borrow(|c| c.clone()) else { return };
-        ui.set_error(SharedString::new());
-        ui.set_page(3);
-        let attempt = ATTEMPT.with_borrow_mut(|a| {
-            *a += 1;
-            *a
-        });
-        let weak = ui.as_weak();
-        std::thread::spawn(move || {
-            let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from).and_then(|rt| rt.block_on(pair::pair(&mac, &code)));
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if ATTEMPT.with_borrow(|a| *a != attempt) {
-                    return; // cancelled meanwhile
-                }
-                match result {
-                    Ok(Outcome::Paired(p)) => {
-                        let saved = Config::load_or_default().and_then(|mut cfg| {
-                            let first = cfg.host.is_empty();
-                            cfg.add_mac(p.clone(), first);
-                            cfg.save()
-                        });
-                        if let Err(e) = saved {
-                            ui.set_error(format!("Linked, but the settings couldn't be saved: {e:#}").into());
-                            ui.set_page(2);
-                            return;
-                        }
-                        ui.set_mac_name(p.name.into());
-                        ui.set_page(4);
-                    }
-                    Ok(Outcome::Denied) => {
-                        ui.set_error(format!("{} didn't allow this computer.", ui.get_mac_name()).into());
-                        ui.set_page(2);
-                    }
-                    Err(e) => {
-                        ui.set_error(format!("{e:#}").into());
-                        ui.set_page(2);
-                    }
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
     ui.on_cancel_wait(move || {
-        ATTEMPT.with_borrow_mut(|a| *a += 1);
+        cancel_link();
         if let Some(ui) = weak.upgrade() {
-            ui.set_page(2);
+            ui.set_page(1);
         }
     });
 
@@ -568,6 +472,10 @@ pub fn run() -> Result<()> {
     });
 
     let shown = ui.run();
+    // Closed while asking a Mac: say so there (it takes its question down) before leaving.
+    if let Some((_, thread)) = cancel_link() {
+        let _ = thread.join();
+    }
     // Closing the helper's input takes the firewall rule back out.
     if let Some(mut child) = opening.lock().unwrap().take() {
         drop(child.stdin.take());
@@ -582,26 +490,83 @@ fn already_linked(m: &FoundMac) -> bool {
     !m.id.is_empty() && Config::load_or_default().is_ok_and(|c| c.macs.iter().any(|p| p.fingerprint.starts_with(&m.id)))
 }
 
-/// Shows `typed` in the code boxes as the code it can be: letters and digits of the code's
-/// alphabet, upper case, at most 8 (the dash is drawn, never typed).
-fn show_code(ui: &Wizard, typed: &str) -> String {
-    let clean = pair::clean_code_chars(typed);
-    if ui.get_code_text().as_str() != clean {
-        ui.set_code_text(clean.clone().into());
-    }
-    let mut chars: Vec<SharedString> = clean.chars().map(|c| c.to_string().into()).collect();
-    chars.resize(8, SharedString::new());
-    ui.set_code_chars(std::rc::Rc::new(VecModel::from(chars)).into());
-    ui.set_code_filled(clean.len() as i32);
-    clean
+/// Shows `code` ("XXX-XXX") in the code boxes, a character each; "" empties them.
+fn show_code(ui: &Wizard, code: &str) {
+    let mut chars: Vec<SharedString> = code.chars().filter(|c| *c != '-').map(|c| c.to_string().into()).collect();
+    chars.resize(6, SharedString::new());
+    ui.set_code_chars(Rc::new(VecModel::from(chars)).into());
+    ui.set_code_known(!code.is_empty());
 }
 
-fn choose(ui: &Wizard, m: FoundMac) {
+/// Forgets the link request under way, if any, and tells its thread to stop asking.
+fn cancel_link() -> Option<(Arc<Notify>, JoinHandle<()>)> {
+    ATTEMPT.with_borrow_mut(|a| *a += 1);
+    let linking = LINKING.with_borrow_mut(Option::take);
+    if let Some((cancel, _)) = &linking {
+        cancel.notify_one();
+    }
+    linking
+}
+
+/// Asks `mac` to link, on the page with the code. The answer leads to the last page, or back to
+/// the list with what went wrong.
+fn start_link(ui: &Wizard, mac: FoundMac) {
+    cancel_link();
     show_code(ui, "");
-    ui.set_mac_name(m.name.clone().into());
+    ui.set_mac_name(mac.name.clone().into());
     ui.set_error(SharedString::new());
-    CHOSEN.with_borrow_mut(|c| *c = Some(m));
     ui.set_page(2);
+    let attempt = ATTEMPT.with_borrow(|a| *a);
+    let cancel = Arc::new(Notify::new());
+    let cancelled = cancel.clone();
+    let weak = ui.as_weak();
+    let thread = std::thread::spawn(move || {
+        let weak_code = weak.clone();
+        let on_code = move |code: &str| {
+            let code = code.to_string();
+            let _ = weak_code.upgrade_in_event_loop(move |ui| {
+                if ATTEMPT.with_borrow(|a| *a == attempt) {
+                    show_code(&ui, &code);
+                }
+            });
+        };
+        let result = tokio::runtime::Runtime::new()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| rt.block_on(pair::link(&mac, &cancelled, on_code)));
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if ATTEMPT.with_borrow(|a| *a != attempt) {
+                return; // cancelled meanwhile
+            }
+            LINKING.with_borrow_mut(|l| *l = None);
+            let name = ui.get_mac_name();
+            match result {
+                Ok(Outcome::Linked(p)) => {
+                    let saved = Config::load_or_default().and_then(|mut cfg| {
+                        let first = cfg.host.is_empty();
+                        cfg.add_mac(p.clone(), first);
+                        cfg.save()
+                    });
+                    if let Err(e) = saved {
+                        ui.set_error(format!("Linked, but the settings couldn't be saved: {e:#}").into());
+                        ui.set_page(1);
+                        return;
+                    }
+                    ui.set_mac_name(p.name.into());
+                    ui.set_page(3);
+                }
+                Ok(other) => {
+                    ui.set_error(other.message(&name).unwrap_or_default().into());
+                    ui.set_page(1);
+                }
+                Err(e) => {
+                    log::warn!("linking to {name}: {e:#}");
+                    ui.set_error(format!("Linking to {name} didn't work ({e:#}).").into());
+                    ui.set_page(1);
+                }
+            }
+        });
+    });
+    LINKING.with_borrow_mut(|l| *l = Some((cancel, thread)));
 }
 
 /// A Mac typed in by address ("my-mac.local", "192.168.1.20", optionally ":port").

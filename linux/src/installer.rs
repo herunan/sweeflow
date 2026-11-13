@@ -143,7 +143,7 @@ const PAGE: &str = r#"<!doctype html>
   <ol>
     <li><div><b>Install it</b><span>Open the downloaded Sweeflow.dmg and drag Sweeflow into Applications.</span></div></li>
     <li><div><b>Open it</b><span>Open Sweeflow from Applications. If macOS says it can't check it, go to System Settings → Privacy &amp; Security and click Open Anyway.</span></div></li>
-    <li><div><b>Allow and link</b><span>Sweeflow walks you through what it needs, then shows a code. Type that code on your Linux machine.</span></div></li>
+    <li><div><b>Allow and link</b><span>Sweeflow walks you through what it needs. Then choose this Mac on your Linux machine, check that both show the same code, and click Allow here.</span></div></li>
   </ol>
 </main></body></html>
 "#;

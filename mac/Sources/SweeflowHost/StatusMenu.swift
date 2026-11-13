@@ -193,12 +193,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// Asks once: linking it again needs a new code. The Linux machine forgets this Mac too
-    /// (now, or the next time it connects).
+    /// Asks once: to use it again, it has to be linked again. The Linux machine forgets this Mac
+    /// too (now, or the next time it connects).
     private static func confirmForget(_ label: String, _ fingerprint: String) {
         let alert = NSAlert()
         alert.messageText = "Forget \(label)?"
-        alert.informativeText = "It forgets this Mac too. Linking them again needs a new code."
+        alert.informativeText = "It forgets this Mac too. To use it again, link it again from the Linux machine."
         alert.addButton(withTitle: "Forget")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)

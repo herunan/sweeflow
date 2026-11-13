@@ -33,7 +33,7 @@ USAGE:
     sweeflow                 stream from the linked Mac: its app windows open here
     sweeflow open            start Sweeflow if needed and show its controls (the app menu entry)
     sweeflow panel           Sweeflow's own window: its apps, settings and Macs (without the Plasma widget)
-    sweeflow pair            pair with a Mac on this network (it shows a code to type here)
+    sweeflow pair            link a Mac on this network (both show a code, you click Allow on the Mac)
     sweeflow pair --text     the same, in the terminal
     sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it (development)
     sweeflow launch BUNDLEID open a Mac app (what the Mac app launchers run)
