@@ -636,7 +636,6 @@ pub fn panel_state() -> serde_json::Value {
         "macs": macs,
         "openAtLogin": open_at_login(),
         "square": crate::config::square_corners(),
-        "keepSize": crate::config::keep_app_size(),
         "placement": state.placement,
         "pinned": state.pinned,
         // Stop was chosen (the name is from when it was called Disconnect).
@@ -705,10 +704,6 @@ pub fn panel_do(action: &str, arg: &str) {
         }
         "square" => {
             crate::config::set_square_corners(arg == "on");
-            refresh();
-        }
-        "keep-size" => {
-            crate::config::set_keep_app_size(arg == "on");
             refresh();
         }
         "pin" | "unpin" => {

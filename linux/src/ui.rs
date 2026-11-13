@@ -271,6 +271,32 @@ impl Win {
     fn in_tile(&self) -> bool {
         self.tiled && !self.display && self.info.kind != 1 && matches!(self.role, Role::Toplevel(_)) && crate::hyprland::running()
     }
+
+    /// Kept at least as big (or at most as big) as its app allows: a window that isn't tiled.
+    /// One the desktop tiles (a Hyprland tile, a window the desktop says is tiled or
+    /// maximised) has the size it's given: what doesn't fit of its picture is cut off.
+    fn keeps_app_size(&self) -> bool {
+        self.floating && !self.in_tile()
+    }
+
+    /// Drops the size limits declared from the Mac (it was tiled meanwhile).
+    fn drop_limits(&mut self) {
+        let Role::Toplevel(win) = &self.role else { return };
+        let default_min = if self.info.kind == 2 { (1, 1) } else { MIN_SIZE };
+        let mut changed = false;
+        if self.min_size != default_min {
+            self.min_size = default_min;
+            win.set_min_size(Some(default_min));
+            changed = true;
+        }
+        if self.max_size.take().is_some() {
+            win.set_max_size(None);
+            changed = true;
+        }
+        if changed {
+            win.commit();
+        }
+    }
 }
 
 pub struct App {
@@ -660,7 +686,6 @@ impl App {
             UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png, qh),
             UiEvent::Focused => {}
             UiEvent::CornersSetting => self.apply_corners_setting(qh),
-            UiEvent::KeepSizeSetting => self.apply_keep_size_setting(),
             UiEvent::Tiling(seen) => {
                 let mut changed = Vec::new();
                 for (wid, w) in self.windows.iter_mut().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))) {
@@ -795,7 +820,7 @@ impl App {
             .app_mins
             .get(&(info.bundle_id.clone(), info.kind))
             .copied()
-            .filter(|m| crate::config::keep_app_size() && info.kind == 0 && info.w >= m.0 as f32 && info.h >= m.1 as f32);
+            .filter(|m| !crate::hyprland::running() && info.kind == 0 && info.w >= m.0 as f32 && info.h >= m.1 as f32);
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
             let parent = &self.windows[&info.parent];
             let parent_xdg = match &parent.role {
@@ -1103,8 +1128,9 @@ impl App {
         if !w.in_tile() {
             return;
         }
-        // The Mac is asked for the tile's size, if it has another (a refusal from before the
-        // tiling counts no more).
+        // The tile is the size now: limits declared while it floated go, and the Mac is asked
+        // for the tile's size, if it has another (a refusal from before counts no more).
+        w.drop_limits();
         w.refusal = None;
         self.adopt_mac_size(wid, qh);
     }
@@ -1158,7 +1184,7 @@ impl App {
                 Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
                 refused = false;
             }
-            if refused && !crate::config::keep_app_size() {
+            if refused && !w.keeps_app_size() {
                 // Not kept at the app's size (a Hyprland tile): the app keeps its size and the
                 // window here the desktop's. What fits of the picture shows, cut off at the
                 // window's edge, or the rest of the window is see-through (lay_out). Not asked
@@ -1430,7 +1456,7 @@ impl App {
         };
         // Drawn 1:1 from the window's top-left, never scaled: what doesn't fit (the Mac hasn't
         // followed a shrink yet, or the app goes no smaller than the window here: a Hyprland
-        // tile, see config::keep_app_size) is cut off at the window's edge, and a picture
+        // tile) is cut off at the window's edge, and a picture
         // smaller than the window leaves the rest see-through.
         let ((sw, sh), (dw, dh), (cut_r, cut_b)) = shown_part((fw, fh), px_per_pt, (bw, bh), s);
 
@@ -1653,35 +1679,6 @@ impl App {
             // The tiles are synchronised children of the video: shown with its commit.
             video.commit();
             base.commit();
-        }
-    }
-
-    /// Keeping Mac windows at their app's size was switched: off, the limits declared from the
-    /// apps' refusals go at once (on, the next refusal declares one).
-    fn apply_keep_size_setting(&mut self) {
-        if crate::config::keep_app_size() {
-            return;
-        }
-        self.app_mins.clear();
-        for w in self.windows.values_mut() {
-            let Role::Toplevel(win) = &w.role else { continue };
-            if w.display {
-                continue;
-            }
-            let default_min = if w.info.kind == 2 { (1, 1) } else { MIN_SIZE };
-            let mut changed = false;
-            if w.min_size != default_min {
-                w.min_size = default_min;
-                win.set_min_size(Some(default_min));
-                changed = true;
-            }
-            if w.max_size.take().is_some() {
-                win.set_max_size(None);
-                changed = true;
-            }
-            if changed {
-                win.commit();
-            }
         }
     }
 
@@ -2661,7 +2658,12 @@ impl WindowHandler for App {
         let Some(w) = self.windows.get_mut(&wid) else { return };
         let was_suspended = w.suspended;
         w.suspended = cfg.state.contains(WindowState::SUSPENDED);
+        let was_floating = w.floating;
         w.floating = !(cfg.is_maximized() || cfg.is_fullscreen() || cfg.is_tiled());
+        if was_floating && !w.floating {
+            // Tiled or maximised by the desktop: the size it gives counts, not the app's limits.
+            w.drop_limits();
+        }
         w.maximized = cfg.is_maximized() || cfg.is_fullscreen();
         let size = match cfg.new_size {
             (Some(cw), Some(ch)) => (cw.get(), ch.get()),
@@ -2669,7 +2671,7 @@ impl WindowHandler for App {
         };
         // Within the limits declared (the desktop keeps to them; a Hyprland tile is configured
         // at the tile's size whatever they are, and with them the window keeps the size its
-        // app needs, over the tile's edge: see config::keep_app_size).
+        // app needs, over the tile's edge, while it isn't tiled: see keeps_app_size).
         let size = if w.display {
             size
         } else {
