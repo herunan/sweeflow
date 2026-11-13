@@ -480,8 +480,8 @@ pub struct Standing<'a> {
 /// The same status where the Mac's name stands right above it (the widget and Sweeflow's own
 /// window): without the name, which only repeated it.
 pub fn status_short(s: Standing) -> String {
-    if let Standing { stopped: false, elsewhere: Some(other), .. } = s {
-        return format!("In use by {other}");
+    if let Standing { stopped: false, elsewhere: Some(_), .. } = s {
+        return "Busy · streaming elsewhere".into();
     }
     match s {
         Standing { stopped: true, online: Some(true), .. } => "Stopped · online",
@@ -504,7 +504,7 @@ pub fn status_line(mac: &str, s: Standing) -> String {
         Standing { stopped: true, online: Some(false), .. } => format!("Stopped · {mac} is not online"),
         // The first look on the network takes a moment.
         Standing { stopped: true, .. } => format!("Stopped · {mac}"),
-        Standing { elsewhere: Some(other), .. } => format!("In use by {other} · {mac}"),
+        Standing { elsewhere: Some(_), .. } => format!("{mac} is busy · streaming elsewhere"),
         Standing { connected: true, enabled: false, .. } => format!("Paused · {mac}"),
         Standing { connected: true, locked: true, .. } => format!("Streaming from {mac} · Mac locked"),
         Standing { connected: true, .. } => format!("Streaming from {mac}"),
@@ -536,8 +536,8 @@ pub fn can_start(s: Standing) -> bool {
 }
 
 /// What a Start that can't be chosen says instead.
-pub fn start_hint(other: &str) -> String {
-    format!("Stop streaming on {other} first")
+pub fn start_hint(_other: &str) -> String {
+    "Stop streaming elsewhere first".into()
 }
 
 pub fn action_label(action: &str) -> &'static str {
@@ -998,8 +998,8 @@ mod tests {
         assert_eq!(status_line("Studio", Standing { online: Some(false), ..stopped }), "Stopped · Studio is not online");
         assert_eq!(status_line("Studio", stopped), "Stopped · Studio");
         let elsewhere = Standing { elsewhere: Some("workstation"), online: Some(true), ..Default::default() };
-        assert_eq!(status_line("Studio", elsewhere), "In use by workstation · Studio");
-        assert_eq!(status_short(elsewhere), "In use by workstation");
+        assert_eq!(status_line("Studio", elsewhere), "Studio is busy · streaming elsewhere");
+        assert_eq!(status_short(elsewhere), "Busy · streaming elsewhere");
 
         let waiting = Standing { enabled: true, online: Some(false), ..Default::default() };
         assert_eq!(status_line("Studio", waiting), "Waiting for Studio · not online");
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(stream_actions(elsewhere), ["start", "stop"]);
         assert!(!can_start(elsewhere));
         assert!(can_start(Standing { stopped: true, ..Default::default() }));
-        assert_eq!(start_hint("box"), "Stop streaming on box first");
+        assert_eq!(start_hint("box"), "Stop streaming elsewhere first");
         assert_eq!(stream_actions(Standing { online: Some(false), ..Default::default() }), ["stop"]);
         let labels: Vec<&str> = ["start", "pause", "resume", "stop"].into_iter().map(action_label).collect();
         assert_eq!(labels, ["Start", "Pause", "Resume", "Stop"]);

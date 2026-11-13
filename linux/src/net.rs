@@ -353,8 +353,8 @@ fn parse_busy(body: &[u8]) -> Result<String> {
 }
 
 /// The notifications: on first finding the Mac in use, and when it's free again.
-fn busy_message(mac: &str, other: &str) -> (String, String) {
-    (format!("{mac} is streaming to {other}"), format!("Stop streaming on {other} first; Sweeflow streams here once {mac} is free."))
+fn busy_message(mac: &str, _other: &str) -> (String, String) {
+    (format!("{mac} is busy"), format!("It's streaming elsewhere. Stop it there first; Sweeflow streams here once {mac} is free."))
 }
 
 fn free_message(mac: &str, other: &str) -> (String, String) {
@@ -1303,9 +1303,9 @@ mod tests {
     }
 
     #[test]
-    fn the_notifications_name_both_computers() {
-        assert_eq!(busy_message("Studio", "workstation").0, "Studio is streaming to workstation");
-        assert!(busy_message("Studio", "workstation").1.starts_with("Stop streaming on workstation first"));
+    fn the_notifications_say_the_mac_is_busy() {
+        assert_eq!(busy_message("Studio", "workstation").0, "Studio is busy");
+        assert!(busy_message("Studio", "workstation").1.starts_with("It's streaming elsewhere"));
         assert_eq!(free_message("Studio", "workstation").0, "Studio is free: streaming here now");
     }
 

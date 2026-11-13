@@ -106,17 +106,12 @@ slint::slint! {
         }
     }
 
-    // Whether a Mac can be reached, as a dot before its name: green, red, or hollow while not
-    // known yet. (The way there may be the network, Tailscale or a virtual machine: no signal
-    // bars.)
-    component OnlineDot inherits Rectangle {
-        in property <string> state;
-        width: 8px;
-        height: 8px;
-        border-radius: 4px;
-        background: root.state == "online" ? #30a46c : root.state == "offline" ? Look.danger : transparent;
-        border-width: root.state == "" ? 1px : 0px;
-        border-color: Look.muted;
+    // The colour of where a Mac stands (MacItem.online): Online green; Locked or Busy orange;
+    // Not online grey.
+    global MacState {
+        pure public function ink(state: string) -> color {
+            state == "online" ? #30a46c : state == "offline" ? Look.muted : #e8890c
+        }
     }
 
     component Tab inherits Rectangle {
@@ -431,7 +426,7 @@ slint::slint! {
                             padding-right: 12px;
                             spacing: 2px;
                             for m in root.macs: Row {
-                                height: 40px;
+                                height: 46px;
                                 clickable: false;
                                 if root.editing == m.fingerprint: HorizontalLayout {
                                     padding-left: 6px;
@@ -466,33 +461,44 @@ slint::slint! {
                                     padding-left: 10px;
                                     padding-right: 4px;
                                     spacing: 8px;
-                                    // A status, never an action.
+                                    // The same as a dot before the name (hollow while not known yet).
                                     VerticalLayout {
                                         alignment: center;
                                         horizontal-stretch: 0;
                                         Rectangle {
                                             width: 8px;
-                                            height: 14px;
-                                            OnlineDot { y: 3px; state: m.online; }
-                                            TouchArea {
-                                                changed has-hover => {
-                                                    if (self.has-hover) { Tip.enter(m.online == "online" ? "Online" : m.online == "offline" ? "Not online" : "Checking whether it's online", self.absolute-position.x, self.absolute-position.y, self.width, self.height); } else { Tip.leave(); }
-                                                }
-                                            }
+                                            height: 8px;
+                                            border-radius: 4px;
+                                            background: m.online == "" ? transparent : MacState.ink(m.online);
+                                            border-width: m.online == "" ? 1px : 0px;
+                                            border-color: Look.muted;
                                         }
                                     }
                                     Rectangle {
                                         horizontal-stretch: 1;
                                         min-width: 30px;
-                                        Text {
-                                            width: parent.width;
-                                            height: parent.height;
-                                            text: m.name;
-                                            color: Look.fg;
-                                            font-size: 13px;
-                                            font-weight: m.active ? 600 : 400;
-                                            overflow: elide;
-                                            vertical-alignment: center;
+                                        // The name, and under it where the Mac stands (a status, never
+                                        // an action): Online green; Locked or Busy orange; Not online
+                                        // grey; nothing while not known yet.
+                                        VerticalLayout {
+                                            alignment: center;
+                                            spacing: 1px;
+                                            Text {
+                                                text: m.name;
+                                                color: Look.fg;
+                                                font-size: 13px;
+                                                font-weight: m.active ? 600 : 400;
+                                                overflow: elide;
+                                            }
+                                            if m.online != "": Text {
+                                                text: m.online == "online" ? "Online"
+                                                    : m.online == "offline" ? "Not online"
+                                                    : m.online == "locked" ? "Locked"
+                                                    : "Busy · streaming elsewhere";
+                                                color: MacState.ink(m.online);
+                                                font-size: 11px;
+                                                overflow: elide;
+                                            }
                                         }
                                         TouchArea {
                                             double-clicked => { Tip.leave(); root.confirming = ""; root.editing = m.fingerprint; }
@@ -517,9 +523,10 @@ slint::slint! {
                                             text: "Start";
                                             sign: "start";
                                             // Only a Mac that can be reached.
-                                            enabled: m.online == "online";
-                                            tip: m.online == "online" ? "Start streaming from this Mac"
+                                            enabled: m.online == "online" || m.online == "locked";
+                                            tip: m.online == "online" || m.online == "locked" ? "Start streaming from this Mac"
                                                 : m.online == "offline" ? m.name + " is not online"
+                                                : m.online == "busy" ? "Stop streaming elsewhere first"
                                                 : "Checking whether " + m.name + " is online";
                                             clicked => { root.act("switch", m.fingerprint); }
                                         }
@@ -588,6 +595,8 @@ struct PanelState {
     actions: Vec<String>,
     /// The Mac is streaming to this other computer: Start can't be chosen.
     elsewhere: Option<String>,
+    /// The Mac in use has its screen locked.
+    locked: bool,
     mac: String,
     settings: Settings,
     apps: Vec<App>,
@@ -846,6 +855,17 @@ fn start_blocked(s: &PanelState, action: &str) -> Option<String> {
     }
 }
 
+/// Where a linked Mac stands, for the line under its name: "online", "offline", "locked",
+/// "busy" (streaming to another computer), or "" while not known yet. Locked and busy are known
+/// only of the Mac in use.
+fn mac_state(s: &PanelState, m: &Mac) -> &'static str {
+    match online_text(m.online) {
+        "online" if m.active && s.elsewhere.is_some() => "busy",
+        "online" if m.active && s.locked => "locked",
+        other => other,
+    }
+}
+
 /// A new state from the client (None: it isn't running): shown.
 fn take(ui: &PanelWin, state: Option<PanelState>) {
     VIEW.with_borrow_mut(|v| {
@@ -897,7 +917,7 @@ fn show(ui: &PanelWin, v: &mut View) {
             name: m.name.as_str().into(),
             fingerprint: m.fingerprint.as_str().into(),
             active: m.active,
-            online: online_text(m.online).into(),
+            online: mac_state(&s, m).into(),
         })
         .collect();
     if macs != v.mac_rows {

@@ -75,7 +75,7 @@ PlasmoidItem {
     // Why Start can't be pressed for this Mac ("" if it can): it's streaming to another computer,
     // or it can't be reached (or isn't known to be reachable yet). `online`: true, false or null.
     function startBlocked(name, online, active) {
-        if (active && !canStart && elsewhere !== "") return "Stop streaming on " + elsewhere + " first"
+        if (active && !canStart && elsewhere !== "") return "Stop streaming elsewhere first"
         if (online === false) return name + " is not online"
         if (online === null || online === undefined) return "Checking whether " + name + " is online"
         return ""
@@ -545,37 +545,52 @@ PlasmoidItem {
                                     anchors.fill: parent
                                     visible: !mac.editing && !mac.confirming
                                     spacing: Kirigami.Units.smallSpacing
-                                    // Whether it can be reached: green, red, or hollow while not known
-                                    // yet. A dot, not signal bars: the way there may be the network,
-                                    // Tailscale or a virtual machine. A status, never an action.
+                                    // The name, and under it where the Mac stands (a status, never an
+                                    // action): Online green; Locked or Busy orange; Not online grey;
+                                    // nothing while not known yet. Locked and busy are known only of
+                                    // the Mac in use.
+                                    // The same as a dot before the name (hollow while not known yet).
                                     Rectangle {
-                                        readonly property var online: mac.modelData.online
+                                        readonly property string macState: nameCol.macState
                                         implicitWidth: Kirigami.Units.smallSpacing * 2
                                         implicitHeight: implicitWidth
                                         Layout.leftMargin: Kirigami.Units.smallSpacing
                                         radius: width / 2
-                                        color: online === true ? "#30a46c" : online === false ? "#e5484d" : "transparent"
-                                        border.width: online === null ? 1 : 0
+                                        color: macState === "" ? "transparent" : macState === "online" ? "#30a46c" : macState === "offline" ? Kirigami.Theme.disabledTextColor : "#e8890c"
+                                        border.width: macState === "" ? 1 : 0
                                         border.color: Kirigami.Theme.disabledTextColor
-                                        HoverHandler { id: onlineHover }
-                                        PlasmaComponents3.ToolTip.text: online === true ? "Online" : online === false ? "Not online" : "Checking whether it's online"
-                                        PlasmaComponents3.ToolTip.visible: onlineHover.hovered
-                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
-                                    PlasmaComponents3.Label {
-                                        text: mac.modelData.name
-                                        font.bold: mac.modelData.active
-                                        elide: Text.ElideRight
+                                    ColumnLayout {
+                                        id: nameCol
+                                        readonly property string macState: mac.modelData.online === null ? ""
+                                            : mac.modelData.online === false ? "offline"
+                                            : mac.modelData.active && root.elsewhere !== "" ? "busy"
+                                            : mac.modelData.active && root.st.locked ? "locked" : "online"
                                         Layout.fillWidth: true
-                                        MouseArea {
-                                            id: nameArea
-                                            anchors.fill: parent
-                                            hoverEnabled: true
-                                            onDoubleClicked: { root.confirmingMac = ""; root.editingMac = mac.modelData.fingerprint; }
+                                        spacing: 0
+                                        PlasmaComponents3.Label {
+                                            text: mac.modelData.name
+                                            font.bold: mac.modelData.active
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                            MouseArea {
+                                                id: nameArea
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                onDoubleClicked: { root.confirmingMac = ""; root.editingMac = mac.modelData.fingerprint; }
+                                            }
+                                            PlasmaComponents3.ToolTip.text: "Double-click to rename"
+                                            PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
+                                            PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                         }
-                                        PlasmaComponents3.ToolTip.text: "Double-click to rename"
-                                        PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
-                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                        PlasmaComponents3.Label {
+                                            visible: parent.macState !== ""
+                                            text: ({ online: "Online", offline: "Not online", locked: "Locked", busy: "Busy · streaming elsewhere" })[parent.macState] || ""
+                                            color: parent.macState === "online" ? "#30a46c" : parent.macState === "offline" ? Kirigami.Theme.disabledTextColor : "#e8890c"
+                                            font: Kirigami.Theme.smallFont
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                        }
                                     }
                                     Repeater {
                                         model: mac.modelData.active ? root.streamActions : ["start"]
