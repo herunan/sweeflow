@@ -180,6 +180,12 @@ fn bind_stream_keys() {
     let mut keys = Vec::new();
     for k in &crate::setup::STREAM_KEYS {
         let Some(command) = own_command(k.id) else { return };
+        // The letter an earlier version bound (Cmd+Opt+P / X), while still ours: let go.
+        for &(m, mask) in mods {
+            if bound.iter().any(|b| b.0 == mask && b.1.eq_ignore_ascii_case(&k.old.to_string()) && b.2.starts_with(OURS)) {
+                binds.push_str(&format!(r#"hl.unbind("{m} + {}"); "#, k.old));
+            }
+        }
         for &(m, mask) in mods {
             if let Some(by) = bound_by(&bound, mask, k.letter) {
                 log::info!("Hyprland: {m} + {} is bound already ({by}): left alone, not set for \"{}\"", k.letter, k.name);
@@ -192,8 +198,9 @@ fn bind_stream_keys() {
     if binds.is_empty() {
         return;
     }
-    // Once per Hyprland config, as the open key.
-    let lua = format!("if not sweeflow_stream_keys then sweeflow_stream_keys = true; {binds}end");
+    // Once per Hyprland config, as the open key. (Named for the letters: a running Hyprland that
+    // has the earlier ones, P and X, takes these and lets those go.)
+    let lua = format!("if not sweeflow_stream_keys_yz then sweeflow_stream_keys_yz = true; {binds}end");
     match Command::new("hyprctl").args(["eval", &lua]).output() {
         Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {
             log::info!("Hyprland: {}", keys.join(", "));

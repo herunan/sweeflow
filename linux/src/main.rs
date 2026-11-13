@@ -34,8 +34,8 @@ sweeflow — stream Mac app windows into your Linux desktop
 USAGE:
     sweeflow                 stream from the linked Mac: its app windows open here
     sweeflow open            start Sweeflow if needed and show its controls (the app menu entry)
-    sweeflow toggle-pause    pause streaming, or resume it when paused (Cmd+Opt+P)
-    sweeflow toggle-stream   stop streaming, or start it when stopped (Cmd+Opt+X)
+    sweeflow toggle-pause    pause streaming, or resume it when paused (Cmd+Opt+Y)
+    sweeflow toggle-stream   stop streaming, or start it when stopped (Cmd+Opt+Z)
     sweeflow panel           Sweeflow's own window: its apps, settings and Macs (without the Plasma widget)
     sweeflow pair            link a Mac on this network (the Mac shows a code, you type it here)
     sweeflow pair --text     the same, in the terminal

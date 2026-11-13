@@ -341,7 +341,7 @@ impl ksni::Tray for Tray {
         let keys = crate::keys::current();
         // Where streaming stands, and what can be done about it.
         // The status line leads with the same coloured dot the window gives the Mac in use.
-        let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, icon_data: dot, ..Default::default() }.into()];
+        let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, icon_name: dot.into(), ..Default::default() }.into()];
         for &action in actions {
             if let (Some(other), "start") = (&elsewhere, action) {
                 items.push(StandardItem { label: start_hint(other).replace('_', "__"), enabled: false, ..Default::default() }.into());
@@ -353,7 +353,7 @@ impl ksni::Tray for Tray {
             };
             items.push(
                 StandardItem {
-                    label: action_label(action).into(),
+                    label: with_key(action_label(action), key),
                     shortcut: key.as_ref().map(|k| k.menu()).unwrap_or_default(),
                     activate: Box::new(move |_| panel_do(action, "")),
                     ..Default::default()
@@ -364,7 +364,7 @@ impl ksni::Tray for Tray {
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
-                label: "Open Sweeflow".into(),
+                label: with_key("Open Sweeflow", &keys.open),
                 shortcut: keys.open.as_ref().map(|k| k.menu()).unwrap_or_default(),
                 activate: Box::new(|_| open_panel()),
                 ..Default::default()
@@ -414,41 +414,37 @@ fn menu_icon(name: &str) -> String {
     name.into()
 }
 
-/// The coloured dot for where the Mac in use stands, as Sweeflow's window and widget draw it:
-/// violet streaming (a ring paused), green available, orange busy or locked, a grey ring not
-/// online or not known. A 32 px PNG (drawn at the menu's icon size).
-fn state_dot(status: &str) -> Vec<u8> {
-    let (rgb, hollow): ([u8; 3], bool) = match status {
-        "Streaming" => ([0x7c, 0x5c, 0xff], false),
-        "Paused" => ([0x7c, 0x5c, 0xff], true),
-        "Available" => ([0x30, 0xa4, 0x6c], false),
-        s if s.starts_with("Busy") || s == "Locked" => ([0xe8, 0x89, 0x0c], false),
-        _ => ([0x9a, 0x96, 0xa3], true),
-    };
-    const N: usize = 32;
-    let (c, r, ring) = (N as f32 / 2.0, 9.0_f32, 2.6_f32);
-    let mut px = vec![0u8; N * N * 4];
-    for y in 0..N {
-        for x in 0..N {
-            let d = ((x as f32 + 0.5 - c).powi(2) + (y as f32 + 0.5 - c).powi(2)).sqrt();
-            // Antialiased edge; a ring keeps only the outer band.
-            let outer = (r + 0.5 - d).clamp(0.0, 1.0);
-            let inner = if hollow { (d - (r - ring) + 0.5).clamp(0.0, 1.0) } else { 1.0 };
-            let a = (outer * inner * 255.0) as u8;
-            px[(y * N + x) * 4..][..4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
+/// A menu item's text, with its key after it on GNOME: its tray extension doesn't show a menu
+/// item's shortcut (other desktops show it at the right).
+fn with_key(label: &str, key: &Option<crate::keys::Key>) -> String {
+    match key {
+        Some(k) if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") => {
+            format!("{label}   {}", k.shown(crate::setup::mac_keys_remapped(), "Super"))
         }
+        _ => label.to_string(),
     }
-    let mut out = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut out, N as u32, N as u32);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let Ok(mut w) = enc.write_header() else { return Vec::new() };
-        if w.write_image_data(&px).is_err() {
-            return Vec::new();
-        }
+}
+
+/// The coloured dots for where the Mac in use stands, as Sweeflow's window and widget draw them
+/// (name, colour, a ring): violet streaming (a ring paused), green available, orange busy or
+/// locked, a grey ring not online or not known. Installed as named icons (setup::write_icons).
+pub const STATE_DOTS: [(&str, &str, bool); 5] = [
+    ("sweeflow-dot-streaming", "#7c5cff", false),
+    ("sweeflow-dot-paused", "#7c5cff", true),
+    ("sweeflow-dot-available", "#30a46c", false),
+    ("sweeflow-dot-busy", "#e8890c", false),
+    ("sweeflow-dot-offline", "#9a96a3", true),
+];
+
+/// The dot's icon name for the status line.
+fn state_dot(status: &str) -> &'static str {
+    match status {
+        "Streaming" => STATE_DOTS[0].0,
+        "Paused" => STATE_DOTS[1].0,
+        "Available" => STATE_DOTS[2].0,
+        s if s.starts_with("Busy") || s == "Locked" => STATE_DOTS[3].0,
+        _ => STATE_DOTS[4].0,
     }
-    out
 }
 
 fn quit() {
@@ -774,7 +770,7 @@ pub fn panel_do(action: &str, arg: &str) {
         "connect" | "disconnect" => set_started(action == "connect"),
         // With the Mac away, applied once it's back.
         "pause" | "resume" => change(|s| s.enabled = action == "resume"),
-        // The shortcuts (Cmd+Opt+P, Cmd+Opt+X): whichever of the above fits now.
+        // The shortcuts (Cmd+Opt+Y, Cmd+Opt+Z): whichever of the above fits now.
         "pause-toggle" | "stream-toggle" => {
             let state = STATE.lock().unwrap();
             let chosen = toggle_action(action, standing(&state));

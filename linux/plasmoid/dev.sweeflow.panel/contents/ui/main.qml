@@ -120,7 +120,7 @@ PlasmoidItem {
     // What each sign does, said on hover.
     // The keys Plasma has now for open / pause / stop (the client reads them: "⌘⌥P", or as
     // Plasma writes them; "" for one with none), and the Global menu's (fixed).
-    readonly property var shortcutKeys: st.keys || ({ open: "⌘⌥O", pause: "⌘⌥P", stop: "⌘⌥X", menu: "⌘⌥U" })
+    readonly property var shortcutKeys: st.keys || ({ open: "⌘⌥O", pause: "⌘⌥Y", stop: "⌘⌥Z", menu: "⌘⌥U" })
     function withKey(text, key) { return key ? text + " (" + key + ")" : text }
     readonly property var actionTips: ({ start: withKey("Start streaming", shortcutKeys.stop), pause: withKey("Pause streaming", shortcutKeys.pause),
                                          resume: withKey("Resume streaming", shortcutKeys.pause), stop: withKey("Stop streaming", shortcutKeys.stop) })

@@ -384,6 +384,19 @@ fn write_icons(home: &std::path::Path) -> Result<()> {
     std::fs::write(symbolic.join("sweeflow-symbolic.svg"), TRAY_ICON)?;
     // The same, translucent: the tray icon while paused or stopped.
     std::fs::write(symbolic.join("sweeflow-paused-symbolic.svg"), TRAY_ICON.replacen("<g ", "<g opacity=\"0.4\" ", 1))?;
+    // The tray menu's dot for where the Mac stands (tray::state_dot), as named icons: GNOME's
+    // tray extension can't show a menu item's picture sent as data (the whole menu fails).
+    let status = home.join(".local/share/icons/hicolor/scalable/status");
+    std::fs::create_dir_all(&status)?;
+    for (name, colour, hollow) in crate::tray::STATE_DOTS {
+        let shape = if hollow {
+            format!(r#"<circle cx="8" cy="8" r="3.7" fill="none" stroke="{colour}" stroke-width="1.3"/>"#)
+        } else {
+            format!(r#"<circle cx="8" cy="8" r="4.5" fill="{colour}"/>"#)
+        };
+        let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">{shape}</svg>"#);
+        std::fs::write(status.join(format!("{name}.svg")), svg)?;
+    }
     // Desktops look again at a theme folder when its date changes (a new file deeper in doesn't
     // change it): what `touch` on it does.
     if let Ok(f) = std::fs::File::open(home.join(".local/share/icons/hicolor")) {
@@ -464,13 +477,18 @@ pub struct StreamKey {
     icon: &'static str,
     does: &'static str,
     doing: &'static str,
+    pub old: char,
 }
 
-/// Cmd+Opt+P pauses or resumes, Cmd+Opt+X stops or starts (tray::toggle_action).
+/// Cmd+Opt+Y pauses or resumes, Cmd+Opt+Z stops or starts (tray::toggle_action). Not P or X:
+/// with Opt pressed a moment late, Cmd+P and Cmd+X are other things on Omarchy and GNOME (P
+/// switches monitors on GNOME); nothing of the desktops' has Cmd+Y or Cmd+Z.
+/// `old`: the letter an earlier version set, replaced while it's still that one.
 pub const STREAM_KEYS: [StreamKey; 2] = [
     StreamKey {
         id: "toggle-pause",
-        letter: 'P',
+        letter: 'Y',
+        old: 'P',
         name: "Pause or resume streaming",
         icon: "media-playback-pause",
         does: "pauses or resumes streaming",
@@ -478,7 +496,8 @@ pub const STREAM_KEYS: [StreamKey; 2] = [
     },
     StreamKey {
         id: "toggle-stream",
-        letter: 'X',
+        letter: 'Z',
+        old: 'X',
         name: "Stop or start streaming",
         icon: "media-playback-stop",
         does: "stops or starts streaming",
@@ -486,7 +505,7 @@ pub const STREAM_KEYS: [StreamKey; 2] = [
     },
 ];
 
-/// Cmd+Opt+P and Cmd+Opt+X (`STREAM_KEYS`) from any window, in the desktop's own shortcut
+/// Cmd+Opt+Y and Cmd+Opt+Z (`STREAM_KEYS`) from any window, in the desktop's own shortcut
 /// settings, where the user can give them other keys: on Plasma the app menu entry's actions
 /// (System Settings → Keyboard → Shortcuts → Sweeflow), on GNOME custom shortcuts (Settings →
 /// Keyboard → View and Customize Shortcuts → Custom Shortcuts). Hyprland binds them while
@@ -498,13 +517,21 @@ fn register_stream_keys(home: &std::path::Path) {
     let mut set = false;
     for k in &STREAM_KEYS {
         if desktop.contains("KDE") {
-            let note = format!("{}-key.plasma", k.id);
+            // (A new note per letter: the one for the old letter said it was set once.)
+            let note = format!("{}-key-{}.plasma", k.id, k.letter.to_ascii_lowercase());
             set |= register_key(&note, &plasma_key(k.letter, remapped).0, k.letter, remapped, k.does, k.doing, || plasma_action_key(k, remapped));
         } else if desktop.contains("GNOME") {
-            let note = format!("{}-key.gnome", k.id);
+            let note = format!("{}-key-{}.gnome", k.id, k.letter.to_ascii_lowercase());
             let key = gnome_key_text(k.letter, remapped);
             set |= register_key(&note, &shown_key(k.letter, remapped), k.letter, remapped, k.does, k.doing, || {
-                gnome_custom_key(home, &gnome_path(k.id), k.name, k.id, &key)
+                // Ours still on the old letter: the new one replaces it.
+                let path = gnome_path(k.id);
+                let theirs = gsettings(&["get", &format!("{GNOME_KEYS}.custom-keybinding:{path}"), "binding"]).unwrap_or_default();
+                if binds(&theirs, &gnome_key_text(k.old, remapped)) {
+                    gsettings(&["set", &format!("{GNOME_KEYS}.custom-keybinding:{path}"), "binding", &gvariant_str(&key)])?;
+                    return Ok(OpenKey::Set { now: true });
+                }
+                gnome_custom_key(home, &path, k.name, k.id, &key)
             });
         }
     }
@@ -600,8 +627,11 @@ type ShortcutInfo = (String, String, String, String, String, String, Vec<i32>, V
 fn plasma_action_key(k: &StreamKey, remapped: bool) -> Result<OpenKey> {
     let entry = ["--file", "kglobalshortcutsrc", "--group", "services", "--group", LAUNCHER, "--key", k.id];
     let there = Command::new("kreadconfig6").args(entry).output().context("kreadconfig6")?;
-    // A key the user gave it (or "none"), or an earlier install did.
-    if !String::from_utf8_lossy(&there.stdout).trim().is_empty() {
+    // A key the user gave it (or "none"), or an earlier install did; not the old letter an
+    // earlier version set (replaced by the new one).
+    let there = String::from_utf8_lossy(&there.stdout).trim().to_string();
+    let old = [plasma_key(k.old, false).0, plasma_key(k.old, true).0];
+    if !there.is_empty() && !old.iter().any(|o| there.split([',', '\t']).next() == Some(o.as_str())) {
         return Ok(OpenKey::Kept);
     }
     let (_, code) = plasma_key(k.letter, remapped);
@@ -870,7 +900,12 @@ pub(crate) fn plasma_bindings() -> [Option<crate::keys::Key>; 3] {
     let widgets = {
         let mut cache = WIDGETS.lock().unwrap();
         if !cache.as_ref().is_some_and(|c| c.0.elapsed() < std::time::Duration::from_secs(300)) {
-            *cache = Some((std::time::Instant::now(), plasma_widgets().unwrap_or_default()));
+            // Only a read that found the widget is kept: an empty one (the shell busy or
+            // restarting) is asked again next time.
+            match plasma_widgets() {
+                Ok(found) if !found.is_empty() => *cache = Some((std::time::Instant::now(), found)),
+                _ => {}
+            }
         }
         cache.as_ref().map(|c| c.1.clone()).unwrap_or_default()
     };
@@ -1065,7 +1100,7 @@ mod tests {
         assert_eq!(gnome_path("toggle-pause"), "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sweeflow-toggle-pause/");
         assert_ne!(gnome_path("toggle-stream"), gnome_path("toggle-pause"));
         let keys: Vec<(&str, char, &str)> = STREAM_KEYS.iter().map(|k| (k.id, k.letter, k.name)).collect();
-        assert_eq!(keys, [("toggle-pause", 'P', "Pause or resume streaming"), ("toggle-stream", 'X', "Stop or start streaming")]);
+        assert_eq!(keys, [("toggle-pause", 'Y', "Pause or resume streaming"), ("toggle-stream", 'Z', "Stop or start streaming")]);
     }
 
     #[test]

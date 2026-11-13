@@ -182,8 +182,8 @@ slint::slint! {
         // The keys the desktop has now for opening Sweeflow, pausing and stopping ("⌘⌥P", or as
         // the desktop writes them; "" for none).
         in property <string> key-open: "⌘⌥O";
-        in property <string> key-pause: "⌘⌥P";
-        in property <string> key-stop: "⌘⌥X";
+        in property <string> key-pause: "⌘⌥Y";
+        in property <string> key-stop: "⌘⌥Z";
         in property <bool> paired;
         in property <string> mac-name;
         in property <string> status;
