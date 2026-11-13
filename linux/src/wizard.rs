@@ -654,12 +654,10 @@ fn after_first_link(fingerprint: &str) -> Result<()> {
             .unwrap_or(false)
     });
     if let (true, Some(bus)) = (running, &bus) {
-        // TODO(merge): `use` is where crate::net::request_take_over() goes (tray::use_mac).
         bus.call_method(Some(BUS_NAME), "/dev/sweeflow/Panel", Some("dev.sweeflow.Panel"), "Do", &("use", fingerprint))?;
         return Ok(());
     }
-    // TODO(merge): a client started fresh should take the Mac's session over too
-    // (crate::net::request_take_over() once it's running, or a flag it reads on start).
+    // (A Mac streaming to another computer meanwhile answers Busy: "In use by …" until it's free.)
     crate::net::set_offline(false);
     crate::setup::start_client()
 }

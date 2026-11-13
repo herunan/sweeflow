@@ -920,8 +920,7 @@ fn use_mac(fingerprint: &str) {
     }
     log::info!("streaming from the Mac just linked, {}", cfg.host);
     crate::net::set_offline(false);
-    // TODO(merge): crate::net::request_take_over() — the Mac just linked may be serving another
-    // Linux computer; this one asked for it, so it takes the session over.
+    // A Mac already streaming to another computer answers Busy: "In use by …" until it's free.
     restart();
 }
 
