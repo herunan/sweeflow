@@ -185,6 +185,7 @@ pub fn install() -> Result<()> {
     run(&["restart", "sweeflow.service"])?;
     install_icon_and_widget(&home)?;
     register_open_key(&home);
+    register_stream_keys(&home);
     install_mac_dmg(&home)?;
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
@@ -271,16 +272,14 @@ const WIDGET_FILES: &[(&str, &str)] = &[
 /// windows (the wizard, app id "sweeflow", by the file's name) to the logo. No StartupWMClass:
 /// with it, Plasma's task manager takes every window of the process (the Mac apps too) for
 /// Sweeflow and shows them all with its logo.
+///
+/// Its actions are the streaming toggles (`STREAM_KEYS`): on Plasma their shortcuts belong to
+/// them (System Settings → Shortcuts → Sweeflow), and the app menu offers them on the entry.
 pub fn write_launcher(home: &std::path::Path) -> Result<()> {
     let apps = home.join(".local/share/applications");
     std::fs::create_dir_all(&apps)?;
-    let file = apps.join("sweeflow.desktop");
-    let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=Sweeflow\nGenericName=Mac apps\nComment=Mac apps on this desktop\n\
-         Exec={} open\nIcon=sweeflow\nTerminal=false\nStartupNotify=false\n\
-         Categories=Network;RemoteAccess;\nKeywords=mac;macos;stream;\n",
-        home.join(".local/bin/sweeflow").display()
-    );
+    let file = apps.join(LAUNCHER);
+    let entry = launcher_entry(&home.join(".local/bin/sweeflow").display().to_string());
     if std::fs::read_to_string(&file).ok().as_deref() != Some(entry.as_str()) {
         std::fs::write(file, entry)?;
     }
@@ -291,6 +290,27 @@ pub fn write_launcher(home: &std::path::Path) -> Result<()> {
     if std::fs::read_to_string(&display).ok().as_deref() != Some(entry) {
         std::fs::write(display, entry)?;
     }
+    Ok(())
+}
+
+/// The app menu entry's text (see `write_launcher`), for the installed binary at `bin`.
+fn launcher_entry(bin: &str) -> String {
+    let ids: String = STREAM_KEYS.iter().map(|k| format!("{};", k.id)).collect();
+    let actions: String =
+        STREAM_KEYS.iter().map(|k| format!("\n[Desktop Action {}]\nName={}\nExec={bin} {}\nIcon={}\n", k.id, k.name, k.id, k.icon)).collect();
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Sweeflow\nGenericName=Mac apps\nComment=Mac apps on this desktop\n\
+         Exec={bin} open\nIcon=sweeflow\nTerminal=false\nStartupNotify=false\n\
+         Categories=Network;RemoteAccess;\nKeywords=mac;macos;stream;\nActions={ids}\n{actions}"
+    )
+}
+
+/// `sweeflow toggle-pause` / `toggle-stream`, what the shortcuts run: the running client's
+/// toggle (tray::panel_do "pause-toggle" / "stream-toggle").
+pub fn toggle(action: &str) -> Result<()> {
+    let bus = zbus::blocking::Connection::session()?;
+    bus.call_method(Some("dev.sweeflow.Client"), "/dev/sweeflow/Panel", Some("dev.sweeflow.Panel"), "Do", &(action, ""))
+        .map_err(|e| anyhow::anyhow!("sweeflow isn't running (`sweeflow open` starts it): {e}"))?;
     Ok(())
 }
 
@@ -423,30 +443,121 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
 fn register_open_key(home: &std::path::Path) {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let remapped = mac_keys_remapped();
-    let (note, key, set): (&str, &str, fn(&std::path::Path, bool) -> Result<OpenKey>) = if desktop.contains("KDE") {
+    let (does, doing) = ("opens Sweeflow", "opening Sweeflow");
+    if desktop.contains("KDE") {
         // (open-key.kde was the note of the app menu entry's shortcut, which this replaces.)
-        ("open-key.plasma-widget", plasma_key(remapped).0, plasma_open_key)
+        let key = plasma_key('O', remapped).0;
+        register_key("open-key.plasma-widget", &key, 'O', remapped, does, doing, || plasma_open_key(home, remapped));
     } else if desktop.contains("GNOME") {
-        ("open-key.gnome", if remapped { "Ctrl+Alt+O" } else { "Super+Alt+O" }, gnome_open_key)
-    } else {
-        return;
-    };
+        register_key("open-key.gnome", &shown_key('O', remapped), 'O', remapped, does, doing, || gnome_open_key(home, remapped));
+    }
+}
+
+/// A shortcut for one of the streaming toggles: Cmd+Opt+<letter> runs `sweeflow <id>`.
+pub struct StreamKey {
+    /// The command's argument; also the app menu entry's action and the end of the GNOME path.
+    pub id: &'static str,
+    pub letter: char,
+    /// What the desktop's shortcut settings call it.
+    pub name: &'static str,
+    /// The app menu action's icon.
+    icon: &'static str,
+    does: &'static str,
+    doing: &'static str,
+}
+
+/// Cmd+Opt+P pauses or resumes, Cmd+Opt+X stops or starts (tray::toggle_action).
+pub const STREAM_KEYS: [StreamKey; 2] = [
+    StreamKey {
+        id: "toggle-pause",
+        letter: 'P',
+        name: "Pause or resume streaming",
+        icon: "media-playback-pause",
+        does: "pauses or resumes streaming",
+        doing: "pausing or resuming streaming",
+    },
+    StreamKey {
+        id: "toggle-stream",
+        letter: 'X',
+        name: "Stop or start streaming",
+        icon: "media-playback-stop",
+        does: "stops or starts streaming",
+        doing: "stopping or starting streaming",
+    },
+];
+
+/// Cmd+Opt+P and Cmd+Opt+X (`STREAM_KEYS`) from any window, in the desktop's own shortcut
+/// settings, where the user can give them other keys: on Plasma the app menu entry's actions
+/// (System Settings → Keyboard → Shortcuts → Sweeflow), on GNOME custom shortcuts (Settings →
+/// Keyboard → View and Customize Shortcuts → Custom Shortcuts). Hyprland binds them while
+/// Sweeflow runs (hyprland.rs); in a Mac window they are caught there (ui.rs). Same rules as the
+/// open key: only while the key is free, once (a note per key).
+fn register_stream_keys(home: &std::path::Path) {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let remapped = mac_keys_remapped();
+    let mut set = false;
+    for k in &STREAM_KEYS {
+        if desktop.contains("KDE") {
+            let note = format!("{}-key.plasma", k.id);
+            set |= register_key(&note, &plasma_key(k.letter, remapped).0, k.letter, remapped, k.does, k.doing, || plasma_action_key(k, remapped));
+        } else if desktop.contains("GNOME") {
+            let note = format!("{}-key.gnome", k.id);
+            let key = gnome_key_text(k.letter, remapped);
+            set |= register_key(&note, &shown_key(k.letter, remapped), k.letter, remapped, k.does, k.doing, || {
+                gnome_custom_key(home, &gnome_path(k.id), k.name, k.id, &key)
+            });
+        }
+    }
+    if set && desktop.contains("KDE") {
+        println!("    (other keys for them: System Settings → Keyboard → Shortcuts → Sweeflow)");
+    } else if set && desktop.contains("GNOME") {
+        println!("    (other keys for them: Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts)");
+    } else if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        // The client binds them as it starts (hyprland.rs), so which ones it could isn't known here.
+        let keys: Vec<String> = STREAM_KEYS.iter().map(|k| format!("SUPER + ALT + {} {}", k.letter, k.does)).collect();
+        println!("    SUPER + ALT + O opens Sweeflow from any window; {} where the key isn't bound already", keys.join(", "));
+        println!("    (Hyprland bindings Sweeflow adds while it runs; Sweeflow's window lists the ones it has. For other keys,");
+        println!("    bind `sweeflow open`, `sweeflow toggle-pause` or `sweeflow toggle-stream` in your Hyprland config)");
+    }
+}
+
+/// Sets one of Sweeflow's shortcuts with `set`, once (see `register_open_key`), and says how it
+/// went. True when it was set now.
+fn register_key(note: &str, key: &str, letter: char, remapped: bool, does: &str, doing: &str, set: impl FnOnce() -> Result<OpenKey>) -> bool {
     let note = config::dir().join(note);
     if note.exists() {
-        return;
+        return false;
     }
-    // What's pressed is Cmd+Opt+O either way.
-    let key = if remapped { format!("Cmd+Opt+O ({key} once your key remapper has turned Cmd into Ctrl)") } else { key.to_string() };
-    match set(home, remapped) {
-        Ok(OpenKey::Set { now: true }) => println!("    {key} opens Sweeflow from any window"),
+    // What's pressed is Cmd+Opt+<letter> either way.
+    let key = if remapped { format!("Cmd+Opt+{letter} ({key} once your key remapper has turned Cmd into Ctrl)") } else { key.to_string() };
+    let set_now = match set() {
+        Ok(OpenKey::Set { now: true }) => {
+            println!("    {key} {does} from any window");
+            true
+        }
         // No note yet: the next install looks again whether it is still there.
-        Ok(OpenKey::Set { now: false }) => return println!("    {key} opens Sweeflow from any window, from the next login"),
-        Ok(OpenKey::Kept) => {}
-        Ok(OpenKey::Taken(by)) => return println!("    ({key} is already used by {by}: no shortcut set for opening Sweeflow)"),
-        Err(e) => return println!("    (couldn't set {key} to open Sweeflow: {e:#})"),
-    }
+        Ok(OpenKey::Set { now: false }) => {
+            println!("    {key} {does} from any window, from the next login");
+            return true;
+        }
+        Ok(OpenKey::Kept) => false,
+        Ok(OpenKey::Taken(by)) => {
+            println!("    ({key} is already used by {by}: no shortcut set for {doing})");
+            return false;
+        }
+        Err(e) => {
+            println!("    (couldn't set {key} for {doing}: {e:#})");
+            return false;
+        }
+    };
     let _ = std::fs::create_dir_all(config::dir());
     let _ = std::fs::write(note, format!("{key}\n"));
+    set_now
+}
+
+/// Cmd+Opt+<letter> as the desktop sees it, for the install's lines (GNOME's way of writing it).
+fn shown_key(letter: char, remapped: bool) -> String {
+    format!("{}+Alt+{letter}", if remapped { "Ctrl" } else { "Super" })
 }
 
 /// A Mac-style key remapper is installed (Toshy, Kinto): outside the Mac windows (which it
@@ -470,10 +581,48 @@ enum OpenKey {
     Taken(String),
 }
 
-/// The key on Plasma, as written in its config and as Qt counts it (Qt::META or Qt::CTRL, |
-/// Qt::ALT | Qt::Key_O): how KGlobalAccel is asked.
-fn plasma_key(remapped: bool) -> (&'static str, i32) {
-    if remapped { ("Ctrl+Alt+O", 0x0400_0000 | 0x0800_0000 | 0x4f) } else { ("Meta+Alt+O", 0x1000_0000 | 0x0800_0000 | 0x4f) }
+/// Cmd+Opt+<letter> on Plasma, as written in its config and as Qt counts it (Qt::META or
+/// Qt::CTRL, | Qt::ALT | Qt::Key_<letter>): how KGlobalAccel is asked.
+fn plasma_key(letter: char, remapped: bool) -> (String, i32) {
+    let letter = letter.to_ascii_uppercase();
+    let (name, cmd) = if remapped { ("Ctrl", 0x0400_0000) } else { ("Meta", 0x1000_0000) };
+    (format!("{name}+Alt+{letter}"), cmd | 0x0800_0000 | letter as i32)
+}
+
+/// What KGlobalAccel says about a shortcut: (action, its name, component, its name, context,
+/// its name, keys, default keys).
+type ShortcutInfo = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
+
+/// One of the streaming toggles' shortcuts on Plasma: the key of the app menu entry's action
+/// (see `launcher_entry`), as System Settings sets one (KGlobalAccel keeps it in
+/// kglobalshortcutsrc, [services][sweeflow.desktop], and runs the action's Exec when pressed).
+/// It shows there as "Sweeflow" → `k.name`.
+fn plasma_action_key(k: &StreamKey, remapped: bool) -> Result<OpenKey> {
+    let entry = ["--file", "kglobalshortcutsrc", "--group", "services", "--group", LAUNCHER, "--key", k.id];
+    let there = Command::new("kreadconfig6").args(entry).output().context("kreadconfig6")?;
+    // A key the user gave it (or "none"), or an earlier install did.
+    if !String::from_utf8_lossy(&there.stdout).trim().is_empty() {
+        return Ok(OpenKey::Kept);
+    }
+    let (_, code) = plasma_key(k.letter, remapped);
+    let key = (vec![code, 0, 0, 0],);
+    let bus = zbus::blocking::Connection::session()?;
+    let others: Vec<ShortcutInfo> = kglobalaccel(&bus, "globalShortcutsByKey", &(&key, (0i32,)))?.body().deserialize()?;
+    if let Some(i) = others.into_iter().find(|i| !(i.2 == LAUNCHER && i.0 == k.id)) {
+        return Ok(OpenKey::Taken(if i.1 == i.3 { i.3 } else { format!("{} ({})", i.3, i.1) }));
+    }
+    // KDE's app database has to know the entry's actions first.
+    let _ = Command::new("kbuildsycoca6").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let id = [LAUNCHER, k.id, "Sweeflow", k.name];
+    let told = || -> zbus::Result<bool> {
+        kglobalaccel(&bus, "doRegister", &(&id,))?;
+        kglobalaccel(&bus, "setForeignShortcutKeys", &(&id, vec![&key]))?;
+        let keys: Vec<(Vec<i32>,)> = kglobalaccel(&bus, "shortcutKeys", &(&id,))?.body().deserialize()?;
+        Ok(keys.iter().any(|k| k.0.first() == Some(&code)))
+    };
+    let now = told().map_err(|e| anyhow::anyhow!("Plasma's shortcut service: {e}"))?;
+    anyhow::ensure!(now, "Plasma's shortcut service didn't take it");
+    Ok(OpenKey::Set { now })
 }
 /// The app menu entry (see `write_launcher`), whose "launch" action earlier versions gave the
 /// key.
@@ -552,14 +701,12 @@ fn plasma_open_key(_home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
     if widgets.iter().any(|w| !w.2.is_empty()) {
         return Ok(OpenKey::Kept);
     }
-    let (key_text, code) = plasma_key(remapped);
+    let (key_text, code) = plasma_key('O', remapped);
     // A key sequence on D-Bus: up to four keys, the unused ones 0.
     let key = (vec![code, 0, 0, 0],);
     let bus = zbus::blocking::Connection::session()?;
-    // (action, its name, component, its name, context, its name, keys, default keys);
     // 0: the shortcuts with exactly this key. Not counting the app menu entry's, ours.
-    type Info = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
-    let others: Vec<Info> = kglobalaccel(&bus, "globalShortcutsByKey", &(&key, (0i32,)))?.body().deserialize()?;
+    let others: Vec<ShortcutInfo> =kglobalaccel(&bus, "globalShortcutsByKey", &(&key, (0i32,)))?.body().deserialize()?;
     if let Some(i) = others.into_iter().find(|i| i.2 != LAUNCHER) {
         return Ok(OpenKey::Taken(if i.1 == i.3 { i.3 } else { format!("{} ({})", i.3, i.1) }));
     }
@@ -637,14 +784,29 @@ fn gsettings(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// A custom shortcut as GNOME's Settings → Keyboard makes them: its name, command and key under
-/// a path of its own, and that path in the list of custom shortcuts. GNOME takes it up at once.
+/// Cmd+Opt+<letter> as GNOME writes a key: "<Super><Alt>p", or with a Mac-style key remapper
+/// (see `mac_keys_remapped`) the key that arrives, "<Control><Alt>p".
+fn gnome_key_text(letter: char, remapped: bool) -> String {
+    format!("<{}><Alt>{}", if remapped { "Control" } else { "Super" }, letter.to_ascii_lowercase())
+}
+
+/// Where a streaming toggle's custom shortcut is kept: next to the open key's.
+fn gnome_path(id: &str) -> String {
+    format!("{}-{id}/", GNOME_KEY_PATH.trim_end_matches('/'))
+}
+
 fn gnome_open_key(home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
-    let key = if remapped { GNOME_REMAPPED_KEY } else { GNOME_KEY };
+    gnome_custom_key(home, GNOME_KEY_PATH, "Sweeflow", "open", if remapped { GNOME_REMAPPED_KEY } else { GNOME_KEY })
+}
+
+/// A custom shortcut as GNOME's Settings → Keyboard makes them: its name, command (`sweeflow
+/// <arg>`) and key under a path of its own, and that path in the list of custom shortcuts. GNOME
+/// takes it up at once.
+fn gnome_custom_key(home: &std::path::Path, our_path: &str, name: &str, arg: &str, key: &str) -> Result<OpenKey> {
     let list = gsettings(&["get", GNOME_KEYS, "custom-keybindings"])?;
     let paths = quoted(&list);
     // Ours from an earlier install, whatever key the user has given it since.
-    if paths.iter().any(|p| p == GNOME_KEY_PATH) {
+    if paths.iter().any(|p| p == our_path) {
         return Ok(OpenKey::Kept);
     }
     // Who else has the key: another custom shortcut, or one of GNOME's own (every setting is
@@ -666,15 +828,47 @@ fn gnome_open_key(home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
         }
     }
     // The shortcut first, then its place in the list, so GNOME never sees half of it.
-    let ours = format!("{GNOME_KEYS}.custom-keybinding:{GNOME_KEY_PATH}");
-    let command = format!("{} open", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
-    gsettings(&["set", &ours, "name", &gvariant_str("Sweeflow")])?;
+    let ours = format!("{GNOME_KEYS}.custom-keybinding:{our_path}");
+    let command = format!("{} {arg}", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
+    gsettings(&["set", &ours, "name", &gvariant_str(name)])?;
     gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
     gsettings(&["set", &ours, "binding", &gvariant_str(key)])?;
-    if let Some(list) = with_path(&list, GNOME_KEY_PATH) {
+    if let Some(list) = with_path(&list, our_path) {
         gsettings(&["set", GNOME_KEYS, "custom-keybindings", &list])?;
     }
     Ok(OpenKey::Set { now: true })
+}
+
+/// The keys GNOME has now for Sweeflow's custom shortcuts (open, pause, stop), as it writes
+/// them ("<Super><Alt>o"); None for one that isn't there or has no key. (For showing them.)
+pub(crate) fn gnome_bindings() -> [Option<String>; 3] {
+    let Ok(list) = gsettings(&["get", GNOME_KEYS, "custom-keybindings"]) else { return Default::default() };
+    let paths = quoted(&list);
+    let binding = |path: &str| -> Option<String> {
+        if !paths.iter().any(|p| p == path) {
+            return None;
+        }
+        let value = gsettings(&["get", &format!("{GNOME_KEYS}.custom-keybinding:{path}"), "binding"]).ok()?;
+        quoted(&value).into_iter().find(|k| gnome_key(k).is_some())
+    };
+    [binding(GNOME_KEY_PATH), binding(&gnome_path(STREAM_KEYS[0].id)), binding(&gnome_path(STREAM_KEYS[1].id))]
+}
+
+/// The keys Plasma has now (KGlobalAccel's) for opening Sweeflow (the tray widget's shortcut)
+/// and for the two streaming toggles. None for one with no key. (For showing them.)
+pub(crate) fn plasma_bindings() -> [Option<crate::keys::Key>; 3] {
+    let Ok(bus) = zbus::blocking::Connection::session() else { return Default::default() };
+    let keys_of = |component: &str, action: &str| -> Option<crate::keys::Key> {
+        let id = [component, action, "", ""];
+        let keys: Vec<(Vec<i32>,)> = kglobalaccel(&bus, "shortcutKeys", &(&id,)).ok()?.body().deserialize().ok()?;
+        keys.into_iter().find_map(|k| k.0.first().copied().filter(|&c| c != 0)).and_then(crate::keys::Key::from_qt)
+    };
+    let widgets = plasma_widgets().unwrap_or_default();
+    let open = main_widget(&widgets).and_then(|(_, id, text)| {
+        // Its config's key as the fallback, for a shell that hasn't registered it yet.
+        keys_of("plasmashell", &widget_action(id)).or_else(|| crate::keys::Key::from_qt_text(text))
+    });
+    [open, keys_of(LAUNCHER, STREAM_KEYS[0].id), keys_of(LAUNCHER, STREAM_KEYS[1].id)]
 }
 
 /// The strings in a value as gsettings prints it: `['a', 'b']`, `'a'`, or `@as []` (none).
@@ -717,7 +911,7 @@ fn with_path(list: &str, path: &str) -> Option<String> {
 /// A GNOME key ("<Super><Alt>o") as its modifiers in a fixed order and its key, however it was
 /// written: any order, any case, Mod4 for Super, Mod1 for Alt, Primary for Control. None for
 /// text that isn't a key.
-fn gnome_key(text: &str) -> Option<(Vec<String>, String)> {
+pub(crate) fn gnome_key(text: &str) -> Option<(Vec<String>, String)> {
     let mut mods = Vec::new();
     let mut rest = text.trim();
     while let Some(after) = rest.strip_prefix('<') {
@@ -839,9 +1033,44 @@ mod tests {
 
     #[test]
     fn plasma_keys_as_qt_counts_them() {
-        assert_eq!(plasma_key(false), ("Meta+Alt+O", 0x1800_004f));
-        assert_eq!(plasma_key(true), ("Ctrl+Alt+O", 0x0c00_004f));
+        assert_eq!(plasma_key('O', false), ("Meta+Alt+O".to_string(), 0x1800_004f));
+        assert_eq!(plasma_key('O', true), ("Ctrl+Alt+O".to_string(), 0x0c00_004f));
+        assert_eq!(plasma_key('P', false), ("Meta+Alt+P".to_string(), 0x1800_0050));
+        assert_eq!(plasma_key('x', false), ("Meta+Alt+X".to_string(), 0x1800_0058));
+        assert_eq!(plasma_key('X', true), ("Ctrl+Alt+X".to_string(), 0x0c00_0058));
         assert!(binds("['<Primary><Alt>o']", GNOME_REMAPPED_KEY));
+    }
+
+    #[test]
+    fn the_streaming_keys_as_each_desktop_writes_them() {
+        assert_eq!(gnome_key_text('O', false), GNOME_KEY);
+        assert_eq!(gnome_key_text('O', true), GNOME_REMAPPED_KEY);
+        assert_eq!(gnome_key_text('P', false), "<Super><Alt>p");
+        assert_eq!(gnome_key_text('X', true), "<Control><Alt>x");
+        assert!(binds("['<Mod4><Mod1>X']", &gnome_key_text('X', false)));
+        assert!(!binds("['<Super><Alt>o']", &gnome_key_text('P', false)));
+        assert_eq!(shown_key('P', false), "Super+Alt+P");
+        assert_eq!(shown_key('X', true), "Ctrl+Alt+X");
+        // Their own paths, next to the open key's, each a different one.
+        assert_eq!(gnome_path("toggle-pause"), "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sweeflow-toggle-pause/");
+        assert_ne!(gnome_path("toggle-stream"), gnome_path("toggle-pause"));
+        let keys: Vec<(&str, char, &str)> = STREAM_KEYS.iter().map(|k| (k.id, k.letter, k.name)).collect();
+        assert_eq!(keys, [("toggle-pause", 'P', "Pause or resume streaming"), ("toggle-stream", 'X', "Stop or start streaming")]);
+    }
+
+    #[test]
+    fn the_app_menu_entry_has_the_toggles_as_actions() {
+        let entry = launcher_entry("/home/me/.local/bin/sweeflow");
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("\nExec=/home/me/.local/bin/sweeflow open\n"));
+        assert!(entry.contains("\nActions=toggle-pause;toggle-stream;\n"));
+        assert!(entry.contains(
+            "\n[Desktop Action toggle-pause]\nName=Pause or resume streaming\nExec=/home/me/.local/bin/sweeflow toggle-pause\nIcon=media-playback-pause\n"
+        ));
+        assert!(entry.contains("\n[Desktop Action toggle-stream]\nName=Stop or start streaming\nExec=/home/me/.local/bin/sweeflow toggle-stream\n"));
+        // The main entry's keys all come before the first action's group.
+        let main = entry.split("\n[Desktop Action").next().unwrap();
+        assert!(main.contains("Keywords=") && main.contains("Actions="));
     }
 
     #[test]

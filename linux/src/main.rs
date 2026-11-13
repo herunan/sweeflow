@@ -6,6 +6,7 @@ mod desktop;
 mod frames;
 mod hyprland;
 mod installer;
+mod keys;
 mod launchers;
 mod lights;
 mod look;
@@ -33,6 +34,8 @@ sweeflow — stream Mac app windows into your Linux desktop
 USAGE:
     sweeflow                 stream from the linked Mac: its app windows open here
     sweeflow open            start Sweeflow if needed and show its controls (the app menu entry)
+    sweeflow toggle-pause    pause streaming, or resume it when paused (Cmd+Opt+P)
+    sweeflow toggle-stream   stop streaming, or start it when stopped (Cmd+Opt+X)
     sweeflow panel           Sweeflow's own window: its apps, settings and Macs (without the Plasma widget)
     sweeflow pair            link a Mac on this network (the Mac shows a code, you type it here)
     sweeflow pair --text     the same, in the terminal
@@ -119,6 +122,8 @@ fn main() -> Result<()> {
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
         Some("open") => setup::open(),
+        Some("toggle-pause") => setup::toggle("pause-toggle"),
+        Some("toggle-stream") => setup::toggle("stream-toggle"),
         Some("launch") => launchers::launch(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("quit") => launchers::quit(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("menu") => palette::run(),

@@ -118,8 +118,12 @@ PlasmoidItem {
     // The streaming actions, as they're named and drawn.
     readonly property var actionLabels: ({ start: "Start", pause: "Pause", resume: "Resume", stop: "Stop" })
     // What each sign does, said on hover.
-    readonly property var actionTips: ({ start: "Start streaming (Meta+Alt+X)", pause: "Pause streaming (Meta+Alt+P)",
-                                         resume: "Resume streaming (Meta+Alt+P)", stop: "Stop streaming (Meta+Alt+X)" })
+    // The keys Plasma has now for open / pause / stop (the client reads them: "⌘⌥P", or as
+    // Plasma writes them; "" for one with none), and the Global menu's (fixed).
+    readonly property var shortcutKeys: st.keys || ({ open: "⌘⌥O", pause: "⌘⌥P", stop: "⌘⌥X", menu: "⌘⌥U" })
+    function withKey(text, key) { return key ? text + " (" + key + ")" : text }
+    readonly property var actionTips: ({ start: withKey("Start streaming", shortcutKeys.stop), pause: withKey("Pause streaming", shortcutKeys.pause),
+                                         resume: withKey("Resume streaming", shortcutKeys.pause), stop: withKey("Stop streaming", shortcutKeys.stop) })
     readonly property var actionIcons: ({ start: "media-playback-start", pause: "media-playback-pause",
                                           resume: "media-playback-start", stop: "media-playback-stop" })
 
@@ -305,16 +309,18 @@ PlasmoidItem {
                             spacing: Kirigami.Units.smallSpacing
                             Kirigami.Heading { level: 5; text: "Keyboard shortcuts" }
                             Repeater {
-                                model: [["⌘⌥O", "Open Sweeflow"], ["⌘⌥P", "Pause or resume"], ["⌘⌥X", "Stop or start"], ["⌘⌥U", "Mac app's global menu"]]
+                                model: [[root.shortcutKeys.open, "Open Sweeflow"], [root.shortcutKeys.pause, "Pause or resume"], [root.shortcutKeys.stop, "Stop or start"], ["⌘⌥U", "Mac app's global menu"]]
                                 delegate: RowLayout {
                                     required property var modelData
                                     spacing: Kirigami.Units.largeSpacing
                                     Rectangle {
-                                        implicitWidth: Kirigami.Units.gridUnit * 2.6
+                                        // Wider for a key written out ("Ctrl+Shift+F5").
+                                        implicitWidth: Math.max(Kirigami.Units.gridUnit * 2.6, keyText.implicitWidth + Kirigami.Units.largeSpacing)
                                         implicitHeight: keyText.implicitHeight + Kirigami.Units.smallSpacing
                                         radius: Kirigami.Units.cornerRadius
                                         color: Qt.alpha(Kirigami.Theme.textColor, 0.1)
-                                        PlasmaComponents3.Label { id: keyText; anchors.centerIn: parent; text: modelData[0] }
+                                        // A shortcut the user removed: none.
+                                        PlasmaComponents3.Label { id: keyText; anchors.centerIn: parent; text: modelData[0] || "none"; opacity: modelData[0] ? 1 : 0.6 }
                                     }
                                     PlasmaComponents3.Label { text: modelData[1] }
                                 }

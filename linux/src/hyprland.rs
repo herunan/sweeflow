@@ -36,6 +36,7 @@ pub fn add_to_config() {
     std::thread::spawn(|| {
         hide_title_bars();
         bind_open_key();
+        bind_stream_keys();
         keep_menu_focused();
         place_sweeflow_window();
         close_on_click_elsewhere();
@@ -44,6 +45,7 @@ pub fn add_to_config() {
             if event.starts_with("configreloaded") {
                 hide_title_bars();
                 bind_open_key();
+                bind_stream_keys();
                 keep_menu_focused();
                 place_sweeflow_window();
                 close_on_click_elsewhere();
@@ -119,23 +121,133 @@ fn close_on_click_elsewhere() {
 /// on Omarchy. Runs the installed binary, the one the service runs. A config reload drops the
 /// binding, so it is added again after each.
 fn bind_open_key() {
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let bin = std::path::Path::new(&home).join(".local/bin/sweeflow").display().to_string();
-    // Quoted for the shell Hyprland runs it through, and the whole command for Lua.
-    let command = format!("'{}' open", bin.replace('\'', r"'\''")).replace('\\', r"\\").replace('"', "\\\"");
+    let Some(command) = own_command("open") else { return };
     // Once per Hyprland config (its Lua globals go with a reload, as the binding does): added
     // again by every start of the client, the key ran `sweeflow open` twice, which opens the
     // window and closes it again.
     // With a Mac-style key remapper (Toshy, Kinto), Cmd+Opt+O arrives as CTRL + ALT + O outside
     // the Mac windows: that key too.
     let keys: &[&str] = if crate::setup::mac_keys_remapped() { &["SUPER + ALT + O", "CTRL + ALT + O"] } else { &["SUPER + ALT + O"] };
-    let binds: String = keys.iter().map(|k| format!(r#"hl.bind("{k}", hl.dsp.exec_cmd("{command}")); "#)).collect();
+    let binds: String =
+        keys.iter().map(|k| format!(r#"hl.bind("{k}", hl.dsp.exec_cmd("{command}"), {{ description = "{OURS}{OPEN_NAME}" }}); "#)).collect();
     let lua = format!("if not sweeflow_open_key then sweeflow_open_key = true; {binds}end");
     match Command::new("hyprctl").args(["eval", &lua]).output() {
         Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => log::info!("Hyprland: {} opens Sweeflow", keys.join(" or ")),
         Ok(o) => log::warn!("Hyprland didn't take the key for Sweeflow's window ({lua}): {}", String::from_utf8_lossy(&o.stdout).trim()),
         Err(e) => log::debug!("hyprctl: {e}"),
     }
+}
+
+/// `sweeflow <arg>` with the installed binary, the one the service runs: quoted for the shell
+/// Hyprland runs it through, and the whole command for a Lua string.
+fn own_command(arg: &str) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let bin = std::path::Path::new(&home).join(".local/bin/sweeflow").display().to_string();
+    Some(format!("'{}' {arg}", bin.replace('\'', r"'\''")).replace('\\', r"\\").replace('"', "\\\""))
+}
+
+/// SUPER + ALT + P (pause or resume) and SUPER + ALT + X (stop or start): `sweeflow
+/// toggle-pause` / `toggle-stream` (setup::STREAM_KEYS), like the open key, but only on a key
+/// nothing else has (Omarchy has SUPER + ALT + K for its tmux keys, say): the user's own binding
+/// wins, and binding `sweeflow toggle-…` to other keys in their config is how they change them.
+fn bind_stream_keys() {
+    // Just after a config reload Hyprland may list nothing for a moment: asked again, and
+    // nothing bound while it still lists nothing (a key the user has could be taken over).
+    let mut bound = Vec::new();
+    for _ in 0..10 {
+        match Command::new("hyprctl").args(["binds", "-j"]).output() {
+            Ok(o) => bound = parse_binds(&String::from_utf8_lossy(&o.stdout)),
+            Err(e) => return log::debug!("hyprctl: {e}"),
+        }
+        if !bound.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if bound.is_empty() {
+        return log::warn!("Hyprland lists no key bindings: Sweeflow's streaming keys not bound");
+    }
+    let mods: &[(&str, u32)] = if crate::setup::mac_keys_remapped() { &[("SUPER + ALT", SUPER_ALT), ("CTRL + ALT", CTRL_ALT)] } else { &[("SUPER + ALT", SUPER_ALT)] };
+    let mut binds = String::new();
+    let mut keys = Vec::new();
+    for k in &crate::setup::STREAM_KEYS {
+        let Some(command) = own_command(k.id) else { return };
+        for &(m, mask) in mods {
+            if let Some(by) = bound_by(&bound, mask, k.letter) {
+                log::info!("Hyprland: {m} + {} is bound already ({by}): left alone, not set for \"{}\"", k.letter, k.name);
+                continue;
+            }
+            binds.push_str(&format!(r#"hl.bind("{m} + {}", hl.dsp.exec_cmd("{command}"), {{ description = "{OURS}{}" }}); "#, k.letter, k.name));
+            keys.push(format!("{m} + {} ({})", k.letter, k.name));
+        }
+    }
+    if binds.is_empty() {
+        return;
+    }
+    // Once per Hyprland config, as the open key.
+    let lua = format!("if not sweeflow_stream_keys then sweeflow_stream_keys = true; {binds}end");
+    match Command::new("hyprctl").args(["eval", &lua]).output() {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {
+            log::info!("Hyprland: {}", keys.join(", "));
+            // The menu and panels show them.
+            crate::keys::reread();
+        }
+        Ok(o) => log::warn!("Hyprland didn't take Sweeflow's streaming keys ({lua}): {}", String::from_utf8_lossy(&o.stdout).trim()),
+        Err(e) => log::debug!("hyprctl: {e}"),
+    }
+}
+
+/// Hyprland's modifier masks (`hyprctl binds -j`'s modmask): SUPER (64) + ALT (8), CTRL (4) +
+/// ALT.
+const SUPER_ALT: u32 = 64 | 8;
+const CTRL_ALT: u32 = 4 | 8;
+/// How Sweeflow's own bindings' descriptions start.
+const OURS: &str = "Sweeflow: ";
+const OPEN_NAME: &str = "Open Sweeflow";
+
+/// The keys Hyprland has now for opening Sweeflow, pausing and stopping (as hyprland's modmask
+/// and key): Sweeflow's own bindings (by their descriptions), or one in the user's config that
+/// runs `sweeflow open` / `toggle-pause` / `toggle-stream`. (For showing them.)
+pub fn our_keys() -> [Option<(u32, String)>; 3] {
+    let Ok(o) = Command::new("hyprctl").args(["binds", "-j"]).output() else { return Default::default() };
+    find_ours(&String::from_utf8_lossy(&o.stdout))
+}
+
+fn find_ours(json: &str) -> [Option<(u32, String)>; 3] {
+    let Ok(serde_json::Value::Array(all)) = serde_json::from_str(json) else { return Default::default() };
+    let wanted = [(OPEN_NAME, "open"), (crate::setup::STREAM_KEYS[0].name, crate::setup::STREAM_KEYS[0].id), (crate::setup::STREAM_KEYS[1].name, crate::setup::STREAM_KEYS[1].id)];
+    wanted.map(|(name, arg)| {
+        let described = format!("{OURS}{name}");
+        let runs = |b: &serde_json::Value| {
+            let a = b["arg"].as_str().unwrap_or("");
+            b["dispatcher"].as_str().is_some_and(|d| d.starts_with("exec")) && a.contains("sweeflow") && a.split_whitespace().last() == Some(arg)
+        };
+        // A key that isn't a key (a mouse button, a submap's) doesn't count.
+        let mut ours = all.iter().filter(|b| b["submap"].as_str().unwrap_or("").is_empty() && !b["mouse"].as_bool().unwrap_or(false));
+        ours.find(|b| b["description"].as_str() == Some(described.as_str()) || runs(b))
+            .and_then(|b| Some((b["modmask"].as_u64()? as u32, b["key"].as_str()?.to_string())))
+    })
+}
+
+/// The bindings `hyprctl binds -j` lists, as (modmask, key, description), outside submaps.
+fn parse_binds(json: &str) -> Vec<(u32, String, String)> {
+    let Ok(serde_json::Value::Array(all)) = serde_json::from_str(json) else { return Vec::new() };
+    all.iter()
+        .filter(|b| b["submap"].as_str().unwrap_or("").is_empty() && !b["mouse"].as_bool().unwrap_or(false))
+        .filter_map(|b| {
+            let mask = b["modmask"].as_u64()? as u32;
+            Some((mask, b["key"].as_str()?.to_string(), b["description"].as_str().unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
+/// What else has this key (its description, or "another binding"); None when it's free or
+/// only Sweeflow's own.
+fn bound_by(bound: &[(u32, String, String)], mask: u32, letter: char) -> Option<String> {
+    bound
+        .iter()
+        .find(|b| b.0 == mask && b.1.eq_ignore_ascii_case(&letter.to_string()) && !b.2.starts_with(OURS))
+        .map(|b| if b.2.is_empty() { "another binding".to_string() } else { b.2.clone() })
 }
 
 /// No title bars on Sweeflow's windows. Omarchy draws one on every window of a floating
@@ -313,5 +425,25 @@ mod tests {
         assert!(super::place_rule_lua(26, 0).contains(r#"move = { "(monitor_w-window_w-8)", "34" }"#));
         assert!(super::place_rule_lua(0, 30).contains(r#""(monitor_h-window_h-38)""#));
         assert!(super::place_rule_lua(0, 0).contains(r#""8" }"#));
+    }
+
+    #[test]
+    fn a_key_something_else_has_is_left_alone() {
+        // As Omarchy lists them: SUPER + ALT + K is its tmux keys; a submap's and our own don't count.
+        let json = r#"[
+            {"modmask": 72, "key": "K", "submap": "", "mouse": false, "description": "Tmux keybindings"},
+            {"modmask": 64, "key": "P", "submap": "", "mouse": false, "description": "Pseudo window"},
+            {"modmask": 72, "key": "p", "submap": "resize", "mouse": false, "description": "In a submap"},
+            {"modmask": 12, "key": "P", "submap": "", "mouse": false, "description": "Sweeflow: Pause or resume streaming"},
+            {"modmask": 12, "key": "k", "submap": "", "mouse": false, "description": ""},
+            {"modmask": 72, "key": "mouse:272", "submap": "", "mouse": true, "description": ""}
+        ]"#;
+        let bound = super::parse_binds(json);
+        assert_eq!(bound.len(), 4);
+        assert_eq!(super::bound_by(&bound, super::SUPER_ALT, 'K').as_deref(), Some("Tmux keybindings"));
+        assert_eq!(super::bound_by(&bound, super::SUPER_ALT, 'P'), None);
+        assert_eq!(super::bound_by(&bound, super::CTRL_ALT, 'P'), None);
+        assert_eq!(super::bound_by(&bound, super::CTRL_ALT, 'K').as_deref(), Some("another binding"));
+        assert!(super::parse_binds("not json").is_empty());
     }
 }

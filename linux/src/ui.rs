@@ -2545,6 +2545,19 @@ fn is_open_sweeflow_key(mods: &Modifiers, key: Keysym) -> bool {
     mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::o | Keysym::O)
 }
 
+/// Cmd+Opt+P (pause or resume) and Cmd+Opt+X (stop, or start when stopped), with no other
+/// modifier: the tray's toggle for it (tray::panel_do), as the desktop's shortcuts run it.
+fn stream_toggle_key(mods: &Modifiers, key: Keysym) -> Option<&'static str> {
+    if !(mods.logo && mods.alt && !mods.ctrl && !mods.shift) {
+        return None;
+    }
+    match key {
+        Keysym::p | Keysym::P => Some("pause-toggle"),
+        Keysym::x | Keysym::X => Some("stream-toggle"),
+        _ => None,
+    }
+}
+
 /// Opens the Global menu (`sweeflow menu`, palette.rs): a process of its own, as from the tray.
 fn open_global_menu() {
     run_own("menu", "the Global menu");
@@ -3018,6 +3031,13 @@ impl KeyboardHandler for App {
             // binding gets the key first, see hyprland.rs; elsewhere this is the way while a
             // Mac window has focus).
             run_own("open", "Sweeflow");
+            self.swallowed.push(e.raw_code);
+            return;
+        }
+        if let Some(toggle) = stream_toggle_key(&self.mods, e.keysym) {
+            // Cmd+Opt+P / Cmd+Opt+X, for the same reason. Off this thread: it may wait on the
+            // tray's state.
+            std::thread::spawn(move || crate::tray::panel_do(toggle, ""));
             self.swallowed.push(e.raw_code);
             return;
         }

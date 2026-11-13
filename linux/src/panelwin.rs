@@ -179,6 +179,11 @@ slint::slint! {
         in property <bool> running;
         // The desktop has a place to change keyboard shortcuts (Plasma, GNOME; not Hyprland).
         in property <bool> shortcut-settings;
+        // The keys the desktop has now for opening Sweeflow, pausing and stopping ("⌘⌥P", or as
+        // the desktop writes them; "" for none).
+        in property <string> key-open: "⌘⌥O";
+        in property <string> key-pause: "⌘⌥P";
+        in property <string> key-stop: "⌘⌥X";
         in property <bool> paired;
         in property <string> mac-name;
         in property <string> status;
@@ -613,18 +618,26 @@ slint::slint! {
                 spacing: 7px;
                 Text { text: "Keyboard shortcuts"; color: Look.fg; font-size: 13px; font-weight: 600; }
                 for k in [
-                    { key: "⌘⌥O", what: "Open Sweeflow" },
-                    { key: "⌘⌥P", what: "Pause or resume" },
-                    { key: "⌘⌥X", what: "Stop or start" },
+                    { key: root.key-open, what: "Open Sweeflow" },
+                    { key: root.key-pause, what: "Pause or resume" },
+                    { key: root.key-stop, what: "Stop or start" },
                     { key: "⌘⌥U", what: "Mac app's global menu" },
                 ]: HorizontalLayout {
                     spacing: 10px;
                     Rectangle {
-                        width: 46px;
+                        // Wider for a key written out ("Ctrl+Shift+F5").
+                        width: max(46px, key-text.preferred-width + 12px);
                         height: 20px;
                         border-radius: 5px;
                         background: Look.fg.transparentize(0.9);
-                        Text { text: k.key; color: Look.fg; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                        key-text := Text {
+                            // A shortcut the user removed: none.
+                            text: k.key == "" ? "none" : k.key;
+                            color: k.key == "" ? Look.muted : Look.fg;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
                     }
                     Text { text: k.what; color: Look.fg; font-size: 12px; vertical-alignment: center; overflow: elide; }
                 }
@@ -668,6 +681,16 @@ struct PanelState {
     macs: Vec<Mac>,
     open_at_login: bool,
     square: bool,
+    /// The keys the desktop has now (keys::Keys::json); None from a client before them.
+    keys: Option<ShownKeys>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+struct ShownKeys {
+    open: String,
+    pause: String,
+    stop: String,
 }
 
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
@@ -948,6 +971,11 @@ fn show(ui: &PanelWin, v: &mut View) {
     };
     ui.set_running(true);
     ui.set_shortcut_settings(crate::tray::shortcut_settings_place().is_some());
+    if let Some(k) = &s.keys {
+        ui.set_key_open(k.open.as_str().into());
+        ui.set_key_pause(k.pause.as_str().into());
+        ui.set_key_stop(k.stop.as_str().into());
+    }
     ui.set_paired(s.paired);
     ui.set_mac_name(if s.mac.is_empty() { "Mac".into() } else { s.mac.as_str().into() });
     ui.set_status(s.status.as_str().into());

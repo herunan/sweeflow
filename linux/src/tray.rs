@@ -113,6 +113,8 @@ fn unpaired() -> bool {
 pub fn start() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = REFRESH.set(tx);
+    // The keys the menu and panels show, as the user changes them.
+    crate::keys::watch();
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
@@ -332,6 +334,8 @@ impl ksni::Tray for Tray {
         let actions = stream_actions(standing(&state));
         let elsewhere = state.elsewhere.clone();
         drop(state);
+        // Each item shows the key the desktop has for it now (the user may have changed it).
+        let keys = crate::keys::current();
         // Where streaming stands, and what can be done about it.
         // The status line leads with the same coloured dot the window gives the Mac in use.
         let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, icon_data: dot, ..Default::default() }.into()];
@@ -340,18 +344,30 @@ impl ksni::Tray for Tray {
                 items.push(StandardItem { label: start_hint(other).replace('_', "__"), enabled: false, ..Default::default() }.into());
                 continue;
             }
-            let icon = match action {
-                "pause" => "media-playback-pause-symbolic",
-                "stop" => "media-playback-stop-symbolic",
-                _ => "media-playback-start-symbolic",
+            let key = match action {
+                "pause" | "resume" => &keys.pause,
+                _ => &keys.stop,
             };
             items.push(
-                StandardItem { label: action_label(action).into(), icon_name: menu_icon(icon), activate: Box::new(move |_| panel_do(action, "")), ..Default::default() }
-                    .into(),
+                StandardItem {
+                    label: action_label(action).into(),
+                    shortcut: key.as_ref().map(|k| k.menu()).unwrap_or_default(),
+                    activate: Box::new(move |_| panel_do(action, "")),
+                    ..Default::default()
+                }
+                .into(),
             );
         }
         items.push(MenuItem::Separator);
-        items.push(StandardItem { label: "Open Sweeflow".into(), activate: Box::new(|_| open_panel()), ..Default::default() }.into());
+        items.push(
+            StandardItem {
+                label: "Open Sweeflow".into(),
+                shortcut: keys.open.as_ref().map(|k| k.menu()).unwrap_or_default(),
+                activate: Box::new(|_| open_panel()),
+                ..Default::default()
+            }
+            .into(),
+        );
         // (The Global menu opens with Cmd+Opt+U in a Mac window, on every desktop: no item here.)
         items.push(MenuItem::Separator);
         items.push(
@@ -593,6 +609,19 @@ pub fn can_start(s: Standing) -> bool {
     s.elsewhere.is_none()
 }
 
+/// What a shortcut's toggle (Do "pause-toggle" / "stream-toggle", see `panel_do`) does now: one
+/// of the actions, or None when there's nothing it can do. Pause or resume: Pause while
+/// streaming, Resume while paused, nothing otherwise (stopped, waiting for the Mac). Stop or
+/// start: Start when stopped (if it can be chosen), Stop otherwise (also ends the waiting).
+pub fn toggle_action(toggle: &str, s: Standing) -> Option<&'static str> {
+    match toggle {
+        "pause-toggle" => stream_actions(s).iter().copied().find(|a| matches!(*a, "pause" | "resume")),
+        "stream-toggle" if s.stopped => can_start(s).then_some("start"),
+        "stream-toggle" => Some("stop"),
+        _ => None,
+    }
+}
+
 /// What a Start that can't be chosen says instead.
 pub fn start_hint(_other: &str) -> String {
     "Stop streaming elsewhere first".into()
@@ -707,6 +736,9 @@ pub fn panel_state() -> serde_json::Value {
         "elsewhere": state.elsewhere,
         "canStart": can_start(standing),
         "showAt": state.show_at,
+        // The keys the desktop has now for open / pause / stop (and the Global menu's): as
+        // shown, "" for one with none.
+        "keys": crate::keys::current().json(),
     })
 }
 
@@ -739,6 +771,16 @@ pub fn panel_do(action: &str, arg: &str) {
         "connect" | "disconnect" => set_started(action == "connect"),
         // With the Mac away, applied once it's back.
         "pause" | "resume" => change(|s| s.enabled = action == "resume"),
+        // The shortcuts (Cmd+Opt+P, Cmd+Opt+X): whichever of the above fits now.
+        "pause-toggle" | "stream-toggle" => {
+            let state = STATE.lock().unwrap();
+            let chosen = toggle_action(action, standing(&state));
+            drop(state);
+            match chosen {
+                Some(a) => panel_do(a, ""),
+                None => log::info!("{action}: nothing to do now"),
+            }
+        }
         "show" => {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             STATE.lock().unwrap().show_at = now.as_millis() as u64;
@@ -1083,6 +1125,29 @@ mod tests {
         assert_eq!(stream_actions(Standing { online: Some(false), ..Default::default() }), ["stop"]);
         let labels: Vec<&str> = ["start", "pause", "resume", "stop"].into_iter().map(action_label).collect();
         assert_eq!(labels, ["Start", "Pause", "Resume", "Stop"]);
+    }
+
+    #[test]
+    fn the_shortcuts_toggle_what_fits_now() {
+        let streaming = Standing { connected: true, enabled: true, online: Some(true), ..Default::default() };
+        let paused = Standing { enabled: false, ..streaming };
+        let stopped = Standing { stopped: true, online: Some(true), ..Default::default() };
+        let waiting = Standing { online: Some(false), ..Default::default() };
+        let busy = Standing { stopped: true, elsewhere: Some("box"), ..Default::default() };
+        let started_elsewhere = Standing { elsewhere: Some("box"), online: Some(true), ..Default::default() };
+        assert_eq!(toggle_action("pause-toggle", streaming), Some("pause"));
+        assert_eq!(toggle_action("pause-toggle", Standing { locked: true, ..streaming }), Some("pause"));
+        assert_eq!(toggle_action("pause-toggle", paused), Some("resume"));
+        assert_eq!(toggle_action("pause-toggle", stopped), None);
+        assert_eq!(toggle_action("pause-toggle", waiting), None);
+        assert_eq!(toggle_action("stream-toggle", streaming), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", paused), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", waiting), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", started_elsewhere), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", stopped), Some("start"));
+        // The Mac streams to another computer: it has to be stopped there first.
+        assert_eq!(toggle_action("stream-toggle", busy), None);
+        assert_eq!(toggle_action("show", streaming), None);
     }
 
     #[test]
