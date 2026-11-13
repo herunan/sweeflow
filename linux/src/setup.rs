@@ -352,6 +352,8 @@ fn write_icons(home: &std::path::Path) -> Result<()> {
     let symbolic = home.join(".local/share/icons/hicolor/symbolic/apps");
     std::fs::create_dir_all(&symbolic)?;
     std::fs::write(symbolic.join("sweeflow-symbolic.svg"), TRAY_ICON)?;
+    // The same, translucent: the tray icon while paused or stopped.
+    std::fs::write(symbolic.join("sweeflow-paused-symbolic.svg"), TRAY_ICON.replacen("<g ", "<g opacity=\"0.4\" ", 1))?;
     // Desktops look again at a theme folder when its date changes (a new file deeper in doesn't
     // change it): what `touch` on it does.
     if let Ok(f) = std::fs::File::open(home.join(".local/share/icons/hicolor")) {

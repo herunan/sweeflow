@@ -282,7 +282,9 @@ impl ksni::Tray for Tray {
     /// menu's first line say it): bars that get one draw the pair themselves, in the icons' own
     /// colours instead of theirs (Omarchy's), and not every theme has the emblems.
     fn icon_name(&self) -> String {
-        "sweeflow-symbolic".into()
+        // Solid while streaming, translucent (a second copy of the icon) while paused, stopped or away.
+        let st = standing(&STATE.lock().unwrap());
+        if st.connected && st.enabled && !st.stopped && !st.locked { "sweeflow-symbolic" } else { "sweeflow-paused-symbolic" }.into()
     }
 
     /// Where that icon is, for bars that haven't noticed them in the icon theme (one that

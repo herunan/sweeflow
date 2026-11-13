@@ -177,3 +177,64 @@ export component Spin inherits Rectangle {
         }
     }
 }
+
+// Hover hints. A control that has a hint tells `Tip` where it is while the pointer is over it
+// (Tip.enter / Tip.leave); one TipBubble at the end of the window draws it after a short wait,
+// above everything and kept inside the window. Slint has no tooltips of its own.
+export global Tip {
+    in-out property <string> want;
+    in-out property <length> ax;
+    in-out property <length> ay;
+    in-out property <length> ah;
+
+    public function enter(text: string, x: length, y: length, w: length, h: length) {
+        root.want = text;
+        root.ax = x + w / 2;
+        root.ay = y;
+        root.ah = h;
+    }
+    public function leave() {
+        root.want = "";
+    }
+
+    // What the stream signs (start, pause, resume, stop) do.
+    pure public function stream(id: string) -> string {
+        return id == "start" ? "Start streaming" : id == "pause" ? "Pause streaming" : id == "resume" ? "Resume streaming" : id == "stop" ? "Stop streaming" : "";
+    }
+}
+
+export component TipBubble inherits Rectangle {
+    // The window's size, to keep the bubble inside it.
+    in property <length> bounds-w;
+    in property <length> bounds-h;
+    property <string> w: Tip.want;
+    property <string> ready;
+    property <bool> shown: Tip.want != "" && root.ready == Tip.want;
+    property <length> bw: label.preferred-width + 16px;
+    property <length> bh: 24px;
+    changed w => { if (self.w == "") { self.ready = ""; } }
+
+    Timer {
+        interval: 450ms;
+        running: Tip.want != "" && root.ready != Tip.want;
+        triggered => { root.ready = Tip.want; }
+    }
+
+    visible: root.shown;
+    width: root.bw;
+    height: root.bh;
+    x: max(4px, min(Tip.ax - root.bw / 2, root.bounds-w - root.bw - 4px));
+    y: Tip.ay + Tip.ah + 4px + root.bh > root.bounds-h ? Tip.ay - root.bh - 4px : Tip.ay + Tip.ah + 4px;
+    border-radius: min(Look.radius, 6px);
+    border-width: 1px;
+    border-color: Look.line;
+    background: Look.bg.mix(Look.fg, 0.9);
+    label := Text {
+        x: 8px;
+        text: Tip.want;
+        color: Look.fg;
+        font-size: 12px;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}

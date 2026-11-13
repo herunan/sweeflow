@@ -86,6 +86,9 @@ PlasmoidItem {
     readonly property string statusText: !running ? "Not running" : !paired ? "No Mac linked yet" : st.status || ""
     // The streaming actions, as they're named and drawn.
     readonly property var actionLabels: ({ start: "Start", pause: "Pause", resume: "Resume", stop: "Stop" })
+    // What each sign does, said on hover.
+    readonly property var actionTips: ({ start: "Start streaming", pause: "Pause streaming",
+                                         resume: "Resume streaming", stop: "Stop streaming" })
     readonly property var actionIcons: ({ start: "media-playback-start", pause: "media-playback-pause",
                                           resume: "media-playback-start", stop: "media-playback-stop" })
 
@@ -126,7 +129,7 @@ PlasmoidItem {
             color: Kirigami.Theme.textColor
             active: parent.containsMouse
             // Paused or away: faded, with a small badge saying which.
-            opacity: root.streaming && !root.locked ? 1 : 0.55
+            opacity: root.streaming && !root.locked ? 1 : 0.4
             Kirigami.Icon {
                 visible: !root.streaming || root.locked
                 anchors { right: parent.right; bottom: parent.bottom }
@@ -247,6 +250,7 @@ PlasmoidItem {
                         required property string modelData
                         icon.name: root.actionIcons[modelData] || ""
                         text: root.actionLabels[modelData] || modelData
+                        tip: root.actionTips[modelData] || text
                         onClicked: root.act(modelData)
                     }
                 }
@@ -380,8 +384,8 @@ PlasmoidItem {
                                     PlasmaComponents3.ToolButton {
                                         text: appRow.modelData.pinned ? "Unpin" : "Pin"
                                         onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
-                                        PlasmaComponents3.ToolTip.text: "First in this list"
-                                        PlasmaComponents3.ToolTip.visible: hovered && !appRow.modelData.pinned
+                                        PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin: it stops coming first in this list" : "Pin: it comes first in this list"
+                                        PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
                                     PlasmaComponents3.Switch {
@@ -392,7 +396,7 @@ PlasmoidItem {
                                             root.set({ exclude: exclude });
                                             checked = Qt.binding(() => appRow.shown);
                                         }
-                                        PlasmaComponents3.ToolTip.text: appRow.shown ? "Its windows come here" : "Its windows stay on the Mac"
+                                        PlasmaComponents3.ToolTip.text: appRow.shown ? "Its windows come here. Click to hide them" : "Its windows stay on the Mac. Click to bring them here"
                                         PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
@@ -406,16 +410,6 @@ PlasmoidItem {
                             text: search.text.trim() !== "" ? "No matching apps" : "The Mac's apps show here once it has connected."
                         }
                     }
-                }
-                PlasmaComponents3.Label {
-                    Layout.fillWidth: true
-                    Layout.leftMargin: Kirigami.Units.largeSpacing
-                    Layout.rightMargin: Kirigami.Units.largeSpacing
-                    Layout.bottomMargin: Kirigami.Units.smallSpacing
-                    text: "Pinned apps come first in this list. The switch says whether an app's windows come here."
-                    font: Kirigami.Theme.smallFont
-                    opacity: 0.7
-                    wrapMode: Text.Wrap
                 }
             }
         }
@@ -502,9 +496,9 @@ PlasmoidItem {
             }
         }
 
-        // The linked Macs: each one's name and Online / Not online, and under them its stream
-        // actions (those of its state for the Mac in use; Start, which switches to it, for
-        // another), Rename, and Unlink last.
+        // The linked Macs, one line each: the name (double-click to rename), an icon saying
+        // whether it is online, its stream actions (those of its state for the Mac in use; Start,
+        // which switches to it, for another) and Unlink.
         Component {
             id: macsPage
             ColumnLayout {
@@ -536,64 +530,62 @@ PlasmoidItem {
                             contentItem: Item {
                                 implicitHeight: Math.max(lines.implicitHeight, renaming.implicitHeight, asking.implicitHeight)
 
-                                // Two lines: the Mac and its status, then what can be done with it
-                                // (side by side they left the name no room).
-                                ColumnLayout {
+                                // One line: the Mac (double-click the name to rename it), whether
+                                // it can be reached, then the stream signs and Unlink.
+                                RowLayout {
                                     id: lines
                                     anchors.fill: parent
                                     visible: !mac.editing && !mac.confirming
                                     spacing: Kirigami.Units.smallSpacing
-                                    RowLayout {
-                                        spacing: Kirigami.Units.smallSpacing * 2
-                                        // Filled: the Mac in use.
-                                        Rectangle {
-                                            id: inUse
-                                            implicitWidth: Kirigami.Units.smallSpacing * 2
-                                            implicitHeight: implicitWidth
-                                            radius: width / 2
-                                            color: mac.modelData.active ? Kirigami.Theme.highlightColor : "transparent"
-                                            border.width: mac.modelData.active ? 0 : 1
-                                            border.color: Kirigami.Theme.disabledTextColor
+                                    PlasmaComponents3.Label {
+                                        text: mac.modelData.name
+                                        font.bold: mac.modelData.active
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                        Layout.leftMargin: Kirigami.Units.smallSpacing
+                                        MouseArea {
+                                            id: nameArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            onDoubleClicked: { root.confirmingMac = ""; root.editingMac = mac.modelData.fingerprint; }
                                         }
-                                        PlasmaComponents3.Label {
-                                            text: mac.modelData.name
-                                            font.bold: mac.modelData.active
-                                            elide: Text.ElideRight
-                                            Layout.fillWidth: true
-                                        }
-                                        // A status, never an action.
-                                        PlasmaComponents3.Label {
-                                            visible: mac.modelData.online !== null
-                                            text: mac.modelData.online ? "Online" : "Not online"
-                                            font: Kirigami.Theme.smallFont
-                                            opacity: 0.7
+                                        PlasmaComponents3.ToolTip.text: "Double-click to rename"
+                                        PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
+                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                    }
+                                    // A status, never an action; nothing until it is known.
+                                    Kirigami.Icon {
+                                        visible: mac.modelData.online !== null
+                                        source: mac.modelData.online ? "network-wireless-signal-good-symbolic" : "network-wireless-disconnected-symbolic"
+                                        color: mac.modelData.online ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
+                                        isMask: true
+                                        implicitWidth: Kirigami.Units.iconSizes.small
+                                        implicitHeight: implicitWidth
+                                        Layout.preferredWidth: implicitWidth
+                                        Layout.preferredHeight: implicitHeight
+                                        HoverHandler { id: onlineHover }
+                                        PlasmaComponents3.ToolTip.text: mac.modelData.online ? "Online" : "Not online"
+                                        PlasmaComponents3.ToolTip.visible: onlineHover.hovered
+                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                    }
+                                    Repeater {
+                                        model: mac.modelData.active ? root.streamActions : ["start"]
+                                        delegate: SignButton {
+                                            required property string modelData
+                                            icon.name: root.actionIcons[modelData] || ""
+                                            text: root.actionLabels[modelData] || modelData
+                                            tip: mac.modelData.active ? root.actionTips[modelData] : "Start streaming from this Mac"
+                                            onClicked: mac.modelData.active ? root.act(modelData) : root.act("switch", mac.modelData.fingerprint)
                                         }
                                     }
-                                    RowLayout {
-                                        // Under the name.
-                                        Layout.leftMargin: inUse.width + Kirigami.Units.smallSpacing * 2
-                                        spacing: Kirigami.Units.smallSpacing
-                                        Repeater {
-                                            model: mac.modelData.active ? root.streamActions : ["start"]
-                                            delegate: SignButton {
-                                                required property string modelData
-                                                icon.name: root.actionIcons[modelData] || ""
-                                                text: root.actionLabels[modelData] || modelData
-                                                tip: mac.modelData.active ? text : "Start: stream from this Mac instead"
-                                                onClicked: mac.modelData.active ? root.act(modelData) : root.act("switch", mac.modelData.fingerprint)
-                                            }
-                                        }
-                                        PlasmaComponents3.ToolButton {
-                                            icon.name: "edit-rename"
-                                            text: "Rename"
-                                            onClicked: { root.confirmingMac = ""; root.editingMac = mac.modelData.fingerprint; }
-                                        }
-                                        PlasmaComponents3.ToolButton {
-                                            icon.name: "edit-delete-remove"
-                                            text: "Unlink"
-                                            onClicked: { root.editingMac = ""; root.confirmingMac = mac.modelData.fingerprint; }
-                                        }
-                                        Item { Layout.fillWidth: true }
+                                    PlasmaComponents3.ToolButton {
+                                        icon.name: "edit-delete-remove"
+                                        text: "Unlink"
+                                        display: QQC2.AbstractButton.IconOnly
+                                        onClicked: { root.editingMac = ""; root.confirmingMac = mac.modelData.fingerprint; }
+                                        PlasmaComponents3.ToolTip.text: "Unlink this Mac"
+                                        PlasmaComponents3.ToolTip.visible: hovered
+                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
                                 }
 

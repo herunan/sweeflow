@@ -16,7 +16,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 slint::slint! {
     import { ScrollView } from "std-widgets.slint";
-    import { Look, Label, Dim, Btn, Field, Sign } from "look.slint";
+    import { Look, Label, Dim, Btn, Field, Sign, Tip, TipBubble } from "look.slint";
     export { Look }
 
     export struct AppRow { id: string, name: string, icon: image, has-icon: bool, initial: string, running: bool, pinned: bool, shown: bool, heading: string }
@@ -31,6 +31,8 @@ slint::slint! {
         in property <bool> danger;
         // A drawn sign instead of the text (see Sign); the text stays as the accessible name.
         in property <string> sign;
+        // Shown when the pointer rests on it.
+        in property <string> tip;
         callback clicked;
         height: 26px;
         width: root.sign != "" ? 34px : max(44px, label.preferred-width + 18px);
@@ -46,7 +48,10 @@ slint::slint! {
         touch := TouchArea {
             enabled: root.enabled;
             mouse-cursor: pointer;
-            clicked => { root.clicked(); }
+            clicked => { Tip.leave(); root.clicked(); }
+            changed has-hover => {
+                if (self.has-hover && root.tip != "") { Tip.enter(root.tip, root.absolute-position.x, root.absolute-position.y, root.width, root.height); } else { Tip.leave(); }
+            }
         }
         label := Text {
             visible: root.sign == "";
@@ -67,6 +72,7 @@ slint::slint! {
     component Switch inherits Rectangle {
         in property <bool> on;
         in property <bool> enabled: true;
+        in property <string> tip;
         callback toggled;
         width: 36px;
         height: 20px;
@@ -92,6 +98,39 @@ slint::slint! {
             enabled: root.enabled;
             mouse-cursor: pointer;
             clicked => { root.toggled(); }
+            changed has-hover => {
+                if (self.has-hover && root.tip != "") { Tip.enter(root.tip, root.absolute-position.x, root.absolute-position.y, root.width, root.height); } else { Tip.leave(); }
+            }
+        }
+    }
+
+    // Whether a Mac can be reached, as a signal icon: bars in the accent colour, or dimmed and
+    // struck through.
+    component Signal inherits Rectangle {
+        in property <string> state;
+        width: 16px;
+        height: 14px;
+        property <color> ink: root.state == "online" ? Look.accent : Look.muted;
+        Rectangle { x: 1px; y: 8px; width: 3px; height: 5px; background: root.ink; border-radius: 1px; }
+        Rectangle { x: 6px; y: 4px; width: 3px; height: 9px; background: root.ink; border-radius: 1px; }
+        Rectangle { x: 11px; y: 0px; width: 3px; height: 13px; background: root.ink; border-radius: 1px; }
+        if root.state == "offline": Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 16;
+            viewbox-height: 14;
+            commands: "M 1 13 L 15 1";
+            stroke: Look.bg;
+            stroke-width: 4px;
+        }
+        if root.state == "offline": Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 16;
+            viewbox-height: 14;
+            commands: "M 1 13 L 15 1";
+            stroke: Look.muted;
+            stroke-width: 1.5px;
         }
     }
 
@@ -106,7 +145,7 @@ slint::slint! {
         accessible-action-default => { root.clicked(); }
         TouchArea {
             mouse-cursor: pointer;
-            clicked => { root.clicked(); }
+            clicked => { Tip.leave(); root.clicked(); }
         }
         Text {
             text: root.text;
@@ -237,7 +276,7 @@ slint::slint! {
                         horizontal-stretch: 0;
                         for a in root.actions: VerticalLayout {
                             alignment: center;
-                            Chip { text: a.label; sign: a.id; clicked => { root.act(a.id, ""); } }
+                            Chip { text: a.label; sign: a.id; tip: Tip.stream(a.id); clicked => { root.act(a.id, ""); } }
                         }
                     }
                 }
@@ -315,15 +354,15 @@ slint::slint! {
                                             }
                                             if a.running: VerticalLayout {
                                                 alignment: center;
-                                                Chip { text: "Quit"; clicked => { root.act("quit-app", a.id); } }
+                                                Chip { text: "Quit"; tip: "Quit this app on the Mac"; clicked => { root.act("quit-app", a.id); } }
                                             }
                                             VerticalLayout {
                                                 alignment: center;
-                                                Chip { text: a.pinned ? "Unpin" : "Pin"; clicked => { root.pin(a.id, !a.pinned); } }
+                                                Chip { text: a.pinned ? "Unpin" : "Pin"; tip: a.pinned ? "Unpin: it stops coming first in this list" : "Pin: it comes first in this list"; clicked => { root.pin(a.id, !a.pinned); } }
                                             }
                                             VerticalLayout {
                                                 alignment: center;
-                                                Switch { on: a.shown; toggled => { root.show-app(a.id, !a.shown); } }
+                                                Switch { on: a.shown; tip: a.shown ? "Its windows come here. Click to hide them" : "Its windows stay on the Mac. Click to bring them here"; toggled => { root.show-app(a.id, !a.shown); } }
                                             }
                                         }
                                     }
@@ -331,7 +370,6 @@ slint::slint! {
                             }
                         }
                     }
-                    Dim { text: "Pinned apps come first in this list. The switch says whether an app's windows come here."; font-size: 11px; }
                 }
 
                 // Settings, every one a switch.
@@ -408,9 +446,7 @@ slint::slint! {
                             padding-right: 12px;
                             spacing: 2px;
                             for m in root.macs: Row {
-                                // Two lines: the Mac and its status, then what can be done with it (side
-                                // by side they left the name no room).
-                                height: 68px;
+                                height: 40px;
                                 clickable: false;
                                 if root.editing == m.fingerprint: HorizontalLayout {
                                     padding-left: 6px;
@@ -439,53 +475,65 @@ slint::slint! {
                                     VerticalLayout { alignment: center; Chip { text: "Unlink"; danger: true; clicked => { root.confirming = ""; root.act("forget", m.fingerprint); } } }
                                     VerticalLayout { alignment: center; Chip { text: "Cancel"; clicked => { root.confirming = ""; } } }
                                 }
-                                if root.editing != m.fingerprint && root.confirming != m.fingerprint: VerticalLayout {
+                                // One line: the Mac (double-click the name to rename it), whether it
+                                // can be reached, then the stream signs and Unlink.
+                                if root.editing != m.fingerprint && root.confirming != m.fingerprint: HorizontalLayout {
                                     padding-left: 10px;
-                                    padding-right: 6px;
-                                    padding-top: 7px;
-                                    padding-bottom: 7px;
-                                    spacing: 6px;
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        VerticalLayout {
-                                            alignment: center;
-                                            Rectangle {
-                                                width: 8px;
-                                                height: 8px;
-                                                border-radius: 4px;
-                                                background: m.active ? Look.accent : transparent;
-                                                border-width: m.active ? 0px : 1px;
-                                                border-color: Look.line;
-                                            }
-                                        }
+                                    padding-right: 4px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        min-width: 30px;
                                         Text {
+                                            width: parent.width;
+                                            height: parent.height;
                                             text: m.name;
                                             color: Look.fg;
                                             font-size: 13px;
                                             font-weight: m.active ? 600 : 400;
                                             overflow: elide;
                                             vertical-alignment: center;
-                                            horizontal-stretch: 1;
                                         }
-                                        // A status, never an action.
-                                        Text { text: m.online; color: Look.muted; font-size: 11px; vertical-alignment: center; horizontal-stretch: 0; }
-                                    }
-                                    HorizontalLayout {
-                                        padding-left: 16px;
-                                        spacing: 4px;
-                                        alignment: start;
-                                        // Start, pause, resume and stop as the signs a player uses.
-                                        if m.active: HorizontalLayout {
-                                            spacing: 4px;
-                                            for a in root.actions: Chip {
-                                                text: a.label;
-                                                sign: a.id;
-                                                clicked => { root.act(a.id, ""); }
+                                        TouchArea {
+                                            double-clicked => { Tip.leave(); root.confirming = ""; root.editing = m.fingerprint; }
+                                            changed has-hover => {
+                                                if (self.has-hover) { Tip.enter("Double-click to rename", self.absolute-position.x, self.absolute-position.y, self.width, self.height); } else { Tip.leave(); }
                                             }
                                         }
-                                        if !m.active: Chip { text: "Start"; sign: "start"; clicked => { root.act("switch", m.fingerprint); } }
-                                        Chip { text: "Rename"; clicked => { root.confirming = ""; root.editing = m.fingerprint; } }
-                                        Chip { text: "Unlink"; clicked => { root.editing = ""; root.confirming = m.fingerprint; } }
+                                    }
+                                    // A status, never an action; nothing until it is known.
+                                    if m.online != "": VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 0;
+                                        Rectangle {
+                                            width: 16px;
+                                            height: 14px;
+                                            Signal { state: m.online; }
+                                            TouchArea {
+                                                changed has-hover => {
+                                                    if (self.has-hover) { Tip.enter(m.online == "online" ? "Online" : "Not online", self.absolute-position.x, self.absolute-position.y, self.width, self.height); } else { Tip.leave(); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Start, pause, resume and stop as the signs a player uses.
+                                    if m.active: HorizontalLayout {
+                                        spacing: 4px;
+                                        horizontal-stretch: 0;
+                                        for a in root.actions: VerticalLayout {
+                                            alignment: center;
+                                            Chip { text: a.label; sign: a.id; tip: Tip.stream(a.id); clicked => { root.act(a.id, ""); } }
+                                        }
+                                    }
+                                    if !m.active: VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 0;
+                                        Chip { text: "Start"; sign: "start"; tip: "Start streaming from this Mac"; clicked => { root.act("switch", m.fingerprint); } }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 0;
+                                        Chip { text: "Unlink"; tip: "Unlink this Mac"; clicked => { root.editing = ""; root.confirming = m.fingerprint; } }
                                     }
                                 }
                             }
@@ -522,6 +570,8 @@ slint::slint! {
                 }
             }
         }
+
+        TipBubble { bounds-w: root.width; bounds-h: root.height; }
     }
 }
 
@@ -589,11 +639,11 @@ fn parse_state(json: &str) -> Option<PanelState> {
     serde_json::from_str(json).inspect_err(|e| log::warn!("Sweeflow's state: {e}")).ok()
 }
 
-/// Online / Not online, a status only: nothing while not known yet.
+/// "online" / "offline" for the Mac's icon (the window words it in a hint): "" while not known yet.
 fn online_text(online: Option<bool>) -> &'static str {
     match online {
-        Some(true) => "Online",
-        Some(false) => "Not online",
+        Some(true) => "online",
+        Some(false) => "offline",
         None => "",
     }
 }
@@ -1026,8 +1076,8 @@ mod tests {
         assert_eq!(s.apps[1], App { id: "com.apple.Safari".into(), name: "Safari".into(), icon: "file:///nowhere/safari.png".into(), state: 3, pinned: false });
         assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true) });
         assert_eq!(s.macs[1].online, None);
-        assert_eq!(s.macs.iter().map(|m| online_text(m.online)).collect::<Vec<_>>(), ["Online", ""]);
-        assert_eq!(online_text(Some(false)), "Not online");
+        assert_eq!(s.macs.iter().map(|m| online_text(m.online)).collect::<Vec<_>>(), ["online", ""]);
+        assert_eq!(online_text(Some(false)), "offline");
         assert!(s.open_at_login && !s.square);
     }
 
