@@ -328,7 +328,8 @@ slint::slint! {
                     }
                 }
                 Label {
-                    text: code-note != "" ? code-note : code-ready ? "It's in a window on " + mac-name + "." : "";
+                    // Only news here (a wrong code, the Mac stopped it): the title already says where the code is.
+                    text: code-note;
                     color: code-wrong ? Look.danger : Look.muted;
                     horizontal-alignment: center;
                 }
@@ -550,7 +551,10 @@ fn start_link(ui: &Wizard, mac: FoundMac) {
     ui.set_code_wrong(false);
     let (codes_tx, mut codes) = mpsc::unbounded_channel();
     CODES.with_borrow_mut(|c| *c = Some(codes_tx));
-    ui.set_mac_name(mac.name.clone().into());
+    // A Mac typed in by address is called by its address until it answers with its name
+    // (when linked): "your Mac" reads better than an IP address meanwhile.
+    let typed = mac.name.parse::<std::net::IpAddr>().is_ok() || mac.name == "localhost" || mac.name.contains(':');
+    ui.set_mac_name(if typed { "your Mac".into() } else { mac.name.clone().into() });
     ui.set_error(SharedString::new());
     ui.set_page(2);
     let attempt = ATTEMPT.with_borrow(|a| *a);

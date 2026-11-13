@@ -392,7 +392,8 @@ final class CodeWindow: NSObject {
         let digits = NSTextField(labelWithString: code.map(String.init).joined(separator: " "))
         digits.font = .monospacedDigitSystemFont(ofSize: 48, weight: .semibold)
         digits.alignment = .center
-        note.stringValue = "It works once, for linking \(name) to this Mac."
+        // Said once, in the title; the note is for how it ended (wrong codes, expired, linked).
+        note.stringValue = ""
         note.alignment = .center
         note.textColor = .secondaryLabelColor
         note.preferredMaxLayoutWidth = 300

@@ -869,6 +869,9 @@ impl App {
         // and whatever Hyprland has no binding for still reaches the Mac. `SWEEFLOW_KEYS=mac`
         // gives the Mac everything there too.
         let desktop_keys_win = crate::hyprland::running() && std::env::var("SWEEFLOW_KEYS").as_deref() != Ok("mac");
+        if matches!(role, Role::Toplevel(_)) && !desktop_keys_win {
+            gnome_allow_shortcuts(&info.bundle_id);
+        }
         let inhibitor = match (&role, &self.inhibit_mgr, &self.seat) {
             (Role::Toplevel(_), Some(m), Some(seat)) if !desktop_keys_win => Some(m.inhibit_shortcuts(&base, seat, qh, ())),
             _ => None,
@@ -2415,6 +2418,44 @@ fn shown_part(content: (u32, u32), px_per_pt: f64, window: (u32, u32), s: f64) -
 /// app that sizes itself in its own steps (Terminal's character cells) lands a point or two off
 /// the size asked, and its corners stay rounded.
 const SLIVER: f64 = 2.0;
+
+/// GNOME asks "Allow inhibiting shortcuts?" the first time each app's window wants the
+/// keyboard's shortcuts, and every Mac app is an app of its own there: one prompt per Mac app.
+/// The answer is kept in the permission store (what its Allow button writes), so Sweeflow writes
+/// it for its own Mac windows before asking. Once per app per run; only on GNOME.
+fn gnome_allow_shortcuts(bundle_id: &str) {
+    static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME")) {
+        return;
+    }
+    {
+        let mut done = DONE.lock().unwrap();
+        if done.iter().any(|b| b == bundle_id) {
+            return;
+        }
+        done.push(bundle_id.to_string());
+    }
+    let app = format!("sweeflow-{bundle_id}");
+    // Before the window asks (a few ms, once per app): on a thread it lost the race.
+    {
+        static BUS: std::sync::OnceLock<Option<zbus::blocking::Connection>> = std::sync::OnceLock::new();
+        let Some(bus) = BUS.get_or_init(|| zbus::blocking::Connection::session().ok()) else { return };
+        // GNOME looks it up by the app's desktop entry; the bare app id covers a window it
+        // couldn't match to one.
+        for id in [format!("{app}.desktop"), app.clone()] {
+            let r = bus.call_method(
+                Some("org.freedesktop.impl.portal.PermissionStore"),
+                "/org/freedesktop/impl/portal/PermissionStore",
+                Some("org.freedesktop.impl.portal.PermissionStore"),
+                "SetPermission",
+                &("gnome", true, "shortcuts-inhibitor", id.as_str(), vec!["GRANTED"]),
+            );
+            if let Err(e) = r {
+                log::debug!("permission store: {e}");
+            }
+        }
+    }
+}
 
 /// Smallest a Mac window gets here, unless its app is known to need more.
 const MIN_SIZE: (u32, u32) = (100, 60);
