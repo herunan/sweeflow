@@ -252,7 +252,7 @@ struct Win {
     /// fitted into a Hyprland tile (`fitted`).
     fit: (f64, f64, f64),
     /// Tiled on Hyprland with a picture that isn't the tile's size (the Mac hasn't followed yet,
-    /// or can't): the picture is drawn scaled to fit, centred on a dark base, at this size
+    /// or can't): the picture is drawn scaled to fit, centred, the rest see-through, at this size
     /// (logical px). None: drawn 1:1 from the window's corner.
     fitted: Option<(i32, i32)>,
     /// Hyprland gave the tile a new size the Mac hasn't been asked for yet, and when (arm_settle).
@@ -1270,9 +1270,11 @@ impl App {
             t.xdg_surface().set_window_geometry(0, 0, bw as i32, bh as i32);
         }
         let base = w.base();
-        // Transparent: the window's rounded corners must show the desktop behind them. The
-        // display view is letterboxed: dark bars. So is a picture fitted into a Hyprland tile.
-        let fill = if w.display || w.fitted.is_some() { &self.background } else { &self.clear };
+        // Transparent: the window's rounded corners must show the desktop behind them, and so
+        // must the strips beside a picture fitted into a Hyprland tile (an app that goes no
+        // smaller than its tile looks like a smaller window in it). The display view is
+        // letterboxed: dark bars.
+        let fill = if w.display { &self.background } else { &self.clear };
         base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -1425,6 +1427,14 @@ impl App {
         let s = self.scale;
         let (bw, bh) = w.size;
         let px_per_pt = px_per_pt(reported, fw, w.info.w, s);
+        // Never more of the frame than the Mac window itself: right after it shrinks, the capture
+        // is still its old size and macOS fills the rest with black. Beyond the window there's
+        // nothing to show, so it stays see-through, like the rest of the window here.
+        let (fw, fh) = if w.info.w > 0.0 && w.info.h > 0.0 && !w.display {
+            (fw.min((w.info.w as f64 * px_per_pt).round() as u32).max(1), fh.min((w.info.h as f64 * px_per_pt).round() as u32).max(1))
+        } else {
+            (fw, fh)
+        };
         // In a Hyprland tile the picture is fitted instead while it isn't the tile's size: all
         // of it, scaled, in the middle of the tile. Everything below is placed by the scaled
         // sizes, so the strips, corner tiles and lights go with it.
