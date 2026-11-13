@@ -462,7 +462,7 @@ PlasmoidItem {
                     // Plasma only: the other desktops have no menu bar to put the menus in.
                     ToggleRow {
                         visible: !!root.placement.plasma
-                        label: "Global Menu"
+                        label: "Global menu widget"
                         hint: "The Mac apps' menus at the top of the screen"
                         on: !!root.placement.globalMenu
                         onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
