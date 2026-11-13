@@ -169,6 +169,8 @@ final class HostState {
     private var mutedByUs = false
 
     init() {
+        // Hidden by a run that ended without putting it back (a crash, a forced quit).
+        DockHider.restore()
         NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: .main) { [weak self] _ in
             self?.apply()
         }
@@ -189,6 +191,7 @@ final class HostState {
         teardown?.cancel()
         BuiltInScreen.setConnected(true)
         undimForGood()
+        DockHider.hide()
         apply()
     }
 
@@ -209,6 +212,7 @@ final class HostState {
             guard let self, self.sessions == 0 else { return }
             log("no client: removing virtual display, allowing sleep")
             self.display.remove()
+            DockHider.restore()
             self.wake.release()
             self.wake.releaseReachable()
             self.setMuted(false)
