@@ -179,6 +179,7 @@ pub fn install() -> Result<()> {
     write_icons(&home)?;
     run(&["restart", "sweeflow.service"])?;
     install_icon_and_widget(&home)?;
+    register_open_key(&home);
     install_mac_dmg(&home)?;
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
@@ -398,4 +399,308 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
         println!("    (couldn't add the Sweeflow widget to the system tray: add it from the tray's settings)");
     }
     Ok(())
+}
+
+/// Cmd+Opt+O (Super+Alt+O) opens Sweeflow from any window: the desktop's own shortcut for
+/// `sweeflow open`, on Plasma and GNOME. (Hyprland has its binding, hyprland.rs, and while a Mac
+/// window has the focus the key is caught there on every desktop, ui.rs.)
+///
+/// Set once, and only while nothing else has the key. After that it is the user's: a note in
+/// the config folder says it was done, so a later install doesn't bring back a shortcut they
+/// changed or removed (delete the note to have it set again).
+fn register_open_key(home: &std::path::Path) {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let (note, key, set): (&str, &str, fn(&std::path::Path) -> Result<OpenKey>) = if desktop.contains("KDE") {
+        ("open-key.kde", PLASMA_KEY, plasma_open_key)
+    } else if desktop.contains("GNOME") {
+        ("open-key.gnome", "Super+Alt+O", gnome_open_key)
+    } else {
+        return;
+    };
+    let note = config::dir().join(note);
+    if note.exists() {
+        return;
+    }
+    match set(home) {
+        Ok(OpenKey::Set { now: true }) => println!("    {key} opens Sweeflow from any window"),
+        // No note yet: the next install looks again whether it is still there.
+        Ok(OpenKey::Set { now: false }) => return println!("    {key} opens Sweeflow from any window, from the next login"),
+        Ok(OpenKey::Kept) => {}
+        Ok(OpenKey::Taken(by)) => return println!("    ({key} is already used by {by}: no shortcut set for opening Sweeflow)"),
+        Err(e) => return println!("    (couldn't set {key} to open Sweeflow: {e:#})"),
+    }
+    let _ = std::fs::create_dir_all(config::dir());
+    let _ = std::fs::write(note, format!("{key}\n"));
+}
+
+/// How setting the desktop's shortcut went.
+enum OpenKey {
+    /// Ours now; `now`: it works already, without logging in again.
+    Set { now: bool },
+    /// Sweeflow's shortcut was there already, with our key or one the user gave it: left alone.
+    Kept,
+    /// Something else has the key (its name): left alone.
+    Taken(String),
+}
+
+const PLASMA_KEY: &str = "Meta+Alt+O";
+/// The same key as Qt counts it (Qt::META | Qt::ALT | Qt::Key_O): how KGlobalAccel is asked.
+const PLASMA_KEY_CODE: i32 = 0x1000_0000 | 0x0800_0000 | 0x4f;
+/// The app menu entry (see `write_launcher`): the shortcut is its "launch" action.
+const LAUNCHER: &str = "sweeflow.desktop";
+
+/// A call to Plasma's shortcut service (KGlobalAccel; inside KWin on Wayland).
+fn kglobalaccel<B>(bus: &zbus::blocking::Connection, method: &str, body: &B) -> zbus::Result<zbus::Message>
+where
+    B: serde::Serialize + zvariant::DynamicType,
+{
+    bus.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), method, body)
+}
+
+/// Plasma 6 keeps an application's shortcuts by its desktop file: kglobalshortcutsrc, group
+/// [services][sweeflow.desktop], key _launch. It reads that file when the session starts, so
+/// the running shortcut service is told too, the way System Settings adds an application.
+fn plasma_open_key(_home: &std::path::Path) -> Result<OpenKey> {
+    let entry = ["--file", "kglobalshortcutsrc", "--group", "services", "--group", LAUNCHER, "--key", "_launch"];
+    let there = Command::new("kreadconfig6").args(entry).output().context("kreadconfig6")?;
+    // Ours from an earlier install, the user's own key, or "none" (they took the key away).
+    if !String::from_utf8_lossy(&there.stdout).trim().is_empty() {
+        return Ok(OpenKey::Kept);
+    }
+    // A key sequence on D-Bus: up to four keys, the unused ones 0.
+    let key = (vec![PLASMA_KEY_CODE, 0, 0, 0],);
+    let bus = zbus::blocking::Connection::session()?;
+    let free: bool = kglobalaccel(&bus, "globalShortcutAvailable", &(&key, LAUNCHER))?.body().deserialize()?;
+    if !free {
+        // (action, its name, component, its name, context, its name, keys, default keys);
+        // 0: the shortcuts with exactly this key.
+        type Info = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
+        let by = kglobalaccel(&bus, "globalShortcutsByKey", &(&key, (0i32,)))
+            .and_then(|r| r.body().deserialize::<Vec<Info>>())
+            .ok()
+            .and_then(|all| all.into_iter().next())
+            .map(|i| if i.1 == i.3 { i.3 } else { format!("{} ({})", i.3, i.1) })
+            .unwrap_or_else(|| "another shortcut".into());
+        return Ok(OpenKey::Taken(by));
+    }
+    let wrote = Command::new("kwriteconfig6").args(entry).arg(PLASMA_KEY).status().context("kwriteconfig6")?;
+    anyhow::ensure!(wrote.success(), "kwriteconfig6 failed");
+
+    // Now, for this session. The shortcut service finds the launcher in the applications
+    // cache, which is brought up to date first (the launcher may have been written a moment
+    // ago). Then, as System Settings does it: registering an action with no name makes the
+    // service read the launcher (it does nothing if it can't find it), that action is dropped
+    // again, and the launch action is given the key.
+    let _ = Command::new("kbuildsycoca6").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let action = |action: &'static str, name: &'static str| vec![LAUNCHER, action, "Sweeflow", name];
+    let launch = action("_launch", "Sweeflow");
+    let told = || -> zbus::Result<bool> {
+        kglobalaccel(&bus, "doRegister", &(action("", ""),))?;
+        kglobalaccel(&bus, "unregister", &(LAUNCHER, ""))?;
+        kglobalaccel(&bus, "setForeignShortcutKeys", &(&launch, vec![&key]))?;
+        let keys: Vec<(Vec<i32>,)> = kglobalaccel(&bus, "shortcutKeys", &(&launch,))?.body().deserialize()?;
+        Ok(keys.iter().any(|k| k.0.first() == Some(&PLASMA_KEY_CODE)))
+    };
+    let now = told().unwrap_or_else(|e| {
+        log::warn!("telling Plasma about {PLASMA_KEY}: {e}");
+        false
+    });
+    Ok(OpenKey::Set { now })
+}
+
+const GNOME_KEYS: &str = "org.gnome.settings-daemon.plugins.media-keys";
+/// Where Sweeflow's custom shortcut is kept (the ones made in GNOME's Settings are custom0,
+/// custom1…).
+const GNOME_KEY_PATH: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sweeflow/";
+const GNOME_KEY: &str = "<Super><Alt>o";
+
+fn gsettings(args: &[&str]) -> Result<String> {
+    let out = Command::new("gsettings").args(args).stderr(Stdio::null()).output().context("gsettings")?;
+    anyhow::ensure!(out.status.success(), "gsettings {} failed", args.join(" "));
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A custom shortcut as GNOME's Settings → Keyboard makes them: its name, command and key under
+/// a path of its own, and that path in the list of custom shortcuts. GNOME takes it up at once.
+fn gnome_open_key(home: &std::path::Path) -> Result<OpenKey> {
+    let list = gsettings(&["get", GNOME_KEYS, "custom-keybindings"])?;
+    let paths = quoted(&list);
+    // Ours from an earlier install, whatever key the user has given it since.
+    if paths.iter().any(|p| p == GNOME_KEY_PATH) {
+        return Ok(OpenKey::Kept);
+    }
+    // Who else has the key: another custom shortcut, or one of GNOME's own (every setting is
+    // looked at: a key is written the same way wherever it is kept).
+    for path in &paths {
+        let other = format!("{GNOME_KEYS}.custom-keybinding:{path}");
+        if gsettings(&["get", &other, "binding"]).is_ok_and(|b| binds(&b, GNOME_KEY)) {
+            let name = gsettings(&["get", &other, "name"]).ok().and_then(|n| quoted(&n).into_iter().next());
+            return Ok(OpenKey::Taken(name.filter(|n| !n.is_empty()).unwrap_or_else(|| "another custom shortcut".into())));
+        }
+    }
+    for line in gsettings(&["list-recursively"])?.lines() {
+        // "schema key value"
+        let mut words = line.splitn(3, ' ');
+        if let (Some(_), Some(name), Some(value)) = (words.next(), words.next(), words.next()) {
+            if binds(value, GNOME_KEY) {
+                return Ok(OpenKey::Taken(name.to_string()));
+            }
+        }
+    }
+    // The shortcut first, then its place in the list, so GNOME never sees half of it.
+    let ours = format!("{GNOME_KEYS}.custom-keybinding:{GNOME_KEY_PATH}");
+    let command = format!("{} open", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
+    gsettings(&["set", &ours, "name", &gvariant_str("Sweeflow")])?;
+    gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
+    gsettings(&["set", &ours, "binding", &gvariant_str(GNOME_KEY)])?;
+    if let Some(list) = with_path(&list, GNOME_KEY_PATH) {
+        gsettings(&["set", GNOME_KEYS, "custom-keybindings", &list])?;
+    }
+    Ok(OpenKey::Set { now: true })
+}
+
+/// The strings in a value as gsettings prints it: `['a', 'b']`, `'a'`, or `@as []` (none).
+fn quoted(value: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\'' && c != '"' {
+            continue;
+        }
+        let mut text = String::new();
+        while let Some(d) = chars.next() {
+            match d {
+                '\\' => text.extend(chars.next()),
+                d if d == c => break,
+                d => text.push(d),
+            }
+        }
+        found.push(text);
+    }
+    found
+}
+
+/// A string as gsettings takes it.
+fn gvariant_str(text: &str) -> String {
+    format!("'{}'", text.replace('\\', r"\\").replace('\'', r"\'"))
+}
+
+/// The list of custom shortcuts with ours added at the end, the others as they were. None when
+/// it is in the list already.
+fn with_path(list: &str, path: &str) -> Option<String> {
+    let mut paths = quoted(list);
+    if paths.iter().any(|p| p == path) {
+        return None;
+    }
+    paths.push(path.to_string());
+    Some(format!("[{}]", paths.iter().map(|p| gvariant_str(p)).collect::<Vec<_>>().join(", ")))
+}
+
+/// A GNOME key ("<Super><Alt>o") as its modifiers in a fixed order and its key, however it was
+/// written: any order, any case, Mod4 for Super, Mod1 for Alt, Primary for Control. None for
+/// text that isn't a key.
+fn gnome_key(text: &str) -> Option<(Vec<String>, String)> {
+    let mut mods = Vec::new();
+    let mut rest = text.trim();
+    while let Some(after) = rest.strip_prefix('<') {
+        let (name, after) = after.split_once('>')?;
+        mods.push(match name.to_lowercase().as_str() {
+            "mod4" => "super".to_string(),
+            "mod1" => "alt".to_string(),
+            "primary" | "control" | "ctl" => "ctrl".to_string(),
+            name => name.to_string(),
+        });
+        rest = after;
+    }
+    if rest.is_empty() || rest.contains(|c: char| c.is_whitespace() || c == '<' || c == '>') {
+        return None;
+    }
+    mods.sort();
+    mods.dedup();
+    Some((mods, rest.to_lowercase()))
+}
+
+/// The value (as gsettings prints it) has this key among its strings.
+fn binds(value: &str, key: &str) -> bool {
+    let key = gnome_key(key);
+    key.is_some() && quoted(value).iter().any(|k| gnome_key(k) == key)
+}
+
+/// The program's path as one word of a command line (GNOME splits a shortcut's command the way
+/// a shell does): as it is when it has nothing a shell would trip on, in single quotes otherwise.
+fn command_word(path: &str) -> String {
+    if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_strings_gsettings_prints() {
+        assert!(quoted("@as []").is_empty());
+        assert!(quoted("[]\n").is_empty());
+        assert_eq!(quoted("'<Super><Alt>o'\n"), ["<Super><Alt>o"]);
+        assert_eq!(quoted("['/a/custom0/', '/a/custom1/']"), ["/a/custom0/", "/a/custom1/"]);
+        // A name with a quote in it: printed in the other quotes, or escaped.
+        assert_eq!(quoted(r#""Sam's terminal""#), ["Sam's terminal"]);
+        assert_eq!(quoted(r"['it\'s', 'a\\b']"), ["it's", r"a\b"]);
+        assert_eq!(quoted("uint32 5"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn our_path_joins_the_custom_shortcuts_once() {
+        let ours = GNOME_KEY_PATH;
+        assert_eq!(with_path("@as []", ours), Some(format!("['{ours}']")));
+        let others = "['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/', \
+                      '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/']";
+        let added = with_path(others, ours).unwrap();
+        // The others stay, in their order, ours after them.
+        assert_eq!(added, format!("{}, '{ours}']", others.trim_end_matches(']')));
+        assert_eq!(quoted(&added).len(), 3);
+        // A second install finds it there and writes nothing.
+        assert_eq!(with_path(&added, ours), None);
+        assert_eq!(with_path(&format!("['{ours}']"), ours), None);
+    }
+
+    #[test]
+    fn strings_are_written_as_gsettings_reads_them() {
+        assert_eq!(gvariant_str("Sweeflow"), "'Sweeflow'");
+        assert_eq!(gvariant_str("/home/me/.local/bin/sweeflow open"), "'/home/me/.local/bin/sweeflow open'");
+        assert_eq!(gvariant_str(r"it's a\b"), r"'it\'s a\\b'");
+        // And read back the same.
+        let odd = r"'/home/o'\''brien/bin/sweeflow' open";
+        assert_eq!(quoted(&gvariant_str(odd)), [odd]);
+    }
+
+    #[test]
+    fn the_same_key_however_it_is_written() {
+        assert!(binds("['<Super><Alt>o']", GNOME_KEY));
+        assert!(binds("'<Alt><Super>O'", GNOME_KEY));
+        assert!(binds("['<Super>Up', '<Mod1><Mod4>o']", GNOME_KEY));
+        assert!(binds("['<Primary><Shift>Escape']", "<Control><Shift>escape"));
+        // Other keys, other modifiers, and settings that aren't keys.
+        assert!(!binds("['<Super>o']", GNOME_KEY));
+        assert!(!binds("['<Super><Alt>p']", GNOME_KEY));
+        assert!(!binds("['<Super><Alt><Shift>o']", GNOME_KEY));
+        assert!(!binds("@as []", GNOME_KEY));
+        assert!(!binds("'o'", GNOME_KEY));
+        assert!(!binds("'Open <Super><Alt>o here'", GNOME_KEY));
+        assert!(!binds("true", GNOME_KEY));
+        assert!(!binds("['']", GNOME_KEY));
+        assert_eq!(gnome_key("<Alt><Super>O"), Some((vec!["alt".to_string(), "super".to_string()], "o".to_string())));
+        assert_eq!(gnome_key("<Super>"), None);
+        assert_eq!(gnome_key("<Super"), None);
+    }
+
+    #[test]
+    fn the_command_is_one_word_and_open() {
+        assert_eq!(command_word("/home/me/.local/bin/sweeflow"), "/home/me/.local/bin/sweeflow");
+        assert_eq!(command_word("/home/my name/.local/bin/sweeflow"), "'/home/my name/.local/bin/sweeflow'");
+        assert_eq!(command_word("/home/o'brien/bin/sweeflow"), r"'/home/o'\''brien/bin/sweeflow'");
+    }
 }
