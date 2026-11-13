@@ -1231,9 +1231,15 @@ impl App {
                 if w.refusal == Some((size, mac)) && !w.floated && kept_shape && (shape(size) / shape(mac) - 1.0).abs() > 0.03 {
                     log::info!("window {wid}: keeps its shape ({}x{}, asked {}x{}): floating it at that size", mac.0, mac.1, size.0, size.1);
                     let info = w.info.clone();
+                    // What the Mac said of it once, which it won't say again for the new one.
+                    let buttons = w.buttons.clone();
                     self.pending_fixed.insert(wid, (None, false));
                     self.remove_window(wid);
                     self.add_window(info, qh);
+                    if let Some(w) = self.windows.get_mut(&wid) {
+                        w.buttons = buttons;
+                    }
+                    self.update_lights(wid, qh);
                     return;
                 }
                 if w.refusal != Some((size, mac)) {
