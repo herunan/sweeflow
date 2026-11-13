@@ -333,6 +333,8 @@ impl ksni::Tray for Tray {
         }
         let state = STATE.lock().unwrap();
         let status = status_of(&state).replace('_', "__");
+        // The keys' column on GNOME (see with_key): as far right as the status line reaches.
+        let column = key_column(&status);
         let dot = state_dot(status_short(standing(&state)).as_str());
         let actions = stream_actions(standing(&state));
         let elsewhere = state.elsewhere.clone();
@@ -353,7 +355,7 @@ impl ksni::Tray for Tray {
             };
             items.push(
                 StandardItem {
-                    label: with_key(action_label(action), key),
+                    label: with_key(action_label(action), key, column),
                     shortcut: key.as_ref().map(|k| k.menu()).unwrap_or_default(),
                     activate: Box::new(move |_| panel_do(action, "")),
                     ..Default::default()
@@ -364,7 +366,7 @@ impl ksni::Tray for Tray {
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
-                label: with_key("Open Sweeflow", &keys.open),
+                label: with_key("Open Sweeflow", &keys.open, column),
                 shortcut: keys.open.as_ref().map(|k| k.menu()).unwrap_or_default(),
                 activate: Box::new(|_| open_panel()),
                 ..Default::default()
@@ -416,13 +418,46 @@ fn menu_icon(name: &str) -> String {
 
 /// A menu item's text, with its key after it on GNOME: its tray extension doesn't show a menu
 /// item's shortcut (other desktops show it at the right).
-fn with_key(label: &str, key: &Option<crate::keys::Key>) -> String {
+fn with_key(label: &str, key: &Option<crate::keys::Key>, column: f32) -> String {
     match key {
         Some(k) if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") => {
-            format!("{label}   {}", k.shown(crate::setup::mac_keys_remapped(), "Super"))
+            // Lined up in a column at the end of the rows, by tabs (key_column).
+            let tabs = (column - tab_stop(text_width(label))) as usize + 1;
+            format!("{label}{}{}", "\t".repeat(tabs), k.shown(crate::setup::mac_keys_remapped(), "Super"))
         }
         _ => label.to_string(),
     }
+}
+
+/// GNOME's menu has a tab stop every 32 px, and a tab needs about 8 px of room before the next
+/// one (measured): the first stop a tab after text this wide reaches.
+const TAB: f32 = 32.0;
+fn tab_stop(width: f32) -> f32 {
+    ((width + 8.0) / TAB).ceil()
+}
+
+/// The tab stop the keys start at, so they end where the rows do: the status line (with its dot
+/// after it) is the widest; never before the first stop after "Open Sweeflow".
+fn key_column(status: &str) -> f32 {
+    const KEY: f32 = 38.0; // "⌘⌥Y"
+    const DOT: f32 = 22.0;
+    let end = ((text_width(status) + DOT - KEY) / TAB).floor();
+    end.max(tab_stop(text_width("Open Sweeflow")))
+}
+
+/// About how wide a menu item's text is in GNOME's menu font (Adwaita Sans / Cantarell, 11 pt).
+fn text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|c| match c {
+            ' ' => 4.2,
+            'i' | 'l' | 'j' | 't' | 'f' | 'r' | 'I' => 4.5,
+            'm' | 'w' => 11.0,
+            'M' | 'W' => 13.0,
+            c if c.is_uppercase() => 9.5,
+            _ => 7.6,
+        })
+        .sum::<f32>()
+        * 1.08
 }
 
 /// The coloured dots for where the Mac in use stands, as Sweeflow's window and widget draw them
