@@ -1557,7 +1557,10 @@ impl App {
         let l = ((t_px as f64 / px_per_pt) * s).round() as i32; // corner size, logical px
         // (Strips that aren't showing yet need the buffer.)
         let was_split = w.corners.as_ref().is_some_and(|c| c.split);
+        // Square corners (Omarchy's look) need no strips: the picture is one surface. Strips
+        // there also showed a band of an older picture along the top and bottom on Hyprland.
         let split = t_px > 0
+            && !crate::config::square_corners()
             && sw as u32 > 3 * t_px
             && sh as u32 > 3 * t_px
             && l > 0
