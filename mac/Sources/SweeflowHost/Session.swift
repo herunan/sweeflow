@@ -776,10 +776,17 @@ final class Session {
     /// itself or its toolbar within the title-bar strip (above the controls), or a spot that
     /// dragged this app's window before, tells Linux to move the window on the first motion.
     private func classifyPress(_ wid: UInt32, at p: CGPoint, id: UInt32) {
-        guard let win = tracker.windows[wid], win.kind == .toplevel,
-              let button = sentButtons[wid]?.first(where: { $0 != .zero }) else { return }
-        // The traffic lights sit centred in the title bar (or the toolbar merged with it).
-        let strip = button.minY + button.maxY + 2
+        guard let win = tracker.windows[wid], win.kind != .popup else { return }
+        // The traffic lights sit centred in the title bar (or the toolbar merged with it). A
+        // floating panel without them (a reminder) is moved by any bare part of it.
+        let strip: CGFloat
+        if let button = sentButtons[wid]?.first(where: { $0 != .zero }) {
+            strip = button.minY + button.maxY + 2
+        } else if win.kind == .dialog {
+            strip = win.frame.height
+        } else {
+            return
+        }
         let y = p.y - win.frame.minY
         guard y >= 0, y <= strip else { return }
         let bundle = win.bundleId
@@ -842,7 +849,7 @@ final class Session {
     }
 
     private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
-        guard let win = tracker.windows[wid], win.kind == .toplevel else { return }
+        guard let win = tracker.windows[wid], win.kind != .popup else { return }
         if buttonDown || gesture?.wid != wid {
             // Where the window is as the press lands: the tracker's frame when its last look is
             // recent, else the first look from here (see checkGesture) says. Not asked on this
