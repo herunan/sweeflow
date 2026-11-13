@@ -106,34 +106,17 @@ slint::slint! {
         }
     }
 
-    // Whether a Mac can be reached, as a signal icon: bars in the accent colour, or dimmed and
-    // struck through.
-    component Signal inherits Rectangle {
+    // Whether a Mac can be reached, as a dot before its name: green, red, or hollow while not
+    // known yet. (The way there may be the network, Tailscale or a virtual machine: no signal
+    // bars.)
+    component OnlineDot inherits Rectangle {
         in property <string> state;
-        width: 16px;
-        height: 14px;
-        property <color> ink: root.state == "online" ? Look.accent : Look.muted;
-        Rectangle { x: 1px; y: 8px; width: 3px; height: 5px; background: root.ink; border-radius: 1px; }
-        Rectangle { x: 6px; y: 4px; width: 3px; height: 9px; background: root.ink; border-radius: 1px; }
-        Rectangle { x: 11px; y: 0px; width: 3px; height: 13px; background: root.ink; border-radius: 1px; }
-        if root.state == "offline": Path {
-            width: 100%;
-            height: 100%;
-            viewbox-width: 16;
-            viewbox-height: 14;
-            commands: "M 1 13 L 15 1";
-            stroke: Look.bg;
-            stroke-width: 4px;
-        }
-        if root.state == "offline": Path {
-            width: 100%;
-            height: 100%;
-            viewbox-width: 16;
-            viewbox-height: 14;
-            commands: "M 1 13 L 15 1";
-            stroke: Look.muted;
-            stroke-width: 1.5px;
-        }
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: root.state == "online" ? #30a46c : root.state == "offline" ? Look.danger : transparent;
+        border-width: root.state == "" ? 1px : 0px;
+        border-color: Look.muted;
     }
 
     component Tab inherits Rectangle {
@@ -360,11 +343,11 @@ slint::slint! {
                                             }
                                             VerticalLayout {
                                                 alignment: center;
-                                                Chip { text: a.pinned ? "Unpin" : "Pin"; tip: a.pinned ? "Unpin: it stops coming first in this list" : "Pin: it comes first in this list"; clicked => { root.pin(a.id, !a.pinned); } }
+                                                Chip { text: a.pinned ? "Unpin" : "Pin"; tip: a.pinned ? "Unpin from the top" : "Pin to the top"; clicked => { root.pin(a.id, !a.pinned); } }
                                             }
                                             VerticalLayout {
                                                 alignment: center;
-                                                Switch { on: a.shown; tip: a.shown ? "Its windows come here. Click to hide them" : "Its windows stay on the Mac. Click to bring them here"; toggled => { root.show-app(a.id, !a.shown); } }
+                                                Switch { on: a.shown; tip: a.shown ? "Block this app from streaming" : "Allow this app to stream"; toggled => { root.show-app(a.id, !a.shown); } }
                                             }
                                         }
                                     }
@@ -483,6 +466,21 @@ slint::slint! {
                                     padding-left: 10px;
                                     padding-right: 4px;
                                     spacing: 8px;
+                                    // A status, never an action.
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 0;
+                                        Rectangle {
+                                            width: 8px;
+                                            height: 14px;
+                                            OnlineDot { y: 3px; state: m.online; }
+                                            TouchArea {
+                                                changed has-hover => {
+                                                    if (self.has-hover) { Tip.enter(m.online == "online" ? "Online" : m.online == "offline" ? "Not online" : "Checking whether it's online", self.absolute-position.x, self.absolute-position.y, self.width, self.height); } else { Tip.leave(); }
+                                                }
+                                            }
+                                        }
+                                    }
                                     Rectangle {
                                         horizontal-stretch: 1;
                                         min-width: 30px;
@@ -503,21 +501,6 @@ slint::slint! {
                                             }
                                         }
                                     }
-                                    // A status, never an action; nothing until it is known.
-                                    if m.online != "": VerticalLayout {
-                                        alignment: center;
-                                        horizontal-stretch: 0;
-                                        Rectangle {
-                                            width: 16px;
-                                            height: 14px;
-                                            Signal { state: m.online; }
-                                            TouchArea {
-                                                changed has-hover => {
-                                                    if (self.has-hover) { Tip.enter(m.online == "online" ? "Online" : "Not online", self.absolute-position.x, self.absolute-position.y, self.width, self.height); } else { Tip.leave(); }
-                                                }
-                                            }
-                                        }
-                                    }
                                     // Start, pause, resume and stop as the signs a player uses.
                                     if m.active: HorizontalLayout {
                                         spacing: 4px;
@@ -530,7 +513,16 @@ slint::slint! {
                                     if !m.active: VerticalLayout {
                                         alignment: center;
                                         horizontal-stretch: 0;
-                                        Chip { text: "Start"; sign: "start"; tip: "Start streaming from this Mac"; clicked => { root.act("switch", m.fingerprint); } }
+                                        Chip {
+                                            text: "Start";
+                                            sign: "start";
+                                            // Only a Mac that can be reached.
+                                            enabled: m.online == "online";
+                                            tip: m.online == "online" ? "Start streaming from this Mac"
+                                                : m.online == "offline" ? m.name + " is not online"
+                                                : "Checking whether " + m.name + " is online";
+                                            clicked => { root.act("switch", m.fingerprint); }
+                                        }
                                     }
                                     VerticalLayout {
                                         alignment: center;
@@ -839,6 +831,21 @@ fn icon(url: &str) -> Option<slint::Image> {
     ICONS.with_borrow_mut(|icons| icons.entry(path.to_string()).or_insert_with(|| slint::Image::load_from_path(std::path::Path::new(path)).ok()).clone())
 }
 
+/// Why Start can't be pressed now, if it can't: the Mac is streaming to another computer, or it
+/// can't be reached (or isn't known to be reachable yet).
+fn start_blocked(s: &PanelState, action: &str) -> Option<String> {
+    if action != "start" {
+        return None;
+    }
+    let mac = if s.mac.is_empty() { "The Mac" } else { s.mac.as_str() };
+    match (&s.elsewhere, s.online) {
+        (Some(other), _) => Some(crate::tray::start_hint(other)),
+        (None, Some(false)) => Some(format!("{mac} is not online")),
+        (None, None) => Some(format!("Checking whether {mac} is online")),
+        _ => None,
+    }
+}
+
 /// A new state from the client (None: it isn't running): shown.
 fn take(ui: &PanelWin, state: Option<PanelState>) {
     VIEW.with_borrow_mut(|v| {
@@ -870,10 +877,7 @@ fn show(ui: &PanelWin, v: &mut View) {
             .map(|a| Action {
                 id: a.as_str().into(),
                 label: crate::tray::action_label(a).into(),
-                tip: match (&s.elsewhere, a.as_str()) {
-                    (Some(other), "start") => crate::tray::start_hint(other).into(),
-                    _ => Default::default(),
-                },
+                tip: start_blocked(&s, a).unwrap_or_default().into(),
             })
             .collect();
     // Set only when they change: a button rebuilt under the pointer loses the click.

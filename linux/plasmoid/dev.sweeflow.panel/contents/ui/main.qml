@@ -72,6 +72,14 @@ PlasmoidItem {
     // stopped there.
     readonly property string elsewhere: st.elsewhere || ""
     readonly property bool canStart: st.canStart !== false
+    // Why Start can't be pressed for this Mac ("" if it can): it's streaming to another computer,
+    // or it can't be reached (or isn't known to be reachable yet). `online`: true, false or null.
+    function startBlocked(name, online, active) {
+        if (active && !canStart && elsewhere !== "") return "Stop streaming on " + elsewhere + " first"
+        if (online === false) return name + " is not online"
+        if (online === null || online === undefined) return "Checking whether " + name + " is online"
+        return ""
+    }
     readonly property string appsJson: JSON.stringify(st.apps || [])
     readonly property var allApps: JSON.parse(appsJson)
     readonly property string macsJson: JSON.stringify((st.macs || []).map(m => ({
@@ -244,10 +252,11 @@ PlasmoidItem {
                     model: root.streamActions
                     delegate: SignButton {
                         required property string modelData
-                        readonly property bool blocked: modelData === "start" && !root.canStart
+                        readonly property string why: modelData === "start" ? root.startBlocked(root.st.mac || "The Mac", root.st.online === undefined ? null : root.st.online, true) : ""
+                        readonly property bool blocked: why !== ""
                         icon.name: root.actionIcons[modelData] || ""
                         text: root.actionLabels[modelData] || modelData
-                        tip: blocked ? "Stop streaming on " + root.elsewhere + " first" : (root.actionTips[modelData] || text)
+                        tip: blocked ? why : (root.actionTips[modelData] || text)
                         // Faded rather than disabled, so the tip still shows on hover.
                         opacity: blocked ? 0.45 : 1
                         onClicked: if (!blocked) root.act(modelData)
@@ -383,7 +392,7 @@ PlasmoidItem {
                                     PlasmaComponents3.ToolButton {
                                         text: appRow.modelData.pinned ? "Unpin" : "Pin"
                                         onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
-                                        PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin: it stops coming first in this list" : "Pin: it comes first in this list"
+                                        PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin from the top" : "Pin to the top"
                                         PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
@@ -395,7 +404,7 @@ PlasmoidItem {
                                             root.set({ exclude: exclude });
                                             checked = Qt.binding(() => appRow.shown);
                                         }
-                                        PlasmaComponents3.ToolTip.text: appRow.shown ? "Its windows come here. Click to hide them" : "Its windows stay on the Mac. Click to bring them here"
+                                        PlasmaComponents3.ToolTip.text: appRow.shown ? "Block this app from streaming" : "Allow this app to stream"
                                         PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
@@ -536,12 +545,28 @@ PlasmoidItem {
                                     anchors.fill: parent
                                     visible: !mac.editing && !mac.confirming
                                     spacing: Kirigami.Units.smallSpacing
+                                    // Whether it can be reached: green, red, or hollow while not known
+                                    // yet. A dot, not signal bars: the way there may be the network,
+                                    // Tailscale or a virtual machine. A status, never an action.
+                                    Rectangle {
+                                        readonly property var online: mac.modelData.online
+                                        implicitWidth: Kirigami.Units.smallSpacing * 2
+                                        implicitHeight: implicitWidth
+                                        Layout.leftMargin: Kirigami.Units.smallSpacing
+                                        radius: width / 2
+                                        color: online === true ? "#30a46c" : online === false ? "#e5484d" : "transparent"
+                                        border.width: online === null ? 1 : 0
+                                        border.color: Kirigami.Theme.disabledTextColor
+                                        HoverHandler { id: onlineHover }
+                                        PlasmaComponents3.ToolTip.text: online === true ? "Online" : online === false ? "Not online" : "Checking whether it's online"
+                                        PlasmaComponents3.ToolTip.visible: onlineHover.hovered
+                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                    }
                                     PlasmaComponents3.Label {
                                         text: mac.modelData.name
                                         font.bold: mac.modelData.active
                                         elide: Text.ElideRight
                                         Layout.fillWidth: true
-                                        Layout.leftMargin: Kirigami.Units.smallSpacing
                                         MouseArea {
                                             id: nameArea
                                             anchors.fill: parent
@@ -552,29 +577,15 @@ PlasmoidItem {
                                         PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
-                                    // A status, never an action; nothing until it is known.
-                                    Kirigami.Icon {
-                                        visible: mac.modelData.online !== null
-                                        source: mac.modelData.online ? "network-wireless-signal-good-symbolic" : "network-wireless-disconnected-symbolic"
-                                        color: mac.modelData.online ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
-                                        isMask: true
-                                        implicitWidth: Kirigami.Units.iconSizes.small
-                                        implicitHeight: implicitWidth
-                                        Layout.preferredWidth: implicitWidth
-                                        Layout.preferredHeight: implicitHeight
-                                        HoverHandler { id: onlineHover }
-                                        PlasmaComponents3.ToolTip.text: mac.modelData.online ? "Online" : "Not online"
-                                        PlasmaComponents3.ToolTip.visible: onlineHover.hovered
-                                        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
-                                    }
                                     Repeater {
                                         model: mac.modelData.active ? root.streamActions : ["start"]
                                         delegate: SignButton {
                                             required property string modelData
                                             icon.name: root.actionIcons[modelData] || ""
                                             text: root.actionLabels[modelData] || modelData
-                                            readonly property bool blocked: mac.modelData.active && modelData === "start" && !root.canStart
-                                            tip: blocked ? "Stop streaming on " + root.elsewhere + " first"
+                                            readonly property string why: modelData === "start" ? root.startBlocked(mac.modelData.name, mac.modelData.online, mac.modelData.active) : ""
+                                            readonly property bool blocked: why !== ""
+                                            tip: blocked ? why
                                                : mac.modelData.active ? root.actionTips[modelData] : "Start streaming from this Mac"
                                             opacity: blocked ? 0.45 : 1
                                             onClicked: {
