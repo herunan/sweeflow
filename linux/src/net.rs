@@ -1260,19 +1260,28 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
         // Opening blocks until pw-cat opens its end.
         let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
         let mut held: std::collections::VecDeque<(Instant, Vec<u8>)> = Default::default();
-        let mut logged = Duration::ZERO;
+        // The delay in use: it follows the target only once that has been well off it for a
+        // while, as each change is heard (a gap when it grows, a skip when it shrinks).
+        let mut delay = Duration::ZERO;
+        let mut off_since: Option<Instant> = None;
         loop {
             match prx.recv_timeout(Duration::from_millis(2)) {
                 Ok(piece) => held.push_back(piece),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
-            let delay = audio_delay();
-            if delay.abs_diff(logged) > Duration::from_millis(10) {
-                logged = delay;
-                log::info!("audio: {} ms behind its arrival, with the pictures", delay.as_millis());
-            }
             let now = Instant::now();
+            let target = audio_delay();
+            if target.abs_diff(delay) > Duration::from_millis(15) {
+                let since = *off_since.get_or_insert(now);
+                if now - since > Duration::from_secs(2) {
+                    delay = target;
+                    off_since = None;
+                    log::info!("audio: {} ms behind its arrival, with the pictures", delay.as_millis());
+                }
+            } else {
+                off_since = None;
+            }
             while let Some((arrived, _)) = held.front() {
                 let due = *arrived + delay;
                 if due > now {

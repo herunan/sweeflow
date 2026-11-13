@@ -2232,14 +2232,15 @@ impl App {
     /// Redraws a window's traffic lights if their state changed.
     fn update_lights(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let active = self.kb_focus == Some(wid);
+        let pointer_over = self.pointer_focus == Some(wid);
         let Some(w) = self.windows.get_mut(&wid) else { return };
         if !matches!(w.role, Role::Toplevel(_)) {
             return;
         }
-        // A video player (floated because it keeps its shape): none drawn here; it shows its
-        // own controls when the pointer is over it, as on the Mac.
+        // A video player (floated because it keeps its shape): shown only while the pointer is
+        // over the window, as macOS shows a player's controls, so the video fills it otherwise.
         let video = w.floated && !w.fixed && w.info.kind == 0;
-        let Some(rect) = lights::group_rect(&w.buttons).filter(|_| !video) else {
+        let Some(rect) = lights::group_rect(&w.buttons).filter(|_| !video || pointer_over) else {
             if let Some(l) = w.lights.take() {
                 l.viewport.destroy();
                 l.sub.destroy();
