@@ -602,7 +602,8 @@ slint::slint! {
             border-radius: Look.radius;
             border-width: 1px;
             border-color: Look.line;
-            background: Look.surface;
+            // Solid: the window's own colour (its surface colour is see-through), raised a shade.
+            background: Look.bg.mix(Look.fg, 0.94);
             drop-shadow-blur: 16px;
             drop-shadow-color: #00000055;
             key-list := VerticalLayout {
