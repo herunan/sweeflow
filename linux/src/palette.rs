@@ -1,5 +1,6 @@
-//! The Global menu (`sweeflow menu`): the menu bar of the Mac app last used here, in a window of
-//! its own, for desktops that show no app menus (Omarchy, Hyprland) and on Plasma alike. It opens
+//! The Global menu (`sweeflow menu`): the menu bar of the Mac app last used here, as an overlay
+//! like a launcher's (see Palette's `overlay`), for desktops that show no app menus (Omarchy,
+//! Hyprland) and on Plasma and GNOME alike. It opens
 //! on the menu bar's menus and goes into them as the Mac's do; typing searches all of them at
 //! once. A process of its own, like the pairing wizard and the prompts, so its event loop never
 //! shares a thread with the streaming client's. It asks the running client for the menu and has
@@ -153,11 +154,15 @@ slint::slint! {
         in-out property <string> typed <=> field.text;
         // The window is the active one.
         out property <bool> active: field.focused;
+        // An overlay: the window covers the screen (full screen), see-through and dimmed, with
+        // the menu in the middle; a click beside the menu closes it. Otherwise (Hyprland, tiling
+        // desktops) the window is just the menu, which the desktop floats and centres.
+        in property <bool> overlay;
         callback search(string);
-        // Highlight up or down, by rows.
+        // Highlight up or down, by rows (none highlighted: from the top or the bottom).
         callback step(int);
-        // Enter or a click: run the item or go into the submenu.
-        callback choose(int);
+        // Enter (true) or a click (false): run the item or go into the submenu.
+        callback choose(int, bool);
         // Right: into the submenu, if that row is one.
         callback open(int);
         // Left or Backspace: up a level.
@@ -167,11 +172,20 @@ slint::slint! {
 
         title: root.app != "" ? root.app + " - Global menu" : "Global menu";
         icon: @image-url("../../assets/sweeflow-app.svg");
-        background: Look.bg;
+        background: root.overlay ? transparent : Look.bg;
         default-font-family: Look.font;
-        // A fixed size: a dialog, which tiling window managers leave floating.
-        width: 560px;
-        height: 420px;
+        no-frame: true;
+        always-on-top: true;
+        // The menu's own size. As a window of its own, a fixed one: a dialog, which tiling
+        // window managers leave floating. As an overlay the window is the screen's size.
+        property <length> card-width: 560px;
+        property <length> card-height: 420px;
+        preferred-width: root.card-width;
+        preferred-height: root.card-height;
+        min-width: root.overlay ? 0px : root.card-width;
+        max-width: root.overlay ? 100000px : root.card-width;
+        min-height: root.overlay ? 0px : root.card-height;
+        max-height: root.overlay ? 100000px : root.card-height;
         forward-focus: field;
 
         // Only once it's been active: before its first focus it isn't, and must stay open.
@@ -194,6 +208,29 @@ slint::slint! {
             }
         }
 
+        // Beside the menu: dims what's under it, and a click there closes it.
+        if root.overlay: Rectangle {
+            background: #00000040;
+            TouchArea {
+                clicked => { root.dismiss(); }
+            }
+        }
+
+        Rectangle {
+            width: root.overlay ? min(root.card-width, root.width - 32px) : root.width;
+            height: root.overlay ? min(root.card-height, root.height - 32px) : root.height;
+            // A little above the middle, where a launcher sits.
+            x: (root.width - self.width) / 2;
+            y: root.overlay ? max(16px, (root.height - self.height) * 0.4) : 0px;
+            background: Look.bg;
+            border-radius: root.overlay ? Look.radius + 4px : 0px;
+            border-width: root.overlay ? 1px : 0px;
+            border-color: Look.line;
+            drop-shadow-blur: root.overlay ? 32px : 0px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: #00000066;
+            // Clicks on the menu (between its rows) don't reach the backdrop.
+            TouchArea {}
         VerticalLayout {
             padding: 16px;
             spacing: 12px;
@@ -241,13 +278,13 @@ slint::slint! {
                         return accept;
                     }
                     if (event.text == Key.Return) {
-                        if (root.rows.length > 0) {
-                            root.choose(root.selected);
+                        if (root.selected >= 0) {
+                            root.choose(root.selected, true);
                         }
                         return accept;
                     }
                     if (event.text == Key.RightArrow && field.text == "") {
-                        if (root.rows.length > 0) {
+                        if (root.selected >= 0) {
                             root.open(root.selected);
                         }
                         return accept;
@@ -277,7 +314,7 @@ slint::slint! {
                         height: row.height;
                         entry: row;
                         current: i == root.selected;
-                        clicked => { root.choose(i); }
+                        clicked => { root.choose(i, false); }
                     }
                 }
                 Dim {
@@ -289,6 +326,7 @@ slint::slint! {
                     vertical-alignment: center;
                 }
             }
+        }
         }
     }
 }
@@ -582,6 +620,34 @@ fn first_choosable(rows: &[Row]) -> usize {
     rows.iter().position(Row::choosable).unwrap_or(0)
 }
 
+/// Where the arrow keys take the highlight: from the row highlighted, or with none (as it
+/// opens, before a key) to the first row going down and the last going up.
+fn step_from(rows: &[Row], from: Option<usize>, by: i32) -> Option<usize> {
+    let found = match from {
+        Some(from) => step(rows, from, by),
+        None if by >= 0 => step(rows, 0, 0),
+        None => step(rows, rows.len().saturating_sub(1), 0),
+    };
+    rows.get(found).filter(|r| r.choosable()).map(|_| found)
+}
+
+/// The row highlighted as rows are shown: `keep`, if it's still there; otherwise the first
+/// that can be chosen, once the keyboard has been used (an arrow key, or typing: the best match,
+/// so Enter runs it); none before that, as the menu opens (the mouse highlights what it's on).
+fn highlight(rows: &[Row], keep: Option<usize>, keyboard: bool) -> Option<usize> {
+    keep.or_else(|| keyboard.then(|| first_choosable(rows)).filter(|&i| rows.get(i).is_some_and(Row::choosable)))
+}
+
+/// Whether the Global menu opens as an overlay over the whole screen (see Palette's
+/// `overlay`): on desktops that draw a see-through full screen window over the others (Plasma,
+/// GNOME and the desktops built on GNOME's window manager). Not on Hyprland, nor on the tiling
+/// desktops, which show a full screen window on its own (on black): there it's a window of its
+/// own, which they float and centre.
+fn overlay_here(desktop: &str, hyprland: bool) -> bool {
+    let desktop = desktop.to_lowercase();
+    !hyprland && desktop.split(':').any(|d| ["kde", "gnome", "cinnamon", "x-cinnamon", "budgie", "budgie-desktop", "unity", "pantheon"].contains(&d))
+}
+
 const BUS_NAME: &str = "dev.sweeflow.Client";
 const PATH: &str = "/dev/sweeflow/Panel";
 const IFACE: &str = "dev.sweeflow.Panel";
@@ -610,6 +676,9 @@ struct State {
     at: Vec<usize>,
     typed: String,
     rows: Vec<Row>,
+    /// The keyboard has moved through the menu or searched it: rows shown from now on come
+    /// with one highlighted.
+    keyboard: bool,
 }
 
 thread_local! {
@@ -623,7 +692,7 @@ type Keep = Option<(Vec<String>, String)>;
 /// they're still there, the highlighted row.
 fn take_menu(ui: &Palette, menu: Menu) {
     STATE.with_borrow_mut(|s| {
-        let keep = s.rows.get(ui.get_selected() as usize).map(|r| (r.path.clone(), r.name.clone()));
+        let keep = usize::try_from(ui.get_selected()).ok().and_then(|i| s.rows.get(i)).map(|r| (r.path.clone(), r.name.clone()));
         let names = trail(&s.items, &s.at);
         s.items = menu.items;
         s.app = menu.app;
@@ -636,13 +705,12 @@ fn take_menu(ui: &Palette, menu: Menu) {
     });
 }
 
-/// Shows the rows for where it is and what's typed, highlighting `keep` if it's among them (the
-/// first that can be chosen otherwise).
+/// Shows the rows for where it is and what's typed, highlighting `keep` if it's among them (see
+/// `highlight` otherwise).
 fn show(ui: &Palette, s: &mut State, keep: Keep) {
     s.rows = rows_for(&s.items, &s.at, &s.typed);
-    let selected = keep
-        .and_then(|(path, name)| s.rows.iter().position(|r| r.choosable() && r.path == path && r.name == name))
-        .unwrap_or_else(|| first_choosable(&s.rows));
+    let kept = keep.and_then(|(path, name)| s.rows.iter().position(|r| r.choosable() && r.path == path && r.name == name));
+    let selected = highlight(&s.rows, kept, s.keyboard);
     let searching = !s.typed.trim().is_empty();
     let rows: Vec<MenuRow> = s
         .rows
@@ -667,8 +735,12 @@ fn show(ui: &Palette, s: &mut State, keep: Keep) {
     select(ui, s, selected);
 }
 
-/// Highlights row `index` and scrolls it into view.
-fn select(ui: &Palette, s: &State, index: usize) {
+/// Highlights row `index` and scrolls it into view; None: no row.
+fn select(ui: &Palette, s: &State, index: Option<usize>) {
+    let Some(index) = index else {
+        ui.set_selected(-1);
+        return;
+    };
     ui.set_selected(index as i32);
     ui.set_selected_top(s.rows.iter().take(index).map(Row::height).sum());
     ui.set_selected_height(s.rows.get(index).map_or(0.0, Row::height));
@@ -718,7 +790,15 @@ pub fn run() -> Result<()> {
     });
     let ui = Palette::new()?;
     crate::look::apply!(ui);
-    crate::hyprland::keep_window_size();
+    let overlay = overlay_here(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(), crate::hyprland::running());
+    ui.set_overlay(overlay);
+    if overlay {
+        // On the screen the desktop opens new windows on: the one with the pointer or the
+        // focused window, on Plasma and GNOME.
+        ui.window().set_fullscreen(true);
+    } else {
+        crate::hyprland::keep_window_size();
+    }
     // Matches sweeflow.desktop (written by `sweeflow install`): Sweeflow's logo in the title bar
     // and the taskbar. After the window is made, and before it's shown.
     if let Err(e) = slint::set_xdg_app_id("sweeflow") {
@@ -751,18 +831,26 @@ pub fn run() -> Result<()> {
         let Some(ui) = weak.upgrade() else { return };
         STATE.with_borrow_mut(|s| {
             s.typed = typed.to_string();
+            s.keyboard = true;
             show(&ui, s, None);
         });
     });
     let weak = ui.as_weak();
     ui.on_step(move |by| {
         let Some(ui) = weak.upgrade() else { return };
-        STATE.with_borrow(|s| select(&ui, s, step(&s.rows, ui.get_selected().max(0) as usize, by)));
+        STATE.with_borrow_mut(|s| {
+            s.keyboard = true;
+            select(&ui, s, step_from(&s.rows, usize::try_from(ui.get_selected()).ok(), by));
+        });
     });
     let weak = ui.as_weak();
-    ui.on_choose(move |index| {
+    ui.on_choose(move |index, by_key| {
         let Some(ui) = weak.upgrade() else { return };
-        let picked = STATE.with_borrow(|s| choice(s.rows.get(index as usize)));
+        // Into a submenu by a click: nothing highlighted there either, until a key.
+        let picked = STATE.with_borrow_mut(|s| {
+            s.keyboard = by_key;
+            choice(s.rows.get(index as usize))
+        });
         match picked {
             Choice::Run(row) => {
                 let (pid, revision) = STATE.with_borrow(|s| (s.pid, s.revision));
@@ -779,6 +867,7 @@ pub fn run() -> Result<()> {
     ui.on_open(move |index| {
         let Some(ui) = weak.upgrade() else { return };
         STATE.with_borrow_mut(|s| {
+            s.keyboard = true;
             if let Choice::Open(at) = choice(s.rows.get(index as usize)) {
                 open(&ui, s, at);
             }
@@ -791,6 +880,7 @@ pub fn run() -> Result<()> {
             if s.at.is_empty() {
                 return;
             }
+            s.keyboard = true;
             // Back on the submenu it came out of.
             let mut path = trail(&s.items, &s.at);
             let keep = path.pop().map(|name| (path, name));
@@ -1073,5 +1163,38 @@ mod tests {
         let none = level(&[sub(1, "Edit", vec![Item { enabled: false, ..item(2, "Undo") }])], &[0]);
         assert_eq!(step(&none, 0, 1), 0);
         assert_eq!(first_choosable(&none), 0);
+    }
+
+    #[test]
+    fn nothing_is_highlighted_until_a_key() {
+        let items = vec![sub(1, "Edit", vec![Item { enabled: false, ..item(2, "Undo") }, item(3, "Cut"), sep(4), item(5, "Paste"), Item { enabled: false, ..item(6, "Delete") }])];
+        let rows = level(&items, &[0]);
+        // As it opens: none, unless one is kept.
+        assert_eq!(highlight(&rows, None, false), None);
+        assert_eq!(highlight(&rows, Some(3), false), Some(3));
+        // Once the keyboard has been used (a search: the best match).
+        assert_eq!(highlight(&rows, None, true), Some(1));
+        let none = level(&[sub(1, "Edit", vec![Item { enabled: false, ..item(2, "Undo") }])], &[0]);
+        assert_eq!(highlight(&none, None, true), None);
+        assert_eq!(highlight(&[], None, true), None);
+        // The first arrow key: Down to the first row that can be chosen, Up to the last.
+        assert_eq!(step_from(&rows, None, 1), Some(1));
+        assert_eq!(step_from(&rows, None, -1), Some(3));
+        assert_eq!(step_from(&rows, Some(1), 1), Some(3));
+        assert_eq!(step_from(&none, None, 1), None);
+        assert_eq!(step_from(&[], None, -1), None);
+    }
+
+    #[test]
+    fn an_overlay_where_the_desktop_draws_one() {
+        assert!(overlay_here("KDE", false));
+        assert!(overlay_here("ubuntu:GNOME", false));
+        assert!(overlay_here("X-Cinnamon", false));
+        assert!(!overlay_here("Hyprland", true));
+        // Hyprland started from a session that says KDE, say.
+        assert!(!overlay_here("KDE", true));
+        assert!(!overlay_here("sway", false));
+        assert!(!overlay_here("niri", false));
+        assert!(!overlay_here("", false));
     }
 }
