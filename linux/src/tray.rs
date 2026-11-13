@@ -7,7 +7,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use ksni::{
     blocking::{Handle, TrayMethods},
-    menu::{CheckmarkItem, StandardItem, SubMenu},
+    menu::StandardItem,
     MenuItem, ToolTip,
 };
 use serde::{Deserialize, Serialize};
@@ -342,10 +342,6 @@ impl ksni::Tray for Tray {
             items.push(StandardItem { label: action_label(action).into(), activate: Box::new(move |_| panel_do(action, "")), ..Default::default() }.into());
         }
         items.push(MenuItem::Separator);
-        // Sweeflow's window in a menu, for bars that only show a menu (GNOME's): the Macs (start,
-        // rename, unlink, link another), the apps (stream here, pin, quit), the settings.
-        items.extend(lite_menu(&panel_state()));
-        items.push(MenuItem::Separator);
         items.push(StandardItem { label: "Open Sweeflow".into(), activate: Box::new(|_| open_panel()), ..Default::default() }.into());
         // (The Global menu opens with Cmd+Opt+M in a Mac window, on every desktop: no item here.)
         items.push(MenuItem::Separator);
@@ -362,165 +358,6 @@ impl ksni::Tray for Tray {
         );
         items
     }
-}
-
-/// The tray menu's Macs, Apps and Settings, from the state the windows show.
-fn lite_menu(st: &serde_json::Value) -> Vec<MenuItem<Tray>> {
-    let b = |v: &serde_json::Value| v.as_bool().unwrap_or(false);
-    let esc = |s: &str| s.replace('_', "__");
-    let mut out: Vec<MenuItem<Tray>> = Vec::new();
-    // Macs: each a submenu, its name with where it stands (as the window's dot and line say
-    // it); in it, starting it (switching to it), renaming (in the window: a menu takes no
-    // typing) and unlinking, asked once more. Then linking another.
-    let connected = b(&st["connected"]);
-    let enabled = st["settings"]["enabled"].as_bool().unwrap_or(true);
-    let mut macs: Vec<MenuItem<Tray>> = st["macs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|m| {
-            let active = b(&m["active"]);
-            let state = if active && connected {
-                if b(&st["locked"]) { "Locked" } else if enabled { "Streaming" } else { "Paused" }
-            } else {
-                match m["online"].as_bool() {
-                    None => "",
-                    Some(false) => "Not online",
-                    Some(true) if b(&m["busy"]) || (active && !st["elsewhere"].is_null()) => "Busy · streaming elsewhere",
-                    Some(true) if b(&m["locked"]) => "Locked",
-                    Some(true) => "Available",
-                }
-            };
-            let name = m["name"].as_str().unwrap_or("Mac").to_string();
-            let label = if state.is_empty() { esc(&name) } else { format!("{} · {state}", esc(&name)) };
-            let fp = m["fingerprint"].as_str().unwrap_or_default().to_string();
-            let mut inside: Vec<MenuItem<Tray>> = Vec::new();
-            if !active {
-                let can = matches!(state, "Available" | "Locked");
-                let why = if state == "Busy · streaming elsewhere" { "Stop streaming elsewhere first" } else { "Not online" };
-                let f = fp.clone();
-                inside.push(
-                    StandardItem {
-                        label: if can { "Start streaming from this Mac".into() } else { why.into() },
-                        enabled: can,
-                        activate: Box::new(move |_: &mut Tray| panel_do("switch", &f)),
-                        ..Default::default()
-                    }
-                    .into(),
-                );
-            } else {
-                inside.push(StandardItem { label: "In use".into(), enabled: false, ..Default::default() }.into());
-            }
-            inside.push(StandardItem { label: "Rename…".into(), activate: Box::new(|_: &mut Tray| open_panel()), ..Default::default() }.into());
-            let f = fp.clone();
-            inside.push(
-                SubMenu {
-                    label: "Unlink…".into(),
-                    submenu: vec![StandardItem {
-                        label: format!("Unlink {} (link it again to use it)", esc(&name)),
-                        activate: Box::new(move |_: &mut Tray| panel_do("forget", &f)),
-                        ..Default::default()
-                    }
-                    .into()],
-                    ..Default::default()
-                }
-                .into(),
-            );
-            SubMenu { label: if active { format!("✓ {label}") } else { label }, submenu: inside, ..Default::default() }.into()
-        })
-        .collect();
-    macs.push(MenuItem::Separator);
-    macs.push(StandardItem { label: "Link a Mac…".into(), activate: Box::new(|_: &mut Tray| open_wizard()), ..Default::default() }.into());
-    out.push(SubMenu { label: "Macs".into(), submenu: macs, ..Default::default() }.into());
-    // Apps (pinned first, as the window lists them): each a submenu with whether it streams
-    // here, whether it's pinned to the top, and Quit while it runs.
-    let exclude: Vec<String> = st["settings"]["exclude"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
-    let all: Vec<(String, String, bool, bool)> = st["apps"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|a| Some((a["id"].as_str()?.to_string(), a["name"].as_str().unwrap_or_default().to_string(), a["state"].as_u64().unwrap_or(0) > 0, b(&a["pinned"]))))
-        .collect();
-    if !all.is_empty() {
-        let allowed = all.iter().filter(|(id, ..)| !exclude.contains(id)).count();
-        let total = all.len();
-        let apps: Vec<MenuItem<Tray>> = all
-            .into_iter()
-            .map(|(id, name, running, pinned)| {
-                let on = !exclude.contains(&id);
-                let mut label = esc(&name);
-                if running {
-                    label += " · running";
-                }
-                if !on {
-                    label += " · blocked";
-                }
-                let mut inside: Vec<MenuItem<Tray>> = Vec::new();
-                let i = id.clone();
-                inside.push(
-                    CheckmarkItem {
-                        label: "Stream here".into(),
-                        checked: on,
-                        activate: Box::new(move |_: &mut Tray| {
-                            let mut ex: Vec<String> = STATE.lock().unwrap().settings.as_ref().map(|s| s.exclude.clone()).unwrap_or_default();
-                            ex.retain(|b| *b != i);
-                            if on {
-                                ex.push(i.clone());
-                            }
-                            panel_set(&serde_json::json!({ "exclude": ex }).to_string());
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
-                );
-                let i = id.clone();
-                inside.push(
-                    CheckmarkItem {
-                        label: "Pinned to the top".into(),
-                        checked: pinned,
-                        activate: Box::new(move |_: &mut Tray| panel_do(if pinned { "unpin" } else { "pin" }, &i)),
-                        ..Default::default()
-                    }
-                    .into(),
-                );
-                if running {
-                    let i = id.clone();
-                    inside.push(StandardItem { label: "Quit".into(), activate: Box::new(move |_: &mut Tray| panel_do("quit-app", &i)), ..Default::default() }.into());
-                }
-                SubMenu { label, submenu: inside, ..Default::default() }.into()
-            })
-            .collect();
-        out.push(SubMenu { label: format!("Apps ({allowed}/{total} allowed)"), submenu: apps, ..Default::default() }.into());
-    }
-    // Settings, in the window's words and order.
-    let set = &st["settings"];
-    let toggle = |label: &str, on: bool, change: Box<dyn Fn(&mut Tray) + Send>| -> MenuItem<Tray> {
-        CheckmarkItem { label: label.into(), checked: on, activate: change, ..Default::default() }.into()
-    };
-    let json_flip = |key: &'static str, on: bool| -> Box<dyn Fn(&mut Tray) + Send> {
-        Box::new(move |_: &mut Tray| panel_set(&serde_json::json!({ key: !on }).to_string()))
-    };
-    let high = set["quality"].as_str() != Some("light");
-    let square = b(&st["square"]);
-    let login = b(&st["openAtLogin"]);
-    let settings = vec![
-        toggle("Mac sound on Linux", b(&set["sound"]), json_flip("sound", b(&set["sound"]))),
-        toggle("Shared clipboard", b(&set["clipboard"]), json_flip("clipboard", b(&set["clipboard"]))),
-        toggle("Drag and drop", b(&set["dragDrop"]), json_flip("dragDrop", b(&set["dragDrop"]))),
-        toggle("Mac apps in app launcher", b(&set["launcher"]), json_flip("launcher", b(&set["launcher"]))),
-        toggle("Square window corners", square, Box::new(move |_: &mut Tray| panel_do("square", if square { "off" } else { "on" }))),
-        toggle(
-            "High quality",
-            high,
-            Box::new(move |_: &mut Tray| panel_set(&serde_json::json!({ "quality": if high { "light" } else { "sharp" } }).to_string())),
-        ),
-        toggle("Open at login", login, Box::new(move |_: &mut Tray| panel_do("login", if login { "off" } else { "on" }))),
-    ];
-    let mut settings = settings;
-    settings.push(MenuItem::Separator);
-    settings.push(StandardItem { label: "Troubleshoot (stream display)".into(), activate: Box::new(|_: &mut Tray| panel_do("display", "")), ..Default::default() }.into());
-    out.push(SubMenu { label: "Settings".into(), submenu: settings, ..Default::default() }.into());
-    out
 }
 
 /// An icon for a menu entry, on Plasma only: its menus carry icons, while GNOME's and Omarchy's
