@@ -243,14 +243,7 @@ PlasmoidItem {
                         PlasmaComponents3.Label {
                             text: root.statusText
                             font: Kirigami.Theme.smallFont
-                            // Where the Mac in use stands: Online green; Locked or Busy orange;
-                            // Not online grey (as in the Macs tab).
-                            readonly property string macState: !root.running || !root.paired ? ""
-                                : root.st.online === false ? "offline"
-                                : root.elsewhere !== "" || root.linkedMacs.some(m => m.active && m.busy) ? "busy"
-                                : root.st.locked ? "locked"
-                                : root.st.online === true ? "online" : ""
-                            color: macState === "online" ? "#30a46c" : macState === "busy" || macState === "locked" ? "#e8890c" : Kirigami.Theme.disabledTextColor
+                            opacity: 0.7
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                         }
@@ -558,17 +551,6 @@ PlasmoidItem {
                                     // action): Online green; Locked or Busy orange; Not online grey;
                                     // nothing while not known yet. Locked and busy are known only of
                                     // the Mac in use.
-                                    // The same as a dot before the name (hollow while not known yet).
-                                    Rectangle {
-                                        readonly property string macState: nameCol.macState
-                                        implicitWidth: Kirigami.Units.smallSpacing * 2
-                                        implicitHeight: implicitWidth
-                                        Layout.leftMargin: Kirigami.Units.smallSpacing
-                                        radius: width / 2
-                                        color: macState === "" ? "transparent" : macState === "online" ? "#30a46c" : macState === "offline" ? Kirigami.Theme.disabledTextColor : "#e8890c"
-                                        border.width: macState === "" ? 1 : 0
-                                        border.color: Kirigami.Theme.disabledTextColor
-                                    }
                                     ColumnLayout {
                                         id: nameCol
                                         readonly property string macState: mac.modelData.online === null ? ""
@@ -592,13 +574,23 @@ PlasmoidItem {
                                             PlasmaComponents3.ToolTip.visible: nameArea.containsMouse
                                             PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                         }
-                                        PlasmaComponents3.Label {
-                                            visible: parent.macState !== ""
-                                            text: ({ online: "Online", offline: "Not online", locked: "Locked", busy: "Busy · streaming elsewhere" })[parent.macState] || ""
-                                            color: parent.macState === "online" ? "#30a46c" : parent.macState === "offline" ? Kirigami.Theme.disabledTextColor : "#e8890c"
-                                            font: Kirigami.Theme.smallFont
-                                            elide: Text.ElideRight
-                                            Layout.fillWidth: true
+                                        // The dot says it in colour; the words stay plain.
+                                        RowLayout {
+                                            visible: nameCol.macState !== ""
+                                            spacing: Kirigami.Units.smallSpacing
+                                            Rectangle {
+                                                implicitWidth: Math.round(Kirigami.Units.smallSpacing * 1.75)
+                                                implicitHeight: implicitWidth
+                                                radius: width / 2
+                                                color: nameCol.macState === "online" ? "#30a46c" : nameCol.macState === "offline" ? Kirigami.Theme.disabledTextColor : "#e8890c"
+                                            }
+                                            PlasmaComponents3.Label {
+                                                text: ({ online: "Online", offline: "Not online", locked: "Locked", busy: "Busy · streaming elsewhere" })[nameCol.macState] || ""
+                                                font: Kirigami.Theme.smallFont
+                                                opacity: 0.7
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
+                                            }
                                         }
                                     }
                                     Repeater {

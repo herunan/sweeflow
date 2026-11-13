@@ -248,7 +248,7 @@ slint::slint! {
                                     background: root.dot == 2 ? Look.accent : root.dot == 1 ? #d9a520 : Look.muted;
                                 }
                             }
-                            Text { text: root.status; color: root.status-state == "" ? Look.muted : MacState.ink(root.status-state); font-size: 12px; overflow: elide; horizontal-stretch: 1; }
+                            Text { text: root.status; color: Look.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; }
                         }
                     }
                     // What can be done in this state (pause and stop, resume and stop, or start),
@@ -463,19 +463,6 @@ slint::slint! {
                                     padding-left: 10px;
                                     padding-right: 4px;
                                     spacing: 8px;
-                                    // The same as a dot before the name (hollow while not known yet).
-                                    VerticalLayout {
-                                        alignment: center;
-                                        horizontal-stretch: 0;
-                                        Rectangle {
-                                            width: 8px;
-                                            height: 8px;
-                                            border-radius: 4px;
-                                            background: m.online == "" ? transparent : MacState.ink(m.online);
-                                            border-width: m.online == "" ? 1px : 0px;
-                                            border-color: Look.muted;
-                                        }
-                                    }
                                     Rectangle {
                                         horizontal-stretch: 1;
                                         min-width: 30px;
@@ -492,14 +479,23 @@ slint::slint! {
                                                 font-weight: m.active ? 600 : 400;
                                                 overflow: elide;
                                             }
-                                            if m.online != "": Text {
-                                                text: m.online == "online" ? "Online"
-                                                    : m.online == "offline" ? "Not online"
-                                                    : m.online == "locked" ? "Locked"
-                                                    : "Busy · streaming elsewhere";
-                                                color: MacState.ink(m.online);
-                                                font-size: 11px;
-                                                overflow: elide;
+                                            // The dot says it in colour; the words stay plain.
+                                            if m.online != "": HorizontalLayout {
+                                                spacing: 5px;
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Rectangle { width: 7px; height: 7px; border-radius: 3.5px; background: MacState.ink(m.online); }
+                                                }
+                                                Text {
+                                                    text: m.online == "online" ? "Online"
+                                                        : m.online == "offline" ? "Not online"
+                                                        : m.online == "locked" ? "Locked"
+                                                        : "Busy · streaming elsewhere";
+                                                    color: Look.muted;
+                                                    font-size: 11px;
+                                                    overflow: elide;
+                                                    horizontal-stretch: 1;
+                                                }
                                             }
                                         }
                                         TouchArea {
