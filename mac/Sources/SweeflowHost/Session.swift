@@ -425,7 +425,11 @@ final class Session {
                         if pressed, pressId != 0 { classifyPress(wid, at: p, id: pressId) }
                     }
                 }
-                if pressed { press(wid, at: p, then: post) } else { post() }
+                if pressed { press(wid, at: p, then: post) } else {
+                    post()
+                    // A capture gone quiet shows up as a click with no new picture.
+                    for st in streamers.values where st.wid == wid { st.expectFrameAfterInput() }
+                }
             }
         case .scroll:
             let (_, p) = try pointerTarget(&m)
@@ -438,6 +442,8 @@ final class Session {
             // Keys that open, close or switch things (menus, dialogs, fields, shortcuts) look
             // closely; plain typing only as closely as pointer motion.
             if v == 1 { userDidSomething(click: Self.actionKeys.contains(code) || input.commandOrControlHeld) }
+            // Keys go to the focused window: its capture should show what they did.
+            if v == 1 { for st in streamers.values where st.active { st.expectFrameAfterInput() } }
         case .releaseAll:
             input.releaseAll()
             setClientFocus(0)

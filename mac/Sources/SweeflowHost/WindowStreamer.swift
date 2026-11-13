@@ -425,6 +425,39 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Captures ScreenCaptureKit delivered since the capture started, unchanged ones included.
+    private var delivered = 0
+    private var inputChecks = 0
+    private var lastInputRestart: UInt64 = 0
+
+    /// A capture can go quiet for good: after the virtual display was replaced (a computer
+    /// switching in), several windows' captures delivered nothing again, ever, while clicks and
+    /// keys still reached the apps, so the window looked frozen on Linux (Calculator read
+    /// "7+278" on the Mac and "7+2" on Linux). Input almost always changes something on
+    /// screen, so a click or key that is followed by no capture at all for 0.8 s means the
+    /// capture is dead: it's started afresh (which always begins with a frame), at most once
+    /// every 3 s per window. A live one delivers a frame for any change, so nothing restarts.
+    func expectFrameAfterInput() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.showingPause, self.stream != nil else { return }
+            self.inputChecks += 1
+            let check = self.inputChecks, before = self.delivered
+            self.queue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, !self.stopped, !self.paused, !self.showingPause, check == self.inputChecks,
+                      let s = self.stream, self.delivered == before, !ScreenLock.isLocked else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now - self.lastInputRestart > 3_000_000_000 else { return }
+                self.lastInputRestart = now
+                log("stream \(self.wid): nothing captured after input, starting the capture again")
+                s.stopCapture { _ in }
+                self.stream = nil
+                self.forceKeyframe = true
+                self.startRetries = 0
+                self.restartCapture(still: true)
+            }
+        }
+    }
+
     /// When the last resume was asked for (host µs), until its first frame goes out (0: none due).
     private var resumedUs: UInt64 = 0
 
@@ -684,6 +717,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         // A locked Mac captures as blank: keep showing the last real frame instead.
         guard !ScreenLock.isLocked else { return }
+        // Counted before the unchanged ones are dropped: the capture is alive (see
+        // expectFrameAfterInput).
+        queue.async { [weak self] in if let self, stream === self.stream { self.delivered &+= 1 } }
         guard differsFromLast(pb) else { return }
         // Where the window's content actually is in the buffer: when it doesn't fill it (the
         // configured size is stale), ScreenCaptureKit pads with black.
