@@ -203,6 +203,9 @@ struct Win {
     /// The app won't let it be resized (WINDOW_FIXED): it keeps exactly the Mac's size here
     /// (declared as both its smallest and its largest), on every desktop.
     fixed: bool,
+    /// Where its app put it on the Mac's screen (fractions), for a fixed one: placed there again
+    /// when its app changes its size (Calculator switching mode), as it was anchored to its corner.
+    spot: Option<(f32, f32)>,
     /// A first refusal (size asked, size the Mac kept), not acted on yet: the Mac may just be
     /// lagging behind a drag. Only the same refusal twice in a row declares a limit.
     refusal: Option<((u32, u32), (u32, u32))>,
@@ -657,11 +660,15 @@ impl App {
                 // Said before the window is added: it's made a dialog of its size from the start.
                 self.pending_fixed.insert(wid, spot);
             }
-            UiEvent::WindowFixed(wid, _) => {
+            UiEvent::WindowFixed(wid, spot) => {
                 if let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.display) {
                     w.fixed = true;
+                    w.spot = spot;
                     log::info!("window {wid}: its app won't let it be resized: kept at its own size");
                     Self::hold_mac_size(w);
+                    if let Some(spot) = spot {
+                        crate::desktop::place_at_spot(format!("sweeflow-{}", w.info.bundle_id), display_title(&w.info.app_name, &w.info.title), spot);
+                    }
                     if crate::hyprland::running() {
                         // Hyprland floats a window whose smallest and largest size are the same
                         // only when it opens; this one was already tiled.
@@ -810,6 +817,7 @@ impl App {
             return;
         }
         let mut fixed_now = false;
+        let mut fixed_spot = None;
         let mac_size = (info.w.round().max(1.0) as u32, info.h.round().max(1.0) as u32);
         let (role, base) = if info.kind == 1 && self.windows.contains_key(&info.parent) {
             let parent = &self.windows[&info.parent];
@@ -861,6 +869,7 @@ impl App {
                     d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
                 }
                 fixed_now = true;
+                fixed_spot = spot;
                 if let Some(spot) = spot {
                     crate::desktop::place_at_spot(
                         format!("sweeflow-{}", info.bundle_id),
@@ -944,6 +953,7 @@ impl App {
                 min_size: if fixed_now { mac_size } else if info_kind == 2 || info_kind == 3 { (1, 1) } else { MIN_SIZE },
                 max_size: fixed_now.then_some(mac_size),
                 fixed: fixed_now,
+                spot: fixed_spot,
                 refusal: None,
                 size,
                 requested: None,
@@ -1182,7 +1192,11 @@ impl App {
         if matches!(w.role, Role::Toplevel(_)) {
             // A window its app won't let be resized: exactly the Mac's size, whatever it is now.
             if w.fixed {
+                let before = w.size;
                 Self::hold_mac_size(w);
+                if let Some(spot) = w.spot.filter(|_| w.size != before) {
+                    crate::desktop::place_at_spot(format!("sweeflow-{}", w.info.bundle_id), display_title(&w.info.app_name, &w.info.title), spot);
+                }
                 self.draw_base(wid, qh);
                 self.relayout(wid, qh);
                 return;
