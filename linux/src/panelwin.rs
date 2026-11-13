@@ -177,6 +177,8 @@ slint::slint! {
 
         // The client answers on D-Bus (it isn't running otherwise).
         in property <bool> running;
+        // The desktop has a place to change keyboard shortcuts (Plasma, GNOME; not Hyprland).
+        in property <bool> shortcut-settings;
         in property <bool> paired;
         in property <string> mac-name;
         in property <string> status;
@@ -626,7 +628,12 @@ slint::slint! {
                     }
                     Text { text: k.what; color: Look.fg; font-size: 12px; vertical-alignment: center; overflow: elide; }
                 }
-                Text { text: "⌘ is the Super key. Change these in your desktop's keyboard settings."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
+                Text { text: "⌘ is the Super key."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
+                if root.shortcut-settings: HorizontalLayout {
+                    alignment: start;
+                    Btn { text: "Change shortcuts…"; clicked => { root.show-keys = false; root.act("shortcut-settings", ""); } }
+                }
+                if !root.shortcut-settings: Text { text: "Sweeflow sets these in Hyprland as it starts; bind other keys in your Hyprland config to change them."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
             }
         }
 
@@ -940,6 +947,7 @@ fn show(ui: &PanelWin, v: &mut View) {
         return;
     };
     ui.set_running(true);
+    ui.set_shortcut_settings(crate::tray::shortcut_settings_place().is_some());
     ui.set_paired(s.paired);
     ui.set_mac_name(if s.mac.is_empty() { "Mac".into() } else { s.mac.as_str().into() });
     ui.set_status(s.status.as_str().into());

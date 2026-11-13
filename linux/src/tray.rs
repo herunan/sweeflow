@@ -318,8 +318,7 @@ impl ksni::Tray for Tray {
                 MenuItem::Separator,
                 StandardItem {
                     label: "Quit Sweeflow".into(),
-                    icon_name: menu_icon("application-exit-symbolic"),
-                    activate: Box::new(|_| {
+                        activate: Box::new(|_| {
                         quit();
                     }),
                     ..Default::default()
@@ -352,13 +351,12 @@ impl ksni::Tray for Tray {
             );
         }
         items.push(MenuItem::Separator);
-        items.push(StandardItem { label: "Open Sweeflow".into(), icon_name: menu_icon("sweeflow-symbolic"), activate: Box::new(|_| open_panel()), ..Default::default() }.into());
+        items.push(StandardItem { label: "Open Sweeflow".into(), activate: Box::new(|_| open_panel()), ..Default::default() }.into());
         // (The Global menu opens with Cmd+Opt+M in a Mac window, on every desktop: no item here.)
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
                 label: "Quit Sweeflow".into(),
-                icon_name: menu_icon("application-exit-symbolic"),
                 activate: Box::new(|_| {
                     quit();
                 }),
@@ -367,6 +365,28 @@ impl ksni::Tray for Tray {
             .into(),
         );
         items
+    }
+}
+
+/// Where the desktop lets keyboard shortcuts be changed (Sweeflow's among them): Plasma's
+/// System Settings at Shortcuts, GNOME's Settings at Keyboard. Hyprland has no such place (its
+/// config file; Sweeflow adds its keys while it runs), so nothing opens there.
+pub fn shortcut_settings_place() -> Option<&'static [&'static str]> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if desktop.contains("KDE") {
+        Some(&["systemsettings", "kcm_keys"])
+    } else if desktop.contains("GNOME") {
+        Some(&["gnome-control-center", "keyboard"])
+    } else {
+        None
+    }
+}
+
+fn open_shortcut_settings() {
+    if let Some(cmd) = shortcut_settings_place() {
+        if let Err(e) = std::process::Command::new(cmd[0]).args(&cmd[1..]).spawn() {
+            log::warn!("opening the shortcut settings ({}): {e}", cmd[0]);
+        }
     }
 }
 
@@ -766,6 +786,7 @@ pub fn panel_do(action: &str, arg: &str) {
                 let _ = net.send(NetCmd::Control(W::new(t::QUIT_APP).str(arg).finish()));
             }
         }
+        "shortcut-settings" => open_shortcut_settings(),
         "display" => {
             if let Some(net) = NET.get() {
                 let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(1).finish()));

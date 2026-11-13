@@ -320,9 +320,14 @@ PlasmoidItem {
                                 }
                             }
                             PlasmaComponents3.Label {
-                                text: "⌘ is the Meta key. Change these in System Settings → Shortcuts."
+                                text: "⌘ is the Meta key."
                                 font: Kirigami.Theme.smallFont
                                 opacity: 0.7
+                            }
+                            PlasmaComponents3.Button {
+                                text: "Change shortcuts…"
+                                icon.name: "configure-shortcuts"
+                                onClicked: { keysPopup.close(); root.act("shortcut-settings"); root.expanded = false; }
                             }
                         }
                     }
