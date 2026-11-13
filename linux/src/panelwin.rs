@@ -651,6 +651,8 @@ struct Mac {
     online: Option<bool>,
     /// Streaming to another computer (as it says on the network).
     busy: bool,
+    /// Its screen is locked (the same).
+    locked: bool,
 }
 
 fn parse_state(json: &str) -> Option<PanelState> {
@@ -870,6 +872,7 @@ fn mac_state(s: &PanelState, m: &Mac) -> &'static str {
     }
     match m.online {
         Some(true) if m.busy || (m.active && s.elsewhere.is_some()) => "busy",
+        Some(true) if m.locked => "locked",
         Some(true) => "available",
         Some(false) => "offline",
         None => "",
@@ -1127,7 +1130,7 @@ mod tests {
         assert_eq!(s.settings.exclude, ["com.apple.Notes"]);
         assert_eq!(s.apps.len(), 4);
         assert_eq!(s.apps[1], App { id: "com.apple.Safari".into(), name: "Safari".into(), icon: "file:///nowhere/safari.png".into(), state: 3, pinned: false });
-        assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true), busy: false });
+        assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true), busy: false, locked: false });
         assert_eq!(s.macs[1].online, None);
         // The Mac in use streaming here; another not known yet; then each other state.
         assert_eq!(s.macs.iter().map(|m| mac_state(&s, m)).collect::<Vec<_>>(), ["streaming", ""]);

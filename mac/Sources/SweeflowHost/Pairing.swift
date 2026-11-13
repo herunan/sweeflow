@@ -321,6 +321,10 @@ final class Pairing {
         w.u16(settings.config.port)
         w.u16(Pairing.version)
         w.bytes(tag)
+        // Streaming to a computer now: a linked computer that can't see this Mac's network
+        // announcement (a virtual machine's network, a network that drops it) asks instead.
+        w.u8(Server.serving ? 1 : 0)
+        w.u8(ScreenLock.isLocked ? 1 : 0)
         stream.send(w)
     }
 
@@ -357,7 +361,7 @@ final class Pairing {
 /// connecting (a connection is turned away while another computer is served).
 func serviceTXT(busy: Bool = false) -> NWTXTRecord {
     NWTXTRecord(["id": String(identity.fingerprint.prefix(16)), "port": "\(settings.config.port)", "v": "\(protocolVersion)",
-                 "busy": busy ? "1" : "0"])
+                 "busy": busy ? "1" : "0", "locked": ScreenLock.isLocked ? "1" : "0"])
 }
 
 /// The code a computer that's linking has to type, in big digits. A window of its own rather than

@@ -639,6 +639,7 @@ fn manual_mac(text: &str) -> Option<FoundMac> {
         addr,
         stream_port: 44120,
         busy: false,
+        locked: false,
     })
 }
 

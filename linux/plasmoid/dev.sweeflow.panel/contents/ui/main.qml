@@ -88,6 +88,7 @@ PlasmoidItem {
         online: m.online === undefined ? null : m.online,
         // Streaming to another computer (as it says on the network).
         busy: !!m.busy,
+        locked: !!m.locked,
     })))
     readonly property var linkedMacs: JSON.parse(macsJson)
     // The Mac being renamed, or asked about unlinking (fingerprints).
@@ -559,6 +560,7 @@ PlasmoidItem {
                                             : mac.modelData.online === null ? ""
                                             : mac.modelData.online === false ? "offline"
                                             : mac.modelData.busy || (mac.modelData.active && root.elsewhere !== "") ? "busy"
+                                            : mac.modelData.locked ? "locked"
                                             : "available"
                                         Layout.fillWidth: true
                                         spacing: 0

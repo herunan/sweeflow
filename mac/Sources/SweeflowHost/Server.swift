@@ -90,11 +90,25 @@ final class Server {
     private var listener: NWListener?
     /// The session being served.
     private var session: Session? {
-        didSet { if (session != nil) != (oldValue != nil) { advertise() } }
+        didSet {
+            if (session != nil) != (oldValue != nil) {
+                Server.lock.withLock { Server.servingNow = session != nil }
+                advertise()
+            }
+        }
     }
 
+    /// A computer is being served now (read from the linking listener's queue).
+    static var serving: Bool { lock.withLock { servingNow } }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var servingNow = false
+
     /// The streaming service on the network, saying whether a computer is being served (busy).
+    /// Watches the screen lock once, so the announcement says when it's locked.
+    private lazy var watchLock: Void = ScreenLock.onChange { [weak self] in self?.queue.async { self?.advertise() } }
+
     private func advertise() {
+        _ = watchLock
         guard let l = listener else { return }
         l.service = NWListener.Service(name: macName, type: streamServiceType, domain: nil, txtRecord: serviceTXT(busy: session != nil))
     }
@@ -154,6 +168,7 @@ final class Server {
         l.newConnectionGroupHandler = { [weak self] group in self?.accept(group) }
         l.start(queue: queue)
         listener = l
+        _ = watchLock
     }
 
     private func accept(_ group: NWConnectionGroup) {

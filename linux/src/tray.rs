@@ -485,6 +485,8 @@ pub fn status_short(s: Standing) -> String {
     }
     // The same words as the Mac's line in the list of Macs.
     match s {
+        Standing { stopped: true, online: Some(true), elsewhere: Some(_), .. } => "Busy · streaming elsewhere",
+        Standing { stopped: true, online: Some(true), locked: true, .. } => "Locked",
         Standing { stopped: true, online: Some(true), .. } => "Available",
         Standing { stopped: true, online: Some(false), .. } => "Not online",
         Standing { stopped: true, .. } => "Stopped",
@@ -551,12 +553,15 @@ pub fn action_label(action: &str) -> &'static str {
 }
 
 fn standing(state: &State) -> Standing<'_> {
+    let stopped = crate::net::offline();
+    // Stopped here, the Mac in use still says on the network whether it's busy or locked.
+    let (busy, locked) = if stopped { crate::net::in_use_says() } else { (false, false) };
     Standing {
-        stopped: crate::net::offline(),
-        elsewhere: state.elsewhere.as_deref(),
+        stopped,
+        elsewhere: state.elsewhere.as_deref().or(busy.then_some("")),
         connected: state.settings.is_some(),
         enabled: state.settings.as_ref().is_none_or(|s| s.enabled),
-        locked: crate::net::mac_locked(),
+        locked: crate::net::mac_locked() || locked,
         refused: state.mac_refused,
         online: crate::net::mac_online(),
     }
@@ -603,7 +608,8 @@ pub fn panel_state() -> serde_json::Value {
                                 // Reachable on the network: null until known.
                                 "online": crate::net::online(&m.fingerprint),
                                 // Streaming to another computer (as its network announcement says).
-                                "busy": crate::net::busy(&m.fingerprint) })
+                                "busy": crate::net::busy(&m.fingerprint),
+                                "locked": crate::net::locked(&m.fingerprint) })
         })
         .collect();
     let mac_name = mac_name(&state, &cfg);

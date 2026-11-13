@@ -77,6 +77,16 @@ pub struct FoundMac {
     pub stream_port: u16,
     /// Streaming to a computer now (from the TXT record; a Mac from before it said so: false).
     pub busy: bool,
+    /// Its screen is locked (the same).
+    pub locked: bool,
+}
+
+/// What a linked Mac says of itself without being connected to: streaming to a computer, and
+/// whether its screen is locked.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Presence {
+    pub busy: bool,
+    pub locked: bool,
 }
 
 pub enum Found {
@@ -116,6 +126,7 @@ pub fn browse(service: &'static str, mut on: impl FnMut(Found) + Send + 'static)
                         addr: SocketAddr::new(ip, port),
                         stream_port: s.get_property_val_str("port").and_then(|p| p.parse().ok()).unwrap_or(44120),
                         busy: s.get_property_val_str("busy") == Some("1"),
+                        locked: s.get_property_val_str("locked") == Some("1"),
                     }));
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => on(Found::Gone(instance_name(&fullname, service))),
@@ -148,14 +159,14 @@ pub fn locate(fingerprint: &str, wait: Duration) -> Option<SocketAddr> {
 }
 
 /// The Macs advertising streaming on the network within `wait`: the start of each one's
-/// certificate fingerprint (16 hex digits, as `locate` matches them), and whether it's busy
-/// streaming to a computer.
-pub fn seen_on_network(wait: Duration) -> std::collections::HashMap<String, bool> {
-    let seen: Arc<Mutex<std::collections::HashMap<String, bool>>> = Arc::default();
+/// certificate fingerprint (16 hex digits, as `locate` matches them), and what each says of
+/// itself.
+pub fn seen_on_network(wait: Duration) -> std::collections::HashMap<String, Presence> {
+    let seen: Arc<Mutex<std::collections::HashMap<String, Presence>>> = Arc::default();
     let s2 = seen.clone();
     let browser = browse(STREAM_SERVICE, move |f| {
         if let Found::Up(m) = f {
-            s2.lock().unwrap().insert(m.id, m.busy);
+            s2.lock().unwrap().insert(m.id, Presence { busy: m.busy, locked: m.locked });
         }
     });
     if browser.is_ok() {
@@ -394,12 +405,51 @@ async fn speaks_old(addr: SocketAddr) -> bool {
 /// Sends `ty` (PAIR_UNLINK or PAIR_CHECK, no payload) on a stream of its own and returns the
 /// status the Mac answers with.
 async fn ask(conn: &quinn::Connection, ty: u8) -> Result<u8> {
+    Ok(ask_full(conn, ty).await?.0)
+}
+
+/// The same, with what the Mac says of itself (None: a Mac from before it said so).
+async fn ask_full(conn: &quinn::Connection, ty: u8) -> Result<(u8, Option<Presence>)> {
     let (mut tx, mut rx) = conn.open_bi().await?;
     tx.write_all(&W::new(ty).finish()).await?;
     let reply = tokio::time::timeout(Duration::from_secs(5), proto::read_msg(&mut rx)).await.context("no answer")??;
     let Some((t::PAIR_RESULT, body)) = reply else { bail!("no answer") };
     let _ = tx.finish();
-    Ok(R::new(&body).u8()?)
+    let mut r = R::new(&body);
+    let status = r.u8()?;
+    let presence = (|| -> Option<Presence> {
+        r.str().ok()?;
+        r.u16().ok()?;
+        r.u16().ok()?;
+        r.bytes().ok()?;
+        let busy = r.u8().ok()? != 0;
+        Some(Presence { busy, locked: r.u8().is_ok_and(|l| l != 0) })
+    })();
+    Ok((status, presence))
+}
+
+/// Asks a linked Mac directly whether it's there and busy, for when its network announcement
+/// isn't seen (a virtual machine's network, or one that drops multicast): what it says of itself
+/// if it answered as this computer's linked Mac; None if it didn't answer.
+pub fn probe(mac: &PairedMac) -> Option<Presence> {
+    let host = mac.host.rsplit_once(':').map_or(mac.host.as_str(), |(h, _)| h).trim_matches(['[', ']']);
+    let addr = (host, PAIR_PORT).to_socket_addrs().ok()?.next()?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    let want = mac.fingerprint.clone();
+    rt.block_on(async move {
+        let check: HostCheck = Arc::new(move |got: &[u8]| if hex::encode(got) == want { Ok(()) } else { Err("not that Mac".into()) });
+        let endpoint = net::client_endpoint(check, LINK_ALPN).ok()?;
+        let answer = async {
+            let conn = tokio::time::timeout(Duration::from_secs(2), endpoint.connect(addr, "sweeflow").ok()?).await.ok()?.ok()?;
+            let a = ask_full(&conn, t::PAIR_CHECK).await.ok();
+            conn.close(0u32.into(), b"done");
+            a
+        }
+        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
+        // Linked (0) or not, it answered: it's there.
+        answer.map(|(_, p)| p.unwrap_or_default())
+    })
 }
 
 /// Asks the linked Mac at `addr` (whose certificate must be `fingerprint`) one thing: `ty`.
@@ -604,7 +654,7 @@ mod tests {
     }
 
     fn found() -> FoundMac {
-        FoundMac { name: "Air".into(), id: String::new(), hostname: "air.local".into(), addr: "192.168.1.20:44121".parse().unwrap(), stream_port: 44120, busy: false }
+        FoundMac { name: "Air".into(), id: String::new(), hostname: "air.local".into(), addr: "192.168.1.20:44121".parse().unwrap(), stream_port: 44120, busy: false, locked: false }
     }
 
     fn result(status: u8, tag: &[u8]) -> Vec<u8> {
