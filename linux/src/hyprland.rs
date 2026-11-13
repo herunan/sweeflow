@@ -104,7 +104,10 @@ fn place_rule_lua(top: i64, bottom: i64) -> String {
 /// lets the click through) and closes the two when the click is not on one of them. Once per
 /// Hyprland config, like the key.
 fn close_on_click_elsewhere() {
-    let lua = r#"if not sweeflow_click_closes then sweeflow_click_closes = true; hl.bind("mouse:272", function() local function ours(w) return w and w.class == "sweeflow" and (w.title == "Sweeflow" or string.find(w.title or "", "Global menu", 1, true)) end; if ours(hl.get_active_window()) then return end; for _, w in ipairs(hl.get_windows({ class = "sweeflow" })) do if ours(w) then hl.dispatch(hl.dsp.window.close({ window = "address:" .. w.address })) end end end, { non_consuming = true }) end"#;
+    // Where the click is, not which window has the focus: a click on the desktop or the bar
+    // moves no focus. A click in the strip above a window placed under a top bar is the bar's
+    // (its tray icon opens and closes the window itself).
+    let lua = r#"if not sweeflow_click_closes2 then sweeflow_click_closes2 = true; hl.bind("mouse:272", function() local function ours(w) return w and w.class == "sweeflow" and (w.title == "Sweeflow" or string.find(w.title or "", "Global menu", 1, true)) end; local p = hl.get_cursor_pos(); for _, w in ipairs(hl.get_windows({ class = "sweeflow" })) do if ours(w) and w.at and w.size then local inside = p.x >= w.at.x and p.x < w.at.x + w.size.x and p.y >= w.at.y and p.y < w.at.y + w.size.y; local bar = w.at.y < 80 and p.y < w.at.y; if not inside and not bar then hl.dispatch(hl.dsp.window.close({ window = "address:" .. w.address })) end end end end, { non_consuming = true }) end"#;
     match Command::new("hyprctl").args(["eval", lua]).output() {
         Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {}
         Ok(o) => log::warn!("Hyprland didn't take the click-elsewhere binding: {}", String::from_utf8_lossy(&o.stdout).trim()),
