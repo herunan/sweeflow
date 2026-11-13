@@ -422,6 +422,26 @@ slint::slint! {
                                 Chip { text: "Show"; enabled: root.dim-enabled || root.dimmed; clicked => { root.act("display", ""); } }
                             }
                         }
+                        // The keys, for people to know them (set in the desktop's own shortcut
+                        // settings, where they can be changed; Super is the Mac keyboard's ⌘).
+                        VerticalLayout {
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            padding-top: 10px;
+                            spacing: 4px;
+                            Text { text: "Keyboard shortcuts"; color: Look.fg; font-size: 13px; font-weight: 600; }
+                            for k in [
+                                { what: "Open Sweeflow", key: "Super + Alt + O" },
+                                { what: "Pause or resume streaming", key: "Super + Alt + P" },
+                                { what: "Stop or start streaming", key: "Super + Alt + K" },
+                                { what: "Mac app's menu (in a Mac window)", key: "Super + Alt + M" },
+                            ]: HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: k.what; color: Look.fg; font-size: 12px; horizontal-stretch: 1; overflow: elide; }
+                                Text { text: k.key; color: Look.muted; font-size: 12px; horizontal-stretch: 0; }
+                            }
+                            Text { text: "Super is ⌘ on a Mac keyboard. Change them in your desktop's keyboard settings."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
+                        }
                     }
                 }
 

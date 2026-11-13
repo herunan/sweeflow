@@ -118,8 +118,8 @@ PlasmoidItem {
     // The streaming actions, as they're named and drawn.
     readonly property var actionLabels: ({ start: "Start", pause: "Pause", resume: "Resume", stop: "Stop" })
     // What each sign does, said on hover.
-    readonly property var actionTips: ({ start: "Start streaming", pause: "Pause streaming",
-                                         resume: "Resume streaming", stop: "Stop streaming" })
+    readonly property var actionTips: ({ start: "Start streaming (Meta+Alt+K)", pause: "Pause streaming (Meta+Alt+P)",
+                                         resume: "Resume streaming (Meta+Alt+P)", stop: "Stop streaming (Meta+Alt+K)" })
     readonly property var actionIcons: ({ start: "media-playback-start", pause: "media-playback-pause",
                                           resume: "media-playback-start", stop: "media-playback-stop" })
 
@@ -517,6 +517,30 @@ PlasmoidItem {
                         buttonText: "Show"
                         available: root.streaming
                         onAsked: { root.act("display"); root.expanded = false; }
+                    }
+                    // The keys, for people to know them (set in Plasma's shortcut settings, where
+                    // they can be changed; Meta is the Mac keyboard's ⌘).
+                    PlasmaComponents3.Label {
+                        text: "Keyboard shortcuts"
+                        font.bold: true
+                        Layout.topMargin: Kirigami.Units.smallSpacing * 2
+                    }
+                    Repeater {
+                        model: [["Open Sweeflow", "Meta + Alt + O"], ["Pause or resume streaming", "Meta + Alt + P"],
+                                ["Stop or start streaming", "Meta + Alt + K"], ["Mac app's menu (in a Mac window)", "Meta + Alt + M"]]
+                        delegate: RowLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            PlasmaComponents3.Label { text: modelData[0]; elide: Text.ElideRight; Layout.fillWidth: true }
+                            PlasmaComponents3.Label { text: modelData[1]; opacity: 0.7 }
+                        }
+                    }
+                    PlasmaComponents3.Label {
+                        text: "Meta is ⌘ on a Mac keyboard. Change them in System Settings → Keyboard → Shortcuts."
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
                     }
                     Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                 }

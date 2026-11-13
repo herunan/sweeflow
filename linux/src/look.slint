@@ -199,7 +199,7 @@ export global Tip {
 
     // What the stream signs (start, pause, resume, stop) do.
     pure public function stream(id: string) -> string {
-        return id == "start" ? "Start streaming" : id == "pause" ? "Pause streaming" : id == "resume" ? "Resume streaming" : id == "stop" ? "Stop streaming" : "";
+        return id == "start" ? "Start streaming (Super+Alt+K)" : id == "pause" ? "Pause streaming (Super+Alt+P)" : id == "resume" ? "Resume streaming (Super+Alt+P)" : id == "stop" ? "Stop streaming (Super+Alt+K)" : "";
     }
 }
 
