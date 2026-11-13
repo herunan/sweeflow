@@ -429,7 +429,7 @@ slint::slint! {
                                     padding-right: 4px;
                                     spacing: 6px;
                                     Text {
-                                        text: "Unlink " + m.name + "? Linking it again needs a new code.";
+                                        text: "Unlink " + m.name + "? To use it again you link it again.";
                                         color: Look.fg;
                                         font-size: 12px;
                                         wrap: word-wrap;

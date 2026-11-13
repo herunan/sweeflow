@@ -634,7 +634,7 @@ PlasmoidItem {
                                     visible: mac.confirming
                                     spacing: Kirigami.Units.smallSpacing
                                     PlasmaComponents3.Label {
-                                        text: "Unlink " + mac.modelData.name + "? Linking it again needs a new code."
+                                        text: "Unlink " + mac.modelData.name + "? To use it again you link it again."
                                         wrapMode: Text.Wrap
                                         Layout.fillWidth: true
                                     }

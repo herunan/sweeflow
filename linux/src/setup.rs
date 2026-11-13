@@ -257,7 +257,6 @@ const WIDGET_FILES: &[(&str, &str)] = &[
     ("dev.sweeflow.panel/metadata.json", include_str!("../plasmoid/dev.sweeflow.panel/metadata.json")),
     ("dev.sweeflow.panel/contents/ui/main.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/main.qml")),
     ("dev.sweeflow.panel/contents/ui/ToggleRow.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/ToggleRow.qml")),
-    ("dev.sweeflow.panel/contents/ui/MacRow.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/MacRow.qml")),
     ("dev.sweeflow.panel/contents/icons/sweeflow-tray.svg", LOGO),
     ("dev.sweeflow.panel/contents/icons/sweeflow-app.svg", APP_ICON),
     ("dev.sweeflow.panel/contents/icons/dock.svg", include_str!("../plasmoid/dev.sweeflow.panel/contents/icons/dock.svg")),
