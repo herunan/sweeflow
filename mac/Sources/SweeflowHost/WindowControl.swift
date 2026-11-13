@@ -45,6 +45,28 @@ final class WindowControl {
 
     func forget(_ wid: UInt32) { lock.withLock { cache[wid] = nil } }
 
+    /// Whether the window is a sheet (TextEdit's "Save changes?", a print or export sheet): to
+    /// Accessibility it isn't one of the app's windows but a child of the window it hangs from.
+    func isSheet(_ wid: UInt32, pid: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let wins = value as? [AXUIElement] else { return false }
+        for w in wins {
+            var kids: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(w, kAXChildrenAttribute as CFString, &kids) == .success,
+                  let children = kids as? [AXUIElement] else { continue }
+            for c in children {
+                var role: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(c, kAXRoleAttribute as CFString, &role) == .success,
+                      (role as? String) == "AXSheet" else { continue }
+                var id: CGWindowID = 0
+                if _AXUIElementGetWindow(c, &id) == .success, id == wid { return true }
+            }
+        }
+        return false
+    }
+
     @discardableResult
     /// The app won't let the window be resized (macOS says its size can't be set): a reminder,
     /// an About or settings window, a fixed dialog. Nil if the window can't be looked at.

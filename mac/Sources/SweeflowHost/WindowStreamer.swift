@@ -353,6 +353,22 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
+        if lossless {
+            // A popup that doesn't change (a "Save changes?" sheet sitting still) can get no frame
+            // at all from the live capture: after a moment with none, a still of it (by then
+            // done fading in).
+            queue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, !self.stopped, self.stream === s, self.framesSinceStart == 0 else { return }
+                SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
+                    guard let self, let sb, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+                    self.queue.async {
+                        guard !self.stopped, !self.showingPause, self.stream === s, self.framesSinceStart == 0, !ScreenLock.isLocked else { return }
+                        log("stream \(self.wid): no frame yet: a still of it instead")
+                        self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
+                    }
+                }
+            }
+        }
         s.startCapture { [weak self] err in
             guard let self else { return }
             self.queue.async {

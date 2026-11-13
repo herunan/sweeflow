@@ -845,6 +845,13 @@ impl App {
         for h in hidden {
             self.unhide(h, "its app showed another window instead of closing", qh);
         }
+        // Announced again as another kind: a window shown on its own that the Mac now knows is
+        // attached to another (a "Save changes?" sheet, recognised a moment later), or the other
+        // way round. A toplevel can't become a popup: the window is made anew.
+        if self.windows.get(&wid).is_some_and(|w| (w.info.kind == 1) != (info.kind == 1)) {
+            log::info!("window {wid}: now kind {} (was {}): made anew", info.kind, self.windows[&wid].info.kind);
+            self.remove_window(wid);
+        }
         if let Some(w) = self.windows.get_mut(&wid) {
             // Re-announced after a reconnect: keep the native window, restart the video, and make
             // sure the Mac window still has this window's size.

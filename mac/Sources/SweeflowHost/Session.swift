@@ -1544,7 +1544,10 @@ final class Session {
         }
         tracker.isAppWindow = { [weak self] wid, pid in self?.control_.element(wid, pid: pid) != nil }
         tracker.hasNoButtons = { [weak self] wid, pid in
-            guard let self, self.control_.element(wid, pid: pid) != nil else { return false }
+            guard let self else { return false }
+            // A sheet (a "Save changes?" prompt) isn't among the app's windows: attached to the
+            // window it hangs from, like a popover, on top of it and moving with it.
+            guard self.control_.element(wid, pid: pid) != nil else { return self.control_.isSheet(wid, pid: pid) }
             return self.control_.buttonRects(wid, pid: pid).allSatisfy { $0.width == 0 }
         }
         // Which window has focus changes with what the user does or with app switches, which
