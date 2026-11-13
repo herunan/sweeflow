@@ -182,8 +182,6 @@ slint::slint! {
         in property <string> status;
         // Where the Mac in use stands (as MacItem.online): the status line takes its colour.
         in property <string> status-state;
-        // 2 streaming, 1 paused or ready to stream, 0 neither.
-        in property <int> dot;
         // What can be done about the Mac in use (Pause and Stop, Resume and Stop, Start, or Stop).
         in property <[Action]> actions;
         in property <[AppRow]> apps;
@@ -250,11 +248,14 @@ slint::slint! {
                             spacing: 6px;
                             VerticalLayout {
                                 alignment: center;
+                                // The Mac in use's dot, as in the list of Macs.
                                 Rectangle {
                                     width: 8px;
                                     height: 8px;
                                     border-radius: 4px;
-                                    background: root.dot == 2 ? Look.accent : root.dot == 1 ? #d9a520 : Look.muted;
+                                    background: root.status-state == "" || MacState.hollow(root.status-state) ? transparent : MacState.ink(root.status-state);
+                                    border-width: root.status-state == "" || MacState.hollow(root.status-state) ? 2px : 0px;
+                                    border-color: root.status-state == "" ? Look.muted : MacState.ink(root.status-state);
                                 }
                             }
                             Text { text: root.status; color: Look.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; }
@@ -899,13 +900,6 @@ fn show(ui: &PanelWin, v: &mut View) {
     let active_state = s.macs.iter().find(|m| m.active).map_or("", |m| mac_state(&s, m));
     ui.set_status_state(active_state.into());
     let streaming = s.connected && s.settings.enabled;
-    ui.set_dot(if streaming {
-        2
-    } else if (s.connected && !s.settings.enabled) || (s.offline && s.online == Some(true)) {
-        1
-    } else {
-        0
-    });
     let actions: Vec<Action> =
         s.actions
             .iter()
