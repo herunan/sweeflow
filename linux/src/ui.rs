@@ -150,8 +150,9 @@ struct Lights {
     sub: wl_subsurface::WlSubsurface,
     viewport: WpViewport,
     buffers: std::collections::VecDeque<(wl_buffer::WlBuffer, RawPool)>,
-    /// What is drawn: the state, where, and the video's offset it was placed against.
-    drawn: Option<(lights::State, [f64; 4], i32)>,
+    /// What is drawn: the state, where, the video's offset it was placed against, and the scale
+    /// (not 1 while the picture is fitted into a Hyprland tile).
+    drawn: Option<(lights::State, [f64; 4], i32, f64)>,
 }
 
 /// Work finished on a helper thread that must continue on the Wayland thread.
@@ -226,6 +227,12 @@ struct Win {
     pending: Option<GpuFrame>,
     /// The buffer showing the latest video frame (its frame is in App::in_use).
     shown: Option<wayland_client::backend::ObjectId>,
+    /// That frame's picture: the part of the frame that is the window (px), and its pixels per
+    /// point as the Mac reported them. Kept to lay the picture out again when only the window's
+    /// size here changed (relayout).
+    picture: Option<((u32, u32), u8)>,
+    /// Where the video's subsurface (the middle strip) is in the window.
+    video_at: (i32, i32),
     /// Paused (or the Mac away): the still shown instead of the video.
     still: Option<Still>,
     /// Lossless frame waiting for the first configure.
@@ -240,8 +247,16 @@ struct Win {
     check_pending: bool,
     /// The "Mac display" view (kind 3): letterboxed and scaled to fit, never resized on the Mac.
     display: bool,
-    /// Display view only: logical px per Mac point, and where the picture starts (logical px).
+    /// How the picture is scaled, and where it starts (logical px). The display view: logical px
+    /// per Mac point. An app's window: against its usual 1:1 drawing, so (1, 0, 0) unless it is
+    /// fitted into a Hyprland tile (`fitted`).
     fit: (f64, f64, f64),
+    /// Tiled on Hyprland with a picture that isn't the tile's size (the Mac hasn't followed yet,
+    /// or can't): the picture is drawn scaled to fit, centred on a dark base, at this size
+    /// (logical px). None: drawn 1:1 from the window's corner.
+    fitted: Option<(i32, i32)>,
+    /// Hyprland gave the tile a new size the Mac hasn't been asked for yet, and when (arm_settle).
+    settling: Option<Instant>,
 }
 
 impl Win {
@@ -250,6 +265,14 @@ impl Win {
             Role::Toplevel(w) => w.wl_surface(),
             Role::Popup(p) => p.wl_surface(),
         }
+    }
+
+    /// A Mac app's window in a Hyprland tile. Hyprland alone decides a tile's size and the
+    /// window can't have another: the picture is fitted into the tile, and the Mac's own size
+    /// never becomes a limit or the size here. (Not a popup shown as a window: its lossless
+    /// pictures aren't laid out by lay_out.)
+    fn in_tile(&self) -> bool {
+        self.tiled && !self.display && self.info.kind != 1 && matches!(self.role, Role::Toplevel(_)) && crate::hyprland::running()
     }
 }
 
@@ -629,6 +652,7 @@ impl App {
             UiEvent::Focused => {}
             UiEvent::CornersSetting => self.apply_corners_setting(qh),
             UiEvent::Tiling(seen) => {
+                let mut changed = Vec::new();
                 for (wid, w) in self.windows.iter_mut().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))) {
                     let class = if w.display { "sweeflow-display".to_string() } else { format!("sweeflow-{}", w.info.bundle_id) };
                     let title = display_title(&w.info.app_name, &w.info.title);
@@ -643,7 +667,11 @@ impl App {
                     if w.tiled != tiled {
                         log::info!("window {wid}: {} on Hyprland", if tiled { "tiled" } else { "floating" });
                         w.tiled = tiled;
+                        changed.push(*wid);
                     }
+                }
+                for wid in changed {
+                    self.tiling_changed(wid, qh);
                 }
             }
             UiEvent::WindowButtons(wid, rects) => {
@@ -871,6 +899,8 @@ impl App {
                 lights: None,
                 corners: None,
                 shown: None,
+                picture: None,
+                video_at: (0, 0),
                 still: None,
                 appmenu,
                 dark_titlebar: true,
@@ -885,6 +915,8 @@ impl App {
                 check_pending: false,
                 display,
                 fit: (1.0, 0.0, 0.0),
+                fitted: None,
+                settling: None,
                 popup_settled: false,
             },
         );
@@ -999,6 +1031,78 @@ impl App {
         });
     }
 
+    /// A Hyprland tile got a new size: the Mac is asked for it once it has stood for a moment
+    /// (SETTLE), not at once. Hyprland lays a whole workspace out again in one go, and often
+    /// twice within a moment (a size in between, then the tile's): asked for each, the Mac
+    /// resized every window twice and was still at the first size when looked at. The picture
+    /// is fitted into the tile meanwhile (lay_out), so nothing waits on the Mac to look right.
+    /// One timer per window; each new size starts the wait again.
+    fn arm_settle(lh: &LoopHandle<'static, App>, settling: &mut Option<Instant>, wid: u32, qh: &QueueHandle<Self>) {
+        if settling.replace(Instant::now()).is_some() {
+            return; // the timer is running: it goes by when the last size came
+        }
+        let qh = qh.clone();
+        let _ = lh.insert_source(Timer::from_duration(SETTLE), move |_, _, app| {
+            let Some(w) = app.windows.get_mut(&wid) else { return TimeoutAction::Drop };
+            let Some(since) = w.settling else { return TimeoutAction::Drop };
+            let left = SETTLE.saturating_sub(since.elapsed());
+            if !left.is_zero() {
+                return TimeoutAction::ToDuration(left);
+            }
+            w.settling = None;
+            app.ask_settled_size(wid, &qh);
+            TimeoutAction::Drop
+        });
+    }
+
+    /// The tile's size has stood (arm_settle): the Mac is asked for it.
+    fn ask_settled_size(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let size = w.size;
+        let mac = (w.info.w.round() as u32, w.info.h.round() as u32);
+        if mac == size && w.requested.is_none_or(|(asked, _)| asked == size) {
+            // There and back within the moment: the Mac has this size and was asked for no other.
+            w.followed = true;
+            w.refusal = None;
+        } else {
+            log::debug!("window {wid}: its tile settled at {}x{}: asking the Mac", size.0, size.1);
+            w.requested = Some((size, Instant::now()));
+            let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+            // Check it took (a Mac window that can't follow reports no change).
+            Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+        }
+        // The wait over, a picture just short of the tile is shown as it is (see tile_fit).
+        self.relayout(wid, qh);
+    }
+
+    /// Hyprland tiled the window, or let it float (UiEvent::Tiling).
+    fn tiling_changed(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        if !w.in_tile() {
+            // Floating again: drawn 1:1 from its corner, as floating windows are.
+            if w.fitted.is_some() {
+                self.relayout(wid, qh);
+            }
+            return;
+        }
+        // A tile can't honour a size limit. One declared while the window floated, or before
+        // Hyprland said it was tiled, goes, along with the refusal it came from.
+        if let Role::Toplevel(win) = &w.role {
+            let default_min = if w.info.kind == 2 { (1, 1) } else { MIN_SIZE };
+            if w.min_size != default_min {
+                w.min_size = default_min;
+                win.set_min_size(Some(default_min));
+            }
+            if w.max_size.take().is_some() {
+                win.set_max_size(None);
+            }
+        }
+        w.refusal = None;
+        self.relayout(wid, qh);
+        // And the Mac is asked for the tile's size, if it has another.
+        self.adopt_mac_size(wid, qh);
+    }
+
     fn adopt_mac_size(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         let Some(w) = self.windows.get_mut(&wid) else { return };
         if w.display {
@@ -1007,13 +1111,38 @@ impl App {
         let mac = (w.info.w.round() as u32, w.info.h.round() as u32);
         if mac == w.size || !w.configured {
             w.followed |= mac == w.size;
+            if mac == w.size && w.in_tile() {
+                // It has the tile's size after all: asked again if it leaves it later (below).
+                w.refusal = None;
+            }
             return;
+        }
+        if w.settling.is_some() {
+            return; // a new size is about to be asked for (arm_settle)
         }
         if let Some((_, at)) = w.requested {
             let wait = if matches!(w.role, Role::Toplevel(_)) && !w.floating { 3000 } else { 1500 };
             if at.elapsed() < Duration::from_millis(wait) {
                 return;
             }
+        }
+        if w.in_tile() {
+            // In a Hyprland tile the tile is the size: the window can't be drawn at another, so
+            // the Mac's size is never declared as a limit and never becomes the size here (the
+            // picture overflowed the tile, or left part of it empty). The picture is fitted
+            // into the tile while the Mac's size differs (lay_out). The Mac is asked once more,
+            // in case it was only behind (a whole workspace laid out again at once); an app
+            // that keeps its own size after that is left alone, fitted.
+            let size = w.size;
+            if w.refusal != Some((size, mac)) {
+                w.refusal = Some((size, mac));
+                w.requested = Some((size, Instant::now()));
+                w.followed = false;
+                log::info!("window {wid}: {}x{} on the Mac, {}x{} in its tile: asking again", mac.0, mac.1, size.0, size.1);
+                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+            }
+            return;
         }
         // Asked for this size and the app stayed bigger: that's as small as it goes (a video-call app's
         // meeting window). Declare it as the minimum, so the tiling makes room for the whole
@@ -1141,8 +1270,8 @@ impl App {
         }
         let base = w.base();
         // Transparent: the window's rounded corners must show the desktop behind them. The
-        // display view is letterboxed: dark bars.
-        let fill = if w.display { &self.background } else { &self.clear };
+        // display view is letterboxed: dark bars. So is a picture fitted into a Hyprland tile.
+        let fill = if w.display || w.fitted.is_some() { &self.background } else { &self.clear };
         base.attach(fill.as_ref(), 0, 0);
         w.base_viewport.set_destination(bw as i32, bh as i32);
         base.damage_buffer(0, 0, i32::MAX, i32::MAX);
@@ -1163,7 +1292,12 @@ impl App {
         let mac = (w.info.w.round().max(1.0) as i32, w.info.h.round().max(1.0) as i32);
         let base = w.base();
         let region = self.compositor.wl_compositor().create_region(qh, ());
-        region.add(0, 0, mac.0.min(w.size.0 as i32), mac.1.min(w.size.1 as i32));
+        match w.fitted {
+            // Fitted into its tile: where the picture is drawn. The dark around it takes no
+            // clicks (they would land on the Mac window's edge).
+            Some((fw, fh)) => region.add(w.fit.1 as i32, w.fit.2 as i32, fw, fh),
+            None => region.add(0, 0, mac.0.min(w.size.0 as i32), mac.1.min(w.size.1 as i32)),
+        }
         base.set_input_region(Some(&region));
         region.destroy();
     }
@@ -1256,25 +1390,79 @@ impl App {
             return;
         }
 
+        w.shown = Some(buffer.id());
+        w.picture = Some((frame.content, frame.px_per_pt));
+        self.in_use.insert(buffer.id(), frame);
+        self.lay_out(wid, Some(&buffer), true, qh);
+    }
+
+    /// The window's size here changed (or how Hyprland holds it) with no new picture yet: the
+    /// one shown is laid out again, so a tile is filled at once instead of when the Mac has
+    /// followed.
+    fn relayout(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        if !w.configured || w.display {
+            return;
+        }
+        // The buffer itself is needed only to show it on more surfaces (the corner layout's
+        // strips); a compositor that has let go of it still shows the picture.
+        let buffer = w
+            .shown
+            .clone()
+            .filter(|id| self.in_use.contains_key(id))
+            .and_then(|id| wl_buffer::WlBuffer::from_id(&self.conn, id).ok());
+        self.lay_out(wid, buffer.as_ref(), false, qh);
+    }
+
+    /// Places the window's picture: `fresh`, a new frame's buffer is shown; otherwise the one
+    /// already shown is placed again (relayout).
+    fn lay_out(&mut self, wid: u32, buffer: Option<&wl_buffer::WlBuffer>, fresh: bool, qh: &QueueHandle<Self>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let Some(((fw, fh), reported)) = w.picture else { return };
         // Map the frame to the window's size in points (the frame may be 2x Retina pixels; the
         // compositor then downsamples it), cropped to the window if the Mac lags a resize.
         let s = self.scale;
         let (bw, bh) = w.size;
-        let (fw, fh) = frame.content;
-        let px_per_pt = px_per_pt(frame.px_per_pt, fw, w.info.w, s);
-        let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
-        let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);
-        let (dw, dh) = ((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32);
+        let px_per_pt = px_per_pt(reported, fw, w.info.w, s);
+        // In a Hyprland tile the picture is fitted instead while it isn't the tile's size: all
+        // of it, scaled, in the middle of the tile. Everything below is placed by the scaled
+        // sizes, so the strips, corner tiles and lights go with it.
+        let fit = if w.in_tile() {
+            tile_fit((fw as f64 / px_per_pt * s, fh as f64 / px_per_pt * s), (bw as f64, bh as f64), w.settling.is_none())
+        } else {
+            None
+        };
+        let (k, ox, oy) = fit.unwrap_or((1.0, 0.0, 0.0));
+        let ((sw, sh), (dw, dh)) = shown_part((fw, fh), px_per_pt, (bw, bh), s, k);
+        let fitted = fit.map(|_| (dw, dh));
+        let refitted = w.fitted != fitted || w.fit != (k, ox, oy);
+        w.fitted = fitted;
+        w.fit = (k, ox, oy);
 
         // Apps like Terminal snap to character cells, so the Mac window can differ from ours by
         // a point or two; the corners then go on the visible area (a sliver may be cropped).
         let t_px = w.corners.as_ref().map_or(0, |c| c.t_px);
-        let split = t_px > 0 && (vis_w * px_per_pt) as u32 > 3 * t_px && (vis_h * px_per_pt) as u32 > 3 * t_px;
-        let l = ((t_px as f64 / px_per_pt) * s).round() as i32; // corner size, logical px
-        let (sw, sh) = ((vis_w * px_per_pt) as f64, (vis_h * px_per_pt) as f64);
+        let l = ((t_px as f64 / px_per_pt) * s * k).round() as i32; // corner size, logical px
+        // (Scaled far down, a corner can come to nothing: no strips of no size then. And strips
+        // that aren't showing yet need the buffer.)
+        let was_split = w.corners.as_ref().is_some_and(|c| c.split);
+        let split = t_px > 0
+            && sw as u32 > 3 * t_px
+            && sh as u32 > 3 * t_px
+            && l > 0
+            && dw > 2 * l
+            && dh > 2 * l
+            && (buffer.is_some() || was_split);
         let middle_y = if split { l } else { 0 };
         let base = w.base().clone();
-        let mut relight = false;
+        let at = (ox as i32, oy as i32 + middle_y);
+        let mut relight = refitted;
+        if w.video_at != at {
+            w.video_at = at;
+            w.video_sub.set_position(at.0, at.1);
+            base.commit(); // subsurface positions apply with the parent's commit
+            relight = true; // where the lights hang off the video, they moved with it
+        }
         if let Some(c) = w.corners.as_mut() {
             // The corners setting changed: the tiles again, from the Mac's own.
             if c.squared != crate::config::square_corners() {
@@ -1287,26 +1475,30 @@ impl App {
             }
             if c.middle_y != middle_y {
                 c.middle_y = middle_y;
-                w.video_sub.set_position(0, middle_y);
-                base.commit(); // subsurface positions apply with the parent's commit
-                relight = true; // where the lights hang off the video, they moved with it
+                relight = true;
             }
             if split {
                 let t = t_px as f64;
+                // A strip takes the buffer with a new frame, or when it wasn't showing one.
+                let attach = buffer.filter(|_| fresh || !c.split);
                 // Children of the middle strip: positions are relative to it.
                 let (tsub, tsurf, tvp) = &c.top;
                 tsub.set_position(l, -l);
                 tvp.set_source(t, 0.0, sw - 2.0 * t, t);
                 tvp.set_destination(dw - 2 * l, l);
-                tsurf.attach(Some(&buffer), 0, 0);
-                tsurf.damage_buffer(0, 0, fw as i32, fh as i32);
+                if let Some(buffer) = attach {
+                    tsurf.attach(Some(buffer), 0, 0);
+                    tsurf.damage_buffer(0, 0, fw as i32, fh as i32);
+                }
                 tsurf.commit();
                 let (bsub, bsurf, bvp) = &c.bottom;
                 bsub.set_position(l, dh - 2 * l);
                 bvp.set_source(t, sh - t, sw - 2.0 * t, t);
                 bvp.set_destination(dw - 2 * l, l);
-                bsurf.attach(Some(&buffer), 0, 0);
-                bsurf.damage_buffer(0, 0, fw as i32, fh as i32);
+                if let Some(buffer) = attach {
+                    bsurf.attach(Some(buffer), 0, 0);
+                    bsurf.damage_buffer(0, 0, fw as i32, fh as i32);
+                }
                 bsurf.commit();
                 let pos = [(0, -l), (dw - l, -l), (0, dh - 2 * l), (dw - l, dh - 2 * l)];
                 let new_tiles = c.pending.take();
@@ -1364,11 +1556,24 @@ impl App {
             w.video_viewport.set_source(0.0, 0.0, sw, sh);
             w.video_viewport.set_destination(dw, dh);
         }
-        w.video.attach(Some(&buffer), 0, 0);
-        w.video.damage_buffer(0, 0, fw as i32, fh as i32);
+        if let Some(buffer) = buffer.filter(|_| fresh) {
+            w.video.attach(Some(buffer), 0, 0);
+            w.video.damage_buffer(0, 0, fw as i32, fh as i32);
+        }
         w.video.commit();
-        w.shown = Some(buffer.id());
-        self.in_use.insert(buffer.id(), frame);
+        // A paused still covers the picture: it goes where the picture went.
+        if let Some(st) = w.still.as_ref().filter(|_| !fresh) {
+            st.sub.set_position(ox as i32, oy as i32);
+            st.viewport.set_source(0.0, 0.0, sw, sh);
+            st.viewport.set_destination(dw, dh);
+            st.surface.commit();
+            base.commit();
+        }
+        if refitted {
+            // The base is dark around a fitted picture and clear otherwise, and clicks land
+            // only where the picture is.
+            self.draw_base(wid, qh);
+        }
         if relight {
             self.update_lights(wid, qh);
         }
@@ -1848,12 +2053,11 @@ impl App {
              ((w.info.w as f64 * k).round().max(1.0) as i32, (w.info.h as f64 * k).round().max(1.0) as i32))
         } else {
             let s = self.scale;
-            let (bw, bh) = w.size;
-            let (cw, ch) = frame.content;
-            let ppp = px_per_pt(frame.px_per_pt, cw, w.info.w, s);
-            let vis_w = (cw as f64 / ppp).min(bw as f64 / s);
-            let vis_h = (ch as f64 / ppp).min(bh as f64 / s);
-            ((0, 0), (vis_w * ppp, vis_h * ppp), ((vis_w * s).round().max(1.0) as i32, (vis_h * s).round().max(1.0) as i32))
+            let ppp = px_per_pt(frame.px_per_pt, frame.content.0, w.info.w, s);
+            // (1, 0, 0) unless the picture is fitted into a Hyprland tile: the still is too.
+            let (k, ox, oy) = w.fit;
+            let (src, dst) = shown_part(frame.content, ppp, w.size, s, k);
+            ((ox as i32, oy as i32), src, dst)
         };
         let (sw, sh) = (src.0.max(1.0) as usize, src.1.max(1.0) as usize);
         // Rounded corners: the alpha of the Mac's own corner tiles.
@@ -1943,7 +2147,20 @@ impl App {
                 let (k, ox, oy) = w.fit;
                 (((x - ox) / k).clamp(0.0, w.info.w as f64 - 1.0) as f32, ((y - oy) / k).clamp(0.0, w.info.h as f64 - 1.0) as f32)
             }
-            _ => (x as f32, y as f32),
+            _ => {
+                let (x, y) = self.in_picture(wid, x, y);
+                (x as f32, y as f32)
+            }
+        }
+    }
+
+    /// Window position (logical px) → the same place in the window's picture drawn 1:1, which
+    /// is where the Mac and the traffic lights have it. The same, unless the picture is fitted
+    /// into a Hyprland tile (scaled, and starting inside the tile).
+    fn in_picture(&self, wid: u32, x: f64, y: f64) -> (f64, f64) {
+        match self.windows.get(&wid) {
+            Some(w) if w.fitted.is_some() => unfit(w.fit, x, y),
+            _ => (x, y),
         }
     }
 
@@ -1999,7 +2216,10 @@ impl App {
         // a child of the video too, the last one, and placed relative to it.
         let nested = crate::hyprland::running();
         let video_y = if nested { w.corners.as_ref().map_or(0, |c| c.middle_y) } else { 0 };
-        if w.lights.as_ref().and_then(|l| l.drawn) == Some((state, rect, video_y)) {
+        // A picture fitted into a Hyprland tile is drawn at another scale: the lights too. They
+        // hang off the video there, so they already start where the picture does.
+        let k = if w.fitted.is_some() { w.fit.0 } else { 1.0 };
+        if w.lights.as_ref().and_then(|l| l.drawn) == Some((state, rect, video_y, k)) {
             return;
         }
         if w.lights.is_none() {
@@ -2023,8 +2243,8 @@ impl App {
         let buf = pool.create_buffer(0, pw as i32, ph as i32, (pw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
         let l = w.lights.as_mut().unwrap();
         let s = self.scale;
-        l.sub.set_position((rect[0] * s).round() as i32, (rect[1] * s).round() as i32 - video_y);
-        l.viewport.set_destination((rect[2] * s).round() as i32, (rect[3] * s).round() as i32);
+        l.sub.set_position((rect[0] * s * k).round() as i32, (rect[1] * s * k).round() as i32 - video_y);
+        l.viewport.set_destination(((rect[2] * s * k).round() as i32).max(1), ((rect[3] * s * k).round() as i32).max(1));
         l.surface.attach(Some(&buf), 0, 0);
         l.surface.damage_buffer(0, 0, pw as i32, ph as i32);
         if self.trace {
@@ -2033,7 +2253,7 @@ impl App {
             }
         }
         l.surface.commit();
-        l.drawn = Some((state, rect, video_y));
+        l.drawn = Some((state, rect, video_y, k));
         l.buffers.push_back((buf, pool));
         while l.buffers.len() > 3 {
             if let Some((b, _)) = l.buffers.pop_front() {
@@ -2158,8 +2378,48 @@ fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64
     }
 }
 
+/// The part of a picture that shows in its window (frame px, from its top-left) and the size it
+/// is drawn at (logical px). `content`: the picture in the frame; `s`: logical px per Mac
+/// point; `k`: the scale it is fitted by (1: as it comes, cut off at the window's edge).
+fn shown_part(content: (u32, u32), px_per_pt: f64, window: (u32, u32), s: f64, k: f64) -> ((f64, f64), (i32, i32)) {
+    let vis_w = (content.0 as f64 / px_per_pt).min(window.0 as f64 / (s * k));
+    let vis_h = (content.1 as f64 / px_per_pt).min(window.1 as f64 / (s * k));
+    ((vis_w * px_per_pt, vis_h * px_per_pt), ((vis_w * s * k).round().max(1.0) as i32, (vis_h * s * k).round().max(1.0) as i32))
+}
+
+/// How a picture goes into a Hyprland tile that isn't its size: the scale that makes all of it
+/// fit, and where it then starts to sit in the middle. Sizes in logical px, the picture's as
+/// drawn 1:1. None when the picture is the tile's size (to a pixel): drawn as it comes.
+///
+/// `settled`: no newer size is waiting to be asked of the Mac. Then a picture just short of the
+/// tile is kept at its own scale: an app that sizes itself in its own steps (Terminal's
+/// character cells) never gets exactly the tile's size, and stretched by a hair its text would
+/// stay blurred. While sizes keep coming (a tile being dragged) it is always scaled, so the
+/// picture doesn't jump between the two.
+fn tile_fit(pic: (f64, f64), tile: (f64, f64), settled: bool) -> Option<(f64, f64, f64)> {
+    let ((pw, ph), (tw, th)) = (pic, tile);
+    if pw < 1.0 || ph < 1.0 || ((pw - tw).abs() <= 1.0 && (ph - th).abs() <= 1.0) {
+        return None;
+    }
+    let near = |short: f64| (-1.0..=SNAP).contains(&short);
+    let k = if settled && near(tw - pw) && near(th - ph) { 1.0 } else { (tw / pw).min(th / ph) };
+    Some((k, ((tw - pw * k) / 2.0).round().max(0.0), ((th - ph * k) / 2.0).round().max(0.0)))
+}
+
+/// A place in the window → the same place in its picture drawn 1:1 from the window's corner,
+/// for a picture drawn through `fit` (its scale, and where it starts).
+fn unfit(fit: (f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
+    let (k, ox, oy) = fit;
+    ((x - ox) / k, (y - oy) / k)
+}
+
 /// Smallest a Mac window gets here, unless its app is known to need more.
 const MIN_SIZE: (u32, u32) = (100, 60);
+/// How long a Hyprland tile's size must stand before the Mac is asked for it (see arm_settle).
+const SETTLE: Duration = Duration::from_millis(120);
+/// How far short of its tile (logical px, either way) a picture may be and still be shown at
+/// its own scale (see tile_fit).
+const SNAP: f64 = 40.0;
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
 const KEY_SPACE: u32 = 57;
@@ -2368,6 +2628,7 @@ impl WindowHandler for App {
         };
         let first = !w.configured;
         w.configured = true;
+        let mut retiled = false;
         if w.display {
             // Never resized on the Mac: the picture is scaled into whatever size it's given.
             let k = (size.0 as f64 / w.info.w.max(1.0) as f64).min(size.1 as f64 / w.info.h.max(1.0) as f64);
@@ -2383,11 +2644,18 @@ impl WindowHandler for App {
             w.fit = (k, (size.0 as f64 - w.info.w as f64 * k) / 2.0, (size.1 as f64 - w.info.h as f64 * k) / 2.0);
         } else if size != w.size || (first && size != (w.info.w as u32, w.info.h as u32)) {
             w.size = size;
-            w.requested = Some((size, Instant::now()));
             w.followed = false;
-            let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
-            // Check it took (a Mac window that can't follow reports no change).
-            Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+            if w.in_tile() {
+                // A Hyprland tile: asked of the Mac once the size has stood (arm_settle); the
+                // picture shown is fitted into the tile right away (below).
+                Self::arm_settle(&self.loop_handle, &mut w.settling, wid, qh);
+                retiled = true;
+            } else {
+                w.requested = Some((size, Instant::now()));
+                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                // Check it took (a Mac window that can't follow reports no change).
+                Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+            }
         }
         if cfg.decoration_mode != DecorationMode::Server && first {
             log::debug!("compositor declined server-side decorations");
@@ -2409,6 +2677,9 @@ impl WindowHandler for App {
         }
         if let Some((pw, ph, ppp, us, px)) = pending_raw {
             self.present_raw(wid, pw, ph, ppp, us, px, qh);
+        }
+        if retiled {
+            self.relayout(wid, qh);
         }
     }
 }
@@ -2452,6 +2723,8 @@ impl PointerHandler for App {
         for e in events {
             let Some(wid) = self.wid_for(&e.surface) else { continue };
             let (x, y) = self.to_mac(wid, e.position.0, e.position.1);
+            // For the traffic lights, which are placed by the picture.
+            let (px, py) = self.in_picture(wid, e.position.0, e.position.1);
             match e.kind {
                 PointerEventKind::Enter { serial } => {
                     log::debug!("pointer entered {wid} at {x:.0},{y:.0}");
@@ -2463,7 +2736,7 @@ impl PointerHandler for App {
                         let d = self.cursor_device.get_or_insert_with(|| mgr.get_pointer(pointer, qh, ()));
                         d.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
                     }
-                    self.lights_pointer(wid, e.position.0, e.position.1, qh);
+                    self.lights_pointer(wid, px, py, qh);
                     if !self.over_lights(wid) {
                         self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                     }
@@ -2488,7 +2761,7 @@ impl PointerHandler for App {
                     }
                     let edge = self.edge_at(wid, e.position.0, e.position.1);
                     self.set_edge_cursor(edge, pointer, qh);
-                    self.lights_pointer_at(wid, e.position.0, e.position.1, Some(time), qh);
+                    self.lights_pointer_at(wid, px, py, Some(time), qh);
                     if self.windows.get(&wid).is_some_and(|w| w.lights_pressed.is_some()) {
                         continue; // dragging off a traffic light: not for the Mac
                     }
@@ -2514,7 +2787,7 @@ impl PointerHandler for App {
                             self.local_press = Some(button);
                             continue;
                         }
-                        if let Some(b) = self.button_at(wid, e.position.0, e.position.1) {
+                        if let Some(b) = self.button_at(wid, px, py) {
                             // Like macOS, the action fires on release, and only if the pointer
                             // is still on the button.
                             if let Some(w) = self.windows.get_mut(&wid) {
@@ -2557,7 +2830,7 @@ impl PointerHandler for App {
                                 _ => self.toggle_maximize(wid),
                             }
                         }
-                        self.lights_pointer(wid, e.position.0, e.position.1, qh);
+                        self.lights_pointer(wid, px, py, qh);
                         continue;
                     }
                     if button == BTN_LEFT {
@@ -2823,6 +3096,7 @@ impl DataDeviceHandler for App {
         let (Some((wid, x, y)), Some(offer)) = (target, offer) else {
             return;
         };
+        let (x, y) = self.in_picture(wid, x, y);
         if !crate::tray::allows_drag() {
             log::info!("drop on Mac window {wid} ignored: drag and drop is switched off");
             offer.destroy();
@@ -3111,5 +3385,82 @@ mod tests {
         assert!(!is_global_menu_key(&mods(true, true, true, false), Keysym::m));
         assert!(!is_global_menu_key(&mods(true, true, false, true), Keysym::M));
         assert!(!is_global_menu_key(&mods(true, true, false, false), Keysym::n));
+    }
+
+    #[test]
+    fn a_picture_the_tiles_size_is_drawn_as_it_comes() {
+        assert_eq!(tile_fit((781.0, 468.0), (781.0, 468.0), true), None);
+        assert_eq!(tile_fit((781.0, 468.0), (781.0, 468.0), false), None);
+        // Half a pixel of rounding is still the tile's size.
+        assert_eq!(tile_fit((780.5, 468.0), (781.0, 468.0), true), None);
+        // Nothing to fit yet.
+        assert_eq!(tile_fit((0.0, 0.0), (781.0, 468.0), true), None);
+    }
+
+    #[test]
+    fn a_bigger_picture_is_scaled_down_into_the_tile_and_centred() {
+        // The log's case: asked 781x468, the Mac still at 1024x662.
+        let (k, ox, oy) = tile_fit((1024.0, 662.0), (781.0, 468.0), true).unwrap();
+        assert_eq!(k, 468.0 / 662.0); // the height decides
+        assert_eq!((ox, oy), (29.0, 0.0)); // (781 - 1024 * k) / 2 = 28.5…
+        // All of it shows, inside the tile.
+        let (src, dst) = shown_part((2048, 1324), 2.0, (781, 468), 1.0, k);
+        assert_eq!(src, (2048.0, 1324.0));
+        assert_eq!(dst, (724, 468));
+        assert!(ox as i32 + dst.0 <= 781);
+        // Wider than the tile only: the width decides, bars above and below.
+        let (k, ox, oy) = tile_fit((574.0, 468.0), (381.0, 468.0), true).unwrap();
+        assert_eq!(k, 381.0 / 574.0);
+        assert_eq!((ox, oy), (0.0, 79.0));
+    }
+
+    #[test]
+    fn a_smaller_picture_is_scaled_up_to_the_tile() {
+        let (k, ox, oy) = tile_fit((574.0, 468.0), (1148.0, 1000.0), true).unwrap();
+        assert_eq!((k, ox, oy), (2.0, 0.0, 32.0));
+        let (src, dst) = shown_part((1148, 936), 2.0, (1148, 1000), 1.0, k);
+        assert_eq!((src, dst), ((1148.0, 936.0), (1148, 936)));
+    }
+
+    #[test]
+    fn a_picture_just_short_of_the_tile_keeps_its_scale_once_settled() {
+        // Terminal's character cells: 7 and 10 short of the tile.
+        assert_eq!(tile_fit((793.0, 590.0), (800.0, 600.0), true), Some((1.0, 4.0, 5.0)));
+        // While sizes keep coming it is scaled like any other.
+        let (k, _, oy) = tile_fit((793.0, 590.0), (800.0, 600.0), false).unwrap();
+        assert_eq!(k, 800.0 / 793.0);
+        assert_eq!(oy, ((600.0 - 590.0 * k) / 2.0_f64).round());
+        // Further off than an app's own steps: scaled, settled or not.
+        assert_eq!(tile_fit((700.0, 590.0), (800.0, 600.0), true).unwrap().0, 600.0 / 590.0);
+        // Too big for the tile is never left as it is: it would be cut off.
+        assert!(tile_fit((793.0, 620.0), (800.0, 600.0), true).unwrap().0 < 1.0);
+    }
+
+    #[test]
+    fn an_unfitted_picture_is_cut_off_at_the_window_as_before() {
+        // 1:1: the Mac lags a shrink, the window shows the part that fits.
+        assert_eq!(shown_part((2048, 1324), 2.0, (781, 468), 1.0, 1.0), ((1562.0, 936.0), (781, 468)));
+        // And a picture smaller than the window is shown whole, at its size.
+        assert_eq!(shown_part((1148, 936), 2.0, (1148, 1000), 1.0, 1.0), ((1148.0, 936.0), (574, 468)));
+    }
+
+    #[test]
+    fn a_pointer_position_maps_back_through_the_fit() {
+        let fit = tile_fit((1024.0, 662.0), (781.0, 468.0), true).unwrap();
+        let (_, ox, oy) = fit;
+        // Where the picture starts is its top-left corner.
+        assert_eq!(unfit(fit, ox, oy), (0.0, 0.0));
+        // Its drawn size across is the picture's own size (to the rounding of where it starts).
+        let (_, dst) = shown_part((2048, 1324), 2.0, (781, 468), 1.0, fit.0);
+        let (x, y) = unfit(fit, ox + dst.0 as f64, oy + dst.1 as f64);
+        assert!((x - 1024.0).abs() < 1.0 && (y - 662.0).abs() < 1.0, "{x},{y}");
+        // The middle of the tile is the middle of the picture.
+        let (x, y) = unfit(fit, 781.0 / 2.0, 468.0 / 2.0);
+        assert!((x - 512.0).abs() < 1.0 && (y - 331.0).abs() < 1.0, "{x},{y}");
+        // Scaled up: a traffic light at 20,14 in the picture is hit at twice that, past the bar.
+        let fit = tile_fit((574.0, 468.0), (1148.0, 1000.0), true).unwrap();
+        assert_eq!(unfit(fit, 40.0, 32.0 + 28.0), (20.0, 14.0));
+        // Not fitted: the place itself.
+        assert_eq!(unfit((1.0, 0.0, 0.0), 12.5, 7.0), (12.5, 7.0));
     }
 }
