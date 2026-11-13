@@ -1381,6 +1381,8 @@ impl App {
         }
         // Always ack so the Mac keeps streaming, even if we drop this frame.
         let ack = W::new(t::FRAME_ACK).u64(capture_us).finish();
+        // How far behind its capture the picture is shown: the sound waits as long.
+        crate::net::video_shown(capture_us);
         let _ = self.net.send(NetCmd::Video(wid, ack));
         if !w.configured {
             w.pending = Some(frame);

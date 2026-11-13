@@ -176,6 +176,37 @@ static EPOCH: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new
 static PINGS: std::sync::Mutex<(u32, u64, u64, i64, i64)> = std::sync::Mutex::new((0, 0, 0, 0, 0));
 /// Quickest ping round trip seen (µs) and the Mac's clock minus ours then.
 static BEST_PING: std::sync::Mutex<Option<(i64, i64)>> = std::sync::Mutex::new(None);
+/// How long a picture takes from its capture on the Mac to being shown here (µs, smoothed).
+static VIDEO_LAG_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// A picture captured at `capture_us` (the Mac's clock) was just shown: how long that took,
+/// for keeping the sound in step with the pictures (audio_task). Smoothed, so one slow frame
+/// doesn't move the sound.
+pub fn video_shown(capture_us: u64) {
+    let Some((_, offset)) = *BEST_PING.lock().unwrap() else { return };
+    let now = EPOCH.elapsed().as_micros() as i64;
+    let lag = now - (capture_us as i64 - offset);
+    if !(0..1_000_000).contains(&lag) {
+        return; // the clocks aren't matched up yet
+    }
+    let old = VIDEO_LAG_US.load(std::sync::atomic::Ordering::Relaxed);
+    let new = if old == 0 { lag } else { old + (lag - old) / 32 };
+    VIDEO_LAG_US.store(new, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How much later than it arrives the sound should play, so it's heard with the pictures it
+/// goes with: the pictures' lag from capture to screen, less what sound spends on the same
+/// way (the network to here, and the player's own 20 ms buffer). The Mac captures sound and
+/// pictures at the same moment; pictures then also wait for their encoder, the decoder, and
+/// the screen.
+fn audio_delay() -> std::time::Duration {
+    let video = VIDEO_LAG_US.load(std::sync::atomic::Ordering::Relaxed);
+    let p = *PINGS.lock().unwrap();
+    // The way back from the Mac, as the last pings measured it (their average).
+    let transit = if p.0 > 0 { (p.4 / p.0 as i64).max(0) } else { 0 };
+    let us = (video - transit - 20_000).clamp(0, 250_000);
+    std::time::Duration::from_micros(us as u64)
+}
 
 /// Each window's decoder input, for frames arriving as datagrams.
 static FRAME_SINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, std::sync::mpsc::Sender<Encoded>>>> =
@@ -1220,13 +1251,40 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     let _player = Player;
 
     // Blocking FIFO writes happen on their own thread so the network reader never stalls.
-    let (tx, prx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+    // Each piece is held back until it's due (audio_delay: in step with the pictures); one
+    // that is late by more than a little is dropped, so a shorter delay takes effect at once
+    // instead of the player's buffer growing.
+    let (tx, prx) = std::sync::mpsc::sync_channel::<(std::time::Instant, Vec<u8>)>(256);
     let writer = std::thread::spawn(move || {
+        use std::time::{Duration, Instant};
         // Opening blocks until pw-cat opens its end.
         let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
-        while let Ok(pcm) = prx.recv() {
-            if pipe.write_all(&pcm).is_err() {
-                break;
+        let mut held: std::collections::VecDeque<(Instant, Vec<u8>)> = Default::default();
+        let mut logged = Duration::ZERO;
+        loop {
+            match prx.recv_timeout(Duration::from_millis(2)) {
+                Ok(piece) => held.push_back(piece),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+            let delay = audio_delay();
+            if delay.abs_diff(logged) > Duration::from_millis(10) {
+                logged = delay;
+                log::info!("audio: {} ms behind its arrival, with the pictures", delay.as_millis());
+            }
+            let now = Instant::now();
+            while let Some((arrived, _)) = held.front() {
+                let due = *arrived + delay;
+                if due > now {
+                    break;
+                }
+                let (_, pcm) = held.pop_front().unwrap();
+                if now - due > Duration::from_millis(30) {
+                    continue; // late: dropped, so the delay shrinks now
+                }
+                if pipe.write_all(&pcm).is_err() {
+                    return;
+                }
             }
         }
     });
@@ -1237,7 +1295,7 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
         }
         let Ok(pcm) = R::new(&body).bytes().map(<[u8]>::to_vec) else { continue };
         // If the player falls behind, drop audio rather than letting latency build up.
-        let _ = tx.try_send(pcm);
+        let _ = tx.try_send((std::time::Instant::now(), pcm));
     }
     drop(tx);
     let _ = writer.join();
