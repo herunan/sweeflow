@@ -25,6 +25,8 @@ mod tray;
 mod ui;
 mod wake;
 mod wizard;
+mod x11gl;
+mod x11ui;
 
 use anyhow::Result;
 
@@ -115,7 +117,7 @@ fn main() -> Result<()> {
             hyprland::add_to_config();
             // Before a Mac is linked too: the tray icon is the way back to "Link a Mac".
             tray::start();
-            ui::run(wait_for_a_mac()?)
+            if x11ui::wanted() { x11ui::run(wait_for_a_mac()?) } else { ui::run(wait_for_a_mac()?) }
         }
         Some("pair") if args.get(1).is_some_and(|a| a == "--text") => pair::run_text(),
         Some("pair") => wizard::run(),
@@ -130,6 +132,8 @@ fn main() -> Result<()> {
         Some("panel") => panelwin::run(),
         // Not in the usage: what the client runs to show a Mac prompt (see prompt.rs).
         Some("prompt") => prompt::run(&args[1..]),
+        // Not in the usage: draws made-up Mac windows through the X11 frontend (x11ui.rs).
+        Some("x11-selftest") => x11ui::selftest(&args[1..]),
         Some("status") => setup::status(),
         _ => {
             eprint!("{USAGE}");

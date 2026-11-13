@@ -4928,8 +4928,10 @@ dependencies = [
  "calloop-wayland-source 0.4.1",
  "env_logger",
  "ffmpeg-next",
+ "glow",
  "hex",
  "ksni",
+ "libloading",
  "log",
  "lz4_flex",
  "mdns-sd",
@@ -4947,6 +4949,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",
+ "x11rb",
  "x25519-dalek",
  "zbus",
  "zvariant",
@@ -6348,6 +6351,7 @@ dependencies = [
  "once_cell",
  "rustix 1.1.5",
  "x11rb-protocol",
+ "xcursor",
 ]
 
 [[package]]

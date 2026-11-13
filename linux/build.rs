@@ -24,6 +24,16 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
 }
 
 fn main() {
+    // FFmpeg 7.1 (libavfilter 10.4) and later take a picture's colour space and range in a
+    // buffer source's parameters; older ones (Ubuntu 24.04 / Mint 22: FFmpeg 6.1) don't.
+    println!("cargo::rustc-check-cfg=cfg(avfilter_colour)");
+    let avfilter = std::process::Command::new("pkg-config").args(["--modversion", "libavfilter"]).output();
+    if let Ok(o) = avfilter {
+        let v: Vec<u32> = String::from_utf8_lossy(&o.stdout).trim().split('.').filter_map(|n| n.parse().ok()).collect();
+        if v.len() >= 2 && (v[0], v[1]) >= (10, 4) {
+            println!("cargo::rustc-cfg=avfilter_colour");
+        }
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mac");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut files = Vec::new();

@@ -88,6 +88,9 @@ pub struct GpuFrame {
     pub full_range: bool,
     /// Already RGB (see `rgb_output`): no YUV matrix or range to tell the compositor about.
     pub rgb: bool,
+    /// Decoded on the CPU (no VA-API here, X11 only): the picture as RGBA (width × height × 4)
+    /// in memory, and no planes in GPU memory.
+    pub cpu_rgba: Option<Vec<u8>>,
 }
 
 // The AVFrame is exclusively owned; FFmpeg frames are safe to move between threads.
@@ -106,6 +109,16 @@ impl GpuFrame {
     /// The picture in black and white, as opaque BGRA (width × height): read back from the GPU
     /// (VA-API copes with its own tiling). For a paused window's still; not for every frame.
     pub fn grey(&self) -> Option<Vec<u8>> {
+        if let Some(rgba) = &self.cpu_rgba {
+            return Some(
+                rgba.chunks_exact(4)
+                    .flat_map(|p| {
+                        let v = ((p[0] as u32 * 54 + p[1] as u32 * 183 + p[2] as u32 * 19) >> 8) as u8;
+                        [v, v, v, 255]
+                    })
+                    .collect(),
+            );
+        }
         unsafe {
             let mut sw = av_frame_alloc();
             if sw.is_null() || av_hwframe_transfer_data(sw, self.source, 0) < 0 {
@@ -180,8 +193,11 @@ impl ToRgb {
             (*par).time_base = AVRational { num: 1, den: 1_000_000 };
             (*par).sample_aspect_ratio = AVRational { num: 1, den: 1 };
             (*par).hw_frames_ctx = (*frame).hw_frames_ctx;
-            (*par).color_space = (*frame).colorspace;
-            (*par).color_range = (*frame).color_range;
+            #[cfg(avfilter_colour)]
+            {
+                (*par).color_space = (*frame).colorspace;
+                (*par).color_range = (*frame).color_range;
+            }
             let r = av_buffersrc_parameters_set(src, par);
             av_free(par.cast());
             if r < 0 {
@@ -260,21 +276,33 @@ pub struct Decoder {
     logged: bool,
     /// Set up with the first picture, where pictures go out as RGB.
     to_rgb: Option<ToRgb>,
+    /// Decoding on the CPU (no VA-API device; X11 only): pictures go out as RGBA in memory,
+    /// converted by this.
+    sws: Option<*mut SwsContext>,
+    /// CPU pictures may be handed on (the X11 frontend): also when VA-API opened but FFmpeg
+    /// decodes on the CPU after all (a driver without HEVC decoding).
+    software_ok: bool,
 }
 
 unsafe impl Send for Decoder {}
 
 unsafe extern "C" fn pick_vaapi(_: *mut AVCodecContext, mut fmts: *const AVPixelFormat) -> AVPixelFormat {
+    // FFmpeg lists the hardware formats first and its own (CPU) format last.
+    let mut last = AVPixelFormat::AV_PIX_FMT_NONE;
     unsafe {
         while *fmts != AVPixelFormat::AV_PIX_FMT_NONE {
             if *fmts == AVPixelFormat::AV_PIX_FMT_VAAPI {
                 return *fmts;
             }
+            last = *fmts;
             fmts = fmts.add(1);
         }
     }
-    log::error!("decoder did not offer VAAPI output");
-    AVPixelFormat::AV_PIX_FMT_NONE
+    // No VA-API for this video (the driver can't decode HEVC): the CPU, which only the X11
+    // frontend can show (see `software_ok`); elsewhere the frame is refused later.
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| log::warn!("the decoder offers no VA-API output for this video: the CPU's"));
+    last
 }
 
 impl Decoder {
@@ -304,7 +332,100 @@ impl Decoder {
             if r < 0 {
                 bail!("avcodec_open2 failed ({r})");
             }
-            Ok(Decoder { ctx, hw_device, pkt: av_packet_alloc(), frame: av_frame_alloc(), logged: false, to_rgb: None })
+            Ok(Decoder { ctx, hw_device, pkt: av_packet_alloc(), frame: av_frame_alloc(), logged: false, to_rgb: None, sws: None, software_ok: false })
+        }
+    }
+
+    /// VA-API if the GPU can, otherwise (with `software_ok`) FFmpeg's own decoder on the CPU: a
+    /// GPU without HEVC decoding (a Mesa built without the patented codecs, NVIDIA's driver).
+    /// Only the X11 frontend can show such pictures (as textures).
+    pub fn new_or_software(render_node: &str, software_ok: bool) -> Result<Self> {
+        match Self::new(render_node) {
+            Ok(mut d) => {
+                d.software_ok = software_ok;
+                Ok(d)
+            }
+            Err(e) if software_ok => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| log::warn!("{e:#}: decoding on the CPU instead"));
+                Self::software()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn software() -> Result<Self> {
+        unsafe {
+            let codec = avcodec_find_decoder(AVCodecID::AV_CODEC_ID_HEVC);
+            if codec.is_null() {
+                bail!("no HEVC decoder in FFmpeg");
+            }
+            let ctx = avcodec_alloc_context3(codec);
+            (*ctx).flags |= AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*ctx).flags2 |= AV_CODEC_FLAG2_FAST as i32;
+            // Slices in parallel, frames not (that would add a frame of delay per thread).
+            (*ctx).thread_count = 0;
+            (*ctx).thread_type = 2; // FF_THREAD_SLICE
+            let r = avcodec_open2(ctx, codec, ptr::null_mut());
+            if r < 0 {
+                bail!("avcodec_open2 failed ({r})");
+            }
+            Ok(Decoder {
+                ctx,
+                hw_device: ptr::null_mut(),
+                pkt: av_packet_alloc(),
+                frame: av_frame_alloc(),
+                logged: false,
+                to_rgb: None,
+                sws: Some(ptr::null_mut()),
+                software_ok: true,
+            })
+        }
+    }
+
+    /// A CPU-decoded picture as RGBA.
+    unsafe fn export_cpu(&mut self, capture_us: u64) -> Result<GpuFrame> {
+        unsafe {
+            let f = &*self.frame;
+            let (w, h) = (f.width, f.height);
+            let ctx = sws_getCachedContext(
+                self.sws.unwrap_or(ptr::null_mut()),
+                w, h, std::mem::transmute::<i32, AVPixelFormat>(f.format),
+                w, h, AVPixelFormat::AV_PIX_FMT_RGBA,
+                2 /* SWS_BILINEAR (a constant or an enum, by FFmpeg version) */, ptr::null_mut(), ptr::null_mut(), ptr::null(),
+            );
+            if ctx.is_null() {
+                bail!("no colour converter for this picture");
+            }
+            self.sws = Some(ctx);
+            // BT.709, in the range the stream signals.
+            let full = f.color_range == AVColorRange::AVCOL_RANGE_JPEG;
+            let coeffs = sws_getCoefficients(1 /* SWS_CS_ITU709 */);
+            sws_setColorspaceDetails(ctx, coeffs, full as i32, sws_getCoefficients(5 /* SWS_CS_DEFAULT */), 1, 0, 1 << 16, 1 << 16);
+            let mut rgba = vec![0u8; w as usize * h as usize * 4];
+            let dst = [rgba.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
+            let stride = [w * 4, 0, 0, 0];
+            sws_scale(ctx, f.data.as_ptr() as *const *const u8, f.linesize.as_ptr(), 0, h, dst.as_ptr(), stride.as_ptr());
+            if !self.logged {
+                self.logged = true;
+                log::info!("decoding on the CPU: {}x{} format {} range {:?}", w, h, f.format, f.color_range);
+            }
+            Ok(GpuFrame {
+                decoded_at: std::time::Instant::now(),
+                source: ptr::null_mut(),
+                width: w as u32,
+                height: h as u32,
+                content: (w as u32, h as u32),
+                frame: ptr::null_mut(),
+                format: DRM_FORMAT_XRGB8888,
+                planes: Vec::new(),
+                capture_us,
+                dark_titlebar: true,
+                px_per_pt: 0,
+                full_range: true,
+                rgb: true,
+                cpu_rgba: Some(rgba),
+            })
         }
     }
 
@@ -330,7 +451,19 @@ impl Decoder {
                     bail!("avcodec_receive_frame ({r})");
                 }
                 // Only the newest frame matters (there should only ever be one per packet).
-                let exported = if rgb_output() { self.export_rgb(capture_us) } else { self.export(self.frame, capture_us) };
+                // VA-API that can't decode HEVC: FFmpeg decodes on the CPU after all.
+                let on_cpu = (*self.frame).format != AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+                if on_cpu && self.software_ok && self.sws.is_none() {
+                    log::warn!("VA-API can't decode this video here: decoding on the CPU");
+                    self.sws = Some(ptr::null_mut());
+                }
+                let exported = if self.sws.is_some() {
+                    self.export_cpu(capture_us)
+                } else if rgb_output() {
+                    self.export_rgb(capture_us)
+                } else {
+                    self.export(self.frame, capture_us)
+                };
                 av_frame_unref(self.frame);
                 out = Some(exported?);
             }
@@ -413,6 +546,7 @@ impl Decoder {
                 px_per_pt: 0,
                 full_range: (*self.frame).color_range == AVColorRange::AVCOL_RANGE_JPEG,
                 rgb: shown != self.frame,
+                cpu_rgba: None,
             })
         }
     }
@@ -424,7 +558,139 @@ impl Drop for Decoder {
             av_packet_free(&mut self.pkt);
             av_frame_free(&mut self.frame);
             avcodec_free_context(&mut self.ctx);
-            av_buffer_unref(&mut self.hw_device);
+            if !self.hw_device.is_null() {
+                av_buffer_unref(&mut self.hw_device);
+            }
+            if let Some(ctx) = self.sws.filter(|c| !c.is_null()) {
+                sws_freeContext(ctx);
+            }
         }
+    }
+}
+
+/// A made-up picture in GPU memory, as the decoder gives them (a VA-API surface exported as a
+/// dmabuf), for `sweeflow x11-selftest`, which draws it with no Mac. `yuv(x, y)` gives each
+/// pixel's (Y, Cb, Cr) as 8-bit code values (shifted up for 10-bit); chroma is taken at even
+/// pixels. `ten_bit`: P010 rather than NV12.
+pub fn synthetic_frame(
+    render_node: &str,
+    (width, height): (u32, u32),
+    ten_bit: bool,
+    full_range: bool,
+    yuv: impl Fn(u32, u32) -> (u8, u8, u8),
+) -> Result<GpuFrame> {
+    unsafe {
+        let mut device = ptr::null_mut();
+        let dev = CString::new(render_node)?;
+        let r = av_hwdevice_ctx_create(&mut device, AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, dev.as_ptr(), ptr::null_mut(), 0);
+        if r < 0 {
+            bail!("VA-API device {render_node} unavailable ({r})");
+        }
+        let sw_format = if ten_bit { AVPixelFormat::AV_PIX_FMT_P010LE } else { AVPixelFormat::AV_PIX_FMT_NV12 };
+        let mut pool = av_hwframe_ctx_alloc(device);
+        av_buffer_unref(&mut device);
+        if pool.is_null() {
+            bail!("av_hwframe_ctx_alloc");
+        }
+        let fc = (*pool).data as *mut AVHWFramesContext;
+        (*fc).format = AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*fc).sw_format = sw_format;
+        (*fc).width = width as i32;
+        (*fc).height = height as i32;
+        (*fc).initial_pool_size = 2;
+        let r = av_hwframe_ctx_init(pool);
+        if r < 0 {
+            av_buffer_unref(&mut pool);
+            bail!("av_hwframe_ctx_init ({r})");
+        }
+        let mut hw = av_frame_alloc();
+        let r = av_hwframe_get_buffer(pool, hw, 0);
+        av_buffer_unref(&mut pool);
+        if r < 0 {
+            av_frame_free(&mut hw);
+            bail!("av_hwframe_get_buffer ({r})");
+        }
+        let mut sw = av_frame_alloc();
+        (*sw).format = sw_format as i32;
+        (*sw).width = width as i32;
+        (*sw).height = height as i32;
+        if av_frame_get_buffer(sw, 0) < 0 {
+            av_frame_free(&mut sw);
+            av_frame_free(&mut hw);
+            bail!("av_frame_get_buffer");
+        }
+        let (luma, luma_stride) = ((*sw).data[0], (*sw).linesize[0] as usize);
+        let (chroma, chroma_stride) = ((*sw).data[1], (*sw).linesize[1] as usize);
+        let put = |row: *mut u8, i: usize, v: u8| {
+            if ten_bit {
+                // P010: the 10-bit value in the top bits of a little-endian 16-bit sample.
+                let s = ((v as u16) << 2) << 6;
+                *row.add(i * 2) = s as u8;
+                *row.add(i * 2 + 1) = (s >> 8) as u8;
+            } else {
+                *row.add(i) = v;
+            }
+        };
+        for y in 0..height {
+            let row = luma.add(y as usize * luma_stride);
+            for x in 0..width {
+                put(row, x as usize, yuv(x, y).0);
+            }
+        }
+        for y in 0..height.div_ceil(2) {
+            let row = chroma.add(y as usize * chroma_stride);
+            for x in 0..width.div_ceil(2) {
+                let (_, cb, cr) = yuv(x * 2, y * 2);
+                put(row, x as usize * 2, cb);
+                put(row, x as usize * 2 + 1, cr);
+            }
+        }
+        let r = av_hwframe_transfer_data(hw, sw, 0);
+        av_frame_free(&mut sw);
+        if r < 0 {
+            av_frame_free(&mut hw);
+            bail!("upload to the GPU ({r})");
+        }
+        (*hw).color_range = if full_range { AVColorRange::AVCOL_RANGE_JPEG } else { AVColorRange::AVCOL_RANGE_MPEG };
+        let mut drm = av_frame_alloc();
+        (*drm).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        let r = av_hwframe_map(drm, hw, AV_HWFRAME_MAP_READ as i32);
+        if r < 0 {
+            av_frame_free(&mut drm);
+            av_frame_free(&mut hw);
+            bail!("av_hwframe_map to DRM PRIME failed ({r})");
+        }
+        // As Decoder::export reads them.
+        let desc = &*((*drm).data[0] as *const AVDRMFrameDescriptor);
+        let mut planes = Vec::new();
+        for l in &desc.layers[..desc.nb_layers as usize] {
+            for p in &l.planes[..l.nb_planes as usize] {
+                let obj = &desc.objects[p.object_index as usize];
+                planes.push(Plane { fd: obj.fd, offset: p.offset as u32, stride: p.pitch as u32, modifier: obj.format_modifier });
+            }
+        }
+        let format = if desc.nb_layers == 1 {
+            desc.layers[0].format
+        } else if desc.layers[0].format == DRM_FORMAT_R16 {
+            DRM_FORMAT_P010
+        } else {
+            DRM_FORMAT_NV12
+        };
+        Ok(GpuFrame {
+            decoded_at: std::time::Instant::now(),
+            source: hw,
+            width,
+            height,
+            content: (width, height),
+            frame: drm,
+            format,
+            planes,
+            capture_us: 0,
+            dark_titlebar: true,
+            px_per_pt: 0,
+            full_range,
+            rgb: false,
+            cpu_rgba: None,
+        })
     }
 }

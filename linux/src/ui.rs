@@ -2571,7 +2571,7 @@ impl App {
 }
 
 /// Pixels per point of a frame: as reported by the Mac, else inferred from the window width.
-fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64 {
+pub(crate) fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64 {
     if reported > 0 {
         reported as f64
     } else if window_w_pt > 0.0 {
@@ -2585,7 +2585,7 @@ fn px_per_pt(reported: u8, frame_w: u32, window_w_pt: f32, fallback: f64) -> f64
 /// drawn at (logical px), and whether its right and bottom edges are cut off there (the picture
 /// runs past the window by more than a sliver). `content`: the picture in the frame; `s`:
 /// logical px per Mac point.
-fn shown_part(content: (u32, u32), px_per_pt: f64, window: (u32, u32), s: f64) -> ((f64, f64), (i32, i32), (bool, bool)) {
+pub(crate) fn shown_part(content: (u32, u32), px_per_pt: f64, window: (u32, u32), s: f64) -> ((f64, f64), (i32, i32), (bool, bool)) {
     let (pw, ph) = (content.0 as f64 / px_per_pt, content.1 as f64 / px_per_pt);
     let (ww, wh) = (window.0 as f64 / s, window.1 as f64 / s);
     let (vis_w, vis_h) = (pw.min(ww), ph.min(wh));
@@ -2638,7 +2638,7 @@ fn gnome_allow_shortcuts(bundle_id: &str) {
 }
 
 /// Smallest a Mac window gets here, unless its app is known to need more.
-const MIN_SIZE: (u32, u32) = (100, 60);
+pub(crate) const MIN_SIZE: (u32, u32) = (100, 60);
 /// How long a Hyprland tile's size must stand before the Mac is asked for it (see arm_settle).
 const SETTLE: Duration = Duration::from_millis(120);
 const BTN_LEFT: u32 = 0x110;
@@ -2652,7 +2652,7 @@ const KEY_RIGHTMETA: u32 = 126;
 /// Shows or auto-hides the Plasma panel holding the Global Menu (found by its widget). "Dodge
 /// windows" rather than "always visible" so it never reserves space: toggling it must not make
 /// the tiling layout jump.
-fn set_menu_panel_visible(visible: bool) {
+pub(crate) fn set_menu_panel_visible(visible: bool) {
     let mode = if visible { "dodgewindows" } else { "autohide" };
     let script = format!(
         "panels().forEach(function (p) {{ if (p.widgets().some(function (w) {{ return w.type == \"org.kde.plasma.appmenu\"; }})) p.hiding = \"{mode}\"; }});"
@@ -2668,7 +2668,7 @@ fn set_menu_panel_visible(visible: bool) {
 
 /// Opens KWin's window switcher. Our windows inhibit compositor shortcuts (so Cmd+letter reaches
 /// the Mac), which also blocks Meta+Tab; invoke it explicitly instead.
-fn switch_windows(reverse: bool) {
+pub(crate) fn switch_windows(reverse: bool) {
     let name = if reverse { "Walk Through Windows (Reverse)" } else { "Walk Through Windows" };
     std::thread::spawn(move || {
         let _ = std::process::Command::new("qdbus6")
@@ -2680,7 +2680,7 @@ fn switch_windows(reverse: bool) {
 }
 
 /// Cmd+Space: Linux's search (KRunner), not the Mac's Spotlight, wherever the focus is.
-fn open_search() {
+pub(crate) fn open_search() {
     std::thread::spawn(|| {
         let _ = std::process::Command::new("qdbus6")
             .args(["org.kde.krunner", "/App", "org.kde.krunner.App.toggleDisplay"])
@@ -2717,13 +2717,13 @@ fn stream_toggle_key(mods: &Modifiers, key: Keysym) -> Option<&'static str> {
 }
 
 /// Opens the Global menu (`sweeflow menu`, palette.rs): a process of its own, as from the tray.
-fn open_global_menu() {
+pub(crate) fn open_global_menu() {
     run_own("menu", "the Global menu");
 }
 
 /// Runs this program with one argument (`menu`, `open`): started off the UI thread, and waited
 /// for there, so it doesn't stay behind as a dead process.
-fn run_own(arg: &'static str, what: &'static str) {
+pub(crate) fn run_own(arg: &'static str, what: &'static str) {
     std::thread::spawn(move || {
         let started = std::env::current_exe().and_then(|me| std::process::Command::new(me).arg(arg).spawn());
         match started {
@@ -2736,7 +2736,7 @@ fn run_own(arg: &'static str, what: &'static str) {
 }
 
 /// Diagnostics: writes premultiplied BGRA as an RGBA PNG.
-fn dump_bgra(path: &str, w: u32, h: u32, bgra: &[u8]) {
+pub(crate) fn dump_bgra(path: &str, w: u32, h: u32, bgra: &[u8]) {
     let rgba: Vec<u8> = bgra.chunks(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
     if let Ok(f) = std::fs::File::create(path) {
         let mut enc = png::Encoder::new(f, w, h);
@@ -2759,7 +2759,7 @@ unsafe extern "C" {
     fn clock_gettime(clk: i32, ts: *mut i64) -> i32;
 }
 
-fn display_title(app: &str, title: &str) -> String {
+pub(crate) fn display_title(app: &str, title: &str) -> String {
     if title.is_empty() || title == app {
         app.to_string()
     } else {
@@ -2792,7 +2792,7 @@ pub(crate) fn decode_png_argb(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 /// The four corner tiles (TL, TR, BL, BR; premultiplied BGRA, `t` pixels square each) made
 /// opaque: what the rounded corner leaves see-through takes the colour its row has at the
 /// tile's inner edge, so the window ends in square corners that continue its own edge.
-fn square_tiles(t: usize, mut px: Vec<u8>) -> Vec<u8> {
+pub(crate) fn square_tiles(t: usize, mut px: Vec<u8>) -> Vec<u8> {
     for (i, tile) in px.chunks_exact_mut(t * t * 4).take(4).enumerate() {
         // Left tiles meet the window at their right edge, right tiles at their left.
         let inner = if i % 2 == 0 { t - 1 } else { 0 };
@@ -2811,7 +2811,7 @@ fn square_tiles(t: usize, mut px: Vec<u8>) -> Vec<u8> {
 }
 
 /// A pause sign (a dark disc with two white bars) drawn into an opaque BGRA picture.
-fn draw_pause(px: &mut [u8], stride_px: usize, cx: f64, cy: f64, r: f64) {
+pub(crate) fn draw_pause(px: &mut [u8], stride_px: usize, cx: f64, cy: f64, r: f64) {
     let rows = px.len() / 4 / stride_px.max(1);
     let (bar_w, bar_h, gap) = (r * 0.2, r * 0.9, r * 0.2);
     let x0 = (cx - r - 1.0).max(0.0) as usize;

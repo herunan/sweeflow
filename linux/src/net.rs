@@ -660,7 +660,9 @@ async fn session(
     let saved = async {
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.host).await?.collect();
         let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
-        anyhow::Ok((addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?))
+        // Not for ever: a handshake the Mac never answers would hold Start up indefinitely.
+        let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(addr, "sweeflow")?).await.context("no answer")?;
+        anyhow::Ok((addr, conn.context("connect")?))
     };
     let (addr, conn) = match saved.await {
         Ok(c) => c,
@@ -1162,7 +1164,8 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                 }
                 waiting_for_key = false;
                 if dec.is_none() {
-                    match Decoder::new(&render_node) {
+                    // The X11 frontend can show pictures decoded on the CPU, for a GPU that can't.
+                    match Decoder::new_or_software(&render_node, crate::x11ui::wanted()) {
                         Ok(d) => dec = Some(d),
                         Err(e) => {
                             log::error!("window {wid}: {e:#}");
