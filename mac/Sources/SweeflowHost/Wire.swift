@@ -19,9 +19,6 @@ enum Msg: UInt8 {
     /// From Linux: it did, let go of the press.
     case moveReady = 0x2E, moveTaken = 0x2F
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
-    /// From Linux: u32 wid, f32 w, f32 h — the part of the window it shows, from its top-left
-    /// (all of it while it's scaled into a tile the app won't shrink to): where the corners go.
-    case shownSize = 0x35
     case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55

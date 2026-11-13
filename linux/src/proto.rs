@@ -59,9 +59,6 @@ pub mod t {
     pub const SCROLL: u8 = 0x32;
     pub const KEY: u8 = 0x33;
     pub const RELEASE_ALL: u8 = 0x34;
-    /// u32 wid, f32 w, f32 h: the part of the window shown here, from its top-left (all of it
-    /// while it's scaled into a Hyprland tile): the Mac cuts the corners there.
-    pub const SHOWN_SIZE: u8 = 0x35;
     pub const CLIPBOARD: u8 = 0x40;
     #[allow(dead_code)] // part of the protocol; this client measures RTT from QUIC instead
     pub const PING: u8 = 0x41;

@@ -69,10 +69,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private lazy var cleanCorner = CleanCorner.of(wid)
     /// Whether the window server has just said the window has no badge (WindowTracker.badgeAbsent).
     var badgeAbsent: () -> Bool = { false }
-    /// The size Linux shows this window at (points). When the Mac window can't shrink that far
-    /// (app minimum size), Linux crops it, so the bottom/right corners must be cut at the
-    /// visible edge rather than the window's real edge.
-    var visibleSize: CGSize?
+    /// Where the window's content ends in the last capture (px): all of it, unless the capture
+    /// is of a stale size and macOS padded it (ScreenCaptureKit's content rect). The corner
+    /// tiles are cut there, the window's real corners; Linux puts them on the edges it shows
+    /// whole, and cuts the rest off straight.
+    private var captureContent: CGSize?
     /// The app's icon, shown on the placeholder when the Mac is locked before the first frame.
     var appIcon: CGImage?
     /// Pixels per point of the display the window is on (looked up from its position).
@@ -540,14 +541,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Corner tiles cut from `pb` (sent ahead of its frame), so they match what it shows.
     private func updateCorners(from pb: CVPixelBuffer) {
         let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded())
-        if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale, visible: visiblePx()), hash != cornersHash {
+        if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale), hash != cornersHash {
             cornersHash = hash
             pendingCorners = (t, tiles)
         }
-    }
-
-    private func visiblePx() -> CGSize? {
-        visibleSize.map { CGSize(width: $0.width * scale, height: $0.height * scale) }
     }
 
     /// The colour frame shown before the Mac locked, put back when it unlocks (a static window
@@ -653,7 +650,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 guard !self.showingPause else { return }
                 self.showingPause = true
                 if !placeholder, let b = self.lastBuffer {
-                    guard let grey = pausedCopy(of: b, scale: self.scale, visible: self.visiblePx()) else { return }
+                    guard let grey = pausedCopy(of: b, scale: self.scale, visible: self.captureContent) else { return }
                     self.colourBeforeLock = b
                     self.updateCorners(from: grey)
                     self.pendingBuffer = grey
@@ -661,8 +658,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     // Locked before the first frame: a dark placeholder with the pause symbol.
                     let (w, h) = self.pixelSize()
                     guard let blank = solidBuffer(width: w, height: h, gray: 0x3A) else { return }
-                    if let icon = self.appIcon { drawCentred(icon, in: blank, size: 72 * self.scale, visible: self.visiblePx()) }
-                    guard let grey = pausedCopy(of: blank, scale: self.scale, visible: self.visiblePx()) else { return }
+                    if let icon = self.appIcon { drawCentred(icon, in: blank, size: 72 * self.scale, visible: self.captureContent) }
+                    guard let grey = pausedCopy(of: blank, scale: self.scale, visible: self.captureContent) else { return }
                     self.updateCorners(from: grey)
                     self.pendingBuffer = grey
                 }
@@ -782,6 +779,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
             log("stream \(wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
         }
+        captureContent = contentRect.map { CGSize(width: $0.width * scaleFactor, height: $0.height * scaleFactor) }
         if let r = contentRect {
             let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
             let cw = r.width * scaleFactor, ch = r.height * scaleFactor
@@ -802,7 +800,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// What preparing a frame needs from the streamer's state, taken on `queue`.
     private struct Prep {
-        let buttons: [CGRect], badge: CGRect?, scale: CGFloat, visiblePx: CGSize?, radiusPx: Int
+        let buttons: [CGRect], badge: CGRect?, scale: CGFloat, content: CGSize?, radiusPx: Int
         let detect: Bool, measure: Bool
         let clean: CleanCorner
         let noBadge: Bool
@@ -832,7 +830,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                                    noBadge: p.noBadge)
         // A few radius measurements per window (not every frame) feed the shared vote.
         if p.measure { r.radiusPx = measureCornerRadius(pb, scale: p.scale) }
-        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, visible: p.visiblePx)
+        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, content: p.content)
         fillCorners(pb, radiusPx: Int(28 * p.scale))
         fillEdges(pb, ring: max(2, Int(p.scale)))
         // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
@@ -959,7 +957,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let measure = radiusSamples < 5 && measureCountdown <= 0
             if measure { measureCountdown = 15 }
             let badge = badgeRect()
-            prep = Prep(buttons: buttons, badge: badge, scale: scale, visiblePx: visiblePx(),
+            prep = Prep(buttons: buttons, badge: badge, scale: scale, content: captureContent,
                         radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure,
                         clean: cleanCorner, noBadge: badge == nil && badgeAbsent())
         }
@@ -1318,16 +1316,17 @@ func measureCornerRadius(_ pb: CVPixelBuffer, scale: CGFloat) -> Int? {
 /// The window's four corners (TL, TR, BL, BR) as square premultiplied BGRA tiles with an exact
 /// anti-aliased rounded mask of radius `r` px. Colours come from the nearest pixel inside the
 /// window, so whatever the capture has in the corner (transparency, an erased badge, an app's own
-/// square edge) can't leak through. Returns (tile px, tiles, hash).
-func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, visible: CGSize? = nil) -> (Int, Data, UInt64)? {
+/// square edge) can't leak through. `content`: where the window ends in the buffer (px), when
+/// macOS padded a capture of a stale size. Returns (tile px, tiles, hash).
+func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, content: CGSize? = nil) -> (Int, Data, UInt64)? {
     guard r > 0, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let bufW = CVPixelBufferGetWidth(pb), bufH = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-    // The corners go where Linux's view of the window ends (it crops windows it can't shrink).
-    let w = min(bufW, visible.map { Int($0.width.rounded()) } ?? bufW)
-    let h = min(bufH, visible.map { Int($0.height.rounded()) } ?? bufH)
+    // The window's real corners, wherever its content ends in the buffer.
+    let w = max(1, min(bufW, content.map { Int($0.width.rounded()) } ?? bufW))
+    let h = max(1, min(bufH, content.map { Int($0.height.rounded()) } ?? bufH))
     let s = max(1, Int(scale.rounded()))
     let t = ((r + s - 1) / s) * s          // whole points, so the client can place it exactly
     guard t <= w / 3, t <= h / 3 else { return nil }

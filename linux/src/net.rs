@@ -48,6 +48,8 @@ pub enum UiEvent {
     Focused,
     /// Square or rounded corners was switched (the tray): open windows follow now.
     CornersSetting,
+    /// Keeping Mac windows at least as big as their app allows was switched (config.rs).
+    KeepSizeSetting,
     /// Hyprland's view of this client's windows: (class, title, floating) each. It doesn't tell
     /// a window that it's tiled, as other desktops do (see hyprland::watch_tiling).
     Tiling(Vec<(String, String, bool)>),
@@ -91,6 +93,7 @@ impl UiEvent {
             UiEvent::Cursor { .. } => "cursor",
             UiEvent::Focused => "focused",
             UiEvent::CornersSetting => "corners setting",
+            UiEvent::KeepSizeSetting => "keep size setting",
             UiEvent::Tiling(_) => "tiling",
             UiEvent::WindowButtons(..) => "window buttons",
             UiEvent::MoveStarted(_) => "move started",

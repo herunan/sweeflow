@@ -38,6 +38,7 @@ impl Iface {
     /// back onto the Mac desktop), switch <fingerprint>, use <fingerprint> (a Mac just linked),
     /// forget <fingerprint>, launch <bundle id>, quit-app <bundle id>, pin|unpin <bundle id>,
     /// login on|off (open at login), square on|off (square window corners),
+    /// keep-size on|off (Mac windows kept at least as big as their app allows),
     /// global-menu on|off,
     /// placement (look again at those), quit.
     #[zbus(name = "Do")]

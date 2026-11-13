@@ -256,7 +256,6 @@ final class Session {
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.badgeAbsent = { [weak tracker] in tracker?.badgeAbsent(wid) ?? false }
-            st.visibleSize = requestedSizes[wid]
             st.displayScale = { [weak tracker] in
                 if settings.config.quality == "light" { return 1 }
                 guard let f = tracker?.windows[wid]?.frame else { return nil }
@@ -484,9 +483,6 @@ final class Session {
             setClientFocus(0)
         case .moveTaken:
             moveTaken(try m.u32())
-        case .shownSize:
-            let wid = try m.u32(), size = CGSize(width: CGFloat(try m.f32()), height: CGFloat(try m.f32()))
-            for st in streamers.values where st.wid == wid { st.visibleSize = size }
 
         default:
             log("unhandled message \(m.type)")
@@ -1250,7 +1246,6 @@ final class Session {
     private func clientResized(_ wid: UInt32, to size: CGSize) -> Bool {
         guard let win = tracker.windows[wid] else { return false }
         requestedSizes[wid] = size
-        for st in streamers.values where st.wid == wid { st.visibleSize = size }
         resize(win, to: size)
         return true
     }

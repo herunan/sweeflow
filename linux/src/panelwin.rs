@@ -615,6 +615,7 @@ struct PanelState {
     macs: Vec<Mac>,
     open_at_login: bool,
     square: bool,
+    keep_size: bool,
 }
 
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
@@ -699,6 +700,7 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
         "launcher" => Call::Set(serde_json::json!({ "launcher": !s.settings.launcher })),
         "sharp" => Call::Set(serde_json::json!({ "quality": if s.settings.quality == "light" { "sharp" } else { "light" } })),
         "square" => act("square", on_off(s.square)),
+        "keepSize" => act("keep-size", on_off(s.keep_size)),
         "login" => act("login", on_off(s.open_at_login)),
         _ => return None,
     })
@@ -713,6 +715,7 @@ fn toggles(s: &PanelState) -> Vec<Toggle> {
         t("dragDrop", "Drag and drop", s.settings.drag_drop),
         t("launcher", "Mac apps in app launcher", s.settings.launcher),
         t("square", "Square window corners", s.square),
+        t("keepSize", "Windows as big as their app needs", s.keep_size),
         t("sharp", "High quality", s.settings.quality != "light"),
         t("login", "Open at login", s.open_at_login),
     ]
@@ -1104,7 +1107,7 @@ mod tests {
         ],
         "macs": [{"name": "Studio", "fingerprint": "ab12", "active": true, "kind": "desktop", "online": true},
                  {"name": "Air", "fingerprint": "cd34", "active": false, "kind": "", "online": null}],
-        "openAtLogin": true, "square": false, "placement": {}, "pinned": ["com.apple.Terminal"],
+        "openAtLogin": true, "square": false, "keepSize": true, "placement": {}, "pinned": ["com.apple.Terminal"],
         "offline": false, "online": true, "status": "Streaming from Studio", "actions": ["pause", "stop"], "macRefused": false, "showAt": 0
     }"#;
 
@@ -1135,7 +1138,7 @@ mod tests {
         assert_eq!(mac_state(&stopped, &stopped.macs[0]), "available");
         assert_eq!(mac_state(&stopped, &other(Some(true), true)), "busy");
         assert_eq!(mac_state(&stopped, &other(Some(false), false)), "offline");
-        assert!(s.open_at_login && !s.square);
+        assert!(s.open_at_login && !s.square && s.keep_size);
     }
 
     #[test]
@@ -1165,10 +1168,11 @@ mod tests {
         assert_eq!(flip_call("dragDrop", &s), Some(Call::Set(serde_json::json!({ "dragDrop": false }))));
         assert_eq!(flip_call("sharp", &s), Some(Call::Set(serde_json::json!({ "quality": "sharp" }))));
         assert_eq!(flip_call("square", &s), Some(act("square", "on")));
+        assert_eq!(flip_call("keepSize", &s), Some(act("keep-size", "off")));
         assert_eq!(flip_call("login", &s), Some(act("login", "off")));
         assert_eq!(flip_call("nonsense", &s), None);
         let shown: Vec<(String, bool)> = toggles(&s).into_iter().map(|t| (t.label.to_string(), t.on)).collect();
-        assert_eq!(shown[5], ("High quality".to_string(), false));
-        assert_eq!(shown.len(), 7);
+        assert_eq!(shown[6], ("High quality".to_string(), false));
+        assert_eq!(shown.len(), 8);
     }
 }
