@@ -106,11 +106,20 @@ slint::slint! {
         }
     }
 
-    // The colour of where a Mac stands (MacItem.online): Online green; Locked or Busy orange;
-    // Not online grey.
+    // Where a Mac stands (MacItem.online), as its dot: Streaming violet and Paused a violet ring
+    // (streaming to this computer); Available green; Busy or Locked orange (in the way); Not
+    // online a grey ring.
     global MacState {
         pure public function ink(state: string) -> color {
-            state == "online" ? #30a46c : state == "offline" ? Look.muted : #e8890c
+            state == "streaming" || state == "paused" ? #7c5cff
+                : state == "available" ? #30a46c
+                : state == "busy" || state == "locked" ? #e8890c
+                : Look.muted
+        }
+        pure public function hollow(state: string) -> bool { state == "paused" || state == "offline" }
+        pure public function words(state: string) -> string {
+            state == "streaming" ? "Streaming" : state == "paused" ? "Paused" : state == "available" ? "Available"
+                : state == "busy" ? "Busy · streaming elsewhere" : state == "locked" ? "Locked" : "Not online"
         }
     }
 
@@ -484,13 +493,17 @@ slint::slint! {
                                                 spacing: 5px;
                                                 VerticalLayout {
                                                     alignment: center;
-                                                    Rectangle { width: 7px; height: 7px; border-radius: 3.5px; background: MacState.ink(m.online); }
+                                                    Rectangle {
+                                                        width: 8px;
+                                                        height: 8px;
+                                                        border-radius: 4px;
+                                                        background: MacState.hollow(m.online) ? transparent : MacState.ink(m.online);
+                                                        border-width: MacState.hollow(m.online) ? 2px : 0px;
+                                                        border-color: MacState.ink(m.online);
+                                                    }
                                                 }
                                                 Text {
-                                                    text: m.online == "online" ? "Online"
-                                                        : m.online == "offline" ? "Not online"
-                                                        : m.online == "locked" ? "Locked"
-                                                        : "Busy · streaming elsewhere";
+                                                    text: MacState.words(m.online);
                                                     color: Look.muted;
                                                     font-size: 11px;
                                                     overflow: elide;
@@ -521,8 +534,8 @@ slint::slint! {
                                             text: "Start";
                                             sign: "start";
                                             // Only a Mac that can be reached.
-                                            enabled: m.online == "online" || m.online == "locked";
-                                            tip: m.online == "online" || m.online == "locked" ? "Start streaming from this Mac"
+                                            enabled: m.online == "available" || m.online == "locked";
+                                            tip: m.online == "available" || m.online == "locked" ? "Start streaming from this Mac"
                                                 : m.online == "offline" ? m.name + " is not online"
                                                 : m.online == "busy" ? "Stop streaming elsewhere first"
                                                 : "Checking whether " + m.name + " is online";
@@ -642,15 +655,6 @@ struct Mac {
 
 fn parse_state(json: &str) -> Option<PanelState> {
     serde_json::from_str(json).inspect_err(|e| log::warn!("Sweeflow's state: {e}")).ok()
-}
-
-/// "online" / "offline" for the Mac's icon (the window words it in a hint): "" while not known yet.
-fn online_text(online: Option<bool>) -> &'static str {
-    match online {
-        Some(true) => "online",
-        Some(false) => "offline",
-        None => "",
-    }
 }
 
 /// The heading an app is listed under.
@@ -857,14 +861,18 @@ fn start_blocked(s: &PanelState, action: &str) -> Option<String> {
     }
 }
 
-/// Where a linked Mac stands, for the line under its name: "online", "offline", "locked",
-/// "busy" (streaming to another computer), or "" while not known yet. Locked and busy are known
-/// only of the Mac in use.
+/// Where a linked Mac stands, for the line under its name: "streaming" or "paused" (to this
+/// computer), "locked", "busy" (streaming to another computer), "available", "offline", or ""
+/// while not known yet. Streaming, paused and locked are known only of the Mac in use.
 fn mac_state(s: &PanelState, m: &Mac) -> &'static str {
-    match online_text(m.online) {
-        "online" if m.busy || (m.active && s.elsewhere.is_some()) => "busy",
-        "online" if m.active && s.locked => "locked",
-        other => other,
+    if m.active && s.connected {
+        return if s.locked { "locked" } else if s.settings.enabled { "streaming" } else { "paused" };
+    }
+    match m.online {
+        Some(true) if m.busy || (m.active && s.elsewhere.is_some()) => "busy",
+        Some(true) => "available",
+        Some(false) => "offline",
+        None => "",
     }
 }
 
@@ -1121,8 +1129,15 @@ mod tests {
         assert_eq!(s.apps[1], App { id: "com.apple.Safari".into(), name: "Safari".into(), icon: "file:///nowhere/safari.png".into(), state: 3, pinned: false });
         assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true), busy: false });
         assert_eq!(s.macs[1].online, None);
-        assert_eq!(s.macs.iter().map(|m| online_text(m.online)).collect::<Vec<_>>(), ["online", ""]);
-        assert_eq!(online_text(Some(false)), "offline");
+        // The Mac in use streaming here; another not known yet; then each other state.
+        assert_eq!(s.macs.iter().map(|m| mac_state(&s, m)).collect::<Vec<_>>(), ["streaming", ""]);
+        let paused = PanelState { settings: Settings { enabled: false, ..s.settings.clone() }, ..s.clone() };
+        assert_eq!(mac_state(&paused, &paused.macs[0]), "paused");
+        let stopped = PanelState { connected: false, ..s.clone() };
+        let other = |online, busy| Mac { online, busy, ..stopped.macs[1].clone() };
+        assert_eq!(mac_state(&stopped, &stopped.macs[0]), "available");
+        assert_eq!(mac_state(&stopped, &other(Some(true), true)), "busy");
+        assert_eq!(mac_state(&stopped, &other(Some(false), false)), "offline");
         assert!(s.open_at_login && !s.square);
     }
 

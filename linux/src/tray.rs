@@ -483,16 +483,17 @@ pub fn status_short(s: Standing) -> String {
     if let Standing { stopped: false, elsewhere: Some(_), .. } = s {
         return "Busy · streaming elsewhere".into();
     }
+    // The same words as the Mac's line in the list of Macs.
     match s {
-        Standing { stopped: true, online: Some(true), .. } => "Stopped · online",
-        Standing { stopped: true, online: Some(false), .. } => "Stopped · not online",
+        Standing { stopped: true, online: Some(true), .. } => "Available",
+        Standing { stopped: true, online: Some(false), .. } => "Not online",
         Standing { stopped: true, .. } => "Stopped",
+        Standing { connected: true, locked: true, .. } => "Locked",
         Standing { connected: true, enabled: false, .. } => "Paused",
-        Standing { connected: true, locked: true, .. } => "Streaming · Mac locked",
         Standing { connected: true, .. } => "Streaming",
-        Standing { refused: true, .. } => "Waiting · stopped on the Mac",
-        Standing { online: Some(false), .. } => "Waiting · not online",
-        _ => "Waiting",
+        Standing { refused: true, .. } => "Stopped on the Mac",
+        Standing { online: Some(false), .. } => "Not online",
+        _ => "Connecting",
     }
     .into()
 }

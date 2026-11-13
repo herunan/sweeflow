@@ -553,10 +553,13 @@ PlasmoidItem {
                                     // the Mac in use.
                                     ColumnLayout {
                                         id: nameCol
-                                        readonly property string macState: mac.modelData.online === null ? ""
+                                        // Streaming, paused and locked are known only of the Mac in use.
+                                        readonly property string macState:
+                                            mac.modelData.active && root.connected ? (root.st.locked ? "locked" : root.st.settings && root.st.settings.enabled === false ? "paused" : "streaming")
+                                            : mac.modelData.online === null ? ""
                                             : mac.modelData.online === false ? "offline"
                                             : mac.modelData.busy || (mac.modelData.active && root.elsewhere !== "") ? "busy"
-                                            : mac.modelData.active && root.st.locked ? "locked" : "online"
+                                            : "available"
                                         Layout.fillWidth: true
                                         spacing: 0
                                         PlasmaComponents3.Label {
@@ -578,14 +581,23 @@ PlasmoidItem {
                                         RowLayout {
                                             visible: nameCol.macState !== ""
                                             spacing: Kirigami.Units.smallSpacing
+                                            // Streaming violet, Paused a violet ring (streaming to this
+                                            // computer); Available green; Busy or Locked orange; Not online
+                                            // a grey ring.
                                             Rectangle {
-                                                implicitWidth: Math.round(Kirigami.Units.smallSpacing * 1.75)
+                                                readonly property color ink: ["streaming", "paused"].includes(nameCol.macState) ? "#7c5cff"
+                                                    : nameCol.macState === "available" ? "#30a46c"
+                                                    : ["busy", "locked"].includes(nameCol.macState) ? "#e8890c" : Kirigami.Theme.disabledTextColor
+                                                readonly property bool hollow: nameCol.macState === "paused" || nameCol.macState === "offline"
+                                                implicitWidth: Math.round(Kirigami.Units.smallSpacing * 2)
                                                 implicitHeight: implicitWidth
                                                 radius: width / 2
-                                                color: nameCol.macState === "online" ? "#30a46c" : nameCol.macState === "offline" ? Kirigami.Theme.disabledTextColor : "#e8890c"
+                                                color: hollow ? "transparent" : ink
+                                                border.width: hollow ? 2 : 0
+                                                border.color: ink
                                             }
                                             PlasmaComponents3.Label {
-                                                text: ({ online: "Online", offline: "Not online", locked: "Locked", busy: "Busy · streaming elsewhere" })[nameCol.macState] || ""
+                                                text: ({ streaming: "Streaming", paused: "Paused", available: "Available", offline: "Not online", locked: "Locked", busy: "Busy · streaming elsewhere" })[nameCol.macState] || ""
                                                 font: Kirigami.Theme.smallFont
                                                 opacity: 0.7
                                                 elide: Text.ElideRight
