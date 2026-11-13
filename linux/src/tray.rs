@@ -944,6 +944,10 @@ fn forget_here(fingerprint: &str) {
     }
     refresh();
     if was_active {
+        // Unlinking the Mac in use disconnects; it doesn't go on to another linked Mac (one
+        // locked or far away showed its windows as paused stills). Another one, now listed
+        // first, is there to Start.
+        crate::net::set_offline(true);
         restart();
     }
 }
