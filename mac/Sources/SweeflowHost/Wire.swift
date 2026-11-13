@@ -19,7 +19,8 @@ enum Msg: UInt8 {
     /// From Linux: it did, let go of the press.
     case moveReady = 0x2E, moveTaken = 0x2F
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
-    /// To Linux: u32 wid — the app won't let this window be resized: it keeps its own size there.
+    /// To Linux: u32 wid, f32 fx, f32 fy — the app won't let this window be resized: it keeps its
+    /// own size there, at the same spot of the screen as on the Mac (fractions; see Session.spot).
     case windowFixed = 0x35
     case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B

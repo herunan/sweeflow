@@ -208,6 +208,29 @@ pub fn float_window(class: String, title: String) {
     });
 }
 
+/// Moves this process's floating window of that class (and title) to the same spot of its
+/// monitor's free area as on the Mac (fractions: 0 left/top, 1 right/bottom).
+pub fn place_window(class: &str, title: &str, spot: (f32, f32)) {
+    let json = |args: &[&str]| -> Option<serde_json::Value> { serde_json::from_slice(&Command::new("hyprctl").args(args).output().ok()?.stdout).ok() };
+    let Some(serde_json::Value::Array(clients)) = json(&["-j", "clients"]) else { return };
+    let pid = u64::from(std::process::id());
+    let ours: Vec<_> = clients.iter().filter(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class)).collect();
+    let Some(c) = ours.iter().find(|c| c["title"].as_str() == Some(title)).or(ours.first()) else { return };
+    let Some(serde_json::Value::Array(monitors)) = json(&["-j", "monitors"]) else { return };
+    let Some(m) = monitors.iter().find(|m| m["id"] == c["monitor"]) else { return };
+    let n = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
+    let scale = n(&m["scale"]).max(0.1);
+    let (left, top, right, bottom) = (n(&m["reserved"][0]), n(&m["reserved"][1]), n(&m["reserved"][2]), n(&m["reserved"][3]));
+    let (ax, ay) = (n(&m["x"]) + left, n(&m["y"]) + top);
+    let (aw, ah) = (n(&m["width"]) / scale - left - right, n(&m["height"]) / scale - top - bottom);
+    let (w, h) = (n(&c["size"][0]), n(&c["size"][1]));
+    let x = (ax + spot.0 as f64 * (aw - w).max(0.0)).round();
+    let y = (ay + spot.1 as f64 * (ah - h).max(0.0)).round();
+    let Some(address) = c["address"].as_str() else { return };
+    let lua = format!(r#"hl.dsp.window.move({{ x = {x}, y = {y}, window = "address:{address}" }})"#);
+    let _ = Command::new("hyprctl").args(["dispatch", &lua]).output();
+}
+
 /// Hyprland frames every window as a plain rectangle (no rounding set, as on Omarchy): a Mac
 /// window's rounded corners would leave gaps inside that frame. Looked at once.
 pub fn square_windows() -> bool {

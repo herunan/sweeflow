@@ -43,8 +43,9 @@ pub enum UiEvent {
     WindowAdded(WinInfo),
     WindowChanged { wid: u32, title: String, w: f32, h: f32, rel_x: f32, rel_y: f32 },
     WindowRemoved(u32),
-    /// The app won't let this window be resized.
-    WindowFixed(u32),
+    /// The app won't let this window be resized; where its app put it on the Mac's screen
+    /// (fractions of the room there: 0 left/top, 1 right/bottom), if said.
+    WindowFixed(u32, Option<(f32, f32)>),
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
     Focused,
@@ -90,7 +91,7 @@ impl UiEvent {
             UiEvent::WindowAdded(_) => "window added",
             UiEvent::WindowChanged { .. } => "window changed",
             UiEvent::WindowRemoved(_) => "window removed",
-            UiEvent::WindowFixed(_) => "window fixed",
+            UiEvent::WindowFixed(..) => "window fixed",
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
             UiEvent::Focused => "focused",
@@ -870,7 +871,11 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             rel_y: r.f32()?,
         },
         t::WINDOW_REMOVED => UiEvent::WindowRemoved(r.u32()?),
-        t::WINDOW_FIXED => UiEvent::WindowFixed(r.u32()?),
+        t::WINDOW_FIXED => {
+            let wid = r.u32()?;
+            let spot = r.f32().and_then(|x| Ok((x, r.f32()?))).ok();
+            UiEvent::WindowFixed(wid, spot)
+        }
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
         t::FOCUSED => {

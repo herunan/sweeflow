@@ -293,7 +293,7 @@ pub struct App {
     /// xdg-dialog-v1: marks a fixed-size Mac window as a dialog (floated, not tiled).
     dialog_mgr: Option<XdgWmDialogV1>,
     /// Windows said to be fixed-size before they were added (WINDOW_FIXED comes first).
-    pending_fixed: std::collections::HashSet<u32>,
+    pending_fixed: HashMap<u32, Option<(f32, f32)>>,
     icon_mgr: Option<XdgToplevelIconManagerV1>,
     cursor_mgr: Option<WpCursorShapeManagerV1>,
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
@@ -653,11 +653,11 @@ impl App {
                 let _ = self.net.send(NetCmd::Unsubscribe(wid));
             }
             UiEvent::WindowRemoved(wid) => self.remove_window(wid),
-            UiEvent::WindowFixed(wid) if !self.windows.contains_key(&wid) => {
+            UiEvent::WindowFixed(wid, spot) if !self.windows.contains_key(&wid) => {
                 // Said before the window is added: it's made a dialog of its size from the start.
-                self.pending_fixed.insert(wid);
+                self.pending_fixed.insert(wid, spot);
             }
-            UiEvent::WindowFixed(wid) => {
+            UiEvent::WindowFixed(wid, _) => {
                 if let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.display) {
                     w.fixed = true;
                     log::info!("window {wid}: its app won't let it be resized: kept at its own size");
@@ -849,7 +849,7 @@ impl App {
             let window = self.xdg.create_window(surface, WindowDecorations::RequestClient, qh);
             window.set_title(display_title(&info.app_name, &info.title));
             window.set_app_id(format!("sweeflow-{}", info.bundle_id));
-            if self.pending_fixed.remove(&info.wid) {
+            if let Some(spot) = self.pending_fixed.remove(&info.wid) {
                 // Its app won't let it be resized (a reminder, a dialog): a dialog of exactly its
                 // size from the start, which desktops and tilers (Karousel, Hyprland) float like a
                 // notification instead of tiling; they decide that when a window appears. (Modal:
@@ -861,6 +861,13 @@ impl App {
                     d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
                 }
                 fixed_now = true;
+                if let Some(spot) = spot {
+                    crate::desktop::place_at_spot(
+                        format!("sweeflow-{}", info.bundle_id),
+                        display_title(&info.app_name, &info.title),
+                        spot,
+                    );
+                }
             } else if info.kind != 2 {
                 // Floating panels (kind 2: palettes) are ordinary, independent windows here too:
                 // own taskbar entry, tiled like the rest.

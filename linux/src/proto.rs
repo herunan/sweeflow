@@ -59,8 +59,9 @@ pub mod t {
     pub const SCROLL: u8 = 0x32;
     pub const KEY: u8 = 0x33;
     pub const RELEASE_ALL: u8 = 0x34;
-    /// From the Mac: u32 wid — the app won't let this window be resized (a reminder, a dialog):
-    /// it keeps exactly its own size here.
+    /// From the Mac: u32 wid, f32 fx, f32 fy — the app won't let this window be resized (a
+    /// reminder, a dialog): it keeps exactly its own size here, at the same spot of the screen
+    /// (fractions of the room: 0 left/top, 1 right/bottom; older Macs send only the wid).
     pub const WINDOW_FIXED: u8 = 0x35;
     pub const CLIPBOARD: u8 = 0x40;
     #[allow(dead_code)] // part of the protocol; this client measures RTT from QUIC instead

@@ -1406,6 +1406,7 @@ final class Session {
         tracker.onRemoved = { [weak self] w in
             guard let self else { return }
             self.fixedKnown[w.wid] = nil
+            self.fixedSpots[w.wid] = nil
             let now = DispatchTime.now()
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
@@ -1706,6 +1707,25 @@ final class Session {
 
     /// Whether each window's app lets it be resized (looked at once per window).
     private var fixedKnown: [UInt32: Bool] = [:]
+    /// Where each window first appeared on its screen (see spot(of:)).
+    private var fixedSpots: [UInt32: (Float, Float)] = [:]
+
+    /// The window is fixed-size, and the spot its app put it at: Linux shows it there too.
+    private func sendFixed(_ wid: UInt32) {
+        let (fx, fy) = fixedSpots[wid] ?? (0.5, 0.5)
+        var f = MsgWriter(.windowFixed); f.u32(wid); f.f32(fx); f.f32(fy); control?.send(f)
+    }
+
+    /// Where a window is on its screen, as fractions of the room it has there: 0 flush with the
+    /// left (top) edge, 1 flush with the right (bottom), 0.5 centred. A reminder an app puts in
+    /// the top-right corner is (1, 0) on any screen size.
+    static func spot(of frame: CGRect) -> (Float, Float) {
+        var id: CGDirectDisplayID = 0, n: UInt32 = 0
+        guard CGGetDisplaysWithPoint(CGPoint(x: frame.midX, y: frame.midY), 1, &id, &n) == .success, n > 0 else { return (0.5, 0.5) }
+        let b = CGDisplayBounds(id)
+        let f = { (at: CGFloat, start: CGFloat, room: CGFloat) -> Float in room <= 1 ? 0.5 : Float(max(0, min(1, (at - start) / room))) }
+        return (f(frame.minX, b.minX, b.width - frame.width), f(frame.minY, b.minY, b.height - frame.height))
+    }
 
     /// Tells Linux about a new window. Whether its app lets it be resized is looked at first
     /// (Accessibility, off this queue), so a fixed one (a reminder, a dialog) is said to be
@@ -1715,6 +1735,9 @@ final class Session {
     /// added anyway, and said to be fixed when the answer comes.
     private func sendAdded(_ w: TrackedWindow) {
         if w.kind == .popup { return announce(w, fixed: false) }
+        // Where the app put it, before it's moved onto the virtual display.
+        let spot = Self.spot(of: w.frame)
+        fixedSpots[w.wid] = fixedSpots[w.wid] ?? spot
         if let fixed = fixedKnown[w.wid] { return announce(w, fixed: fixed) }
         final class Once { var sent = false }
         let once = Once(), control = control_, wid = w.wid, pid = w.pid
@@ -1727,7 +1750,7 @@ final class Session {
                     once.sent = true
                     self.announce(now, fixed: fixed)
                 } else if fixed {
-                    var f = MsgWriter(.windowFixed); f.u32(wid); self.control?.send(f)
+                    self.sendFixed(wid)
                 }
             }
         }
@@ -1740,9 +1763,7 @@ final class Session {
 
     private func announce(_ w: TrackedWindow, fixed: Bool) {
         sendIcon(w)
-        if fixed {
-            var f = MsgWriter(.windowFixed); f.u32(w.wid); control?.send(f)
-        }
+        if fixed { sendFixed(w.wid) }
         var m = MsgWriter(.windowAdded)
         m.u32(w.wid); m.i32(w.pid)
         m.str(w.bundleId); m.str(w.appName); m.str(w.title)

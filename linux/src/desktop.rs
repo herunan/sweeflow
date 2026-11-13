@@ -80,3 +80,49 @@ mod tests {
         assert_eq!(other_rules("sweeflow,sweeflow-taskbar", "sweeflow-taskbar"), ["sweeflow"]);
     }
 }
+
+/// Puts a window that floats (a fixed-size Mac window) at the same spot of the screen as its app
+/// put it on the Mac: `spot` is fractions of the room around it (0 left/top, 1 right/bottom).
+/// Wayland lets no app place its own windows, so the desktop does it: a one-off KWin script on
+/// Plasma, Hyprland's own move there. GNOME has no way (it places dialogs itself). A moment
+/// after the window opens, once the desktop has it.
+pub fn place_at_spot(class: String, title: String, spot: (f32, f32)) {
+    let (fx, fy) = (spot.0.clamp(0.0, 1.0), spot.1.clamp(0.0, 1.0));
+    let kde = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("KDE"));
+    if !kde && !crate::hyprland::running() {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if crate::hyprland::running() {
+            crate::hyprland::place_window(&class, &title, (fx, fy));
+            return;
+        }
+        let js = format!(
+            "for (const w of workspace.windowList()) {{ if (w.resourceClass == {c} && w.caption == {t}) {{ \
+               const a = workspace.clientArea(KWin.PlacementArea, w); const g = w.frameGeometry; \
+               w.frameGeometry = {{ x: Math.round(a.x + {fx} * (a.width - g.width)), y: Math.round(a.y + {fy} * (a.height - g.height)), width: g.width, height: g.height }}; }} }}",
+            c = serde_json::to_string(&class).unwrap_or_default(),
+            t = serde_json::to_string(&title).unwrap_or_default(),
+        );
+        // A file of its own each time: KWin keeps a loaded script's code by its path.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let (path, name) = (dir.join(format!("sweeflow-place-{}-{n}.js", std::process::id())), format!("sweeflow-place-{n}"));
+        if std::fs::write(&path, js).is_err() {
+            return;
+        }
+        let Ok(bus) = zbus::blocking::Connection::session() else { return };
+        let id: Option<i32> = bus
+            .call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "loadScript", &(path.to_string_lossy().as_ref(), name.as_str()))
+            .ok()
+            .and_then(|r| r.body().deserialize().ok());
+        if let Some(id) = id {
+            let _ = bus.call_method(Some("org.kde.KWin"), format!("/Scripting/Script{id}").as_str(), Some("org.kde.kwin.Script"), "run", &());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = bus.call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "unloadScript", &(name.as_str(),));
+        let _ = std::fs::remove_file(&path);
+    });
+}
