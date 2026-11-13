@@ -49,6 +49,14 @@ pub fn add_to_config() {
                 keep_menu_focused();
                 place_sweeflow_window();
                 close_on_click_elsewhere();
+            } else if event.starts_with("openlayer>>") || event.starts_with("closelayer>>") {
+                // A bar came or went (Omarchy's shell starts after Sweeflow at login, or
+                // restarts): the room it takes is known a moment later, and Sweeflow's window
+                // is placed by it.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    place_sweeflow_window();
+                });
             }
         }
     });
