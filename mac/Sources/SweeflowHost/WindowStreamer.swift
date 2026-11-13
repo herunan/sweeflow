@@ -354,19 +354,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         if lossless {
-            // A popup that doesn't change (a "Save changes?" sheet sitting still) can get no frame
-            // at all from the live capture: after a moment with none, a still of it (by then
-            // done fading in).
+            // Some popups get no frame at all from the live capture (one sitting still, a
+            // "Save changes?" sheet; Safari's address-bar suggestions, even while they change):
+            // after a moment with none, stills of it instead, taken ten times a second and sent
+            // when they differ, for as long as the capture stays silent.
             queue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, !self.stopped, self.stream === s, self.framesSinceStart == 0 else { return }
-                SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
-                    guard let self, let sb, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
-                    self.queue.async {
-                        guard !self.stopped, !self.showingPause, self.stream === s, self.framesSinceStart == 0, !ScreenLock.isLocked else { return }
-                        log("stream \(self.wid): no frame yet: a still of it instead")
-                        self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
-                    }
-                }
+                self?.pollStills(s, filter: filter)
             }
         }
         s.startCapture { [weak self] err in
@@ -919,6 +912,50 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: encode
 
+    /// The last still sent by pollStills (a sample of its pixels), to send only changes.
+    private var lastStillHash: UInt64 = 0
+    private var pollingStills = false
+
+    /// Stills of a popup whose live capture delivers nothing (see startCapture), every 100 ms
+    /// while that lasts; each one sent only when it differs from the last.
+    private func pollStills(_ s: SCStream, filter: SCContentFilter) {
+        guard !stopped, stream === s, framesSinceStart == 0 else { pollingStills = false; return }
+        if !pollingStills {
+            pollingStills = true
+            lastStillHash = 0
+            log("stream \(wid): no frame from the capture: stills of it instead")
+        }
+        SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
+            guard let self else { return }
+            let pb = sb.flatMap { CMSampleBufferGetImageBuffer($0) }
+            self.queue.async {
+                guard !self.stopped, self.stream === s, self.framesSinceStart == 0 else { self.pollingStills = false; return }
+                if let pb, !self.showingPause, !ScreenLock.isLocked {
+                    let h = Self.sampleHash(pb)
+                    if h != self.lastStillHash {
+                        self.lastStillHash = h
+                        self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
+                    }
+                }
+                self.queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    self?.pollStills(s, filter: filter)
+                }
+            }
+        }
+    }
+
+    /// A quick fingerprint of a picture: every 7th byte of it (enough to tell a change).
+    private static func sampleHash(_ pb: CVPixelBuffer) -> UInt64 {
+        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return 0 }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+        let n = CVPixelBufferGetBytesPerRow(pb) * CVPixelBufferGetHeight(pb)
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        var i = 0
+        while i < n { h = (h ^ UInt64(base[i])) &* 0x100_0000_01b3; i += 7 }
+        return h ^ UInt64(n)
+    }
+
     /// Encodes the pending capture if flow control allows.
     private func pump() {
         // A frame lost on the way (datagrams) is never acknowledged: don't wait for it forever.
@@ -1016,6 +1053,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self?.startRetries = 0
                 return
             }
+            // A popup the capture won't feed is shown by stills (pollStills): restarting the
+            // capture would only make it flicker.
+            if self.lossless { return }
             guard self.startRetries < 3 else {
                 log("stream \(self.wid): still no frame after 3 restarts")
                 CaptureHealth.captureGaveNothing()
