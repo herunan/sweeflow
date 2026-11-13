@@ -441,7 +441,8 @@ fn tab_stop(width: f32) -> f32 {
 fn key_column(status: &str) -> f32 {
     const KEY: f32 = 38.0; // "⌘⌥Y"
     const DOT: f32 = 22.0;
-    let end = ((text_width(status) + DOT - KEY) / TAB).floor();
+    // One stop further than where the status line ends: set apart from the item's text.
+    let end = ((text_width(status) + DOT - KEY) / TAB).floor() + 1.0;
     end.max(tab_stop(text_width("Open Sweeflow")))
 }
 
