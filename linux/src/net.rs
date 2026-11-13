@@ -214,7 +214,9 @@ pub fn locked(fingerprint: &str) -> bool {
 
 /// What the Mac in use says of itself while stopped here: (busy streaming elsewhere, locked).
 pub fn in_use_says() -> (bool, bool) {
-    IN_USE.get().map_or((false, false), |f| (busy(f), locked(f)))
+    // From the config: the Mac in use can change while Sweeflow runs (linking, switching).
+    let f = crate::config::Config::load_or_default().map(|c| c.host_fingerprint).unwrap_or_default();
+    (busy(&f), locked(&f))
 }
 
 /// A linked Mac this computer isn't connected to is streaming to another computer.
