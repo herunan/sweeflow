@@ -320,6 +320,9 @@ pub struct App {
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
     /// xdg-activation: brings a window back to the front (and unminimises it) on a launch.
     activation: Option<XdgActivationV1>,
+    /// The desktop's shortcuts let through (no inhibitor) until then, and while a modifier is
+    /// still held: a window key was just handed to it (see press_key).
+    let_go: Option<Instant>,
     /// Launches whose app had no window here yet: their token, for the window when it comes.
     launch_tokens: HashMap<String, (String, std::time::Instant)>,
     /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
@@ -497,6 +500,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
         activation: bind_opt("xdg_activation_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        let_go: None,
         launch_tokens: HashMap::new(),
         srgb: None,
         srgb_ready: false,
@@ -1039,14 +1043,11 @@ impl App {
         // call for Omarchy: its menu on Super+Space, workspaces, closing and moving windows),
         // and whatever Hyprland has no binding for still reaches the Mac. `SWEEFLOW_KEYS=mac`
         // gives the Mac everything there too.
-        let desktop_keys_win = crate::hyprland::running() && std::env::var("SWEEFLOW_KEYS").as_deref() != Ok("mac");
-        if matches!(role, Role::Toplevel(_)) && !desktop_keys_win {
+        // (Held only while the pointer is over a Mac window: see sync_inhibitor.)
+        if matches!(role, Role::Toplevel(_)) {
             gnome_allow_shortcuts(&info.bundle_id);
         }
-        let inhibitor = match (&role, &self.inhibit_mgr, &self.seat) {
-            (Role::Toplevel(_), Some(m), Some(seat)) if !desktop_keys_win => Some(m.inhibit_shortcuts(&base, seat, qh, ())),
-            _ => None,
-        };
+        let inhibitor = None;
 
         let appmenu = match (&role, &self.appmenu_mgr, &self.menus) {
             (Role::Toplevel(_), Some(mgr), Some(menus)) if info.kind != 3 => {
@@ -2462,6 +2463,48 @@ impl App {
         w.base().commit();
     }
 
+    /// The desktop's shortcuts go to the Mac (Super as Cmd) only while a Mac window has the
+    /// keyboard and the pointer is over a Mac window: the shortcuts inhibitor is held on the
+    /// focused one then, and dropped when the pointer leaves (the desktop's own keys work again
+    /// at once), or for a moment after a window key was handed to the desktop (let_go).
+    fn sync_inhibitor(&mut self, qh: &QueueHandle<Self>) {
+        let held = self.meta_down > 0 || self.mods.alt || self.mods.ctrl;
+        if let Some(t) = self.let_go {
+            if Instant::now() >= t && !held {
+                self.let_go = None;
+            }
+        }
+        // Not on Hyprland: there the desktop's keys stay first (Omarchy sends copy, paste, cut
+        // and select-all on to the Mac itself). Held and dropped on the move, Hyprland fed the
+        // key still down when it was dropped into the Mac window over and over (Super+2
+        // switching workspace typed "2222…" in TextEdit).
+        let target = match (self.kb_focus, self.pointer_focus) {
+            (Some(f), Some(p)) if self.let_go.is_none() && self.windows.contains_key(&p) && !crate::hyprland::running() => Some(f),
+            _ => None,
+        };
+        let (Some(m), Some(seat)) = (self.inhibit_mgr.clone(), self.seat.clone()) else { return };
+        for (wid, w) in self.windows.iter_mut() {
+            let want = Some(*wid) == target && matches!(w.role, Role::Toplevel(_)) && !w.display;
+            if want && w.inhibitor.is_none() {
+                w.inhibitor = Some(m.inhibit_shortcuts(w.base(), &seat, qh, ()));
+            } else if !want {
+                if let Some(i) = w.inhibitor.take() {
+                    i.destroy();
+                }
+            }
+        }
+    }
+
+    fn inhibiting(&self) -> bool {
+        self.windows.values().any(|w| w.inhibitor.is_some())
+    }
+
+    /// Hands the desktop its keys back for a moment (and while a modifier stays held).
+    fn let_go_now(&mut self, qh: &QueueHandle<Self>) {
+        self.let_go = Some(Instant::now() + Duration::from_millis(1500));
+        self.sync_inhibitor(qh);
+    }
+
     /// A launch of an app that already has windows here: its newest one (a minimised one first)
     /// back in front. Wayland lets only the compositor do that, given an activation token: the
     /// launcher's, or one asked for now (which a compositor may only take as a hint).
@@ -3199,6 +3242,7 @@ impl PointerHandler for App {
                 PointerEventKind::Enter { serial } => {
                     log::debug!("pointer entered {wid} at {x:.0},{y:.0}");
                     self.pointer_focus = Some(wid);
+                    self.sync_inhibitor(qh);
                     self.enter_serial = serial;
                     if self.cursor_surface.is_some() {
                         self.apply_cursor();
@@ -3216,6 +3260,7 @@ impl PointerHandler for App {
                     if self.pointer_focus == Some(wid) {
                         self.pointer_focus = None;
                     }
+                    self.sync_inhibitor(qh);
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.lights_hover = false;
                     }
@@ -3223,6 +3268,9 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Motion { time } => {
                     self.pointer_at = (wid, e.position.0, e.position.1);
+                    if self.let_go.is_some() {
+                        self.sync_inhibitor(qh);
+                    }
                     if self.selection.as_ref().is_some_and(|s| s.wid == wid) {
                         self.draw_selection(e.position.0, e.position.1);
                     }
@@ -3387,6 +3435,7 @@ impl KeyboardHandler for App {
             self.send(W::new(t::FOCUS).u32(wid).finish());
             self.update_lights(wid, qh);
         }
+        self.sync_inhibitor(qh);
         self.schedule_menu_panel();
     }
 
@@ -3396,6 +3445,7 @@ impl KeyboardHandler for App {
         if let Some(wid) = was {
             self.update_lights(wid, qh);
         }
+        self.sync_inhibitor(qh);
         self.schedule_menu_panel();
         self.meta_down = 0;
         self.shift_down = 0;
@@ -3406,7 +3456,7 @@ impl KeyboardHandler for App {
         self.send(W::new(t::RELEASE_ALL).finish());
     }
 
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+    fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
         match e.raw_code {
             KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down += 1,
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down += 1,
@@ -3435,16 +3485,35 @@ impl KeyboardHandler for App {
             self.swallowed.push(e.raw_code);
             return;
         }
-        if e.raw_code == KEY_TAB && self.meta_down > 0 {
+        let kde = crate::keys::desktop().contains("KDE");
+        if kde && self.inhibiting() && e.raw_code == KEY_TAB && self.meta_down > 0 {
             // Cmd+Tab switches between *all* desktop windows, like it does everywhere else.
             switch_windows(self.shift_down > 0);
             self.swallowed.push(e.raw_code);
             return;
         }
-        if e.raw_code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
+        if kde && self.inhibiting() && e.raw_code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
             open_search();
             self.swallowed.push(e.raw_code);
             return;
+        }
+        // Keys for windows and the desktop stay the desktop's (deskkeys): run, or handed back.
+        let m = crate::deskkeys::Mods { logo: self.meta_down > 0, alt: self.mods.alt, ctrl: self.mods.ctrl, shift: self.shift_down > 0 };
+        if self.inhibiting() && crate::deskkeys::is_desktop_key(e.raw_code, m) {
+            let handled = if kde {
+                crate::deskkeys::plasma_action(e.raw_code, m).map(|(c, a)| crate::deskkeys::plasma_invoke(&c, &a)).is_some()
+            } else if crate::keys::desktop().contains("GNOME") && crate::deskkeys::gnome_uses(e.raw_code, m) {
+                // GNOME runs none for an app: let through from the next press (deskkeys).
+                self.let_go_now(qh);
+                true
+            } else {
+                false
+            };
+            if handled {
+                log::debug!("key {} with {m:?}: the desktop's", e.raw_code);
+                self.swallowed.push(e.raw_code);
+                return;
+            }
         }
         self.send(W::new(t::KEY).u32(e.raw_code).u8(1).finish());
     }
@@ -3459,11 +3528,14 @@ impl KeyboardHandler for App {
         self.send(W::new(t::KEY).u32(e.raw_code).u8(2).finish());
     }
 
-    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+    fn release_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
         match e.raw_code {
             KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down = self.meta_down.saturating_sub(1),
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down = self.shift_down.saturating_sub(1),
             _ => {}
+        }
+        if self.let_go.is_some() {
+            self.sync_inhibitor(qh);
         }
         if let Some(i) = self.swallowed.iter().position(|&k| k == e.raw_code) {
             self.swallowed.remove(i);
@@ -3951,3 +4023,4 @@ mod tests {
         assert_eq!(shown_part((1562, 936), 2.0, (1000, 600), 2.0), ((1000.0, 600.0), (1000, 600), (true, true)));
     }
 }
+

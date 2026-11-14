@@ -2642,7 +2642,8 @@ impl App {
     /// the pointer elsewhere (the panel, another window) the keyboard is let go: the panel's
     /// menus, which need it, open, and Alt+Tab works.
     fn sync_keyboard_grab(&mut self) {
-        let held_off = self.grab_hold_off.is_some_and(|t| t > std::time::Instant::now());
+        // (And while a modifier is still held: Super+Tab, Tab, Tab… all go to the switcher.)
+        let held_off = self.grab_hold_off.is_some_and(|t| t > std::time::Instant::now() || self.meta_down > 0);
         let want = self.kb_focus.zip(self.pointer_focus).and_then(|(f, _)| self.windows.get(&f).map(|w| w.xid)).filter(|_| !held_off);
         match (want, self.kb_grabbed) {
             (Some(xid), false) => {
@@ -2682,7 +2683,6 @@ impl App {
     }
 
     fn key(&mut self, keycode: u8, down: bool, state: u16) {
-        const KEY_TAB: u32 = 15;
         const KEY_SPACE: u32 = 57;
         let code = evdev_code(keycode);
         let is_meta = code == 125 || code == 126;
@@ -2705,9 +2705,6 @@ impl App {
         if !self.keys_down.insert(keycode) {
             // Held: the key's repeat.
             if self.swallowed.contains(&code) {
-                if code == KEY_TAB {
-                    crate::ui::switch_windows(self.shift_down > 0);
-                }
                 return;
             }
             self.send(W::new(t::KEY).u32(code).u8(2).finish());
@@ -2739,17 +2736,27 @@ impl App {
             }
             _ => {}
         }
-        if code == KEY_TAB && self.meta_down > 0 {
-            crate::ui::switch_windows(self.shift_down > 0);
-            self.swallowed.push(code);
-            return;
-        }
-        if code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
+        if code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 && crate::keys::desktop().contains("Cinnamon") {
             // The desktop's menu takes the keyboard to open: let it go first (the focus moving
             // there then releases the Mac's keys, see focus_out).
             self.grab_hold_off = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
             self.sync_keyboard_grab();
             crate::ui::open_search();
+            self.swallowed.push(code);
+            return;
+        }
+        // Keys for windows and the desktop stay the desktop's (deskkeys): the keyboard is let
+        // go, and the key pressed again for the window manager (XTest), whose binding runs; one
+        // it doesn't use comes back to the Mac window as usual.
+        let m = crate::deskkeys::Mods { logo: self.meta_down > 0, alt: state & 8 != 0, ctrl: state & 4 != 0, shift: self.shift_down > 0 };
+        if self.kb_grabbed && crate::deskkeys::is_desktop_key(code, m) {
+            use x11rb::protocol::xtest::ConnectionExt as _;
+            self.grab_hold_off = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+            self.sync_keyboard_grab();
+            let _ = self.conn.xtest_fake_input(xproto::KEY_PRESS_EVENT, keycode, CURRENT_TIME, self.root, 0, 0, 0);
+            let _ = self.conn.xtest_fake_input(xproto::KEY_RELEASE_EVENT, keycode, CURRENT_TIME, self.root, 0, 0, 0);
+            let _ = self.conn.flush();
+            log::debug!("key {code} with {m:?}: handed to the window manager");
             self.swallowed.push(code);
             return;
         }

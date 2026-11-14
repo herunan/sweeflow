@@ -2,6 +2,7 @@ mod blind;
 mod clipboard;
 mod config;
 mod decode;
+mod deskkeys;
 mod desktop;
 mod frames;
 mod hyprland;

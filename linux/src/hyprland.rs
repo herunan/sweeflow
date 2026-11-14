@@ -489,3 +489,4 @@ mod tests {
         assert!(super::parse_binds("not json").is_empty());
     }
 }
+
