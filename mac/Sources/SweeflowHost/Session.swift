@@ -1755,12 +1755,13 @@ final class Session {
         }
         guard audio == nil else { return }
         let cap = AudioCapture(allowed: { settings.config.allows($0) })
-        cap.onPCM = { [weak self, weak s] pcm in
+        cap.onPCM = { [weak self, weak s] pcm, ageUs in
             self?.queue.async {
                 // Drop rather than queue: late audio is worse than a tiny gap.
                 guard let s, s.pendingBytes < 64_000 else { return }
                 var m = MsgWriter(.audio)
                 m.bytes(pcm)
+                m.u32(ageUs)   // how long after it played it was captured (older clients stop at the sound)
                 s.send(m)
             }
         }

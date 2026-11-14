@@ -6,7 +6,8 @@ import AudioToolbox
 /// Captures the audio of the streamed apps (all of them, mixed) and hands out 48 kHz stereo
 /// 16-bit PCM. The app list is refreshed every few seconds so newly launched apps are heard.
 final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
-    var onPCM: ((Data) -> Void)?
+    /// Each piece of sound, and how long after it played it was handed over here (µs).
+    var onPCM: ((Data, UInt32) -> Void)?
     private let allowed: (String) -> Bool
     private let queue = DispatchQueue(label: "sweeflow.audio", qos: .userInteractive)
     private var stream: SCStream?
@@ -154,14 +155,17 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
-        onPCM?(out)
-        // How old the sound is on arrival here (its start, by the host clock), and how much
-        // comes at once: what capturing it adds to the sound's delay.
+        // How old the sound is on arrival here (its start, by the host clock): what capturing
+        // it adds to its delay, sent with it so Linux keeps it in step with the pictures
+        // whatever this Mac and its macOS take.
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        var ageUs: UInt32 = 0
         if pts.isValid {
             let age = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(pts)
             ageSum += age; ageN += 1; ageMax = max(ageMax, age); framesSum += frames
+            ageUs = UInt32(max(0, min(age, 2)) * 1_000_000)
         }
+        onPCM?(out, ageUs)
         if Date().timeIntervalSince(lastLevelLog) > 5 {
             log(String(format: "audio: peak level %.3f over the last 5s", peak))
             if ageN > 0 {

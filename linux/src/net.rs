@@ -217,27 +217,32 @@ pub fn video_shown(capture_us: u64) {
     VIDEO_LAG_US.store(new, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// How much later than it arrives the sound should play, so it's heard with the pictures it
-/// goes with: the pictures' lag from capture to screen, less what sound spends on the same
-/// way (the network to here, the player's own 20 ms buffer and the cushion before it) and the time
-/// the Mac takes to hand the sound over at all: ScreenCaptureKit gives it ~55 ms after it
-/// played (measured on macOS 26: the Mac logs it as "captured N ms after it played"), where a
-/// picture comes within a frame. Pictures then also wait for their encoder, the decoder, and
-/// the screen. (Measured end to end, a flash and a beep made together: with the 20 ms the
-/// sound came 70-100 ms after its picture.)
-/// How much sound the player is kept ahead by (ms): what the network has lately made pieces
-/// wait, so a late one doesn't run it dry (see audio_task).
-static AUDIO_CUSHION_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60);
+/// How long after it played the Mac hands its sound over (µs), as it measures and sends with
+/// each piece (ScreenCaptureKit: ~55 ms on macOS 26). Smoothed; 0 from a Mac that doesn't say.
+static MAC_AUDIO_AGE_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn audio_delay() -> std::time::Duration {
-    let video = VIDEO_LAG_US.load(std::sync::atomic::Ordering::Relaxed);
+/// How much sound the player is kept ahead by (µs): what the network has lately made pieces
+/// wait, so a late one doesn't run it dry (see audio_task). 0 until the first pieces have come.
+static AUDIO_CUSHION_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The buffer we ask the player for (pw-cat's --latency, pacat's --latency-msec).
+const PLAYER_LATENCY_MS: u64 = 20;
+/// The sound's format (48 kHz, s16, stereo, as the player is told): bytes a millisecond.
+const AUDIO_BYTES_PER_MS: usize = 48 * 2 * 2;
+
+/// How much later than it arrives the sound should play, so it's heard with the pictures it
+/// goes with, all from what's measured on this connection: the pictures' lag from capture to
+/// screen, less what sound spends on its way (the network to here, the sound already waiting
+/// for the player, `queued_us`, and the player's own buffer) and the time this Mac took to
+/// hand it over at all. Never more than the pictures' lag.
+fn audio_delay(queued_us: u64) -> std::time::Duration {
+    use std::sync::atomic::Ordering::Relaxed;
+    let video = VIDEO_LAG_US.load(Relaxed);
     let p = *PINGS.lock().unwrap();
     // The way back from the Mac, as the last pings measured it (their average).
     let transit = if p.0 > 0 { (p.4 / p.0 as i64).max(0) } else { 0 };
-    let player_us = 20_000 + AUDIO_CUSHION_MS.load(std::sync::atomic::Ordering::Relaxed) as i64 * 1000;
-    const MAC_CAPTURE_US: i64 = 55_000;
-    let us = (video - transit - player_us - MAC_CAPTURE_US).clamp(0, 250_000);
-    std::time::Duration::from_micros(us as u64)
+    let sound = transit + MAC_AUDIO_AGE_US.load(Relaxed) + queued_us as i64 + PLAYER_LATENCY_MS as i64 * 1000;
+    std::time::Duration::from_micros((video - sound).clamp(0, video.max(0)) as u64)
 }
 
 /// Each window's decoder input, for frames arriving as datagrams.
@@ -1450,12 +1455,12 @@ fn audio_player() -> Vec<String> {
     let has = |cmd: &str| std::process::Command::new(cmd).arg("--help").output().ok();
     let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if has("pw-cat").is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("--raw")) {
-        return v(&["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms",
+        return v(&["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", &*format!("{PLAYER_LATENCY_MS}ms"),
                    "-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }"]);
     }
     if has("pacat").is_some() {
         log::info!("audio: through pacat (this PipeWire's pw-cat takes no raw audio)");
-        return v(&["pacat", "--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=20",
+        return v(&["pacat", "--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", &*format!("--latency-msec={PLAYER_LATENCY_MS}"),
                    "--client-name=sweeflow", "--stream-name=Mac audio"]);
     }
     log::info!("audio: through aplay");
@@ -1501,6 +1506,7 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     // instead of the player's buffer growing.
     let (tx, prx) = std::sync::mpsc::sync_channel::<(std::time::Instant, Vec<u8>)>(256);
     let writer = std::thread::spawn(move || {
+        use std::sync::atomic::Ordering::Relaxed;
         use std::time::{Duration, Instant};
         // Opening blocks until pw-cat opens its end.
         let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
@@ -1510,40 +1516,52 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
             let mut n: libc::c_int = 0;
             if unsafe { libc::ioctl(p.as_raw_fd(), libc::FIONREAD, &mut n) } == 0 { n.max(0) as usize } else { 0 }
         };
-        // 48 kHz s16 stereo: 192 bytes a millisecond.
-        let cushion = || AUDIO_CUSHION_MS.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let us_of = |bytes: usize| (bytes as u64 * 1000) / AUDIO_BYTES_PER_MS as u64;
+        let bytes_of = |us: u64| (us * AUDIO_BYTES_PER_MS as u64 / 1000) as usize;
+        // The cushion in bytes: what the network has made pieces wait lately (AUDIO_CUSHION_US),
+        // and never less than two pieces.
+        let cushion = |piece: usize| bytes_of(AUDIO_CUSHION_US.load(Relaxed)).max(2 * piece);
         let mut dropped = 0u32;
         // Run dry (or just started): written again only once the cushion's worth is ready.
         let mut priming = true;
+        let mut piece = 0usize;
         let mut held: std::collections::VecDeque<(Instant, Vec<u8>)> = Default::default();
-        // The delay in use: it follows the target only once that has been well off it for a
-        // while, as each change is heard (a gap when it grows, a skip when it shrinks).
+        // The delay in use: it follows the target only once that has been off it by more than
+        // a piece for a while, as each change is heard (a gap when it grows, a skip when it
+        // shrinks).
         let mut delay = Duration::ZERO;
         let mut off_since: Option<Instant> = None;
         loop {
             match prx.recv_timeout(Duration::from_millis(2)) {
-                Ok(piece) => held.push_back(piece),
+                Ok(p) => {
+                    piece = p.1.len();
+                    held.push_back(p)
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
+            if piece == 0 {
+                continue;
+            }
             let now = Instant::now();
-            let target = audio_delay();
-            if target.abs_diff(delay) > Duration::from_millis(15) {
+            let in_pipe = queued(&pipe);
+            let target = audio_delay(us_of(in_pipe));
+            if target.abs_diff(delay) > Duration::from_micros(us_of(piece)) {
                 let since = *off_since.get_or_insert(now);
                 if now - since > Duration::from_secs(2) {
                     delay = target;
                     off_since = None;
-                    log::info!("audio: {} ms behind its arrival, with the pictures", delay.as_millis());
+                    log::info!("audio: held {} ms after arriving, to go with the pictures", delay.as_millis());
                 }
             } else {
                 off_since = None;
             }
-            if !priming && queued(&pipe) == 0 {
+            if !priming && in_pipe == 0 {
                 priming = true;
             }
             if priming {
                 let ready: usize = held.iter().filter(|(arrived, _)| *arrived + delay <= now).map(|(_, p)| p.len()).sum();
-                if ready < cushion() * 192 {
+                if ready < cushion(piece) {
                     continue;
                 }
                 priming = false;
@@ -1554,15 +1572,17 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
                     break;
                 }
                 let (_, pcm) = held.pop_front().unwrap();
-                if now - due > Duration::from_millis(60) {
-                    continue; // late: dropped, so the delay shrinks now
+                // Later than the cushion covers: dropped, so a shorter delay takes effect now.
+                if now - due > Duration::from_micros(us_of(cushion(piece))) {
+                    continue;
                 }
                 // The pipe is the player's cushion against pieces coming unevenly: kept to the
-                // cushion and 40 ms more (and refilled to the cushion when it runs dry, above). Unbounded (64 KB, a third of a second), whatever piled up in it once (a
-                // burst at the start, network jitter) stayed as delay for good, the player
+                // cushion and a piece more (and refilled to the cushion when it runs dry,
+                // above). Unbounded (64 KB, a third of a second), whatever piled up in it once
+                // (a burst at the start, network jitter) stayed as delay for good, the player
                 // draining it only as fast as it plays: the sound came 150-300 ms after its
                 // picture. Made small instead (4 KB), the player ran dry 75 times a second.
-                if queued(&pipe) + pcm.len() > (cushion() + 40) * 192 {
+                if queued(&pipe) + pcm.len() > cushion(piece) + piece {
                     dropped += 1;
                     if dropped.is_power_of_two() {
                         log::info!("audio: {dropped} pieces dropped to keep the player's queue short");
@@ -1576,42 +1596,47 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
         }
     });
     log::info!("audio: playing Mac app sound");
-    let (mut last_piece, mut pieces, mut gaps_over, mut gap_max, mut gap_logged) =
-        (None::<std::time::Instant>, 0u32, 0u32, std::time::Duration::ZERO, std::time::Instant::now());
+    let (mut last_piece, mut pieces, mut gap_max, mut gap_logged) =
+        (None::<std::time::Instant>, 0u32, std::time::Duration::ZERO, std::time::Instant::now());
     while let Ok(Some((ty, body))) = proto::read_msg(&mut rx).await {
         if ty != t::AUDIO {
             continue;
         }
-        let Ok(pcm) = R::new(&body).bytes().map(<[u8]>::to_vec) else { continue };
-        // How evenly pieces come (what the player's cushion has to cover): the longest wait
-        // between two, and how many waited over 40 ms, logged every 10 s.
-        let now = std::time::Instant::now();
-        // The cushion follows how long pieces wait: up at once to the longest wait (pieces
-        // of 20 ms come up to 250 ms apart over a bumpy Wi-Fi, then all at once), back down
-        // halfway towards the last 10 s's longest every 10 s, to no less than 60 ms. A fixed
-        // cushion either ran dry on such waits (gaps) or kept the sound late for good.
+        let mut r = R::new(&body);
+        let Ok(pcm) = r.bytes().map(<[u8]>::to_vec) else { continue };
         use std::sync::atomic::Ordering::Relaxed;
-        if let Some(prev) = last_piece {
+        // How long after it played the Mac got it (newer Macs say): smoothed.
+        if let Ok(age) = r.u32() {
+            let old = MAC_AUDIO_AGE_US.load(Relaxed);
+            MAC_AUDIO_AGE_US.store(if old == 0 { age as i64 } else { old + (age as i64 - old) / 16 }, Relaxed);
+        }
+        // The cushion follows how long pieces wait between them: up at once to the longest
+        // wait (over a bumpy Wi-Fi pieces of 20 ms came up to 250 ms apart, then all at once),
+        // back down every 10 s halfway towards the longest of those 10 s, to no less than two
+        // pieces. A fixed cushion either ran dry on such waits (gaps) or kept the sound late.
+        let now = std::time::Instant::now();
+        let piece_us = (pcm.len() as u64 * 1000) / AUDIO_BYTES_PER_MS as u64;
+        // (A wait of over a second is the sound stopping and starting again, not the network.)
+        if let Some(prev) = last_piece.filter(|p| now - *p < std::time::Duration::from_secs(1)) {
             let gap = now - prev;
             gap_max = gap_max.max(gap);
-            if gap > std::time::Duration::from_millis(40) { gaps_over += 1; }
             pieces += 1;
-            let want = (gap.as_millis() as u64 + 10).min(300);
-            if want > AUDIO_CUSHION_MS.load(Relaxed) {
-                AUDIO_CUSHION_MS.store(want, Relaxed);
+            let want = gap.as_micros() as u64 + piece_us;
+            if want > AUDIO_CUSHION_US.load(Relaxed) {
+                AUDIO_CUSHION_US.store(want, Relaxed);
             }
         }
         last_piece = Some(now);
         if gap_logged.elapsed() > std::time::Duration::from_secs(10) && pieces > 0 {
-            let old = AUDIO_CUSHION_MS.load(Relaxed);
-            let new = ((old + (gap_max.as_millis() as u64 + 10)) / 2).max(60).min(old);
-            AUDIO_CUSHION_MS.store(new, Relaxed);
-            log::info!("audio: {pieces} pieces, longest wait {} ms, {gaps_over} over 40 ms: cushion {old} → {new} ms",
-                       gap_max.as_millis());
-            (pieces, gaps_over, gap_max, gap_logged) = (0, 0, std::time::Duration::ZERO, std::time::Instant::now());
+            let old = AUDIO_CUSHION_US.load(Relaxed);
+            let new = ((old + gap_max.as_micros() as u64 + piece_us) / 2).max(2 * piece_us).min(old);
+            AUDIO_CUSHION_US.store(new, Relaxed);
+            log::info!("audio: longest wait between pieces {} ms: cushion {} → {} ms; the Mac hands sound over {} ms after it plays",
+                       gap_max.as_millis(), old / 1000, new / 1000, MAC_AUDIO_AGE_US.load(Relaxed) / 1000);
+            (pieces, gap_max, gap_logged) = (0, std::time::Duration::ZERO, std::time::Instant::now());
         }
         // If the player falls behind, drop audio rather than letting latency build up.
-        let _ = tx.try_send((std::time::Instant::now(), pcm));
+        let _ = tx.try_send((now, pcm));
     }
     drop(tx);
     let _ = writer.join();
