@@ -208,6 +208,7 @@ slint::slint! {
         in property <[Toggle]> toggles;
         in property <bool> dim-enabled;
         in property <bool> dimmed;
+        in property <bool> display-shown;
         in property <[MacItem]> macs;
         in-out property <int> tab: 0;
         // The keyboard shortcuts' popover is showing (the ⌘ button in the header).
@@ -440,7 +441,7 @@ slint::slint! {
                             }
                             VerticalLayout {
                                 alignment: center;
-                                Chip { text: "Show"; enabled: root.dim-enabled || root.dimmed; clicked => { root.act("display", ""); } }
+                                Chip { text: root.display-shown ? "Hide" : "Show"; enabled: root.dim-enabled || root.dimmed || root.display-shown; clicked => { root.act("display", ""); } }
                             }
                         }
                     }
@@ -694,6 +695,8 @@ struct PanelState {
     macs: Vec<Mac>,
     open_at_login: bool,
     square: bool,
+    /// The Mac's whole screen is up in a window here.
+    display_shown: bool,
     /// The keys the desktop has now (keys::Keys::json); None from a client before them.
     keys: Option<ShownKeys>,
 }
@@ -1022,6 +1025,7 @@ fn show(ui: &PanelWin, v: &mut View) {
     }
     ui.set_dim_enabled(streaming && !s.settings.dim);
     ui.set_dimmed(s.settings.dim);
+    ui.set_display_shown(s.display_shown);
     v.toggles.set_vec(toggles(&s));
     ui.set_app_count(s.apps.len() as i32);
     show_apps(v);

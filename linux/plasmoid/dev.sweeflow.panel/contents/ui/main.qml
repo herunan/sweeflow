@@ -610,9 +610,9 @@ PlasmoidItem {
                     ActionRow {
                         label: "Troubleshoot (stream display)"
                         note: "Show the Mac's whole screen in a window"
-                        buttonText: "Show"
-                        available: root.streaming
-                        onAsked: { root.act("display"); root.expanded = false; }
+                        buttonText: st.displayShown ? "Hide" : "Show"
+                        available: root.streaming || !!st.displayShown
+                        onAsked: { root.act("display"); root.expanded = !!st.displayShown; }
                     }
                     Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                 }

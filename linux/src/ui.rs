@@ -1058,6 +1058,9 @@ impl App {
         self.surfaces.insert(base.id(), wid);
         self.surfaces.insert(video.id(), wid);
         let display = info.kind == 3;
+        if display {
+            crate::tray::set_display_shown(true);
+        }
         // The display opens at a comfortable fraction of its size (it's as big as the screen).
         let size = if display {
             ((info.w * 0.6).max(320.0) as u32, (info.h * 0.6).max(160.0) as u32)
@@ -1142,6 +1145,9 @@ impl App {
         self.unfreeze(wid);
         let Some(w) = self.windows.remove(&wid) else { return };
         log::info!("window {wid} removed ({})", w.info.app_name);
+        if w.display {
+            crate::tray::set_display_shown(false);
+        }
         let _ = self.net.send(NetCmd::Unsubscribe(wid));
         self.surfaces.remove(&w.base().id());
         self.surfaces.remove(&w.video.id());

@@ -811,6 +811,9 @@ impl App {
         let wid = info.wid;
         let popup = info.kind == 1 && self.windows.contains_key(&info.parent);
         let display = info.kind == 3;
+        if display {
+            crate::tray::set_display_shown(true);
+        }
         let size = if display {
             ((info.w * 0.6).max(320.0) as u32, (info.h * 0.6).max(160.0) as u32)
         } else {
@@ -1008,6 +1011,9 @@ impl App {
         self.unfreeze(wid);
         let Some(mut w) = self.windows.remove(&wid) else { return };
         log::info!("window {wid} removed ({})", w.info.app_name);
+        if w.display {
+            crate::tray::set_display_shown(false);
+        }
         let _ = self.net.send(NetCmd::Unsubscribe(wid));
         self.by_xid.remove(&w.xid);
         if self.pointer_focus == Some(wid) {

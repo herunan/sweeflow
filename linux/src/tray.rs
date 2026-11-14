@@ -189,6 +189,14 @@ fn tell_no_tray() {
 }
 
 /// Tells the tray (and widget) to redraw: something they show changed.
+/// The Mac's whole screen is up in a window here (Settings' Troubleshoot row: Show / Hide).
+static DISPLAY_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_display_shown(shown: bool) {
+    DISPLAY_SHOWN.store(shown, std::sync::atomic::Ordering::Relaxed);
+    refresh();
+}
+
 pub fn refresh() {
     if let Some(tx) = REFRESH.get() {
         let _ = tx.send(());
@@ -828,6 +836,7 @@ pub fn panel_state() -> serde_json::Value {
         "macs": macs,
         "openAtLogin": open_at_login(),
         "square": crate::config::square_corners(),
+        "displayShown": DISPLAY_SHOWN.load(std::sync::atomic::Ordering::Relaxed),
         "placement": state.placement,
         "pinned": state.pinned,
         // Stop was chosen (the name is from when it was called Disconnect).
@@ -939,7 +948,8 @@ pub fn panel_do(action: &str, arg: &str) {
         "shortcut-settings" => open_shortcut_settings(),
         "display" => {
             if let Some(net) = NET.get() {
-                let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(1).finish()));
+                let show = !DISPLAY_SHOWN.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(show as u8).finish()));
             }
         }
         "quit" => quit(),
