@@ -217,9 +217,12 @@ PlasmoidItem {
     fullRepresentation: PlasmaExtras.Representation {
         // Sweeflow's violet for its switches, focus and selection, as in its own window on
         // every desktop (look.rs), instead of Plasma's accent.
+        Kirigami.Theme.inherit: false
+        Kirigami.Theme.colorSet: Kirigami.Theme.Window
         Kirigami.Theme.highlightColor: "#8b5cf6"
         Kirigami.Theme.focusColor: "#8b5cf6"
         Kirigami.Theme.hoverColor: "#a78bfa"
+        Kirigami.Theme.linkColor: "#a78bfa"
         Layout.preferredWidth: Kirigami.Units.gridUnit * 24
         Layout.preferredHeight: Kirigami.Units.gridUnit * 32
         collapseMarginsHint: true
