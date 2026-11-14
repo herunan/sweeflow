@@ -145,7 +145,9 @@ slint::slint! {
         default-font-family: Look.font;
         // A fixed size: a dialog, which tiling window managers leave floating.
         width: 560px;
-        height: tailscale-url != "" ? 564px : 540px;
+        // Less on a short screen (see look::fit_to_screen): the page scrolls.
+        in property <length> room: 10000px;
+        height: min(tailscale-url != "" ? 564px : 540px, room);
 
         in-out property <int> page: 0;
         in property <string> installer-url;
@@ -175,7 +177,12 @@ slint::slint! {
         callback submit-code(string);
         callback finish();
 
-        VerticalLayout {
+        sv := ScrollView {
+          content-width: box.width;
+          content-height: box.height;
+          box := VerticalLayout {
+            width: sv.visible-width;
+            height: max(self.preferred-height, sv.visible-height);
             padding: 24px;
 
             if page == 0: VerticalLayout {
@@ -365,6 +372,7 @@ slint::slint! {
                     Btn { text: "Done"; primary: true; clicked => { root.finish(); } }
                 }
             }
+          }
         }
     }
 }
@@ -510,6 +518,7 @@ pub fn run() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
 
+    crate::look::fit_to_screen_soon(&ui, |ui, h| ui.set_room(h));
     let shown = ui.run();
     // Closed while asking a Mac: say so there (it takes its question down) before leaving.
     if let Some((_, thread)) = cancel_link() {

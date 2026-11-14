@@ -181,7 +181,9 @@ slint::slint! {
         default-font-family: Look.font;
         // A fixed size: a dialog, which tiling window managers leave floating.
         width: 420px;
-        height: 600px;
+        // Less on a short screen (see look::fit_to_screen): the tabs scroll.
+        in property <length> room: 600px;
+        height: min(600px, room);
         forward-focus: keys;
 
         // The client answers on D-Bus (it isn't running otherwise).
@@ -1216,6 +1218,7 @@ pub fn run() -> Result<()> {
             }
         });
     }
+    crate::look::fit_to_screen_soon(&ui, |ui, h| ui.set_room(h));
     ui.run()?;
     Ok(())
 }

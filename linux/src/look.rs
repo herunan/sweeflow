@@ -189,6 +189,36 @@ macro_rules! apply {
 }
 pub(crate) use apply;
 
+/// Room for a window on a short screen: once it's up, the height of the screen it's on (in the
+/// window's own units, after the desktop's scaling) less some for the desktop's bars and the
+/// window's title bar, handed to `set` (which caps the window's height; its content scrolls).
+/// Sweeflow's window (600 tall) and Link a Mac (540) were cut off below on screens under about
+/// 680: a laptop at 125 %, a 1080p screen at 175 %. Asked a few times as the window comes up:
+/// which screen it's on is known only once it's shown there.
+pub fn fit_to_screen_soon<C: slint::ComponentHandle + 'static>(ui: &C, set: impl Fn(&C, f32) + Clone + 'static) {
+    for ms in [150u64, 600, 1500] {
+        let (weak, set) = (ui.as_weak(), set.clone());
+        slint::Timer::single_shot(std::time::Duration::from_millis(ms), move || {
+            if let Some(ui) = weak.upgrade() {
+                fit_now(ui.window(), &|h| set(&ui, h));
+            }
+        });
+    }
+}
+
+fn fit_now(window: &slint::Window, set: &dyn Fn(f32)) {
+    use slint::winit_030::WinitWindowAccessor;
+    let room = window.with_winit_window(|w| {
+        let m = w.current_monitor()?;
+        let scale = m.scale_factor().max(0.5);
+        Some(m.size().height as f64 / scale)
+    });
+    log::debug!("fit to screen: screen height {room:?}");
+    if let Some(Some(h)) = room {
+        set((h - 110.0).max(320.0) as f32);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
