@@ -20,15 +20,34 @@ unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
+/// The notification shown for each window without buttons, closed when the Mac window goes.
+static NOTES: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
+
+/// macOS's own prompt helpers go by their process names ("UserNotificationCenter needs you"):
+/// "macOS" reads better.
+fn shown_name(app: &str) -> &str {
+    match app {
+        "CoreServicesUIAgent" | "SecurityAgent" | "UserNotificationCenter" | "universalAccessAuthWarn" | "coreautha"
+        | "LocalAuthenticationRemoteService" => "macOS",
+        _ => app,
+    }
+}
+
 pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String], net: UnboundedSender<NetCmd>) {
+    let app = shown_name(app);
     let heading = if title.is_empty() || title == app { app.to_string() } else { format!("{app} — {title}") };
     // "Help" only opens Apple's help viewer; the rest keep their Mac order (default last).
     let shown: Vec<(usize, &String)> = buttons.iter().enumerate().filter(|(_, b)| b.as_str() != "Help").collect();
     if shown.is_empty() {
-        let _ = Command::new("notify-send")
-            .args(["--app-name=sweeflow", "--icon=dialog-password", "--urgency=critical",
-                   &format!("{heading} needs you on your Mac"), &texts.join("\n\n")])
-            .spawn();
+        let (heading, text) = (format!("{heading} needs you on your Mac"), texts.join("\n\n"));
+        std::thread::spawn(move || {
+            let out = Command::new("notify-send")
+                .args(["--app-name=sweeflow", "--icon=dialog-password", "--urgency=critical", "--print-id", &heading, &text])
+                .output();
+            if let Some(n) = out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok()) {
+                NOTES.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, n);
+            }
+        });
         return;
     }
     // The Mac's cancel button (closing the dialog answers like it, as with any dialog).
@@ -189,6 +208,15 @@ pub fn show_menu(id: u32, app: &str, items: &[String], net: UnboundedSender<NetC
 
 /// The Mac window went away: close its dialog.
 pub fn gone(id: u32) {
+    // A notification (critical ones stay until dismissed): closed with it.
+    if let Some(n) = NOTES.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) {
+        let _ = Command::new("busctl")
+            .args(["--user", "call", "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                   "org.freedesktop.Notifications", "CloseNotification", "u", &n.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
     if let Some(pid) = DIALOGS.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) {
         // SAFETY: signals a process we started (removed from the map, so the waiting thread
         // won't press anything).
