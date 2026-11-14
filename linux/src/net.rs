@@ -566,6 +566,12 @@ fn busy_wait(_checks: u32) -> Duration {
     Duration::from_secs(5)
 }
 
+/// How long to wait before asking again a Mac that disconnected this computer: 5 s at first
+/// (Connect on the Mac is answered quickly), then 10, then every 20 s.
+fn refused_wait(checks: u32) -> Duration {
+    Duration::from_secs((5u64 << checks.min(2)).min(20))
+}
+
 /// Busy's payload: the computer the Mac is streaming to.
 fn parse_busy(body: &[u8]) -> Result<String> {
     R::new(body).str()
@@ -720,6 +726,7 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
     let mut backoff = Duration::from_millis(250);
     // Looks at a Mac in use by another computer, in a row.
     let mut busy_checks = 0;
+    let mut refused_checks = 0;
     loop {
         if offline() {
             let _ = ui.send(UiEvent::Disconnected("stopped, as asked".into()));
@@ -765,6 +772,24 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
             continue;
         }
         busy_checks = 0;
+        if crate::tray::mac_refused() {
+            // Disconnected on the Mac: it lets this computer in again only after Connect there,
+            // so asking every few seconds for good only fills its log. Less often the longer it
+            // lasts (Stop or Start here asks again at once).
+            let until = tokio::time::Instant::now() + refused_wait(refused_checks);
+            refused_checks += 1;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(until) => break,
+                    cmd = cmds.recv() => {
+                        if cmd.is_none() { return; }
+                        if offline() { break; }
+                    }
+                }
+            }
+            continue;
+        }
+        refused_checks = 0;
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(3));
     }
@@ -1652,6 +1677,12 @@ mod tests {
     fn a_busy_mac_is_looked_at_every_few_seconds() {
         let waits: Vec<u64> = (0..6).map(|n| busy_wait(n).as_secs()).collect();
         assert_eq!(waits, [5, 5, 5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn a_mac_that_disconnected_this_computer_is_asked_less_and_less_often() {
+        let waits: Vec<u64> = (0..7).map(|n| refused_wait(n).as_secs()).collect();
+        assert_eq!(waits, [5, 10, 20, 20, 20, 20, 20]);
     }
 
     #[test]

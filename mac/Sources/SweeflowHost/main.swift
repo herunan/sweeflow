@@ -222,6 +222,14 @@ final class HostState {
             if dimmed { dimmed = false; BuiltInScreen.stopDimming() }
             log("client left: tidying up now")
             work.perform()
+            // Not asleep straight away, though: a computer restarting Sweeflow (an update, a
+            // restart, Stop then Start) says goodbye too, and a Mac idle for a while slept the
+            // moment it was let go, before that computer was back.
+            wake.holdReachable()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard let self, self.sessions == 0 else { return }
+                self.wake.releaseReachable()
+            }
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
         }

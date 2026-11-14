@@ -162,13 +162,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     /// Ends that computer's connection and refuses it until Connect (it shows "Disconnected on
     /// the Mac" meanwhile).
-    private static func disconnect(_ fingerprint: String) {
+    static func disconnect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, true)
         server.drop(fingerprint, telling: .macDisconnected)
     }
 
     /// Lets it in again: it connects by itself within a few seconds.
-    private static func connect(_ fingerprint: String) {
+    static func connect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, false)
     }
 

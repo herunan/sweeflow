@@ -159,6 +159,14 @@ final class DebugPort {
             // Who's connected, as the menu and Unlink see it, and as the served session has it.
             let main = host.client.map { "\($0.prefix(12)) \(Identity.clientName($0))" } ?? "none"
             reply("menu: \(main); session: \(DebugPort.session?.clientFingerprint?.prefix(12) ?? "none")")
+        case "disconnect" where p.count == 2, "connect" where p.count == 2:
+            // The menu's Disconnect / Connect for a linked computer (by name or fingerprint start).
+            let key = p[1].lowercased()
+            guard let c = Identity.pairedClients().first(where: {
+                Identity.clientName($0.fingerprint).lowercased() == key || $0.fingerprint.hasPrefix(key)
+            }) else { return reply("no such computer") }
+            if cmd == "disconnect" { StatusMenu.disconnect(c.fingerprint) } else { StatusMenu.connect(c.fingerprint) }
+            reply("\(cmd)ed \(Identity.clientName(c.fingerprint))")
         case "unlink" where p.count == 2:
             // The menu's Unlink… for a linked computer (by name or the start of its fingerprint), as
             // confirmed: no dialog (a modal one would hold up this port too).
