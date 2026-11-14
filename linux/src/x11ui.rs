@@ -804,6 +804,7 @@ impl App {
         let mut size_hints = WmSizeHints::new();
         let mut kind = a._NET_WM_WINDOW_TYPE_NORMAL;
         let mut place = None;
+        let mut over_parent: Option<(i32, i32)> = None;
         if popup {
             kind = a._NET_WM_WINDOW_TYPE_POPUP_MENU;
         } else if display {
@@ -834,6 +835,11 @@ impl App {
                 if let Some(p) = parent {
                     self.conn.change_property32(PropMode::REPLACE, xid, xproto::AtomEnum::WM_TRANSIENT_FOR, xproto::AtomEnum::WINDOW, &[p])?;
                     self.conn.change_property32(PropMode::REPLACE, xid, a._NET_WM_STATE, xproto::AtomEnum::ATOM, &[a._NET_WM_STATE_MODAL])?;
+                    // Over its window where the Mac has it (a "Save changes?" sheet): Cinnamon
+                    // put such a dialog in a corner of the screen.
+                    if let Ok(r) = self.conn.translate_coordinates(p, self.root, 0, 0).map_err(anyhow::Error::from).and_then(|c| Ok(c.reply()?)) {
+                        over_parent = Some((r.dst_x as i32 + info.rel_x.round() as i32, r.dst_y as i32 + info.rel_y.round() as i32));
+                    }
                 }
                 floated_now = true;
                 fixed_spot = spot;
@@ -843,6 +849,10 @@ impl App {
             } else if info.kind != 2 {
                 size_hints.min_size = Some((MIN_SIZE.0 as i32, MIN_SIZE.1 as i32));
             }
+        }
+        if let Some(p) = over_parent {
+            size_hints.position = Some((WmSizeHintsSpecification::UserSpecified, p.0, p.1));
+            self.conn.configure_window(xid, &xproto::ConfigureWindowAux::new().x(p.0).y(p.1))?;
         }
         if let Some(spot) = place {
             let p = spot_position(self.work_area(), size, spot);
@@ -1900,7 +1910,10 @@ impl App {
                 }
             }
             Event::FocusOut(e) => {
-                if e.detail == xproto::NotifyDetail::POINTER || e.mode == xproto::NotifyMode::UNGRAB {
+                // Grabs come and go without the focus moving (ours, taken as a Mac window gets the
+                // focus; or the desktop's for a moment): only a real move counts, including one
+                // made while our grab holds (the window manager focusing a clicked window).
+                if e.detail == xproto::NotifyDetail::POINTER || e.mode == xproto::NotifyMode::UNGRAB || e.mode == xproto::NotifyMode::GRAB {
                     return;
                 }
                 if self.wid_of(e.event).is_some() {
@@ -2189,9 +2202,25 @@ impl App {
         self.send(W::new(t::FOCUS).u32(wid).finish());
         self.update_lights(wid);
         self.schedule_menu_panel();
+        // Every key to the Mac while one of its windows has the focus, as the shortcuts
+        // inhibitor does on Wayland: the window manager's own keys (Cinnamon takes Super for its
+        // menu, and with it every Cmd shortcut) wait until the focus moves on.
+        if let Some(xid) = self.windows.get(&wid).map(|w| w.xid) {
+            let r = self
+                .conn
+                .grab_keyboard(true, xid, CURRENT_TIME, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.status);
+            if r != Some(xproto::GrabStatus::SUCCESS) {
+                log::debug!("window {wid}: keyboard not taken ({r:?}): the desktop keeps its keys");
+            }
+        }
     }
 
     fn focus_out(&mut self) {
+        let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
+        let _ = self.conn.flush();
         let was = self.kb_focus.take();
         log::debug!("keyboard focus left {was:?}");
         if let Some(wid) = was {
