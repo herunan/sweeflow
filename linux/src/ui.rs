@@ -323,6 +323,8 @@ pub struct App {
     /// The desktop's shortcuts let through (no inhibitor) until then, and while a modifier is
     /// still held: a window key was just handed to it (see press_key).
     let_go: Option<Instant>,
+    /// Hyprland is in Sweeflow's key mode (hyprland::mac_keys).
+    hypr_mac_keys: bool,
     /// Launches whose app had no window here yet: their token, for the window when it comes.
     launch_tokens: HashMap<String, (String, std::time::Instant)>,
     /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
@@ -501,6 +503,13 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
         activation: bind_opt("xdg_activation_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         let_go: None,
+        // A key mode left on by a Sweeflow that went away (a crash) is put back.
+        hypr_mac_keys: {
+            if crate::hyprland::running() {
+                crate::hyprland::mac_keys(false);
+            }
+            false
+        },
         launch_tokens: HashMap::new(),
         srgb: None,
         srgb_ready: false,
@@ -633,6 +642,10 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
                 let _ = app.conn.flush();
                 let _ = app.conn.roundtrip();
                 log::info!("stopping: windows taken down");
+                if app.hypr_mac_keys {
+                    // Not left in Sweeflow's key mode, with the desktop's bindings off.
+                    let _ = std::process::Command::new("hyprctl").args(["eval", r#"hl.dispatch(hl.dsp.submap("reset"))"#]).output();
+                }
                 std::process::exit(0);
             }
             _ => {}
@@ -2474,14 +2487,18 @@ impl App {
                 self.let_go = None;
             }
         }
-        // Not on Hyprland: there the desktop's keys stay first (Omarchy sends copy, paste, cut
-        // and select-all on to the Mac itself). Held and dropped on the move, Hyprland fed the
-        // key still down when it was dropped into the Mac window over and over (Super+2
-        // switching workspace typed "2222…" in TextEdit).
         let target = match (self.kb_focus, self.pointer_focus) {
-            (Some(f), Some(p)) if self.let_go.is_none() && self.windows.contains_key(&p) && !crate::hyprland::running() => Some(f),
+            (Some(f), Some(p)) if self.let_go.is_none() && self.windows.contains_key(&p) => Some(f),
             _ => None,
         };
+        if crate::hyprland::running() {
+            // Its own way there (hyprland::mac_keys): no inhibitor.
+            if target.is_some() != self.hypr_mac_keys {
+                self.hypr_mac_keys = target.is_some();
+                crate::hyprland::mac_keys(self.hypr_mac_keys);
+            }
+            return;
+        }
         let (Some(m), Some(seat)) = (self.inhibit_mgr.clone(), self.seat.clone()) else { return };
         for (wid, w) in self.windows.iter_mut() {
             let want = Some(*wid) == target && matches!(w.role, Role::Toplevel(_)) && !w.display;

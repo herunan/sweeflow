@@ -490,3 +490,44 @@ mod tests {
     }
 }
 
+/// While a Mac window is focused and hovered, Hyprland is put in a submap of Sweeflow's own:
+/// none of the desktop's bindings apply there, so shortcuts with a letter reach the Mac (Super
+/// as Cmd), and only the keys for windows and the desktop are bound in it, to what Omarchy has on
+/// them: workspaces (Super+1…0 to switch, Super+Shift+1…0 to move the window there), the next
+/// and previous workspace (Super+Tab, Super+Shift+Tab), switching windows (Alt+Tab), media and
+/// volume. The pointer off a Mac window puts the desktop's own bindings back. (Hyprland runs no
+/// binding while an app holds its shortcuts, nor one asked for by name: the way other desktops
+/// do it doesn't work here.)
+pub fn mac_keys(on: bool) {
+    std::thread::spawn(move || {
+        let lua = if on {
+            r#"if not sweeflow_submap then sweeflow_submap = true; hl.define_submap("sweeflow", function()
+  for n = 1, 10 do
+    local key = "code:" .. tostring(n + 9)
+    hl.bind("SUPER + " .. key, hl.dsp.focus({ workspace = n }))
+    hl.bind("SUPER + SHIFT + " .. key, hl.dsp.window.move({ workspace = n }))
+  end
+  hl.bind("SUPER + TAB", hl.dsp.focus({ workspace = "m+1" }))
+  hl.bind("SUPER + SHIFT + TAB", hl.dsp.focus({ workspace = "m-1" }))
+  hl.bind("ALT + TAB", hl.dsp.window.cycle_next())
+  hl.bind("ALT + SHIFT + TAB", hl.dsp.window.cycle_next({ next = false }))
+  hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"), { locked = true, repeating = true })
+  hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"), { locked = true, repeating = true })
+  hl.bind("XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"), { locked = true })
+  hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })
+  hl.bind("XF86AudioPause", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })
+  hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl next"), { locked = true })
+  hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl previous"), { locked = true })
+  hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("brightnessctl set 5%+"), { locked = true, repeating = true })
+  hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("brightnessctl set 5%-"), { locked = true, repeating = true })
+end) end; hl.dispatch(hl.dsp.submap("sweeflow"))"#
+        } else {
+            r#"hl.dispatch(hl.dsp.submap("reset"))"#
+        };
+        match Command::new("hyprctl").args(["eval", lua]).output() {
+            Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {}
+            Ok(o) => log::warn!("Hyprland didn't take Sweeflow's key mode ({on}): {}", String::from_utf8_lossy(&o.stdout).trim()),
+            Err(e) => log::debug!("hyprctl: {e}"),
+        }
+    });
+}
