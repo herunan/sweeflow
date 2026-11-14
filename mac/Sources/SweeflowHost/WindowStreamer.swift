@@ -386,7 +386,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // when they differ, for as long as the capture stays silent. The moment is short: a
             // capture can take two seconds to start (Quick Look's panel, which zooms in), and
             // a still caught mid-fade is replaced by the next one 100 ms later.
-            queue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            // Straight away where the window server gives stills quickly (see quickStill): the
+            // first is the panel as it starts to open, the next ones follow it.
+            queue.asyncAfter(deadline: .now() + (Self.windowImage != nil ? 0 : 0.15)) { [weak self] in
                 self?.pollStills(s, filter: filter)
             }
         }
@@ -967,9 +969,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // At the size it has now (it may be growing: a panel zooming open).
         applySize(to: config)
-        SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
+        let take = { [weak self] (pb: CVPixelBuffer?, again: Double) in
             guard let self else { return }
-            let pb = sb.flatMap { CMSampleBufferGetImageBuffer($0) }
             self.queue.async {
                 guard !self.stopped, self.stream === s, self.framesSinceStart == 0 else { self.pollingStills = false; return }
                 if let pb, !self.showingPause, !ScreenLock.isLocked {
@@ -979,11 +980,59 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                         self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
                     }
                 }
-                self.queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self.queue.asyncAfter(deadline: .now() + again) { [weak self] in
                     self?.pollStills(s, filter: filter)
                 }
             }
         }
+        // The window server's own picture of the window, where it still gives one: in a few
+        // ms, against ScreenCaptureKit's 70–400, so a panel zooming open (Quick Look) shows as
+        // it opens and whole at once, instead of most of a second later.
+        let wid = self.wid
+        if Self.windowImage != nil, quickMisses < 8 {
+            stillQueue.async { [weak self] in
+                if let pb = Self.quickStill(wid) { return take(pb, 0.03) }
+                // None (the window not drawn yet): again shortly; after a few misses in all,
+                // ScreenCaptureKit's stills instead.
+                self?.queue.async { self?.quickMisses += 1 }
+                take(nil, 0.03)
+            }
+            return
+        }
+        SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sb, _ in
+            take(sb.flatMap { CMSampleBufferGetImageBuffer($0) }, 0.1)
+        }
+    }
+
+    private let stillQueue = DispatchQueue(label: "sweeflow.still", qos: .userInteractive)
+    /// quickStill gave nothing this many times (on `queue`).
+    private var quickMisses = 0
+
+    /// CGWindowListCreateImage, looked up at run time (gone from the SDK's headers since macOS
+    /// 15, still there to call).
+    private typealias WindowImageFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+    private static let windowImage: WindowImageFn? = {
+        guard let f = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
+        return unsafeBitCast(f, to: WindowImageFn.self)
+    }()
+
+    /// The window's picture from the window server (its frame only, at full resolution), as a
+    /// BGRA buffer; nil when it gives none.
+    private static func quickStill(_ wid: UInt32) -> CVPixelBuffer? {
+        // kCGWindowListOptionIncludingWindow; kCGWindowImageBoundsIgnoreFraming | BestResolution.
+        guard let f = windowImage, let img = f(.null, 1 << 3, wid, (1 << 0) | (1 << 3))?.takeRetainedValue(),
+              img.width > 1, img.height > 1 else { return nil }
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        guard CVPixelBufferCreate(nil, img.width, img.height, kCVPixelFormatType_32BGRA, attrs, &pb) == kCVReturnSuccess, let pb else { return nil }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: img.width, height: img.height, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.clear(CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        return pb
     }
 
     /// A quick fingerprint of a picture: every 7th byte of it (enough to tell a change).
