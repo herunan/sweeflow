@@ -211,6 +211,13 @@ pub enum Outcome {
 impl Outcome {
     /// What to tell the person when it didn't link. None when it did, or they cancelled.
     pub fn message(&self, mac: &str) -> Option<String> {
+        let m = self.message_lower(mac)?;
+        // "your Mac" (a Mac typed by address) leads some: capitalised there.
+        let mut c = m.chars();
+        Some(c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or(m))
+    }
+
+    fn message_lower(&self, mac: &str) -> Option<String> {
         Some(match self {
             Outcome::Linked(_) | Outcome::Cancelled => return None,
             Outcome::CancelledThere => format!("Linking was cancelled on {mac}."),
@@ -762,6 +769,7 @@ mod tests {
         assert_eq!(outcome_of(&versioned(2), &m, HOST, None).unwrap(), Outcome::TooOld);
         assert_eq!(outcome_of(&versioned(4), &m, HOST, None).unwrap(), Outcome::TooNew);
         assert_eq!(Outcome::AlreadyHere.message("Air").unwrap(), "Air is already linked to this computer.");
+        assert_eq!(Outcome::AlreadyHere.message("your Mac").unwrap(), "Your Mac is already linked to this computer.");
     }
 
     /// A connection to a stand-in for the Mac's linking listener on this computer, which runs
