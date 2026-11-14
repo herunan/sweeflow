@@ -143,6 +143,9 @@ fn read() -> Keys {
     if desktop.contains("KDE") {
         let [open, pause, stop] = crate::setup::plasma_bindings();
         Keys { open, pause, stop }
+    } else if desktop.contains("Cinnamon") {
+        let [open, pause, stop] = crate::setup::cinnamon_bindings().map(|k| k.as_deref().and_then(Key::from_gnome));
+        Keys { open, pause, stop }
     } else if desktop.contains("GNOME") {
         let [open, pause, stop] = crate::setup::gnome_bindings().map(|k| k.as_deref().and_then(Key::from_gnome));
         Keys { open, pause, stop }

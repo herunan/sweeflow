@@ -170,7 +170,7 @@ slint::slint! {
         callback dismiss();
         callback focus-lost();
 
-        title: root.app != "" ? root.app + " - Global menu" : "Global menu";
+        title: root.app != "" ? root.app + " - Global Menu" : "Global Menu";
         icon: @image-url("../../assets/sweeflow-app.svg");
         background: root.overlay ? transparent : Look.bg;
         default-font-family: Look.font;
@@ -778,7 +778,7 @@ fn run_row(bus: &zbus::blocking::Connection, pid: i32, revision: u32, row: &Row)
 pub fn run() -> Result<()> {
     // One at a time: the key pressed again while it's open does nothing.
     let Some(_only) = crate::lock("sweeflow-menu.lock")? else {
-        log::info!("the Global menu is already open");
+        log::info!("the Global Menu is already open");
         return Ok(());
     };
     let bus = zbus::blocking::Connection::session().inspect_err(|e| log::warn!("no D-Bus session: {e}")).ok();
@@ -899,7 +899,7 @@ pub fn run() -> Result<()> {
         let weak = weak.clone();
         slint::Timer::single_shot(std::time::Duration::from_millis(150), move || {
             if weak.upgrade().is_some_and(|ui| !ui.get_active()) {
-                log::debug!("the Global menu lost the focus: closing");
+                log::debug!("the Global Menu lost the focus: closing");
                 let _ = slint::quit_event_loop();
             }
         });

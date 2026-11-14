@@ -463,6 +463,11 @@ fn register_open_key(home: &std::path::Path) {
         register_key("open-key.plasma-widget", &key, 'O', remapped, does, doing, || plasma_open_key(home, remapped));
     } else if desktop.contains("GNOME") {
         register_key("open-key.gnome", &shown_key('O', remapped), 'O', remapped, does, doing, || gnome_open_key(home, remapped));
+    } else if desktop.contains("Cinnamon") {
+        let key = gnome_key_text('O', remapped);
+        register_key("open-key.cinnamon", &shown_key('O', remapped), 'O', remapped, does, doing, || {
+            cinnamon_custom_key(home, CINNAMON_OPEN, "Sweeflow", "open", &key)
+        });
     }
 }
 
@@ -533,12 +538,20 @@ fn register_stream_keys(home: &std::path::Path) {
                 }
                 gnome_custom_key(home, &path, k.name, k.id, &key)
             });
+        } else if desktop.contains("Cinnamon") {
+            let note = format!("{}-key-{}.cinnamon", k.id, k.letter.to_ascii_lowercase());
+            let key = gnome_key_text(k.letter, remapped);
+            set |= register_key(&note, &shown_key(k.letter, remapped), k.letter, remapped, k.does, k.doing, || {
+                cinnamon_custom_key(home, &cinnamon_id(k.id), k.name, k.id, &key)
+            });
         }
     }
     if set && desktop.contains("KDE") {
         println!("    (other keys for them: System Settings → Keyboard → Shortcuts → Sweeflow)");
     } else if set && desktop.contains("GNOME") {
         println!("    (other keys for them: Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts)");
+    } else if set && desktop.contains("Cinnamon") {
+        println!("    (other keys for them: System Settings → Keyboard → Shortcuts → Custom Shortcuts)");
     } else if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
         // The client binds them as it starts (hyprland.rs), so which ones it could isn't known here.
         let keys: Vec<String> = STREAM_KEYS.iter().map(|k| format!("SUPER + ALT + {} {}", k.letter, k.does)).collect();
@@ -868,6 +881,69 @@ fn gnome_custom_key(home: &std::path::Path, our_path: &str, name: &str, arg: &st
         gsettings(&["set", GNOME_KEYS, "custom-keybindings", &list])?;
     }
     Ok(OpenKey::Set { now: true })
+}
+
+const CINNAMON_KEYS: &str = "org.cinnamon.desktop.keybindings";
+/// Sweeflow's custom shortcuts on Cinnamon, by the names in its list of custom ones (the ones its
+/// settings make are custom0, custom1…).
+const CINNAMON_OPEN: &str = "sweeflow";
+
+fn cinnamon_id(id: &str) -> String {
+    format!("{CINNAMON_OPEN}-{id}")
+}
+
+fn cinnamon_schema(id: &str) -> String {
+    format!("{CINNAMON_KEYS}.custom-keybinding:/org/cinnamon/desktop/keybindings/custom-keybindings/{id}/")
+}
+
+/// A custom shortcut as Cinnamon's System Settings → Keyboard → Shortcuts makes them: name,
+/// command and keys under `id`, and `id` in its list of custom shortcuts (Cinnamon takes it up
+/// at once). Only while nothing else has the key.
+fn cinnamon_custom_key(home: &std::path::Path, id: &str, name: &str, arg: &str, key: &str) -> Result<OpenKey> {
+    let list = gsettings(&["get", CINNAMON_KEYS, "custom-list"])?;
+    let ids = quoted(&list);
+    // Ours from an earlier install, whatever key the user has given it since.
+    if ids.iter().any(|i| i == id) {
+        return Ok(OpenKey::Kept);
+    }
+    for other in &ids {
+        if gsettings(&["get", &cinnamon_schema(other), "binding"]).is_ok_and(|b| binds(&b, key)) {
+            let name = gsettings(&["get", &cinnamon_schema(other), "name"]).ok().and_then(|n| quoted(&n).into_iter().next());
+            return Ok(OpenKey::Taken(name.filter(|n| !n.is_empty()).unwrap_or_else(|| "another custom shortcut".into())));
+        }
+    }
+    for line in gsettings(&["list-recursively"])?.lines() {
+        let mut words = line.splitn(3, ' ');
+        if let (Some(_), Some(name), Some(value)) = (words.next(), words.next(), words.next()) {
+            if binds(value, key) {
+                return Ok(OpenKey::Taken(name.to_string()));
+            }
+        }
+    }
+    let ours = cinnamon_schema(id);
+    let command = format!("{} {arg}", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
+    gsettings(&["set", &ours, "name", &gvariant_str(name)])?;
+    gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
+    gsettings(&["set", &ours, "binding", &format!("[{}]", gvariant_str(key))])?;
+    let mut ids = ids;
+    ids.push(id.to_string());
+    gsettings(&["set", CINNAMON_KEYS, "custom-list", &format!("[{}]", ids.iter().map(|i| gvariant_str(i)).collect::<Vec<_>>().join(", "))])?;
+    Ok(OpenKey::Set { now: true })
+}
+
+/// The keys Cinnamon has now for Sweeflow's custom shortcuts (open, pause, stop), as it writes
+/// them; None for one that isn't there or has no key. (For showing them.)
+pub(crate) fn cinnamon_bindings() -> [Option<String>; 3] {
+    let Ok(list) = gsettings(&["get", CINNAMON_KEYS, "custom-list"]) else { return Default::default() };
+    let ids = quoted(&list);
+    let binding = |id: &str| -> Option<String> {
+        if !ids.iter().any(|i| i == id) {
+            return None;
+        }
+        let value = gsettings(&["get", &cinnamon_schema(id), "binding"]).ok()?;
+        quoted(&value).into_iter().find(|k| gnome_key(k).is_some())
+    };
+    [binding(CINNAMON_OPEN), binding(&cinnamon_id(STREAM_KEYS[0].id)), binding(&cinnamon_id(STREAM_KEYS[1].id))]
 }
 
 /// The keys GNOME has now for Sweeflow's custom shortcuts (open, pause, stop), as it writes

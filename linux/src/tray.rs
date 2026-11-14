@@ -437,6 +437,8 @@ pub fn shortcut_settings_place() -> Option<&'static [&'static str]> {
         Some(&["systemsettings", "kcm_keys"])
     } else if desktop.contains("GNOME") {
         Some(&["gnome-control-center", "keyboard"])
+    } else if desktop.contains("Cinnamon") {
+        Some(&["cinnamon-settings", "keyboard"])
     } else {
         None
     }

@@ -309,7 +309,7 @@ PlasmoidItem {
                             spacing: Kirigami.Units.smallSpacing
                             Kirigami.Heading { level: 5; text: "Keyboard shortcuts" }
                             Repeater {
-                                model: [[root.shortcutKeys.open, "Open Sweeflow"], [root.shortcutKeys.pause, "Pause or resume"], [root.shortcutKeys.stop, "Stop or start"], ["⌘⌥U", "Mac app's global menu"]]
+                                model: [[root.shortcutKeys.open, "Open Sweeflow"], [root.shortcutKeys.pause, "Pause or resume"], [root.shortcutKeys.stop, "Stop or start"], ["⌘⌥U", "Mac app's Global Menu"]]
                                 delegate: RowLayout {
                                     required property var modelData
                                     spacing: Kirigami.Units.largeSpacing
@@ -539,7 +539,7 @@ PlasmoidItem {
                     // Plasma only: the other desktops have no menu bar to put the menus in.
                     ToggleRow {
                         visible: !!root.placement.plasma
-                        label: "Global menu widget"
+                        label: "Global Menu widget"
                         hint: "The Mac apps' menus at the top of the screen"
                         on: !!root.placement.globalMenu
                         onFlipped: (v) => root.act("global-menu", v ? "on" : "off")

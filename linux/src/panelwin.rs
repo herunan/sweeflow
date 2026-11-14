@@ -621,7 +621,7 @@ slint::slint! {
                     { key: root.key-open, what: "Open Sweeflow" },
                     { key: root.key-pause, what: "Pause or resume" },
                     { key: root.key-stop, what: "Stop or start" },
-                    { key: "⌘⌥U", what: "Mac app's global menu" },
+                    { key: "⌘⌥U", what: "Mac app's Global Menu" },
                 ]: HorizontalLayout {
                     spacing: 10px;
                     Rectangle {
@@ -1165,8 +1165,37 @@ pub fn run() -> Result<()> {
     }
 
     watch(ui.as_weak());
+    // On X11 (Cinnamon and the like) it opens by the panel's corner, as a tray popup does,
+    // not wherever the window manager puts new windows.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        // (Not shown yet: its size may still be unknown; it's 420 × 600.)
+        let size = ui.window().size();
+        let size = if size.width == 0 { (420, 600) } else { (size.width, size.height) };
+        if let Some((x, y)) = x11_corner(size) {
+            ui.window().set_position(slint::PhysicalPosition::new(x, y));
+        }
+    }
     ui.run()?;
     Ok(())
+}
+
+/// Where a window this big goes on X11: in the usable area's corner by the panel (bottom right
+/// under a bottom panel, top right under a top one), 8 px in, from the window manager's
+/// _NET_WORKAREA.
+fn x11_corner(size: (u32, u32)) -> Option<(i32, i32)> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen)?;
+    let atom = conn.intern_atom(false, b"_NET_WORKAREA").ok()?.reply().ok()?.atom;
+    let area = conn.get_property(false, root.root, atom, AtomEnum::CARDINAL, 0, 4).ok()?.reply().ok()?;
+    let v: Vec<i32> = area.value32()?.map(|n| n as i32).collect();
+    let [ax, ay, aw, ah] = v[..] else { return None };
+    let (w, h) = (size.0 as i32, size.1 as i32);
+    let x = ax + aw - w - 8;
+    // A panel along the top leaves the usable area starting lower; otherwise it's at the bottom.
+    let y = if ay > 0 { ay + 8 } else { ay + ah - h - 8 };
+    Some((x.max(ax), y.max(ay)))
 }
 
 #[cfg(test)]

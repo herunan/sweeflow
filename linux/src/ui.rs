@@ -2718,7 +2718,7 @@ fn stream_toggle_key(mods: &Modifiers, key: Keysym) -> Option<&'static str> {
 
 /// Opens the Global menu (`sweeflow menu`, palette.rs): a process of its own, as from the tray.
 pub(crate) fn open_global_menu() {
-    run_own("menu", "the Global menu");
+    run_own("menu", "the Global Menu");
 }
 
 /// Runs this program with one argument (`menu`, `open`): started off the UI thread, and waited

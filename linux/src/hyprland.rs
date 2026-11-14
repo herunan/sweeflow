@@ -67,10 +67,10 @@ pub fn add_to_config() {
 /// when it loses the focus, was gone before a letter was typed. A window rule for that one
 /// window (by its title; Sweeflow's other windows have the same class).
 fn keep_menu_focused() {
-    let rule = r#"hl.window_rule({ name = "sweeflow-menu-keeps-focus", enabled = true, match = { class = "sweeflow", title = "(.* - )?Global menu" }, stay_focused = true })"#;
+    let rule = r#"hl.window_rule({ name = "sweeflow-menu-keeps-focus", enabled = true, match = { class = "sweeflow", title = "(.* - )?Global Menu" }, stay_focused = true })"#;
     match Command::new("hyprctl").args(["eval", rule]).output() {
         Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {}
-        Ok(o) => log::warn!("Hyprland didn't take the rule that keeps the Global menu focused: {}", String::from_utf8_lossy(&o.stdout).trim()),
+        Ok(o) => log::warn!("Hyprland didn't take the rule that keeps the Global Menu focused: {}", String::from_utf8_lossy(&o.stdout).trim()),
         Err(e) => log::debug!("hyprctl: {e}"),
     }
 }
@@ -117,7 +117,7 @@ fn close_on_click_elsewhere() {
     // Where the click is, not which window has the focus: a click on the desktop or the bar
     // moves no focus. A click in the strip above a window placed under a top bar is the bar's
     // (its tray icon opens and closes the window itself).
-    let lua = r#"if not sweeflow_click_closes2 then sweeflow_click_closes2 = true; hl.bind("mouse:272", function() local function ours(w) return w and w.class == "sweeflow" and (w.title == "Sweeflow" or string.find(w.title or "", "Global menu", 1, true)) end; local p = hl.get_cursor_pos(); for _, w in ipairs(hl.get_windows({ class = "sweeflow" })) do if ours(w) and w.at and w.size then local inside = p.x >= w.at.x and p.x < w.at.x + w.size.x and p.y >= w.at.y and p.y < w.at.y + w.size.y; local bar = w.at.y < 80 and p.y < w.at.y; if not inside and not bar then hl.dispatch(hl.dsp.window.close({ window = "address:" .. w.address })) end end end end, { non_consuming = true }) end"#;
+    let lua = r#"if not sweeflow_click_closes3 then sweeflow_click_closes3 = true; hl.bind("mouse:272", function() local function ours(w) return w and w.class == "sweeflow" and (w.title == "Sweeflow" or string.find(w.title or "", "Global Menu", 1, true)) end; local p = hl.get_cursor_pos(); for _, w in ipairs(hl.get_windows({ class = "sweeflow" })) do if ours(w) and w.at and w.size then local inside = p.x >= w.at.x and p.x < w.at.x + w.size.x and p.y >= w.at.y and p.y < w.at.y + w.size.y; local bar = w.at.y < 80 and p.y < w.at.y; if not inside and not bar then hl.dispatch(hl.dsp.window.close({ window = "address:" .. w.address })) end end end end, { non_consuming = true }) end"#;
     match Command::new("hyprctl").args(["eval", lua]).output() {
         Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {}
         Ok(o) => log::warn!("Hyprland didn't take the click-elsewhere binding: {}", String::from_utf8_lossy(&o.stdout).trim()),
