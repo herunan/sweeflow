@@ -16,7 +16,7 @@ use smithay_client_toolkit::{
     data_device_manager::{
         data_device::{DataDevice, DataDeviceHandler},
         data_offer::{DataOfferHandler, DragOffer},
-        data_source::{DataSourceHandler, DragSource},
+        data_source::{CopyPasteSource, DataSourceHandler, DragSource},
         DataDeviceManagerState, WritePipe,
     },
     delegate_registry,
@@ -331,6 +331,12 @@ pub struct App {
     dnd_device: Option<DataDevice>,
     /// Linux drag carrying files out of a Mac window.
     drag_source: Option<DragSource>,
+    /// The clipboard where there's no ext-data-control (GNOME): the ordinary Wayland clipboard,
+    /// which works while a Mac window has the keyboard. What the Mac copied (MIME type → bytes),
+    /// our source offering it, and the last keyboard-enter serial (a selection needs one).
+    cp_offers: Option<HashMap<String, Arc<Vec<u8>>>>,
+    cp_source: Option<CopyPasteSource>,
+    kb_serial: u32,
     /// Drop targets waiting for the Mac files of that drag.
     drag_waiting: Vec<WritePipe>,
     drag_uris: Option<Arc<Vec<u8>>>,
@@ -472,6 +478,9 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         ddm: DataDeviceManagerState::bind(&globals, &qh).ok(),
         dnd_device: None,
         drag_source: None,
+        cp_offers: None,
+        cp_source: None,
+        kb_serial: 0,
         drag_waiting: Vec::new(),
         drag_uris: None,
         mac_drag: None,
@@ -2016,6 +2025,17 @@ impl App {
 
     /// Puts the Mac's clipboard on ours.
     fn set_clipboard(&mut self, offers: HashMap<String, Arc<Vec<u8>>>, qh: &QueueHandle<Self>) {
+        if self.data_control.is_none() {
+            // The ordinary clipboard: taken now if a Mac window has the keyboard, else when one
+            // gets it (keyboard enter).
+            if !offers.is_empty() {
+                self.cp_offers = Some(offers);
+                if self.kb_focus.is_some() {
+                    self.offer_clipboard(qh);
+                }
+            }
+            return;
+        }
         let (Some(mgr), Some(device)) = (&self.data_control, &self.clip_device) else { return };
         if offers.is_empty() {
             return;
@@ -2030,6 +2050,15 @@ impl App {
         if let Some(old) = self.clip_source.replace(source) {
             old.destroy();
         }
+    }
+
+    /// The Mac's clipboard as the ordinary Wayland selection (no ext-data-control: GNOME).
+    fn offer_clipboard(&mut self, qh: &QueueHandle<Self>) {
+        let (Some(ddm), Some(device), Some(offers)) = (&self.ddm, &self.dnd_device, &self.cp_offers) else { return };
+        let source = ddm.create_copy_paste_source(qh, offers.keys().cloned().collect::<Vec<_>>());
+        source.set_selection(device, self.kb_serial);
+        self.clip_ignore += 1;
+        self.cp_source = Some(source);
     }
 
     /// The Linux clipboard changed: send it to the Mac (read on a thread: files can be large).
@@ -3143,11 +3172,16 @@ impl KeyboardHandler for App {
         qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
-        _: u32,
+        serial: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
+        self.kb_serial = serial;
         if let Some(wid) = self.wid_for(surface) {
+            // The Mac's clipboard, waiting for a Mac window to have the keyboard (GNOME).
+            if self.data_control.is_none() && self.cp_offers.is_some() && self.cp_source.is_none() {
+                self.offer_clipboard(qh);
+            }
             log::debug!("keyboard focus → {wid}: focusing it on the Mac");
             self.kb_focus = Some(wid);
             // Remembered past this focus for the Global menu, which takes the focus to open
@@ -3347,7 +3381,35 @@ impl DataDeviceHandler for App {
         }
     }
 
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {}
+    /// The clipboard as a focused Wayland client sees it (GNOME, no ext-data-control): what
+    /// another app copied goes to the Mac.
+    fn selection(&mut self, conn: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        if self.data_control.is_some() || !crate::tray::allows_clipboard() {
+            return;
+        }
+        let Some(offer) = self.dnd_device.as_ref().and_then(|d| d.data().selection_offer()) else { return };
+        if self.clip_ignore > 0 {
+            self.clip_ignore -= 1;
+            return;
+        }
+        let mimes = offer.with_mime_types(|m| m.to_vec());
+        let Some(mime) = crate::clipboard::pick_mime(&mimes) else { return };
+        let Ok(mut pipe) = offer.receive(mime.clone()) else { return };
+        let _ = conn.flush();
+        let net = self.net.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut data = Vec::new();
+            if pipe.by_ref().take(crate::clipboard::MAX_BYTES as u64).read_to_end(&mut data).is_err() {
+                return;
+            }
+            let items = crate::clipboard::items_from(&mime, data);
+            if !items.is_empty() {
+                log::debug!("clipboard to the Mac: {} item(s) ({mime})", items.len());
+                let _ = net.send(NetCmd::Clipboard(items));
+            }
+        });
+    }
 
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
         let target = self.dnd_target.take();
@@ -3415,7 +3477,17 @@ impl DataSourceHandler for App {
     }
 
     /// A Linux app wants the files of a drag out of a Mac window: fetch them from the Mac.
-    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, mime: String, mut fd: WritePipe) {
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &wl_data_source::WlDataSource, mime: String, mut fd: WritePipe) {
+        // A paste of the Mac's clipboard (GNOME's ordinary clipboard).
+        if self.cp_source.as_ref().is_some_and(|s| s.inner() == source) {
+            if let Some(data) = self.cp_offers.as_ref().and_then(|o| o.get(&mime)).cloned() {
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = fd.write_all(&data);
+                });
+            }
+            return;
+        }
         log::info!("drag out: target asks for {mime}");
         if let Some(uris) = self.drag_uris.clone() {
             std::thread::spawn(move || {
@@ -3430,7 +3502,13 @@ impl DataSourceHandler for App {
         self.drag_waiting.push(fd);
     }
 
-    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &wl_data_source::WlDataSource) {
+        // Another app copied something: the Mac's clipboard isn't the selection any more.
+        if self.cp_source.as_ref().is_some_and(|s| s.inner() == source) {
+            self.cp_source = None;
+            self.cp_offers = None;
+            return;
+        }
         log::info!("drag out: cancelled (no target took it)");
         self.drag_source = None;
         self.drag_waiting.clear();
