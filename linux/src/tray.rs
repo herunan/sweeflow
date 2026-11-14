@@ -671,7 +671,8 @@ pub fn status_line(mac: &str, s: Standing) -> String {
         Standing { stopped: true, .. } => format!("Stopped · {mac}"),
         Standing { elsewhere: Some(_), .. } => format!("{mac} is streaming elsewhere"),
         Standing { connected: true, enabled: false, .. } => format!("Paused · {mac}"),
-        Standing { connected: true, locked: true, .. } => format!("Streaming from {mac} · Mac locked"),
+        // The state first, as "Paused · …": narrow menus (Omarchy's) cut the end off.
+        Standing { connected: true, locked: true, .. } => format!("Locked · {mac}"),
         Standing { connected: true, .. } => format!("Streaming from {mac}"),
         // Online, but it turns this computer away until allowed again from its own menu.
         Standing { refused: true, .. } => format!("Waiting for {mac} · stopped on the Mac"),
@@ -1197,7 +1198,7 @@ mod tests {
         assert_eq!(status_line("Studio", streaming), "Streaming from Studio");
         assert_eq!(status_short(streaming), "Streaming");
         assert_eq!(status_short(Standing { enabled: false, ..streaming }), "Paused");
-        assert_eq!(status_line("Studio", Standing { locked: true, ..streaming }), "Streaming from Studio · Mac locked");
+        assert_eq!(status_line("Studio", Standing { locked: true, ..streaming }), "Locked · Studio");
         assert_eq!(status_line("Studio", Standing { enabled: false, ..streaming }), "Paused · Studio");
         // Locked while paused: the pause is what matters here.
         assert_eq!(status_line("Studio", Standing { enabled: false, locked: true, ..streaming }), "Paused · Studio");
