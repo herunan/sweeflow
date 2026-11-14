@@ -439,10 +439,12 @@ fn this_computer() -> String {
 }
 
 /// How long to wait before looking again whether the Mac is still streaming to another
-/// computer, after `checks` looks: 5 s, rising to 30 s. (A look is a hello the Mac turns away:
+/// computer. (A look is a hello the Mac turns away:
 /// the other computer doesn't notice.)
-fn busy_wait(checks: u32) -> Duration {
-    Duration::from_secs((5u64 << checks.min(3)).min(30))
+fn busy_wait(_checks: u32) -> Duration {
+    // Every 5 s: streaming here starts within moments of it stopping there (backing off to
+    // 30 s left Sweeflow showing "Busy" for half a minute after the Mac was free).
+    Duration::from_secs(5)
 }
 
 /// Busy's payload: the computer the Mac is streaming to.
@@ -1489,9 +1491,9 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_mac_is_looked_at_less_and_less_often() {
+    fn a_busy_mac_is_looked_at_every_few_seconds() {
         let waits: Vec<u64> = (0..6).map(|n| busy_wait(n).as_secs()).collect();
-        assert_eq!(waits, [5, 10, 20, 30, 30, 30]);
+        assert_eq!(waits, [5, 5, 5, 5, 5, 5]);
     }
 
     #[test]

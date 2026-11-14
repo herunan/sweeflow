@@ -122,6 +122,7 @@ fn run(conn: RustConnection, screen: usize, rx: mpsc::Receiver<Offers>, net: Unb
             .clone()
     };
 
+    log::info!("clipboard: X11 CLIPBOARD shared with the Mac");
     loop {
         // New offers from the Mac: own the selection with them.
         while let Ok(o) = rx.try_recv() {
@@ -190,6 +191,7 @@ fn run(conn: RustConnection, screen: usize, rx: mpsc::Receiver<Offers>, net: Unb
                 offers.clear();
             }
             Event::XfixesSelectionNotify(ev) if ev.owner != win && ev.owner != x11rb::NONE => {
+                log::debug!("clipboard: another app copied (owner {:#x})", ev.owner);
                 // Another app copied something: what it offers, then the best of it.
                 reading = None;
                 conn.convert_selection(win, a.clipboard, a.targets, a.property, x11rb::CURRENT_TIME)?;
@@ -197,6 +199,7 @@ fn run(conn: RustConnection, screen: usize, rx: mpsc::Receiver<Offers>, net: Unb
             }
             Event::SelectionNotify(ev) if ev.requestor == win && ev.property != x11rb::NONE => {
                 let reply = conn.get_property(true, win, a.property, AtomEnum::ANY, 0, u32::MAX / 4)?.reply()?;
+                log::debug!("clipboard: got {} ({} bytes, format {})", name_of(ev.target, &conn), reply.value.len(), reply.format);
                 if ev.target == a.targets {
                     let mimes: Vec<String> = reply.value32().map(|v| v.collect::<Vec<_>>()).unwrap_or_default().into_iter().map(|t| name_of(t, &conn)).collect();
                     if let Some(mime) = crate::clipboard::pick_mime(&mimes) {

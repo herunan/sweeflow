@@ -348,6 +348,8 @@ pub struct App {
     press_at: (f64, f64),
     move_ready: bool,
     drag_spot: Option<(u32, f32, f32, bool, Instant)>,
+    /// The pointer device of the last XInput 2 press (its implicit grab is released for WM moves).
+    xi_pointer: Option<u16>,
     press_time: Instant,
     press_known: bool,
     moved_here: Option<u32>,
@@ -374,6 +376,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     let mut app = App::new(scale, host, None, event_loop.handle())?;
     let net = crate::net::spawn(net_cfg, ui_tx);
     app.net = net.clone();
+    // The clipboard thread needs the network's sender, which only exists from here.
+    app.clip = crate::x11clip::start(net.clone());
     crate::tray::set_net(net.clone());
     crate::pair::watch_links();
     app.menus = match Menus::new(net) {
@@ -443,7 +447,7 @@ impl App {
             keysyms: (8, 0, Vec::new()),
             menus: None,
             loop_handle,
-            clip: net.clone().and_then(crate::x11clip::start),
+            clip: None,
             net: net.unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().0),
             windows: HashMap::new(),
             by_xid: HashMap::new(),
@@ -467,6 +471,7 @@ impl App {
             press_at: (0.0, 0.0),
             move_ready: false,
             drag_spot: None,
+            xi_pointer: None,
             press_time: Instant::now(),
             press_known: false,
             moved_here: None,
@@ -774,7 +779,13 @@ impl App {
         self.conn.create_window(self.depth, xid, self.root, x as i16, y as i16, size.0 as u16, size.1 as u16, 0, xproto::WindowClass::INPUT_OUTPUT, self.gl.visual, &aux)?;
         if self.xi_scroll.is_some() {
             // Pointer motion through XInput 2: with it the scroll valuators (smooth scrolling).
-            let m = xinput::EventMask { deviceid: 1 /* all master devices */, mask: vec![xinput::XIEventMask::MOTION] };
+            // Buttons too: a press then grabs the pointer for XInput 2, and motion keeps coming
+            // while it's held (with a classic press, XInput 2 motion stopped during a drag:
+            // title-bar drags never became window moves).
+            let m = xinput::EventMask {
+                deviceid: 1, // all master devices
+                mask: vec![xinput::XIEventMask::MOTION | xinput::XIEventMask::BUTTON_PRESS | xinput::XIEventMask::BUTTON_RELEASE],
+            };
             self.conn.xinput_xi_select_events(xid, &[m])?;
         }
         let a = &self.atoms;
@@ -1390,6 +1401,10 @@ impl App {
     /// The window manager moves (or resizes) the window from where the pointer is now.
     fn wm_moveresize(&self, xid: u32, direction: u32) {
         let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        // The press's XInput 2 grab too, or the window manager can't take the pointer.
+        if let Some(dev) = self.xi_pointer {
+            let _ = self.conn.xinput_xi_ungrab_device(CURRENT_TIME, dev);
+        }
         let (x, y) = self.pointer_root;
         let ev = xproto::ClientMessageEvent::new(32, xid, self.atoms._NET_WM_MOVERESIZE, [x as i32 as u32, y as i32 as u32, direction, 1, 1]);
         let _ = self.conn.send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
@@ -1855,6 +1870,15 @@ impl App {
                 }
             }
             Event::XinputDeviceChanged(_) => self.query_scroll_devices(),
+            Event::XinputButtonPress(e) | Event::XinputButtonRelease(e) => {
+                let fp = |v: i32| v as f64 / 65536.0;
+                let down = e.event_type == xinput::BUTTON_PRESS_EVENT;
+                if let Some(wid) = self.wid_of(e.event) {
+                    self.pointer_root = (fp(e.root_x) as i16, fp(e.root_y) as i16);
+                    self.xi_pointer = Some(e.deviceid);
+                    self.button(wid, e.detail as u8, down, fp(e.event_x), fp(e.event_y));
+                }
+            }
             Event::ButtonPress(e) => {
                 if let Some(wid) = self.wid_of(e.event) {
                     self.pointer_root = (e.root_x, e.root_y);
@@ -1966,6 +1990,12 @@ impl App {
         if self.windows.get(&wid).is_some_and(|w| w.lights_pressed.is_some()) || self.over_lights(wid) {
             return;
         }
+        if self.left_down == Some(wid) && self.moved_enough(px, py) && !self.move_ready {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                log::debug!("window {wid}: dragging with no move ready");
+            }
+        }
         if self.move_ready && self.left_down == Some(wid) && self.moved_enough(px, py) {
             self.move_here(wid);
             return;
@@ -2011,6 +2041,7 @@ impl App {
                 self.press_at = (px, py);
                 self.pointer_at = (wid, px, py);
                 self.move_ready = self.spot_drags(wid, x, y);
+                log::debug!("window {wid}: left press at {x:.0},{y:.0} (drag spot {:?}): {}", self.drag_spot.map(|s| (s.1, s.2, s.3)), if self.move_ready { "moves on the first motion" } else { "the Mac's" });
                 self.press_time = Instant::now();
                 self.press_known = self.move_ready;
                 self.moved_here = None;
