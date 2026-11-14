@@ -145,8 +145,16 @@ final class Onboarding: NSObject, NSWindowDelegate {
         let intro = NSTextField(wrappingLabelWithString:
             "Your Mac's apps, as windows on your Linux machine. A few things first, then you link them:")
         intro.preferredMaxLayoutWidth = 420
-        screenRow.onAction = { _ = CGRequestScreenCaptureAccess() }
+        // Not allowed though Settings may show Sweeflow switched on: that entry can be an older
+        // copy's (another signature, after an update), which macOS keeps and doesn't apply to
+        // this one. Cleared first (Sweeflow's own entry only), so macOS asks afresh and Settings
+        // lists this copy.
+        screenRow.onAction = {
+            if !CGPreflightScreenCaptureAccess() { Self.resetPermission("ScreenCapture") }
+            _ = CGRequestScreenCaptureAccess()
+        }
         axRow.onAction = {
+            if !AXIsProcessTrusted() { Self.resetPermission("Accessibility") }
             _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         }
         loginRow.onAction = { if !LoginItem.enable() && LoginItem.needsApproval { SMAppService.openSystemSettingsLoginItems() } }
@@ -234,6 +242,18 @@ final class Onboarding: NSObject, NSWindowDelegate {
         }
         b.start(queue: .main)
         browser = b
+    }
+
+    /// Clears this app's entry for one privacy permission (tccutil, no password needed for an
+    /// app's own entry).
+    static func resetPermission(_ service: String) {
+        guard let bid = Bundle.main.bundleIdentifier else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", service, bid]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit(); log("permission \(service): stale entry cleared") } catch {}
     }
 
     @objc private func openPairing() {
