@@ -299,6 +299,14 @@ final class WindowTracker {
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
             // Whether an untitled window is one of the app's own isn't known until the app has
             // answered: a new one waits for that (a moment), one already shown stays as it is.
+            // The badge as macOS lists it to the capturing app itself: an ordinary, shareable
+            // window titled "Window", of its fixed size (other processes see it unshareable,
+            // untitled). Taken for a window too small to stream, it was dropped, and the badge
+            // never known: erased blind, and an app's buttons misplaced (see settledButtons).
+            if layer == 0, (60...72).contains(bounds.width), (17...23).contains(bounds.height) {
+                badges[pid, default: []].append(bounds)
+                continue
+            }
             var realWindow = true
             if layer == 0, title.isEmpty {
                 if let isApp = looksLikeAppWindow(wid, pid: pid) { realWindow = isApp }
@@ -443,6 +451,13 @@ final class WindowTracker {
         }
         zOrder = order
         self.badges = badges
+        // macOS puts the capture badge up some seconds after a capture starts: once it's there,
+        // it says where a window's buttons really are (see Session.settledButtons).
+        for (wid, w) in windows where !badged.contains(wid) && Self.badge(among: badges[w.pid] ?? [], over: w.frame) != nil {
+            badged.insert(wid)
+            onBadgeAppeared?(wid)
+        }
+        badged = badged.filter { windows[$0] != nil }
         for (wid, b) in blind where blindNow[wid] == nil { onBlindRemoved?(b) }
         for (wid, b) in blindNow where blind[wid] == nil { onBlindAdded?(b) }
         blind = blindNow
@@ -451,6 +466,10 @@ final class WindowTracker {
             onScreenSelect?(selecting)
         }
     }
+
+    /// Called once per window when its capture badge is first seen.
+    var onBadgeAppeared: ((UInt32) -> Void)?
+    private var badged: Set<UInt32> = []
 
     /// Where macOS's capture badge overlaps `wid`, relative to the window (points).
     func badgeRect(_ wid: UInt32) -> CGRect? {

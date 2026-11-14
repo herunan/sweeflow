@@ -1409,13 +1409,29 @@ final class Session {
         func key(_ r: [CGRect]) -> String {
             w.bundleId + "|" + r.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" }.joined(separator: " ")
         }
+        // macOS's capture badge sits over the real buttons: when it covers them where they're
+        // reported and not where a shift would put them, they are where reported. (TextEdit has
+        // two real places, by its toolbar's height: going from one to the other and back had it
+        // taken for an app that moves its own buttons, and Linux drew them 26 points too low,
+        // over its formatting bar.)
+        func badgeSaysAsReported(_ shifted: [CGRect]) -> Bool {
+            guard let badge = tracker.badgeRect(wid)?.insetBy(dx: -2, dy: -2) else { return false }
+            let mid = { (r: [CGRect]) in CGPoint(x: r[1].midX, y: r[1].midY) }
+            return badge.contains(mid(rects)) && !badge.contains(mid(shifted))
+        }
         // Known from before: this app's buttons, reported at the standard place.
         if let shift = buttonShifts[key(rects)]?.split(separator: ",").compactMap({ Double($0) }), shift.count == 2 {
-            return rects.map { $0.offsetBy(dx: shift[0], dy: shift[1]) }
+            let shifted = rects.map { $0.offsetBy(dx: shift[0], dy: shift[1]) }
+            if !badgeSaysAsReported(shifted) { return shifted }
+            buttonShifts[key(rects)] = nil
+            UserDefaults.standard.set(buttonShifts, forKey: "buttonShifts")
+            log("window \(wid) (\(w.appName)): the badge is over its buttons where reported: no longer shifted for the app")
+            return rects
         }
         if let kept = buttonsKept[wid] {
             if sameShape(kept, rects) {
                 if rects[0].minY > kept[0].minY { buttonsKept[wid] = rects; return rects }
+                if badgeSaysAsReported(kept) { buttonsKept[wid] = nil; buttonHistory[wid] = nil; return rects }
                 return kept
             }
             // Other buttons altogether (another title bar style): start over.
@@ -1430,6 +1446,9 @@ final class Session {
            history[2].at.uptimeNanoseconds - history[0].at.uptimeNanoseconds < 5_000_000_000 {
             let (a, b) = (history[0].rects, history[1].rects)
             let (lower, higher) = a[0].minY >= b[0].minY ? (a, b) : (b, a)
+            // Both places real (the badge is over the buttons where they are now, the higher
+            // one): nothing to keep or remember.
+            if rects == higher, badgeSaysAsReported(lower) { return rects }
             buttonsKept[wid] = lower
             buttonShifts[key(higher)] = "\(lower[0].minX - higher[0].minX),\(lower[0].minY - higher[0].minY)"
             UserDefaults.standard.set(buttonShifts, forKey: "buttonShifts")
@@ -1566,6 +1585,10 @@ final class Session {
         // Which window has focus changes with what the user does or with app switches, which
         // both start a burst of window checks.
         tracker.onBurstPoll = { [weak self] in self?.checkFocus() }
+        tracker.onBadgeAppeared = { [weak self] wid in
+            guard let self, let w = self.tracker.windows[wid] else { return }
+            self.sendButtons(w)
+        }
         tracker.onBlindAdded = { [weak self] b in self?.blindAdded(b) }
         tracker.onScreenSelect = { [weak self] on in
             log("screenshot selection \(on ? "started" : "ended")")
@@ -1918,7 +1941,8 @@ final class Session {
     /// where Linux drew them from then on. (A look that finds nothing new sends nothing.)
     private func sendButtonsNowAndSettled(_ w: TrackedWindow) {
         sendButtons(w)
-        for delay in [0.4, 1.5] {
+        // (3 s: macOS's capture badge, which says where the buttons really are, is up by then.)
+        for delay in [0.4, 1.5, 3] {
             queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, let now = self.tracker.windows[w.wid] else { return }
                 self.sendButtons(now)
