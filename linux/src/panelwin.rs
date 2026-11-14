@@ -1174,6 +1174,15 @@ pub fn run() -> Result<()> {
         if let Some((x, y)) = x11_corner(size) {
             ui.window().set_position(slint::PhysicalPosition::new(x, y));
         }
+        // Cinnamon opens it (started by a shortcut or the tray) without the focus, and then a
+        // click elsewhere couldn't close it: it asks for the focus once it's up.
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(200), move || {
+            use slint::winit_030::WinitWindowAccessor;
+            if let Some(ui) = weak.upgrade() {
+                ui.window().with_winit_window(|w| w.focus_window());
+            }
+        });
     }
     ui.run()?;
     Ok(())

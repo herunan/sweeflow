@@ -645,7 +645,9 @@ fn highlight(rows: &[Row], keep: Option<usize>, keyboard: bool) -> Option<usize>
 /// own, which they float and centre.
 fn overlay_here(desktop: &str, hyprland: bool) -> bool {
     let desktop = desktop.to_lowercase();
-    !hyprland && desktop.split(':').any(|d| ["kde", "gnome", "cinnamon", "x-cinnamon", "budgie", "budgie-desktop", "unity", "pantheon"].contains(&d))
+    // Not GNOME: its windows get no see-through background there (the overlay came out black),
+    // so the Global Menu is a window of its own size, as on Hyprland.
+    !hyprland && desktop.split(':').any(|d| ["kde", "cinnamon", "x-cinnamon", "budgie", "budgie-desktop", "unity", "pantheon"].contains(&d))
 }
 
 const BUS_NAME: &str = "dev.sweeflow.Client";
@@ -1188,7 +1190,7 @@ mod tests {
     #[test]
     fn an_overlay_where_the_desktop_draws_one() {
         assert!(overlay_here("KDE", false));
-        assert!(overlay_here("ubuntu:GNOME", false));
+        assert!(!overlay_here("ubuntu:GNOME", false));
         assert!(overlay_here("X-Cinnamon", false));
         assert!(!overlay_here("Hyprland", true));
         // Hyprland started from a session that says KDE, say.
