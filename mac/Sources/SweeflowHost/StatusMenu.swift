@@ -18,22 +18,50 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// The logo (a template: macOS draws it in the menu bar's colour): solid while streaming,
-    /// faded otherwise, with no badge (as on Linux; the menu says which).
+    /// Where this Mac stands, as a dot in the logo's empty bottom-right corner (the sweet runs
+    /// from bottom left to top right), in the colours Linux gives it (its trays and Sweeflow's
+    /// window): violet streaming, a violet ring paused, green waiting for a Linux computer.
+    private let dot = CALayer()
+
+    /// The logo (a template: macOS draws it in the menu bar's colour), always solid, with the dot.
     private func updateIcon() {
         let connected = host.connected
         let on = settings.config.enabled && connected
         let base = NSImage(named: "MenuIcon")
             ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Sweeflow")
-        guard let base else { return }
+        guard let base, let button = item.button else { return }
         // The logo is wider than tall (a wrapped sweet): the menu bar's usual height, its own width.
         if base.size.height > 0 {
             base.size = NSSize(width: (16 * base.size.width / base.size.height).rounded(), height: 16)
         }
         base.isTemplate = true
-        item.button?.image = base
-        item.button?.appearsDisabled = !on
-        item.button?.toolTip = !connected ? "Sweeflow: not streaming" : on ? "Sweeflow: streaming" : "Sweeflow: paused"
+        button.image = base
+        button.toolTip = !connected ? "Sweeflow: not streaming" : on ? "Sweeflow: streaming" : "Sweeflow: paused"
+        let violet = NSColor(srgbRed: 0x8b / 255.0, green: 0x5c / 255.0, blue: 0xf6 / 255.0, alpha: 1).cgColor
+        let green = NSColor(srgbRed: 0x30 / 255.0, green: 0xa4 / 255.0, blue: 0x6c / 255.0, alpha: 1).cgColor
+        let ring = connected && !on
+        dot.backgroundColor = ring ? nil : (connected ? violet : green)
+        dot.borderColor = violet
+        dot.borderWidth = ring ? 1.4 : 0
+        button.wantsLayer = true
+        if dot.superlayer == nil { button.layer?.addSublayer(dot) }
+        DispatchQueue.main.async { [weak self] in self?.placeDot() }
+    }
+
+    /// At the image's bottom-right corner, wherever the button has put it.
+    private func placeDot() {
+        guard let button = item.button, let image = button.image else { return }
+        button.layoutSubtreeIfNeeded()
+        let b = button.bounds, side: CGFloat = 5.5
+        let img = CGRect(x: (b.width - image.size.width) / 2, y: (b.height - image.size.height) / 2,
+                         width: image.size.width, height: image.size.height)
+        // The image's bottom edge, in the button's (and so its layer's) coordinates.
+        let y = button.isFlipped ? img.maxY - side : img.minY
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dot.frame = CGRect(x: img.maxX - side, y: y, width: side, height: side)
+        dot.cornerRadius = side / 2
+        CATransaction.commit()
     }
 
     /// Built when opened, so it always shows the current state. Only what concerns this Mac:
