@@ -1267,6 +1267,16 @@ fn close_when_another_is_active() {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let mut opened_over = active();
         let window = words(root, clients_atom, AtomEnum::WINDOW, 1024).into_iter().rev().find(|w| ours(*w));
+        // The focus, asked as a taskbar asks it (source 2): Cinnamon turns down an app's own ask
+        // (winit's, above) for a window opened from the tray, and what was typed went on to the
+        // window that had the keyboard before, a Mac app's.
+        if let Some(w) = window.filter(|w| active() != *w) {
+            use x11rb::protocol::xproto::ClientMessageEvent;
+            let ev = ClientMessageEvent::new(32, w, active_atom, [2, 0, 0, 0, 0]);
+            let _ = conn.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
+            let _ = conn.flush();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         let inside = |x: i32, y: i32, w: u32| -> bool {
             let Some(g) = conn.get_geometry(w).ok().and_then(|c| c.reply().ok()) else { return true };
             let Some(t) = conn.translate_coordinates(w, root, 0, 0).ok().and_then(|c| c.reply().ok()) else { return true };
