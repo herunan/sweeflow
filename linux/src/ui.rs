@@ -340,6 +340,10 @@ pub struct App {
     /// Drop targets waiting for the Mac files of that drag.
     drag_waiting: Vec<WritePipe>,
     drag_uris: Option<Arc<Vec<u8>>>,
+    /// How many files the Mac drag carries (its picture shows the number), and the picture's
+    /// surface while a drag is out (kept alive with its buffer).
+    drag_count: usize,
+    drag_icon: Option<(wl_surface::WlSurface, RawPool, wl_buffer::WlBuffer)>,
     /// A file drag that started in this Mac window (reported by the Mac).
     mac_drag: Option<u32>,
     /// Mac window where the left button is down (forwarded to the Mac).
@@ -483,6 +487,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         kb_serial: 0,
         drag_waiting: Vec::new(),
         drag_uris: None,
+        drag_count: 1,
+        drag_icon: None,
         mac_drag: None,
         left_down: None,
         pointer_at: (0, 0.0, 0.0),
@@ -789,6 +795,7 @@ impl App {
                     self.pointer_at.0
                 );
                 self.mac_drag = Some(wid);
+                self.drag_count = names.len().max(1);
                 self.maybe_take_drag(qh);
             }
             UiEvent::DragData(uris) => {
@@ -2014,13 +2021,76 @@ impl App {
         }
         let (Some(ddm), Some(dev)) = (&self.ddm, &self.dnd_device) else { return };
         let source = ddm.create_drag_and_drop_source(qh, ["text/uri-list"], DndAction::Copy);
-        source.start_drag(dev, w.base(), None, self.press_serial);
+        // A picture under the pointer while it's held (a document, with the number of files),
+        // or nothing shows that anything is being carried.
+        let icon = self.drag_picture(qh);
+        source.start_drag(dev, w.base(), icon.as_ref().map(|i| &i.0), self.press_serial);
+        self.drag_icon = icon;
         self.drag_source = Some(source);
         self.drag_uris = None;
         self.mac_drag = None;
         self.left_down = None;
         self.send(W::new(t::DRAG_TAKEN).u32(wid).finish());
         log::info!("took over the Mac drag from window {wid}");
+    }
+
+    /// The picture a drag out carries: a document (a page with a folded corner) in Sweeflow's
+    /// violet, with the number of files on it when there are several. 48 × 56 logical px.
+    fn drag_picture(&self, qh: &QueueHandle<Self>) -> Option<(wl_surface::WlSurface, RawPool, wl_buffer::WlBuffer)> {
+        let scale = self.scale.max(1.0).ceil() as i32;
+        let (w, h) = (48 * scale, 56 * scale);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let fold = 14.0 * scale as f64;
+        let (violet, white) = ([0xf6u8, 0x5c, 0x8b], [0xffu8, 0xff, 0xff]);
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let m = 2.0 * scale as f64;
+                let inside = fx > m && fy > m && fx < w as f64 - m && fy < h as f64 - m && !(fx > w as f64 - m - fold && fy < m + fold && (fx - (w as f64 - m - fold)) > (fy - m));
+                if !inside {
+                    continue;
+                }
+                let edge = fx < m + 2.0 * scale as f64 || fy < m + 2.0 * scale as f64 || fx > w as f64 - m - 2.0 * scale as f64 || fy > h as f64 - m - 2.0 * scale as f64;
+                let c = if edge { violet } else { white };
+                // BGRA, premultiplied (opaque here).
+                px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[c[0], c[1], c[2], 0xff]);
+            }
+        }
+        // The number of files: a violet disc at the bottom right with white bars for the
+        // count (up to 9; more shows as 9).
+        if self.drag_count > 1 {
+            let (cx, cy, r) = (w as f64 - 14.0 * scale as f64, h as f64 - 14.0 * scale as f64, 11.0 * scale as f64);
+            for y in 0..h {
+                for x in 0..w {
+                    let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+                    if d <= r {
+                        px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[violet[0], violet[1], violet[2], 0xff]);
+                    }
+                }
+            }
+            let n = self.drag_count.min(9) as i32;
+            let bar_w = (2 * scale).max(1);
+            let total = n * bar_w + (n - 1) * scale;
+            let x0 = cx as i32 - total / 2;
+            for b in 0..n {
+                for y in (cy as i32 - 5 * scale)..(cy as i32 + 5 * scale) {
+                    for x in (x0 + b * (bar_w + scale))..(x0 + b * (bar_w + scale) + bar_w) {
+                        if x >= 0 && y >= 0 && x < w && y < h {
+                            px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[white[0], white[1], white[2], 0xff]);
+                        }
+                    }
+                }
+            }
+        }
+        let mut pool = RawPool::new(px.len(), &self.shm).ok()?;
+        pool.mmap().copy_from_slice(&px);
+        let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, (), qh);
+        let surface = self.compositor.create_surface(qh);
+        surface.set_buffer_scale(scale);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, w, h);
+        surface.commit();
+        Some((surface, pool, buffer))
     }
 
     /// Puts the Mac's clipboard on ours.
@@ -3511,6 +3581,7 @@ impl DataSourceHandler for App {
         }
         log::info!("drag out: cancelled (no target took it)");
         self.drag_source = None;
+        self.drag_icon = None;
         self.drag_waiting.clear();
     }
 
@@ -3520,6 +3591,7 @@ impl DataSourceHandler for App {
 
     fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {
         self.drag_source = None;
+        self.drag_icon = None;
     }
 
     fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, a: DndAction) {
