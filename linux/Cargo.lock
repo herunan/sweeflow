@@ -4931,6 +4931,7 @@ dependencies = [
  "glow",
  "hex",
  "ksni",
+ "libc",
  "libloading",
  "log",
  "lz4_flex",

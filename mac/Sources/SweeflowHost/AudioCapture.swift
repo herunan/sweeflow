@@ -106,6 +106,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    private var ageSum = 0.0, ageN = 0, ageMax = 0.0, framesSum = 0
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sb.isValid, let fmt = CMSampleBufferGetFormatDescription(sb),
               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) else { return }
@@ -153,8 +155,20 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         onPCM?(out)
+        // How old the sound is on arrival here (its start, by the host clock), and how much
+        // comes at once: what capturing it adds to the sound's delay.
+        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        if pts.isValid {
+            let age = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(pts)
+            ageSum += age; ageN += 1; ageMax = max(ageMax, age); framesSum += frames
+        }
         if Date().timeIntervalSince(lastLevelLog) > 5 {
             log(String(format: "audio: peak level %.3f over the last 5s", peak))
+            if ageN > 0 {
+                log(String(format: "audio: captured %.0f ms after it played on average (worst %.0f), %d frames a buffer",
+                           ageSum / Double(ageN) * 1000, ageMax * 1000, framesSum / ageN))
+            }
+            ageSum = 0; ageN = 0; ageMax = 0; framesSum = 0
             peak = 0
             lastLevelLog = Date()
         }
