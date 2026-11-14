@@ -457,11 +457,12 @@ fn menu_icon(name: &str) -> String {
     name.into()
 }
 
-/// A menu item's text, with its key after it on GNOME: its tray extension doesn't show a menu
-/// item's shortcut (other desktops show it at the right).
+/// A menu item's text, with its key after it on GNOME and Cinnamon: their tray menus don't show
+/// a menu item's shortcut (other desktops show it at the right).
 fn with_key(label: &str, key: &Option<crate::keys::Key>, column: f32) -> String {
     match key {
-        Some(k) if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") => {
+        // (Cinnamon's panel draws tray menus the same way: no shortcut column either.)
+        Some(k) if ["GNOME", "Cinnamon"].iter().any(|d| std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains(d)) => {
             // Lined up in a column at the end of the rows, by tabs (key_column).
             let tabs = (column - tab_stop(text_width(label))) as usize + 1;
             format!("{label}{}{}", "\t".repeat(tabs), k.shown(crate::setup::mac_keys_remapped(), "Super"))

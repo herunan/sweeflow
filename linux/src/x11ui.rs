@@ -350,6 +350,8 @@ pub struct App {
     drag_spot: Option<(u32, f32, f32, bool, Instant)>,
     /// The pointer device of the last XInput 2 press (its implicit grab is released for WM moves).
     xi_pointer: Option<u16>,
+    /// The keyboard is ours (see sync_keyboard_grab).
+    kb_grabbed: bool,
     press_time: Instant,
     press_known: bool,
     moved_here: Option<u32>,
@@ -472,6 +474,7 @@ impl App {
             move_ready: false,
             drag_spot: None,
             xi_pointer: None,
+            kb_grabbed: false,
             press_time: Instant::now(),
             press_known: false,
             moved_here: None,
@@ -1845,6 +1848,7 @@ impl App {
                 self.pointer_root = (e.root_x, e.root_y);
                 let (px, py) = (e.event_x as f64, e.event_y as f64);
                 self.pointer_focus = Some(wid);
+                self.sync_keyboard_grab();
                 if self.xi_scroll.is_some() {
                     // Scroll valuators moved while the pointer was elsewhere.
                     self.query_scroll_devices();
@@ -1857,8 +1861,10 @@ impl App {
             }
             Event::LeaveNotify(e) => {
                 let Some(wid) = self.wid_of(e.event) else { return };
-                if self.pointer_focus == Some(wid) {
+                // (Not a grab's: a window move or a button's grab moves no pointer anywhere.)
+                if self.pointer_focus == Some(wid) && e.mode == xproto::NotifyMode::NORMAL {
                     self.pointer_focus = None;
+                    self.sync_keyboard_grab();
                 }
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.lights_hover = false;
@@ -2202,26 +2208,41 @@ impl App {
         self.send(W::new(t::FOCUS).u32(wid).finish());
         self.update_lights(wid);
         self.schedule_menu_panel();
-        // Every key to the Mac while one of its windows has the focus, as the shortcuts
-        // inhibitor does on Wayland: the window manager's own keys (Cinnamon takes Super for its
-        // menu, and with it every Cmd shortcut) wait until the focus moves on.
-        if let Some(xid) = self.windows.get(&wid).map(|w| w.xid) {
-            let r = self
-                .conn
-                .grab_keyboard(true, xid, CURRENT_TIME, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|r| r.status);
-            if r != Some(xproto::GrabStatus::SUCCESS) {
-                log::debug!("window {wid}: keyboard not taken ({r:?}): the desktop keeps its keys");
+        self.sync_keyboard_grab();
+    }
+
+    /// Every key to the Mac while one of its windows has the focus and the pointer is over a
+    /// Mac window, as the shortcuts inhibitor does on Wayland: the window manager's own keys
+    /// (Cinnamon takes Super for its menu, and with it every Cmd shortcut) wait meanwhile. With
+    /// the pointer elsewhere (the panel, another window) the keyboard is let go: the panel's
+    /// menus, which need it, open, and Alt+Tab works.
+    fn sync_keyboard_grab(&mut self) {
+        let want = self.kb_focus.zip(self.pointer_focus).and_then(|(f, _)| self.windows.get(&f).map(|w| w.xid));
+        match (want, self.kb_grabbed) {
+            (Some(xid), false) => {
+                let r = self
+                    .conn
+                    .grab_keyboard(true, xid, CURRENT_TIME, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| r.status);
+                self.kb_grabbed = r == Some(xproto::GrabStatus::SUCCESS);
+                if !self.kb_grabbed {
+                    log::debug!("keyboard not taken ({r:?}): the desktop keeps its keys");
+                }
             }
+            (None, true) => {
+                let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
+                let _ = self.conn.flush();
+                self.kb_grabbed = false;
+            }
+            _ => {}
         }
     }
 
     fn focus_out(&mut self) {
-        let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
-        let _ = self.conn.flush();
         let was = self.kb_focus.take();
+        self.sync_keyboard_grab();
         log::debug!("keyboard focus left {was:?}");
         if let Some(wid) = was {
             self.update_lights(wid);
