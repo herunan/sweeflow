@@ -294,6 +294,9 @@ struct Win {
     raw: Option<(Slot, u8)>,
     stale: bool,
     popup_wait: bool,
+    /// Where a popup was dragged to on its window (window points), kept from then on over where
+    /// the Mac has it (Quick Look dragged by its bar).
+    moved_to: Option<(f32, f32)>,
     popup_settled: bool,
     check_pending: bool,
     display: bool,
@@ -402,6 +405,9 @@ pub struct App {
     press_time: Instant,
     press_known: bool,
     moved_here: Option<u32>,
+    /// A popup being dragged (Quick Look by its bar), and the point of it held (px): moved here,
+    /// as the window manager moves windows but not popups (override-redirect).
+    popup_drag: Option<(u32, f64, f64)>,
     local_press: Option<u8>,
     scale: f64,
     host: String,
@@ -530,6 +536,7 @@ impl App {
             press_time: Instant::now(),
             press_known: false,
             moved_here: None,
+            popup_drag: None,
             local_press: None,
             scale,
             host,
@@ -721,9 +728,14 @@ impl App {
                 // Only while the press that started it is still held (see ui.rs).
                 if self.left_down != Some(wid) {
                     log::warn!("window {wid}: title-bar drag reported after the button was released: not moved");
-                } else if let Some(w) = self.windows.get(&wid).filter(|w| !w.popup) {
-                    let xid = w.xid;
-                    self.wm_moveresize(xid, MOVERESIZE_MOVE);
+                } else if let Some(w) = self.windows.get(&wid) {
+                    if w.popup {
+                        // A popup (Quick Look) is moved here, from where the pointer is now.
+                        self.popup_drag = Some((wid, self.pointer_at.1, self.pointer_at.2));
+                    } else {
+                        let xid = w.xid;
+                        self.wm_moveresize(xid, MOVERESIZE_MOVE);
+                    }
                 }
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
@@ -1001,6 +1013,7 @@ impl App {
                 raw: None,
                 stale: false,
                 popup_wait: false,
+                moved_to: None,
                 popup_settled: false,
                 check_pending: false,
                 display,
@@ -1228,7 +1241,8 @@ impl App {
     fn popup_origin(&self, info: &WinInfo) -> Option<(i32, i32)> {
         let parent = self.windows.get(&info.parent)?;
         let r = self.conn.translate_coordinates(parent.xid, self.root, 0, 0).ok()?.reply().ok()?;
-        let (rx, ry) = info.spot_on(parent.info.w, parent.info.h);
+        let moved = self.windows.get(&info.wid).and_then(|w| w.moved_to);
+        let (rx, ry) = moved.unwrap_or_else(|| info.spot_on(parent.info.w, parent.info.h));
         let (mut x, mut y) = (r.dst_x as i32 + rx.round() as i32, r.dst_y as i32 + ry.round() as i32);
         // And on the screen, whole if it fits.
         if let Some(g) = self.conn.get_geometry(self.root).ok().and_then(|c| c.reply().ok()) {
@@ -1522,8 +1536,13 @@ impl App {
 
     fn move_here(&mut self, wid: u32) {
         self.move_ready = false;
-        let Some(xid) = self.windows.get(&wid).filter(|w| !w.popup).map(|w| w.xid) else { return };
-        self.wm_moveresize(xid, MOVERESIZE_MOVE);
+        let Some(w) = self.windows.get(&wid) else { return };
+        if w.popup {
+            self.popup_drag = Some((wid, self.press_at.0, self.press_at.1));
+        } else {
+            let xid = w.xid;
+            self.wm_moveresize(xid, MOVERESIZE_MOVE);
+        }
         self.left_down = None;
         self.mac_drag = None;
         self.moved_here = Some(wid);
@@ -2445,7 +2464,27 @@ impl App {
             self.move_here(wid);
             return;
         }
+        if let Some((dw, gx, gy)) = self.popup_drag {
+            if dw == wid {
+                self.drag_popup(wid, gx, gy);
+            }
+            return;
+        }
         self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
+    }
+
+    /// The dragged popup to where the pointer has it (the point held under the pointer).
+    fn drag_popup(&mut self, wid: u32, gx: f64, gy: f64) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        let (xid, parent) = (w.xid, w.info.parent);
+        let (x, y) = (self.pointer_root.0 as i32 - gx.round() as i32, self.pointer_root.1 as i32 - gy.round() as i32);
+        let _ = self.conn.configure_window(xid, &xproto::ConfigureWindowAux::new().x(x).y(y));
+        let _ = self.conn.flush();
+        // Kept on its window from now on (placed again there when the window moves).
+        let origin = self.windows.get(&parent).and_then(|p| self.conn.translate_coordinates(p.xid, self.root, 0, 0).ok()?.reply().ok());
+        if let (Some(o), Some(w)) = (origin, self.windows.get_mut(&wid)) {
+            w.moved_to = Some(((x - o.dst_x as i32) as f32, (y - o.dst_y as i32) as f32));
+        }
     }
 
     fn button(&mut self, wid: u32, xb: u8, down: bool, px: f64, py: f64) {
@@ -2525,6 +2564,10 @@ impl App {
                 self.mac_drag = None;
                 self.move_ready = false;
                 self.end_selection();
+                // The end of a popup's drag: the Mac let go of its press when it began.
+                if self.popup_drag.take().is_some() {
+                    return;
+                }
             }
             self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());
         }

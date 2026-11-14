@@ -269,6 +269,9 @@ struct Win {
     /// Popup geometry changes wait a moment (see adopt_mac_size).
     popup_wait: bool,
     popup_settled: bool,
+    /// Where a popup was dragged to on its window (window points), kept from then on over where
+    /// the Mac has it (Quick Look, dragged by its bar: see drag_popup).
+    moved_to: Option<(f32, f32)>,
     /// A "did the Mac follow?" look (adopt_mac_size) is scheduled.
     check_pending: bool,
     /// The "Mac display" view (kind 3): letterboxed and scaled to fit, never resized on the Mac.
@@ -430,6 +433,12 @@ pub struct App {
     press_known: bool,
     /// The window Linux started moving itself (the Mac's own MOVE_STARTED for it is moot).
     moved_here: Option<u32>,
+    /// A popup being dragged here (Quick Look by its bar), and the point of it held (popup
+    /// px): desktops move windows, not popups, so the popup is placed again on each motion.
+    popup_drag: Option<(u32, f64, f64)>,
+    /// That popup's last move isn't in place yet: motion meanwhile is still measured from where
+    /// it was, and would move it twice.
+    popup_drag_pending: bool,
     /// A pointer button handled locally (traffic light, resize edge): swallow its release.
     local_press: Option<u32>,
     /// Showing a resize cursor over a window edge instead of the Mac cursor.
@@ -580,6 +589,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         press_time: Instant::now(),
         press_known: false,
         moved_here: None,
+        popup_drag: None,
+        popup_drag_pending: false,
         local_press: None,
         edge_cursor: false,
         scale,
@@ -851,8 +862,10 @@ impl App {
                 if self.left_down != Some(wid) {
                     log::warn!("window {wid}: title-bar drag reported after the button was released: not moved");
                 } else if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
-                    if let Role::Toplevel(t) = &w.role {
-                        t.move_(seat, self.press_serial);
+                    match &w.role {
+                        Role::Toplevel(t) => t.move_(seat, self.press_serial),
+                        // A popup (Quick Look) is moved here, from where the pointer is now.
+                        Role::Popup(_) => self.popup_drag = Some((wid, self.pointer_at.1, self.pointer_at.2)),
                     }
                 }
             }
@@ -1153,6 +1166,7 @@ impl App {
                 fit: (1.0, 0.0, 0.0),
                 settling: None,
                 popup_settled: false,
+                moved_to: None,
             },
         );
         if !is_popup {
@@ -1457,7 +1471,7 @@ impl App {
             Role::Popup(p) => {
                 let pos = XdgPositioner::new(&self.xdg).expect("positioner");
                 pos.set_size(mac.0.max(1) as i32, mac.1.max(1) as i32);
-                let (x, y) = parent_size.map_or((w.info.rel_x, w.info.rel_y), |(pw, ph)| w.info.spot_on(pw, ph));
+                let (x, y) = w.moved_to.unwrap_or_else(|| parent_size.map_or((w.info.rel_x, w.info.rel_y), |(pw, ph)| w.info.spot_on(pw, ph)));
                 pos.set_anchor_rect(x.round() as i32, y.round() as i32, 1, 1);
                 pos.set_anchor(xdg_positioner::Anchor::TopLeft);
                 pos.set_gravity(xdg_positioner::Gravity::BottomRight);
@@ -2122,8 +2136,11 @@ impl App {
     fn move_here(&mut self, wid: u32) {
         self.move_ready = false;
         let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) else { return };
-        let Role::Toplevel(t) = &w.role else { return };
-        t.move_(seat, self.press_serial);
+        match &w.role {
+            Role::Toplevel(t) => t.move_(seat, self.press_serial),
+            // Moved here, by the pointer's motion (drag_popup), from the point pressed.
+            Role::Popup(_) => self.popup_drag = Some((wid, self.press_at.0, self.press_at.1)),
+        }
         self.left_down = None;
         self.mac_drag = None;
         self.moved_here = Some(wid);
@@ -2132,6 +2149,28 @@ impl App {
         log::debug!("window {wid}: move started {:.0} ms after the press, {:+.0},{:+.0} px from it ({})",
                     self.press_time.elapsed().as_secs_f64() * 1000.0, x - self.press_at.0, y - self.press_at.1,
                     if self.press_known { "a spot known from the hover" } else { "on the Mac's answer to the press" });
+    }
+
+    /// A popup dragged by (dx, dy) logical px: placed that much further along on its window.
+    fn drag_popup(&mut self, wid: u32, dx: f64, dy: f64) {
+        let parent_size = self.windows.get(&wid).and_then(|w| self.windows.get(&w.info.parent)).map(|p| (p.info.w, p.info.h));
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        let Role::Popup(p) = &w.role else { return };
+        let (x, y) = w.moved_to.unwrap_or_else(|| parent_size.map_or((w.info.rel_x, w.info.rel_y), |(pw, ph)| w.info.spot_on(pw, ph)));
+        let to = ((x as f64 + dx).round() as f32, (y as f64 + dy).round() as f32);
+        if Some(to) == w.moved_to {
+            return;
+        }
+        w.moved_to = Some(to);
+        let pos = XdgPositioner::new(&self.xdg).expect("positioner");
+        pos.set_size(w.size.0.max(1) as i32, w.size.1.max(1) as i32);
+        pos.set_anchor_rect(to.0 as i32, to.1 as i32, 1, 1);
+        pos.set_anchor(xdg_positioner::Anchor::TopLeft);
+        pos.set_gravity(xdg_positioner::Gravity::BottomRight);
+        pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);
+        p.reposition(&pos, 0);
+        w.base().commit();
+        self.popup_drag_pending = true;
     }
 
     /// A file drag started in a Mac window and the pointer (button still down) has left it:
@@ -3258,6 +3297,9 @@ impl WindowHandler for App {
 impl PopupHandler for App {
     fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, popup: &Popup, cfg: PopupConfigure) {
         let Some(wid) = self.wid_for(popup.wl_surface()) else { return };
+        if self.popup_drag.is_some_and(|d| d.0 == wid) {
+            self.popup_drag_pending = false;
+        }
         let Some(w) = self.windows.get_mut(&wid) else { return };
         w.configured = true;
         w.size = (cfg.width.max(1) as u32, cfg.height.max(1) as u32);
@@ -3346,6 +3388,12 @@ impl PointerHandler for App {
                         // its tiling menu, which then takes every click until it's dismissed.
                         continue;
                     }
+                    if let Some((dw, gx, gy)) = self.popup_drag {
+                        if dw == wid && !self.popup_drag_pending {
+                            self.drag_popup(wid, e.position.0 - gx, e.position.1 - gy);
+                        }
+                        continue;
+                    }
                     if self.move_ready && self.left_down == Some(wid) && self.moved_enough(e.position.0, e.position.1) {
                         self.move_here(wid);
                         continue;
@@ -3421,6 +3469,10 @@ impl PointerHandler for App {
                         self.mac_drag = None;
                         self.move_ready = false;
                         self.end_selection();
+                        // The end of a popup's drag: the Mac let go of its press when it began.
+                        if self.popup_drag.take().is_some() {
+                            continue;
+                        }
                     }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(0).finish());
                 }

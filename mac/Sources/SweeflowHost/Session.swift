@@ -805,13 +805,13 @@ final class Session {
 
     /// Whether `p` is in the window's title-bar strip: the band the traffic lights sit centred
     /// in (the title bar, or the toolbar merged with it). A floating panel without them (a
-    /// reminder) is moved by any bare part of it. Not a popup (menus don't move).
+    /// reminder, Quick Look) is moved by any bare part of it. Not a menu (see movable).
     private func inTitleStrip(_ wid: UInt32, at p: CGPoint) -> Bool {
-        guard let win = tracker.windows[wid], win.kind != .popup else { return false }
+        guard let win = tracker.windows[wid], Self.movable(win) else { return false }
         let strip: CGFloat
         if let button = sentButtons[wid]?.first(where: { $0 != .zero }) {
             strip = button.minY + button.maxY + 2
-        } else if win.kind == .dialog {
+        } else if win.kind == .dialog || win.kind == .popup {
             strip = win.frame.height
         } else {
             return false
@@ -941,8 +941,14 @@ final class Session {
         log("window \(wid): moved by Linux from the press")
     }
 
+    /// Whether a press can move the window: not a menu, but a floating panel shown attached on
+    /// Linux (Quick Look), which Linux moves itself there (a popup to its desktop).
+    static func movable(_ win: TrackedWindow) -> Bool {
+        win.kind != .popup || (1..<24).contains(win.layer)
+    }
+
     private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
-        guard let win = tracker.windows[wid], win.kind != .popup else { return }
+        guard let win = tracker.windows[wid], Self.movable(win) else { return }
         if buttonDown || gesture?.wid != wid {
             // Where the window is as the press lands: the tracker's frame when its last look is
             // recent, else the first look from here (see checkGesture) says. Not asked on this
