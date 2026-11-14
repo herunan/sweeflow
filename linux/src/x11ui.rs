@@ -390,6 +390,8 @@ pub struct App {
     xi_pointer: Option<u16>,
     /// The keyboard is ours (see sync_keyboard_grab).
     kb_grabbed: bool,
+    /// The keyboard was let go for the desktop's own menu (Super+Space): not taken back until then.
+    grab_hold_off: Option<std::time::Instant>,
     /// A drag from Linux over a Mac window, or being dropped on one.
     xdnd_in: Option<XdndIn>,
     /// A Mac file drag carried on outside its window.
@@ -520,6 +522,7 @@ impl App {
             drag_spot: None,
             xi_pointer: None,
             kb_grabbed: false,
+            grab_hold_off: None,
             xdnd_in: None,
             xdnd_out: None,
             drag_count: 1,
@@ -2620,7 +2623,8 @@ impl App {
     /// the pointer elsewhere (the panel, another window) the keyboard is let go: the panel's
     /// menus, which need it, open, and Alt+Tab works.
     fn sync_keyboard_grab(&mut self) {
-        let want = self.kb_focus.zip(self.pointer_focus).and_then(|(f, _)| self.windows.get(&f).map(|w| w.xid));
+        let held_off = self.grab_hold_off.is_some_and(|t| t > std::time::Instant::now());
+        let want = self.kb_focus.zip(self.pointer_focus).and_then(|(f, _)| self.windows.get(&f).map(|w| w.xid)).filter(|_| !held_off);
         match (want, self.kb_grabbed) {
             (Some(xid), false) => {
                 let r = self
@@ -2722,6 +2726,10 @@ impl App {
             return;
         }
         if code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
+            // The desktop's menu takes the keyboard to open: let it go first (the focus moving
+            // there then releases the Mac's keys, see focus_out).
+            self.grab_hold_off = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+            self.sync_keyboard_grab();
             crate::ui::open_search();
             self.swallowed.push(code);
             return;

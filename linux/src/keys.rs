@@ -132,7 +132,7 @@ impl Keys {
     }
 }
 
-fn desktop() -> String {
+pub(crate) fn desktop() -> String {
     std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
 }
 

@@ -2837,11 +2837,19 @@ pub(crate) fn switch_windows(reverse: bool) {
 /// Cmd+Space: Linux's search (KRunner), not the Mac's Spotlight, wherever the focus is.
 pub(crate) fn open_search() {
     std::thread::spawn(|| {
-        let _ = std::process::Command::new("qdbus6")
-            .args(["org.kde.krunner", "/App", "org.kde.krunner.App.toggleDisplay"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Plasma's KRunner; Cinnamon's menu (its search field has the keyboard). GNOME lets no
+        // app open its search (org.gnome.Shell.FocusSearch: access denied).
+        let mut cmd = if crate::keys::desktop().contains("Cinnamon") {
+            let mut c = std::process::Command::new("busctl");
+            c.args(["--user", "call", "org.Cinnamon", "/org/Cinnamon", "org.Cinnamon", "Eval", "s",
+                    r#"imports.ui.appletManager.getRunningInstancesForUuid("menu@cinnamon.org")[0].openMenu()"#]);
+            c
+        } else {
+            let mut c = std::process::Command::new("qdbus6");
+            c.args(["org.kde.krunner", "/App", "org.kde.krunner.App.toggleDisplay"]);
+            c
+        };
+        let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
     });
 }
 
