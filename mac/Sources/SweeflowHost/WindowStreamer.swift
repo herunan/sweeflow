@@ -65,6 +65,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var buttons: [CGRect] = []
     /// Where macOS's capture badge overlaps this window (window points), looked up per frame.
     var badgeRect: () -> CGRect? = { nil }
+    /// The buffer waiting to be encoded is the still taken as a capture starts (see prepare).
+    private var pendingStill = false
     /// The window's top-left corner as it looks without the badge (see CleanCorner).
     private lazy var cleanCorner = CleanCorner.of(wid)
     /// Whether the window server has just said the window has no badge (WindowTracker.badgeAbsent).
@@ -838,6 +840,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // Prepared only if it's encoded: a newer capture may replace it while the encoder is busy.
         pendingBuffer = pb
+        pendingStill = still
         pendingPrepared = false
         refinementsLeft = 2
         pump()
@@ -849,6 +852,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let detect: Bool, measure: Bool
         let clean: CleanCorner
         let noBadge: Bool
+        let still: Bool
     }
 
     /// And what it found, applied back on `queue`.
@@ -872,7 +876,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             buttons = found
         }
         r.dark = eraseCaptureBadge(pb, buttons: buttons, badge: p.badge, scale: p.scale, clean: p.clean, fresh: true,
-                                   noBadge: p.noBadge)
+                                   noBadge: p.noBadge, still: p.still)
         // A few radius measurements per window (not every frame) feed the shared vote.
         if p.measure { r.radiusPx = measureCornerRadius(pb, scale: p.scale) }
         r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, content: p.content)
@@ -1050,7 +1054,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let badge = badgeRect()
             prep = Prep(buttons: buttons, badge: badge, scale: scale, content: captureContent,
                         radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure,
-                        clean: cleanCorner, noBadge: badge == nil && badgeAbsent())
+                        clean: cleanCorner, noBadge: badge == nil && badgeAbsent(), still: pendingStill)
         }
         lastBuffer = pb
         lastEncodeAt = .now()
@@ -1650,6 +1654,9 @@ final class CleanCorner {
     fileprivate var known: [Bool] = []
     private var badge: CGRect?
     private var since: UInt64 = 0
+    /// Said in the log once each: the corner learnt, and pixels under the badge not known
+    /// (covered with plain background: what a logo right after the buttons loses).
+    fileprivate var saidLearnt = false, saidUnknown = false
 
     /// Whether the badge has been at `rect` for a second: only then is the rest of the corner
     /// taken as clear of it (while it moves, the capture and its position can disagree).
@@ -1669,7 +1676,7 @@ final class CleanCorner {
 /// server has just said there is no badge on the window.
 @discardableResult
 func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, scale: CGFloat,
-                       clean: CleanCorner? = nil, fresh: Bool = false, noBadge: Bool = false) -> Bool? {
+                       clean: CleanCorner? = nil, fresh: Bool = false, noBadge: Bool = false, still: Bool = false) -> Bool? {
     let rects = buttons.filter { $0.width > 0 }
     // Two places, each covered with the background around it: where the badge is, and the
     // buttons it may cover (with a margin). Not one box around both: an app that keeps its
@@ -1737,10 +1744,26 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
                 clean.known = [Bool](repeating: false, count: cornerW * cornerH)
             }
         }
+        // The still taken as a capture starts often has no badge on it yet, though the window
+        // server still lists one (a capture of the window just ended, as when this host
+        // restarts): the one look under the badge where it never moves away (Herdr's sits on
+        // its logo). Taken as clear when none of the corner has the badge's violet.
+        var stillClear = false
+        if still, fresh {
+            var violet = 0
+            for y in Swift.stride(from: 0, to: cornerH, by: 2) {
+                let row = base + y * stride
+                for x in Swift.stride(from: 0, to: cornerW, by: 2) {
+                    let (b, g, r) = (Int(row[x * 4]), Int(row[x * 4 + 1]), Int(row[x * 4 + 2]))
+                    if b > 200, (80...175).contains(r), (80...175).contains(g), b - r > 60, b - g > 60 { violet += 1 }
+                }
+            }
+            stillClear = violet < 40
+        }
         // Learnt from a fresh capture: all of the corner while there is no badge, and
         // otherwise wherever the badge (with a margin) isn't, once it has stayed put.
-        let around = badge?.insetBy(dx: -3, dy: -3)
-        if fresh, (badge == nil && noBadge) || (badge.map { clean.settled(at: $0) } ?? false) {
+        let around = stillClear ? nil : badge?.insetBy(dx: -3, dy: -3)
+        if fresh, (badge == nil && noBadge) || stillClear || (badge.map { clean.settled(at: $0) } ?? false) {
             for y in 0..<cornerH {
                 let row = base + y * stride
                 for x in 0..<cornerW where around.map({ !inPill($0, x, y) }) ?? true {
@@ -1748,6 +1771,10 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
                     for c in 0..<4 { clean.px[i * 4 + c] = row[x * 4 + c] }
                     clean.known[i] = true
                 }
+            }
+            if !clean.saidLearnt || stillClear {
+                clean.saidLearnt = true
+                log("capture badge: corner learnt \(around == nil ? "whole (no badge on it)" : "around the badge at \(badge!)")")
             }
         }
     }
@@ -1787,6 +1814,10 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
                     let i = (y * cornerW + x) * 4
                     for c in 0..<4 { p[c] = clean.px[i + c] }
                     continue
+                }
+                if pill, let clean, !clean.saidUnknown, let corner = regions.first, CGFloat(x) / scale > corner.maxX {
+                    clean.saidUnknown = true
+                    log("capture badge at \(region): what's under it past the buttons isn't known (covered plain)")
                 }
                 // The window's own shape stays: where its rounded corner is see-through (the
                 // badge can reach into it), the pixel keeps its alpha and takes the colour
