@@ -34,7 +34,7 @@ PlasmaComponents3.ItemDelegate {
             PlasmaComponents3.ToolTip.visible: hovered && row.actionTip !== ""
             PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
         }
-        PlasmaComponents3.Switch {
+        VioletSwitch {
             checked: row.on
             onToggled: {
                 row.flipped(checked);

@@ -287,7 +287,7 @@ pub fn connected_to() -> Option<SocketAddr> {
 }
 
 /// How this computer reaches a Mac at `host` ("address:port", or a name with its port), for
-/// the sign beside it: "tailscale"; "vm" (a Mac in a virtual machine on this computer: this
+/// the word beside it: "tailscale"; "vm" (a Mac in a virtual machine on this computer: this
 /// computer's own address with the VM's ports forwarded, or a VM network's bridge); "lan";
 /// "internet"; or "" (a name that doesn't say).
 pub fn route_kind(host: &str) -> &'static str {

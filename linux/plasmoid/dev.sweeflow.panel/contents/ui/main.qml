@@ -85,7 +85,7 @@ PlasmoidItem {
         return "available"
     }
     function macInk(state) {
-        return state === "streaming" || state === "paused" ? "#7c5cff" : state === "available" ? "#30a46c"
+        return state === "streaming" || state === "paused" ? root.violet : state === "available" ? "#30a46c"
             : state === "busy" || state === "locked" ? "#e8890c" : Kirigami.Theme.disabledTextColor
     }
     readonly property string activeState: { const a = linkedMacs.find(m => m.active); return a ? macStateOf(a) : "" }
@@ -105,17 +105,18 @@ PlasmoidItem {
         // Streaming to another computer (as it says on the network).
         busy: !!m.busy,
         locked: !!m.locked,
-        // How it's reached (lan, tailscale, vm, internet, or ""), at what address, and whether
-        // that's now (connected) or when it was last.
-        via: m.via || "", address: m.address || "", viaNow: !!m.viaNow,
+        // How it's reached (lan, tailscale, vm, internet, or ""), and at what address.
+        via: m.via || "", address: m.address || "",
     })))
-    readonly property var viaIcons: ({ lan: "go-home-symbolic", tailscale: "network-vpn-symbolic", vm: "computer-symbolic", internet: "globe-symbolic" })
-    // The hover words for how a Mac is reached ("Over Tailscale · 100.64.0.3").
-    function viaTip(m) {
-        const way = ({ lan: "over the local network", tailscale: "over Tailscale", vm: "over a virtual machine's network", internet: "over the internet" })[m.via]
-        if (!way) return ""
-        const words = m.viaNow ? way.charAt(0).toUpperCase() + way.slice(1) : "Last reached " + way
-        return m.address ? words + " · " + m.address : words
+    // Sweeflow's violet: every highlight, and the streaming dot.
+    readonly property color violet: "#8b5cf6"
+    readonly property var viaWords: ({ lan: "Local", tailscale: "Remote", vm: "VM", internet: "Remote" })
+    // How a Mac is reached, in a few words: "Remote: 100.64.0.3".
+    function viaLine(m) {
+        const word = root.viaWords[m.via]
+        if (!word) return ""
+        const where = m.address
+        return where.trim() ? word + ": " + where.trim() : word
     }
     readonly property var activeMac: linkedMacs.find(m => m.active) || null
     readonly property var linkedMacs: JSON.parse(macsJson)
@@ -181,18 +182,16 @@ PlasmoidItem {
         }
     }
 
-    component ViaSign: Kirigami.Icon {
-        // How a Mac is reached, as a small icon that says it on hover.
+    component ViaSign: PlasmaComponents3.Label {
+        // How a Mac is reached, after its status: "· Local: 192.168.1.20", "· Remote:
+        // 100.64.0.3", "· VM: 127.0.0.1" (no dot with no status before it).
         property var info: null
-        visible: !!info && info.via !== ""
-        source: info ? root.viaIcons[info.via] || "" : ""
-        Layout.preferredWidth: Kirigami.Units.iconSizes.small
-        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+        property bool lead: true
+        visible: text !== ""
+        text: { const l = info ? root.viaLine(info) : ""; return l && lead ? "· " + l : l }
+        font: Kirigami.Theme.smallFont
         opacity: 0.7
-        MouseArea { id: viaHover; anchors.fill: parent; hoverEnabled: true }
-        PlasmaComponents3.ToolTip.text: info ? root.viaTip(info) : ""
-        PlasmaComponents3.ToolTip.visible: viaHover.containsMouse && PlasmaComponents3.ToolTip.text !== ""
-        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+        elide: Text.ElideRight
     }
     // A streaming action as its sign, the way a player shows them. Its name stays as the text
     // (for screen readers) and is said on hover.
@@ -244,10 +243,10 @@ PlasmoidItem {
         // every desktop (look.rs), instead of Plasma's accent.
         Kirigami.Theme.inherit: false
         Kirigami.Theme.colorSet: Kirigami.Theme.Window
-        Kirigami.Theme.highlightColor: "#8b5cf6"
-        Kirigami.Theme.focusColor: "#8b5cf6"
-        Kirigami.Theme.hoverColor: "#a78bfa"
-        Kirigami.Theme.linkColor: "#a78bfa"
+        Kirigami.Theme.highlightColor: root.violet
+        Kirigami.Theme.focusColor: root.violet
+        Kirigami.Theme.hoverColor: root.violet
+        Kirigami.Theme.linkColor: root.violet
         Layout.preferredWidth: Kirigami.Units.gridUnit * 24
         Layout.preferredHeight: Kirigami.Units.gridUnit * 32
         collapseMarginsHint: true
@@ -301,8 +300,7 @@ PlasmoidItem {
                             elide: Text.ElideRight
                             Layout.minimumWidth: 0
                         }
-                        ViaSign { info: root.activeMac }
-                        Item { Layout.fillWidth: true }
+                        ViaSign { info: root.activeMac; Layout.fillWidth: true }
                     }
                 }
                 // What can be done in this state, as signs at the right of the name.
@@ -353,7 +351,7 @@ PlasmoidItem {
                                         implicitWidth: Math.max(Kirigami.Units.gridUnit * 2.6, keyText.implicitWidth + Kirigami.Units.largeSpacing)
                                         implicitHeight: keyText.implicitHeight + Kirigami.Units.smallSpacing
                                         radius: Kirigami.Units.cornerRadius
-                                        color: Qt.alpha(Kirigami.Theme.textColor, 0.1)
+                                        color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.1)
                                         // A shortcut the user removed: none.
                                         PlasmaComponents3.Label { id: keyText; anchors.centerIn: parent; text: modelData[0] || "none"; opacity: modelData[0] ? 1 : 0.6 }
                                     }
@@ -393,6 +391,19 @@ PlasmoidItem {
             PlasmaComponents3.TabBar {
                 id: tabs
                 Layout.fillWidth: true
+                // The current tab's underline in Sweeflow's violet (Plasma's theme draws its own
+                // in the desktop's highlight colour).
+                Component.onCompleted: contentItem.highlight = violetTab
+                Component {
+                    id: violetTab
+                    Item {
+                        Rectangle {
+                            anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+                            height: 2
+                            color: root.violet
+                        }
+                    }
+                }
                 PlasmaComponents3.TabButton {
                     readonly property int count: root.allApps.length
                     text: count ? "Apps (" + count + ")" : "Apps"
@@ -435,6 +446,7 @@ PlasmoidItem {
                     Layout.fillWidth: true
                     Layout.margins: Kirigami.Units.smallSpacing
                     placeholderText: "Search apps"
+                    background: FieldFrame { control: search }
                     // Ready to type into whenever the tab opens.
                     onVisibleChanged: if (visible) forceActiveFocus()
                 }
@@ -499,7 +511,7 @@ PlasmoidItem {
                                         PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
-                                    PlasmaComponents3.Switch {
+                                    VioletSwitch {
                                         checked: appRow.shown
                                         onToggled: {
                                             const exclude = (root.settings.exclude || []).filter(b => b !== appRow.modelData.id);
@@ -691,14 +703,13 @@ PlasmoidItem {
                                                 border.color: ink
                                             }
                                             PlasmaComponents3.Label {
-                                                text: ({ streaming: "Streaming", paused: "Paused", available: "Available", offline: "Not online", locked: "Locked", busy: "Busy · streaming elsewhere" })[nameCol.macState] || ""
+                                                text: ({ streaming: "Streaming", paused: "Paused", available: "Available", offline: "Not online", locked: "Locked", busy: "Streaming elsewhere" })[nameCol.macState] || ""
                                                 font: Kirigami.Theme.smallFont
                                                 opacity: 0.7
                                                 elide: Text.ElideRight
                                                 Layout.minimumWidth: 0
                                             }
-                                            ViaSign { info: mac.modelData }
-                                            Item { Layout.fillWidth: true }
+                                            ViaSign { info: mac.modelData; lead: nameCol.macState !== ""; Layout.fillWidth: true }
                                         }
                                     }
                                     Repeater {
@@ -740,6 +751,7 @@ PlasmoidItem {
                                     PlasmaComponents3.TextField {
                                         id: field
                                         Layout.fillWidth: true
+                                        background: FieldFrame { control: field }
                                         onAccepted: mac.save()
                                         Keys.onEscapePressed: root.editingMac = ""
                                         onVisibleChanged: if (visible) {

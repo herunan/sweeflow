@@ -38,8 +38,13 @@ impl Default for Look {
     }
 }
 
-/// This desktop's look.
+/// This desktop's look, with Sweeflow's violet for every highlight whatever the desktop's own
+/// accent (one colour across the widget, its window and the Mac's states).
 pub fn detect() -> Look {
+    Look { accent: Look::default().accent, on_accent: Look::default().on_accent, ..desktop_look() }
+}
+
+fn desktop_look() -> Look {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let hyprland = desktop.contains("Hyprland") || std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some();
     if hyprland {

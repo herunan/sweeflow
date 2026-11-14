@@ -512,8 +512,8 @@ fn text_width(text: &str) -> f32 {
 /// (name, colour, a ring): violet streaming (a ring paused), green available, orange busy or
 /// locked, a grey ring not online or not known. Installed as named icons (setup::write_icons).
 pub const STATE_DOTS: [(&str, &str, bool); 5] = [
-    ("sweeflow-dot-streaming", "#7c5cff", false),
-    ("sweeflow-dot-paused", "#7c5cff", true),
+    ("sweeflow-dot-streaming", "#8b5cf6", false),
+    ("sweeflow-dot-paused", "#8b5cf6", true),
     ("sweeflow-dot-available", "#30a46c", false),
     ("sweeflow-dot-busy", "#e8890c", false),
     ("sweeflow-dot-offline", "#9a96a3", true),
@@ -525,7 +525,7 @@ fn state_dot(status: &str) -> &'static str {
         "Streaming" => STATE_DOTS[0].0,
         "Paused" => STATE_DOTS[1].0,
         "Available" => STATE_DOTS[2].0,
-        s if s.starts_with("Busy") || s == "Locked" => STATE_DOTS[3].0,
+        "Streaming elsewhere" | "Locked" => STATE_DOTS[3].0,
         _ => STATE_DOTS[4].0,
     }
 }
@@ -634,11 +634,11 @@ pub struct Standing<'a> {
 /// window): without the name, which only repeated it.
 pub fn status_short(s: Standing) -> String {
     if let Standing { stopped: false, elsewhere: Some(_), .. } = s {
-        return "Busy · streaming elsewhere".into();
+        return "Streaming elsewhere".into();
     }
     // The same words as the Mac's line in the list of Macs.
     match s {
-        Standing { stopped: true, online: Some(true), elsewhere: Some(_), .. } => "Busy · streaming elsewhere",
+        Standing { stopped: true, online: Some(true), elsewhere: Some(_), .. } => "Streaming elsewhere",
         Standing { stopped: true, online: Some(true), locked: true, .. } => "Locked",
         Standing { stopped: true, online: Some(true), .. } => "Available",
         Standing { stopped: true, online: Some(false), .. } => "Not online",
@@ -791,8 +791,7 @@ pub fn panel_state() -> serde_json::Value {
                                 // How it's reached (net::route_kind) and at what address: where it
                                 // is connected now for the Mac in use, else where it was last.
                                 "via": crate::net::route_kind(&reached(m, &cfg.host_fingerprint)),
-                                "address": address_only(&reached(m, &cfg.host_fingerprint)),
-                                "viaNow": m.fingerprint == cfg.host_fingerprint && crate::net::connected_to().is_some() })
+                                "address": address_only(&reached(m, &cfg.host_fingerprint)) })
         })
         .collect();
     let mac_name = mac_name(&state, &cfg);
@@ -1200,7 +1199,7 @@ mod tests {
         assert_eq!(status_line("Studio", stopped), "Stopped · Studio");
         let elsewhere = Standing { elsewhere: Some("workstation"), online: Some(true), ..Default::default() };
         assert_eq!(status_line("Studio", elsewhere), "Studio is busy · streaming elsewhere");
-        assert_eq!(status_short(elsewhere), "Busy · streaming elsewhere");
+        assert_eq!(status_short(elsewhere), "Streaming elsewhere");
 
         let waiting = Standing { enabled: true, online: Some(false), ..Default::default() };
         assert_eq!(status_line("Studio", waiting), "Waiting for Studio · not online");
