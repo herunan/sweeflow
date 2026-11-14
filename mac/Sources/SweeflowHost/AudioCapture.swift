@@ -13,6 +13,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var apps: Set<String> = []
     private var timer: DispatchSourceTimer?
     private var stopped = false
+    /// Failed starts in a row (for the wait before the next try).
+    private var failures = 0
     private var peak: Float = 0
     private var lastLevelLog = Date()
 
@@ -82,15 +84,22 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 self.stream = s
                 s.startCapture { [weak self] err in
-                    guard let err else { return log("audio capture: \(ids.sorted())") }
+                    guard let err else {
+                        self?.queue.async { self?.failures = 0 }
+                        return log("audio capture: \(ids.sorted())")
+                    }
                     // Most often while the virtual display is being set up or changing. The failed
                     // stream was kept and never started again: no Mac sound for the whole session.
-                    log("audio capture failed: \(err.localizedDescription); trying again in 2 s")
                     self?.queue.async {
                         guard let self, self.stream === s else { return }
+                        // 2 s, then less and less often, to once a minute (a Mac with no sound
+                        // device fails every time).
+                        let wait = min(60.0, 2.0 * pow(2.0, Double(self.failures)))
+                        self.failures += 1
+                        log("audio capture failed: \(err.localizedDescription); trying again in \(Int(wait)) s")
                         self.stream = nil
                         self.apps = []
-                        self.queue.asyncAfter(deadline: .now() + 2) { self.refresh() }
+                        self.queue.asyncAfter(deadline: .now() + wait) { self.refresh() }
                     }
                 }
             }

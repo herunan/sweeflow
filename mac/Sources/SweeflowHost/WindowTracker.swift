@@ -424,9 +424,18 @@ final class WindowTracker {
             popupMax[p.wid] = CGSize(width: max(big.width, p.frame.width), height: max(big.height, p.frame.height))
             let near = owners.filter { $0.pid == p.pid && $0.frame.insetBy(dx: -40, dy: -40).intersects(p.frame) }
             // Prefer a panel (drawn above its app's windows), then the frontmost window.
-            guard let parent = near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
+            // A floating panel (Quick Look's) belongs to the app's frontmost window, the one it
+            // was opened from: by overlap on this display it went to whichever window it happened
+            // to lie over there, a column away on Linux. Not lying wholly on that window (macOS
+            // centres the panel on the display), it's shown centred on it.
+            let panel = (1..<24).contains(p.layer)
+            guard let parent = (panel ? frontToplevel[p.pid] : nil) ?? near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
             p.parent = parent.wid
             p.rel = CGPoint(x: p.frame.minX - parent.frame.minX, y: p.frame.minY - parent.frame.minY)
+            if panel, !parent.frame.contains(p.frame) {
+                p.rel = CGPoint(x: ((parent.frame.width - p.frame.width) / 2).rounded(),
+                                y: max(0, ((parent.frame.height - p.frame.height) / 3).rounded()))
+            }
             seen[p.wid] = p
             order.append(p.wid)
         }
