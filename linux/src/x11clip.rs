@@ -148,7 +148,10 @@ fn run(conn: RustConnection, screen: usize, rx: mpsc::Receiver<Offers>, net: Unb
                         atoms.push(conn.intern_atom(false, m.as_bytes())?.reply()?.atom);
                     }
                     conn.change_property32(PropMode::REPLACE, req.requestor, property, a.atom, &atoms)?;
-                } else if let Some(data) = offers.get(&name_of(req.target, &conn)).cloned() {
+                } else if let Some(data) = offers.get(&name_of(req.target, &conn)).cloned().filter(|_| {
+                    // The Mac's files, pasted: fetched first (this thread waits for them).
+                    crate::clipboard::wait_for_files(&name_of(req.target, &conn))
+                }) {
                     if data.len() > CHUNK {
                         // In parts: INCR with the size, then a piece each time the requestor
                         // deletes the property.

@@ -1,7 +1,12 @@
 //! Shared clipboard with the Mac: text, images and files, both ways.
 //!
 //! Wire format (on the clipboard stream): u16 n, then n × (str kind, str name, bytes data), with
-//! kind `text/plain;charset=utf-8`, `image/png` or `file`.
+//! kind `text/plain;charset=utf-8`, `image/png`, `file` or `file-ref`.
+//!
+//! Files copied on the Mac come as `file-ref`s: their names only (data: the copy's number, u32
+//! LE). They're fetched from the Mac when an app here pastes them (see `wait_for_files`): read
+//! on the Mac at every copy, a file in iCloud Drive, Documents, Desktop or Downloads made macOS
+//! ask whether Sweeflow may, whether it was pasted here or not.
 
 use std::{
     collections::HashMap,
@@ -17,6 +22,8 @@ use crate::proto::{t, R, W};
 pub const TEXT: &str = "text/plain;charset=utf-8";
 pub const PNG: &str = "image/png";
 pub const FILE: &str = "file";
+/// A file named only, fetched when it's pasted.
+pub const FILE_REF: &str = "file-ref";
 /// A web link (drops only).
 pub const URL: &str = "url";
 
@@ -49,6 +56,28 @@ pub fn decode(body: &[u8]) -> Result<Vec<ClipItem>> {
 /// them) and are offered as URIs, so they only appear where you paste or drop them.
 pub fn offers_for(items: &[ClipItem], area: &str) -> HashMap<String, Arc<Vec<u8>>> {
     let mut out: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+    let refs: Vec<&ClipItem> = items.iter().filter(|i| i.kind == FILE_REF).collect();
+    if area == "clipboard" {
+        *PENDING.0.lock().unwrap() = None;
+    }
+    if let Some(first) = refs.first() {
+        // Where they'll be once fetched: the list can be given before they're there.
+        let number = first.data.get(..4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if let Some(dir) = fresh_cache_dir(area) {
+            let names: Vec<String> = refs
+                .iter()
+                .filter_map(|i| std::path::Path::new(&i.name).file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            let uris: Vec<String> =
+                names.iter().map(|n| format!("file://{}", uri_escape(&dir.join(n).to_string_lossy()))).collect();
+            out.insert("text/uri-list".into(), Arc::new(format!("{}\r\n", uris.join("\r\n")).into_bytes()));
+            out.insert("x-special/gnome-copied-files".into(), Arc::new(format!("copy\n{}", uris.join("\n")).into_bytes()));
+            // KDE's clipboard history reads every file list as it's copied, which would fetch
+            // them all: it leaves alone what is marked as a secret.
+            out.insert("x-kde-passwordManagerHint".into(), Arc::new(b"secret".to_vec()));
+            *PENDING.0.lock().unwrap() = Some(Pending { number, dir, state: Fetch::NotAsked });
+        }
+    }
     let has_files = items.iter().any(|i| i.kind == FILE);
     let dir = if has_files { fresh_cache_dir(area) } else { None };
     let files: Vec<PathBuf> =
@@ -70,6 +99,79 @@ pub fn offers_for(items: &[ClipItem], area: &str) -> HashMap<String, Arc<Vec<u8>
         }
     }
     out
+}
+
+/// The Mac's files on the clipboard here, not fetched yet.
+struct Pending {
+    number: u32,
+    dir: PathBuf,
+    state: Fetch,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Fetch {
+    NotAsked,
+    Asked,
+    Here,
+    Failed,
+}
+
+static PENDING: (std::sync::Mutex<Option<Pending>>, std::sync::Condvar) = (std::sync::Mutex::new(None), std::sync::Condvar::new());
+/// Sends a message on the clipboard stream (set while connected).
+static CLIP_STREAM: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> = std::sync::Mutex::new(None);
+
+pub fn set_clip_stream(tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>) {
+    *CLIP_STREAM.lock().unwrap() = tx;
+}
+
+/// Before a paste of `mime` is answered: if it's a list of the Mac's files not fetched yet,
+/// fetches them and waits (blocking; up to two minutes). False: they couldn't be had.
+pub fn wait_for_files(mime: &str) -> bool {
+    if mime != "text/uri-list" && mime != "x-special/gnome-copied-files" {
+        return true;
+    }
+    let (lock, ready) = &PENDING;
+    let mut p = lock.lock().unwrap();
+    let Some(number) = p.as_ref().map(|p| p.number) else { return true };
+    if p.as_ref().is_some_and(|p| p.state == Fetch::NotAsked) {
+        let sent = CLIP_STREAM.lock().unwrap().as_ref().is_some_and(|tx| tx.send(W::new(t::CLIP_FETCH).u32(number).finish()).is_ok());
+        log::info!("clipboard: the Mac's files pasted here: fetching them");
+        if let Some(p) = p.as_mut() {
+            p.state = if sent { Fetch::Asked } else { Fetch::Failed };
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match p.as_ref() {
+            Some(q) if q.number == number && q.state == Fetch::Asked => {}
+            Some(q) if q.number == number => return q.state == Fetch::Here,
+            _ => return false, // another copy since
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            log::warn!("clipboard: the Mac's files didn't come in time");
+            return false;
+        }
+        p = ready.wait_timeout(p, left).unwrap().0;
+    }
+}
+
+/// The Mac's answer to a fetch (CLIP_FILES): the files saved where their list said.
+pub fn files_arrived(body: &[u8]) {
+    let mut r = R::new(body);
+    let Ok(number) = r.u32() else { return };
+    let items = decode(&body[4..]).unwrap_or_default();
+    let (lock, ready) = &PENDING;
+    let dir = match lock.lock().unwrap().as_ref() {
+        Some(p) if p.number == number => p.dir.clone(),
+        _ => return,
+    };
+    let saved = items.iter().filter(|i| i.kind == FILE).filter(|i| save_to(&dir, i).is_some()).count();
+    log::info!("clipboard: {saved} of the Mac's files here");
+    if let Some(p) = lock.lock().unwrap().as_mut().filter(|p| p.number == number) {
+        p.state = if saved > 0 { Fetch::Here } else { Fetch::Failed };
+    }
+    ready.notify_all();
 }
 
 /// ~/.cache/sweeflow/<area>/<n>: a new directory per copy or drag. Older ones are removed once
@@ -283,6 +385,36 @@ mod tests {
         assert_eq!(back[0].data, "héllo".as_bytes());
         assert_eq!(back[1].name, "a b.pdf");
         assert_eq!(back[1].data, vec![0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn mac_files_are_fetched_only_when_pasted() {
+        let cache = std::env::temp_dir().join(format!("sweeflow-test-{}", std::process::id()));
+        // SAFETY: the only test that reads or sets it.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &cache) };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        set_clip_stream(Some(tx));
+        let tag = 7u32.to_le_bytes().to_vec();
+        let offers = offers_for(&[ClipItem { kind: FILE_REF.into(), name: "a b.txt".into(), data: tag }], "clipboard");
+        let uris = String::from_utf8(offers["text/uri-list"].to_vec()).unwrap();
+        let path = uri_unescape(uris.trim().strip_prefix("file://").unwrap());
+        assert!(!std::path::Path::new(&path).exists(), "not fetched at the copy");
+        assert!(rx.try_recv().is_err(), "nothing asked at the copy");
+        assert!(wait_for_files("image/png"), "other types don't wait");
+        let paste = std::thread::spawn(|| wait_for_files("text/uri-list"));
+        // The Mac answers the fetch.
+        let ask = loop {
+            if let Ok(m) = rx.try_recv() { break m; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(ask[4], t::CLIP_FETCH);
+        let mut answer = 7u32.to_le_bytes().to_vec();
+        answer.extend_from_slice(&encode(&[ClipItem { kind: FILE.into(), name: "a b.txt".into(), data: b"hi".to_vec() }])[5..]);
+        files_arrived(&answer);
+        assert!(paste.join().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"hi");
+        set_clip_stream(None);
+        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]

@@ -960,6 +960,11 @@ async fn session(
         let ui3 = ui.clone();
         let task = tokio::spawn(async move {
             while let Ok(Some((ty, body))) = proto::read_msg(&mut crx).await {
+                if ty == t::CLIP_FILES {
+                    // The Mac's clipboard files, being pasted here (see clipboard::wait_for_files).
+                    let _ = tokio::task::spawn_blocking(move || crate::clipboard::files_arrived(&body)).await;
+                    continue;
+                }
                 if ty == t::DRAG_DATA {
                     // The dragged Mac files: save them, hand the UI a URI list.
                     let parsed = crate::clipboard::decode(&body);
@@ -985,7 +990,19 @@ async fn session(
                 }
             }
         });
-        (Arc::new(tokio::sync::Mutex::new(ctx)), task)
+        let ctx = Arc::new(tokio::sync::Mutex::new(ctx));
+        // Messages from the clipboard code (a paste fetching the Mac's files).
+        let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        crate::clipboard::set_clip_stream(Some(ftx));
+        let out = ctx.clone();
+        tokio::spawn(async move {
+            while let Some(m) = frx.recv().await {
+                if out.lock().await.write_all(&m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (ctx, task)
     };
 
     let mut video: HashMap<u32, (quinn::SendStream, tokio::task::JoinHandle<()>)> = HashMap::new();

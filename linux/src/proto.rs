@@ -79,6 +79,10 @@ pub mod t {
     pub const DRAG_FETCH: u8 = 0x49;
     pub const DRAG_DATA: u8 = 0x4A;
     pub const DRAG_DROP_LOCAL: u8 = 0x4B;
+    /// C→S u32 n: the files of the Mac's clipboard copy n are being pasted here.
+    pub const CLIP_FETCH: u8 = 0x4C;
+    /// S→C u32 n, then a clipboard item list: them (empty: gone or unreadable).
+    pub const CLIP_FILES: u8 = 0x4D;
     pub const PONG: u8 = 0x42;
     pub const SUBSCRIBE: u8 = 0x50;
     pub const FRAME: u8 = 0x51;

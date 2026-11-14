@@ -31,6 +31,10 @@ enum Msg: UInt8 {
     case addresses = 0x36
     case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
+    /// From Linux: u32 n — the files of clipboard copy n (told as `file-ref` items) are being
+    /// pasted. To Linux: u32 n, u16 count, count × (str kind, str name, bytes data) — them (none:
+    /// the clipboard has changed since, or they couldn't be read).
+    case clipFetch = 0x4C, clipFiles = 0x4D
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55
     case audioSubscribe = 0x60, audio = 0x61
     // Linking listener only (see Pairing.swift): a request, this Mac's share (its code is up), the

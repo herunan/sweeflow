@@ -318,6 +318,19 @@ final class Session {
                     }
                 }
             }
+        case .clipFetch:
+            let number = try m.u32()
+            guard let sync = clipboard?.0 else { return }
+            sync.files(number) { [weak self] items in
+                self?.queue.async {
+                    var out = MsgWriter(.clipFiles)
+                    out.u32(number)
+                    out.u16(UInt16(items?.count ?? 0))
+                    for it in items ?? [] { out.str(it.kind.rawValue); out.str(it.name); out.bytes(it.data) }
+                    s.send(out)
+                    log("clipboard: pasted on Linux: \(items.map { $0.map(\.name) } ?? ["(gone)"])")
+                }
+            }
         case .dragDropLocal:
             // A drag out of one Mac window dropped on another (via Linux): drop the same files.
             let wid = try m.u32(), x = try m.f32(), y = try m.f32()
@@ -1793,7 +1806,7 @@ final class Session {
                 m.u16(UInt16(items.count))
                 for it in items { m.str(it.kind.rawValue); m.str(it.name); m.bytes(it.data) }
                 s.send(m)
-                log("clipboard to Linux: \(items.map { $0.kind == .file ? $0.name : $0.kind.rawValue })")
+                log("clipboard to Linux: \(items.map { $0.kind == .fileRef ? $0.name : $0.kind.rawValue })")
             }
         }
         sync.start()
