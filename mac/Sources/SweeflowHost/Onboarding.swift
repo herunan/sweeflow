@@ -273,8 +273,7 @@ private final class PermissionRow {
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
-        let asked = UserDefaults.standard.bool(forKey: "asked." + title)
-        button = NSButton(title: settings == nil || asked ? "Open Settings" : "Allow…", target: nil, action: nil)
+        button = NSButton(title: settings == nil ? "Open Settings" : "Allow…", target: nil, action: nil)
         button.bezelStyle = .push
         mark.font = .systemFont(ofSize: 18)
         let spacer = NSView()
@@ -295,17 +294,22 @@ private final class PermissionRow {
         button.isHidden = granted
     }
 
-    /// First press: macOS's own question (which has its own way to Settings). Pressed again, or
-    /// asked before (macOS then shows nothing): the settings page. Never both at once.
+    /// macOS is asked every time (its own question, which has its own way to Settings): that
+    /// also puts Sweeflow back in the list in Settings after it was removed there (once asked,
+    /// Sweeflow used to open Settings only, and the entry never came back). When macOS shows no
+    /// question (it was turned down before), the settings page opens instead. Never both.
     @objc private func act() {
         guard let url = settingsURL else { return onAction() }
-        let key = "asked." + title
-        if UserDefaults.standard.bool(forKey: key) {
-            NSWorkspace.shared.open(url)
-        } else {
-            UserDefaults.standard.set(true, forKey: key)
-            onAction()
-            button.title = "Open Settings"
+        onAction()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if !Self.permissionPromptShowing() { NSWorkspace.shared.open(url) }
         }
+    }
+
+    /// Whether macOS has a permission question up (screen recording, accessibility).
+    private static func permissionPromptShowing() -> Bool {
+        let owners: Set<String> = ["UserNotificationCenter", "universalAccessAuthWarn", "CoreServicesUIAgent", "SecurityAgent"]
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        return list.contains { owners.contains($0[kCGWindowOwnerName as String] as? String ?? "") }
     }
 }
