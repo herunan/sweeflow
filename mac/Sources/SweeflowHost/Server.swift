@@ -118,6 +118,18 @@ final class Server {
     /// The client certificate of the latest handshake (one client connects at a time).
     private var lastVerified: String?
 
+    /// The certificate fingerprint of the computer at the other end of a stream, from that
+    /// connection's own handshake (lastVerified is only the latest handshake of any computer,
+    /// and with several connecting or looking at once it can be another one's).
+    static func peerFingerprint(_ conn: NWConnection) -> String? {
+        guard let m = conn.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata else { return nil }
+        var leaf: Data?
+        _ = sec_protocol_metadata_access_peer_certificate_chain(m.securityProtocolMetadata) { cert in
+            if leaf == nil { leaf = SecCertificateCopyData(sec_certificate_copy_ref(cert).takeRetainedValue()) as Data }
+        }
+        return leaf.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
+    }
+
     /// Ends the connection of that client, if it's the one connected.
     func drop(_ fingerprint: String, telling msg: Msg) {
         queue.async { [weak self] in

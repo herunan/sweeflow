@@ -192,7 +192,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     /// Asks once: to use it again, it has to be linked again. The Linux machine unlinks this Mac
     /// too (now if it's connected, otherwise once it next connects or sees this Mac online).
-    private static func confirmForget(_ label: String, _ fingerprint: String) {
+    static func confirmForget(_ label: String, _ fingerprint: String) {
         let alert = NSAlert()
         alert.messageText = "Unlink \(label)?"
         alert.informativeText = "It's unlinked on \(label) too. To use it again, link it again from there."
@@ -200,6 +200,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        forget(fingerprint)
+    }
+
+    /// What Unlink does once confirmed: the computer forgotten here, and told (now if it's the one
+    /// connected, else when it next connects or sees this Mac online).
+    static func forget(_ fingerprint: String) {
         Identity.removeClient(fingerprint)
         Identity.setDisconnected(fingerprint, false)
         if host.client == fingerprint {

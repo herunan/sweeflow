@@ -482,52 +482,105 @@ async fn ask_mac(addr: SocketAddr, fingerprint: &str, ty: u8) -> Result<u8> {
     status
 }
 
-/// Fingerprints of Macs unlinked here that haven't been told yet (a line each, beside the config).
+/// Macs unlinked here that haven't been told yet: a line each, beside the config, of the
+/// fingerprint and then the places it was last known at (host:port of its streaming service).
 fn pending_file() -> std::path::PathBuf {
     crate::config::dir().join("unlink-pending")
 }
 
-pub fn pending_unlinks() -> Vec<String> {
+fn pending_entries() -> Vec<(String, Vec<String>)> {
     std::fs::read_to_string(pending_file())
         .unwrap_or_default()
         .lines()
-        .map(|l| l.trim().to_ascii_lowercase())
-        .filter(|l| l.len() == 64)
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let fp = words.next()?.to_ascii_lowercase();
+            (fp.len() == 64).then(|| (fp, words.map(str::to_string).collect()))
+        })
         .collect()
 }
 
-fn set_pending_unlinks(all: &[String]) {
-    let text: String = all.iter().map(|f| format!("{f}\n")).collect();
+pub fn pending_unlinks() -> Vec<String> {
+    pending_entries().into_iter().map(|(fp, _)| fp).collect()
+}
+
+fn set_pending_entries(all: &[(String, Vec<String>)]) {
+    let text: String = all.iter().map(|(f, places)| format!("{f} {}\n", places.join(" ")).replace(" \n", "\n")).collect();
     if let Err(e) = std::fs::write(pending_file(), text) {
         log::warn!("saving the Macs still to tell: {e}");
     }
 }
 
 fn done_unlinking(fingerprint: &str) {
-    let mut all = pending_unlinks();
-    all.retain(|f| f != fingerprint);
-    set_pending_unlinks(&all);
+    let mut all = pending_entries();
+    all.retain(|(f, _)| f != fingerprint);
+    set_pending_entries(&all);
     log::info!("told the Mac {} it was unlinked", &fingerprint[..8.min(fingerprint.len())]);
 }
 
-/// This computer unlinked `mac`: tells it (off this thread). Noted first, so that if it can't be
-/// reached now (or Sweeflow restarts meanwhile) it's told once it's next seen (`watch_links`), or
-/// when it's linked again.
+/// This computer unlinked `mac`: tells it (off this thread). Noted first, with where it was, so
+/// that if it can't be reached now (or Sweeflow restarts meanwhile, as unlinking the Mac in use
+/// does) it's told later: at those places (`tell_pending`, at start and now and then), once it's
+/// seen on the network (`watch_links`), or when it's linked again.
 pub fn tell_unlinked(mac: PairedMac) {
-    let mut all = pending_unlinks();
-    if !all.contains(&mac.fingerprint) {
-        all.push(mac.fingerprint.clone());
-        set_pending_unlinks(&all);
-    }
-    std::thread::spawn(move || {
-        let host = mac.host.rsplit_once(':').map_or(mac.host.as_str(), |(h, _)| h).trim_matches(['[', ']']);
-        let Some(addr) = (host, PAIR_PORT).to_socket_addrs().ok().and_then(|mut a| a.next()) else { return };
-        let Ok(rt) = tokio::runtime::Runtime::new() else { return };
-        match rt.block_on(ask_mac(addr, &mac.fingerprint, t::PAIR_UNLINK)) {
-            Ok(9) => done_unlinking(&mac.fingerprint),
-            other => log::info!("{} not told it was unlinked yet: {other:?}", mac.name),
+    let mut all = pending_entries();
+    all.retain(|(f, _)| *f != mac.fingerprint);
+    all.push((mac.fingerprint.clone(), crate::config::places(&mac)));
+    set_pending_entries(&all);
+    std::thread::spawn(tell_pending);
+}
+
+/// Tells each Mac still to be told that it was unlinked, at the places it was last known at
+/// (its linking port beside each).
+fn tell_pending() {
+    static BUSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_one_at_a_time) = BUSY.try_lock() else { return };
+    let Ok(rt) = tokio::runtime::Runtime::new() else { return };
+    for (fp, places) in pending_entries() {
+        let addrs = places.iter().filter_map(|p| {
+            let host = p.rsplit_once(':').map_or(p.as_str(), |(h, _)| h).trim_matches(['[', ']']);
+            (host, PAIR_PORT).to_socket_addrs().ok().and_then(|mut a| a.next())
+        });
+        let mut last = None;
+        for addr in addrs {
+            match rt.block_on(ask_mac(addr, &fp, t::PAIR_UNLINK)) {
+                Ok(9) => {
+                    done_unlinking(&fp);
+                    last = None;
+                    break;
+                }
+                other => last = Some(format!("{addr}: {other:?}")),
+            }
         }
-    });
+        if let Some(why) = last {
+            log::info!("Mac {} not told it was unlinked yet ({why})", &fp[..8]);
+        }
+    }
+}
+
+/// Asks each linked Mac this computer isn't streaming from whether it's still linked there, at
+/// its places (the first that answers); one that unlinked this computer is unlinked here too.
+fn check_links() {
+    let Ok(cfg) = Config::load_or_default() else { return };
+    let streaming = crate::net::connected_to().is_some();
+    let Ok(rt) = tokio::runtime::Runtime::new() else { return };
+    for mac in cfg.macs.iter().filter(|m| !(streaming && m.fingerprint == cfg.host_fingerprint)) {
+        let addrs = crate::config::places(mac).into_iter().filter_map(|p| {
+            let host = p.rsplit_once(':').map_or(p.as_str(), |(h, _)| h).trim_matches(['[', ']']).to_string();
+            (host.as_str(), PAIR_PORT).to_socket_addrs().ok().and_then(|mut a| a.next())
+        });
+        for addr in addrs {
+            match rt.block_on(ask_mac(addr, &mac.fingerprint, t::PAIR_CHECK)) {
+                Ok(10) => {
+                    log::info!("{} unlinked this computer: unlinking it here too", mac.name);
+                    crate::tray::mac_unlinked_us(&mac.fingerprint);
+                    break;
+                }
+                Ok(_) => break,
+                Err(_) => {}
+            }
+        }
+    }
 }
 
 /// While Sweeflow runs: whenever a Mac shows up on the network, tells it if it was unlinked here,
@@ -535,6 +588,14 @@ pub fn tell_unlinked(mac: PairedMac) {
 /// while not streaming to it): if not, it's unlinked here too. Through each Mac's linking
 /// listener, which leaves its streaming session alone.
 pub fn watch_links() {
+    // Without Bonjour (a virtual machine's network, Tailscale, the internet) no Mac is ever seen
+    // below: at start and every few minutes, Macs unlinked here are told at the places they were
+    // last known at, and linked ones asked whether this computer is still linked there.
+    std::thread::spawn(|| loop {
+        tell_pending();
+        check_links();
+        std::thread::sleep(Duration::from_secs(180));
+    });
     let (tx, rx) = std::sync::mpsc::channel::<FoundMac>();
     let browser = browse(PAIR_SERVICE, move |f| {
         if let Found::Up(m) = f {
