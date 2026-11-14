@@ -413,7 +413,10 @@ final class WindowTracker {
             // (a list that gets shorter shrinks in height only).
             if closing.contains(p.wid) { continue }
             let big = popupMax[p.wid] ?? p.frame.size
-            if p.frame.width < big.width * 0.9 && p.frame.height < big.height * 0.9 {
+            // Not a floating panel (layers 1–23): Quick Look's opens over its window and then
+            // settles to its picture's size, smaller in both directions (on macOS 26 in a VM,
+            // 810×543 to 370×399), and was taken down as closing while it stayed up.
+            if !(1..<24).contains(p.layer), p.frame.width < big.width * 0.9 && p.frame.height < big.height * 0.9 {
                 log("popup \(p.wid) (\(p.appName)) shrank from \(big) to \(p.frame.size): taken as closing")
                 closing.insert(p.wid)
                 continue
