@@ -643,6 +643,14 @@ fn highlight(rows: &[Row], keep: Option<usize>, keyboard: bool) -> Option<usize>
 /// GNOME and the desktops built on GNOME's window manager). Not on Hyprland, nor on the tiling
 /// desktops, which show a full screen window on its own (on black): there it's a window of its
 /// own, which they float and centre.
+/// The X screen's size in pixels (the root window's).
+fn x11_screen_size() -> Option<(u32, u32)> {
+    use x11rb::connection::Connection as _;
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen)?;
+    Some((root.width_in_pixels as u32, root.height_in_pixels as u32))
+}
+
 fn overlay_here(desktop: &str, hyprland: bool) -> bool {
     let desktop = desktop.to_lowercase();
     // Not GNOME: its windows get no see-through background there (the overlay came out black),
@@ -797,6 +805,14 @@ pub fn run() -> Result<()> {
     if overlay {
         // On the screen the desktop opens new windows on: the one with the pointer or the
         // focused window, on Plasma and GNOME.
+        // On X11 it's made the screen's size and place first: Cinnamon otherwise maps it small
+        // in a corner and animates it from there to full screen.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            if let Some((w, h)) = x11_screen_size() {
+                ui.window().set_position(slint::PhysicalPosition::new(0, 0));
+                ui.window().set_size(slint::PhysicalSize::new(w, h));
+            }
+        }
         ui.window().set_fullscreen(true);
     } else {
         crate::hyprland::keep_window_size();

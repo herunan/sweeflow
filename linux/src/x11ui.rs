@@ -324,6 +324,8 @@ pub struct App {
     menus: Option<Menus>,
     loop_handle: LoopHandle<'static, App>,
     net: UnboundedSender<NetCmd>,
+    /// The CLIPBOARD selection, kept on its own thread (x11clip.rs); None in the self-test.
+    clip: Option<crate::x11clip::Clipboard>,
     windows: HashMap<u32, Win>,
     by_xid: HashMap<u32, u32>,
     pending_fixed: HashMap<u32, (Option<(f32, f32)>, bool)>,
@@ -441,6 +443,7 @@ impl App {
             keysyms: (8, 0, Vec::new()),
             menus: None,
             loop_handle,
+            clip: net.clone().and_then(crate::x11clip::start),
             net: net.unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().0),
             windows: HashMap::new(),
             by_xid: HashMap::new(),
@@ -664,9 +667,10 @@ impl App {
                 }
             }
             UiEvent::ToggleMaximize(wid) => self.toggle_maximize(wid),
-            UiEvent::Clipboard(_) => {
-                // TODO(x11 phase 2): offer the Mac's clipboard as the CLIPBOARD selection.
-                log::debug!("clipboard from the Mac: not on X11 yet");
+            UiEvent::Clipboard(offers) => {
+                if let Some(c) = &self.clip {
+                    c.set(offers);
+                }
             }
             UiEvent::DragBegan { wid, names } => {
                 // TODO(x11 phase 2): continue a Mac file drag outside its window as an XDND drag.
@@ -1020,6 +1024,16 @@ impl App {
                 if let Some(spot) = spot.filter(|_| self.windows.get(&wid).is_some_and(|w| w.size != before)) {
                     self.place_at_spot(wid, spot);
                 }
+                self.draw(wid);
+                return;
+            }
+            if w.floating {
+                // A window the window manager doesn't tile (on Cinnamon, every one) follows its
+                // Mac window: one that opens small and grows (Preview zooming a picture open)
+                // grows here too. (Resizing it here asks the Mac first: `requested` above.)
+                w.size = mac;
+                let xid = w.xid;
+                self.resize_x(xid, mac);
                 self.draw(wid);
                 return;
             }

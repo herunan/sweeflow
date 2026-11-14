@@ -25,6 +25,7 @@ mod tray;
 mod ui;
 mod wake;
 mod wizard;
+mod x11clip;
 mod x11gl;
 mod x11ui;
 

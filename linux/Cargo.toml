@@ -32,7 +32,7 @@ wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
 x25519-dalek = { version = "2", default-features = false }
 # The X11 frontend (x11ui.rs, x11gl.rs): X itself, and EGL + OpenGL ES for the video (libEGL and
 # libX11 are loaded at run time, so nothing more is needed to build).
-x11rb = { version = "0.13.2", features = ["cursor", "randr", "render", "shape", "xinput", "xkb"] }
+x11rb = { version = "0.13.2", features = ["cursor", "randr", "render", "shape", "xfixes", "xinput", "xkb"] }
 glow = "0.18"
 libloading = "0.8"
 zbus = "5"

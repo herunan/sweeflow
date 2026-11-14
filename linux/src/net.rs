@@ -1261,6 +1261,26 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
     }
 }
 
+/// The command that plays raw 48 kHz stereo 16-bit audio from a file: PipeWire's `pw-cat` where
+/// it takes raw audio (PipeWire 1.2 and later), else PulseAudio's `pacat` (PipeWire answers as
+/// PulseAudio; Ubuntu 24.04 / Mint 22 ship PipeWire 1.0), else ALSA's `aplay`. As its own
+/// "sweeflow" stream in the mixer where the player can name it.
+fn audio_player() -> Vec<String> {
+    let has = |cmd: &str| std::process::Command::new(cmd).arg("--help").output().ok();
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if has("pw-cat").is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("--raw")) {
+        return v(&["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms",
+                   "-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }"]);
+    }
+    if has("pacat").is_some() {
+        log::info!("audio: through pacat (this PipeWire's pw-cat takes no raw audio)");
+        return v(&["pacat", "--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=20",
+                   "--client-name=sweeflow", "--stream-name=Mac audio"]);
+    }
+    log::info!("audio: through aplay");
+    v(&["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2"])
+}
+
 /// Plays the Mac's audio through PipeWire (`pw-cat`), as its own "sweeflow" stream in the mixer.
 ///
 /// The player runs as a transient systemd user unit reading a FIFO, not as our child: KDE's
@@ -1277,9 +1297,8 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     const UNIT: &str = "sweeflow-audio";
     let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).status();
     let started = std::process::Command::new("systemd-run")
-        .args(["--user", "--quiet", "--collect", "--unit", UNIT, "pw-cat", "--playback", "--raw"])
-        .args(["--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms"])
-        .args(["-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }"])
+        .args(["--user", "--quiet", "--collect", "--unit", UNIT])
+        .args(audio_player())
         .arg(&fifo)
         .status();
     if !started.is_ok_and(|s| s.success()) {
