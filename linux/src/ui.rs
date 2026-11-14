@@ -934,7 +934,8 @@ impl App {
             };
             let pos = XdgPositioner::new(&self.xdg).expect("positioner");
             pos.set_size(info.w.max(1.0) as i32, info.h.max(1.0) as i32);
-            pos.set_anchor_rect(info.rel_x.round() as i32, info.rel_y.round() as i32, 1, 1);
+            let (x, y) = info.spot_on(parent.info.w, parent.info.h);
+            pos.set_anchor_rect(x.round() as i32, y.round() as i32, 1, 1);
             pos.set_anchor(xdg_positioner::Anchor::TopLeft);
             pos.set_gravity(xdg_positioner::Gravity::BottomRight);
             pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);
@@ -1317,6 +1318,8 @@ impl App {
     }
 
     fn adopt_mac_size(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        // Where a popup goes on its parent (looked up before this window is borrowed).
+        let parent_size = self.windows.get(&wid).and_then(|w| self.windows.get(&w.info.parent)).map(|p| (p.info.w, p.info.h));
         let Some(w) = self.windows.get_mut(&wid) else { return };
         if w.display {
             return; // scaled to fit, whatever its size
@@ -1414,7 +1417,8 @@ impl App {
             Role::Popup(p) => {
                 let pos = XdgPositioner::new(&self.xdg).expect("positioner");
                 pos.set_size(mac.0.max(1) as i32, mac.1.max(1) as i32);
-                pos.set_anchor_rect(w.info.rel_x.round() as i32, w.info.rel_y.round() as i32, 1, 1);
+                let (x, y) = parent_size.map_or((w.info.rel_x, w.info.rel_y), |(pw, ph)| w.info.spot_on(pw, ph));
+                pos.set_anchor_rect(x.round() as i32, y.round() as i32, 1, 1);
                 pos.set_anchor(xdg_positioner::Anchor::TopLeft);
                 pos.set_gravity(xdg_positioner::Gravity::BottomRight);
                 pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);

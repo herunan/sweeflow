@@ -1216,7 +1216,14 @@ impl App {
     fn popup_origin(&self, info: &WinInfo) -> Option<(i32, i32)> {
         let parent = self.windows.get(&info.parent)?;
         let r = self.conn.translate_coordinates(parent.xid, self.root, 0, 0).ok()?.reply().ok()?;
-        Some((r.dst_x as i32 + info.rel_x.round() as i32, r.dst_y as i32 + info.rel_y.round() as i32))
+        let (rx, ry) = info.spot_on(parent.info.w, parent.info.h);
+        let (mut x, mut y) = (r.dst_x as i32 + rx.round() as i32, r.dst_y as i32 + ry.round() as i32);
+        // And on the screen, whole if it fits.
+        if let Some(g) = self.conn.get_geometry(self.root).ok().and_then(|c| c.reply().ok()) {
+            x = x.min(g.width as i32 - info.w.round() as i32).max(0);
+            y = y.min(g.height as i32 - info.h.round() as i32).max(0);
+        }
+        Some((x, y))
     }
 
     fn place_popup(&self, wid: u32) {

@@ -235,15 +235,35 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Looks up a window that's about to be subscribed to (it just appeared).
     static func prefetch(_ wid: UInt32) {
         let t0 = Date()
+        prefetchLock.withLock { if prefetching[wid] == nil { prefetching[wid] = [] } }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
-            guard let w = content?.windows.first(where: { $0.windowID == wid }) else { return }
-            prefetchLock.withLock { prefetched[wid] = (w, Date()) }
-            log(String(format: "window %u: looked up for capture in %.0f ms", wid, Date().timeIntervalSince(t0) * 1000))
+            let w = content?.windows.first(where: { $0.windowID == wid })
+            let waiting = prefetchLock.withLock { () -> [(SCWindow?) -> Void] in
+                if let w { prefetched[wid] = (w, Date()) }
+                return prefetching.removeValue(forKey: wid) ?? []
+            }
+            if w != nil { log(String(format: "window %u: looked up for capture in %.0f ms", wid, Date().timeIntervalSince(t0) * 1000)) }
+            waiting.forEach { $0(w) }
         }
     }
+    /// Subscriptions that came while their window's lookup was still under way: they take its
+    /// answer (a fresh full lookup of every window took half a second more; Quick Look's panel,
+    /// subscribed right after it appears, waited for one each time).
+    private static var prefetching: [UInt32: [(SCWindow?) -> Void]] = [:]
 
     func start() {
         if displayID != nil { return startDisplay() }
+        let joined = Self.prefetchLock.withLock { () -> Bool in
+            guard Self.prefetched[wid] == nil, Self.prefetching[wid] != nil else { return false }
+            Self.prefetching[wid]?.append { [weak self] w in
+                guard let self else { return }
+                _ = Self.prefetchLock.withLock { Self.prefetched.removeValue(forKey: self.wid) }
+                guard let w else { return self.lookUpAndStart() }
+                self.queue.async { if !self.stopped { self.startCapture(w) } }
+            }
+            return true
+        }
+        if joined { return }
         let cached = Self.prefetchLock.withLock { Self.prefetched.removeValue(forKey: wid) }
         if let cached, Date().timeIntervalSince(cached.at) < 5 {
             queue.async { [weak self] in
@@ -252,6 +272,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             return
         }
+        lookUpAndStart()
+    }
+
+    private func lookUpAndStart() {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, err in
             guard let self else { return }
             self.queue.async {
@@ -357,8 +381,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // Some popups get no frame at all from the live capture (one sitting still, a
             // "Save changes?" sheet; Safari's address-bar suggestions, even while they change):
             // after a moment with none, stills of it instead, taken ten times a second and sent
-            // when they differ, for as long as the capture stays silent.
-            queue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            // when they differ, for as long as the capture stays silent. The moment is short: a
+            // capture can take two seconds to start (Quick Look's panel, which zooms in), and
+            // a still caught mid-fade is replaced by the next one 100 ms later.
+            queue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 self?.pollStills(s, filter: filter)
             }
         }
@@ -401,13 +427,21 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     func windowResized(to size: CGSize) {
         guard size != pointSize, let stream else { pointSize = size; return }
         pointSize = size
-        if lossless, let win = scWindow {
+        if lossless, scWindow != nil {
             // Menus are static: after a reconfigure ScreenCaptureKit would not deliver a frame
             // until the content changes, leaving the old-size image. A fresh capture always
-            // starts with a frame.
-            stream.stopCapture { _ in }
-            self.stream = nil
-            startCapture(win)
+            // starts with a frame. Once the size has settled, though: a panel that zooms open
+            // (Quick Look's) changes size every few milliseconds, and a capture started for
+            // each (forty in a third of a second) put off its first picture until it stopped.
+            // Meanwhile stills of it go out (pollStills, at the size it has then).
+            resizeRestarts += 1
+            let gen = resizeRestarts
+            queue.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                guard let self, !self.stopped, gen == self.resizeRestarts, let st = self.stream, let win = self.scWindow else { return }
+                st.stopCapture { _ in }
+                self.stream = nil
+                self.startCapture(win)
+            }
             return
         }
         applySize(to: config)
@@ -420,6 +454,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// stayed at its old picture on Linux, at the old size. So if no frame has come shortly
     /// after the last resize, the capture is started afresh, which always begins with one.
     private var resizeChecks = 0
+    /// Popups' resizes, for restarting their capture once the size settles (windowResized).
+    private var resizeRestarts = 0
     /// A shrunk capture was seen (and dropped) since the last proper frame.
     private var shrunkSeen = false
 
@@ -925,6 +961,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             lastStillHash = 0
             log("stream \(wid): no frame from the capture: stills of it instead")
         }
+        // At the size it has now (it may be growing: a panel zooming open).
+        applySize(to: config)
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
             guard let self else { return }
             let pb = sb.flatMap { CMSampleBufferGetImageBuffer($0) }

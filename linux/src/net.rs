@@ -35,6 +35,21 @@ pub struct WinInfo {
     pub kind: u8,
 }
 
+impl WinInfo {
+    /// Where a popup goes on its parent (window points): where the Mac has it, unless that's
+    /// nowhere on the parent. The Mac keeps its windows side by side on its virtual display, so
+    /// a panel it centres on that display (Quick Look's) can sit far off its window: placed by
+    /// that offset here it opened off the side of the screen. Centred on the parent instead.
+    pub fn spot_on(&self, parent_w: f32, parent_h: f32) -> (f32, f32) {
+        let apart = self.rel_x >= parent_w || self.rel_x + self.w <= 0.0 || self.rel_y >= parent_h || self.rel_y + self.h <= 0.0;
+        if apart {
+            (((parent_w - self.w) / 2.0).round(), ((parent_h - self.h) / 2.0).max(0.0).round())
+        } else {
+            (self.rel_x, self.rel_y)
+        }
+    }
+}
+
 pub enum UiEvent {
     Connected(String),
     Disconnected(String),
