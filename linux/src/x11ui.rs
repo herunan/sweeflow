@@ -1501,8 +1501,15 @@ impl App {
     }
 
     /// The window manager moves (or resizes) the window from where the pointer is now.
-    fn wm_moveresize(&self, xid: u32, direction: u32) {
+    fn wm_moveresize(&mut self, xid: u32, direction: u32) {
         let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+        // And the keyboard (held for the Mac's shortcuts, sync_keyboard_grab): Muffin takes it
+        // for a move too (Esc ends one) and gives the move up when it can't, so no Mac window
+        // moved on Cinnamon. Taken again when the pointer or the focus comes back after.
+        if self.kb_grabbed {
+            let _ = self.conn.ungrab_keyboard(CURRENT_TIME);
+            self.kb_grabbed = false;
+        }
         // The press's XInput 2 grab too, or the window manager can't take the pointer.
         if let Some(dev) = self.xi_pointer {
             let _ = self.conn.xinput_xi_ungrab_device(CURRENT_TIME, dev);
@@ -1515,8 +1522,8 @@ impl App {
 
     fn move_here(&mut self, wid: u32) {
         self.move_ready = false;
-        let Some(w) = self.windows.get(&wid).filter(|w| !w.popup) else { return };
-        self.wm_moveresize(w.xid, MOVERESIZE_MOVE);
+        let Some(xid) = self.windows.get(&wid).filter(|w| !w.popup).map(|w| w.xid) else { return };
+        self.wm_moveresize(xid, MOVERESIZE_MOVE);
         self.left_down = None;
         self.mac_drag = None;
         self.moved_here = Some(wid);
