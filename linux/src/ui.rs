@@ -441,6 +441,10 @@ pub struct App {
     paused: bool,
     /// Windows closed here while the Mac was away: closed there too once it's back.
     closed_offline: HashSet<u32>,
+    /// Popups (a save sheet, a menu) of a window that hasn't shown a picture yet, made once it
+    /// has: Hyprland never drew a popup of a window still being set up (a sheet already up when
+    /// the windows were announced never showed).
+    popups_waiting: HashMap<u32, WinInfo>,
     trace_event_ms: Option<u32>,
     /// Whether the Global Menu panel is currently shown (it only shows for Mac windows).
     menu_panel_shown: Option<bool>,
@@ -583,6 +587,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         connected: false,
         paused: false,
         closed_offline: HashSet::new(),
+        popups_waiting: HashMap::new(),
         trace_event_ms: None,
         menu_panel_shown: None,
     };
@@ -723,6 +728,9 @@ impl App {
             }
             UiEvent::WindowAdded(info) => self.add_window(info, qh),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
+                if let Some(i) = self.popups_waiting.get_mut(&wid) {
+                    (i.title, i.w, i.h, i.rel_x, i.rel_y) = (title.clone(), w, h, rel_x, rel_y);
+                }
                 if let Some(win) = self.windows.get_mut(&wid) {
                     if let Role::Toplevel(t) = &win.role {
                         if title != win.info.title {
@@ -751,7 +759,10 @@ impl App {
                 self.freeze(wid, qh);
                 let _ = self.net.send(NetCmd::Unsubscribe(wid));
             }
-            UiEvent::WindowRemoved(wid) => self.remove_window(wid),
+            UiEvent::WindowRemoved(wid) => {
+                self.popups_waiting.remove(&wid);
+                self.remove_window(wid)
+            }
             UiEvent::WindowFixed(wid, spot, fixed) if !self.windows.contains_key(&wid) => {
                 // Said before the window is added: it's made a dialog (of its size, if fixed)
                 // from the start.
@@ -759,7 +770,7 @@ impl App {
             }
             UiEvent::WindowFixed(_, _, false) => {} // a floating panel already shown: as it is
             UiEvent::WindowFixed(wid, spot, true) => {
-                if let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.display) {
+                if let Some(w) = self.windows.get_mut(&wid).filter(|w| !w.display && matches!(w.role, Role::Toplevel(_))) {
                     w.fixed = true;
                     w.spot = spot;
                     log::info!("window {wid}: its app won't let it be resized: kept at its own size");
@@ -938,6 +949,12 @@ impl App {
             self.adopt_mac_size(wid, qh);
             return;
         }
+        if info.kind == 1 && self.windows.get(&info.parent).is_some_and(|p| p.shown.is_none() && matches!(p.role, Role::Toplevel(_))) {
+            log::info!("popup {wid}: waits for its window {} to be set up", info.parent);
+            self.popups_waiting.insert(wid, info);
+            return;
+        }
+        self.popups_waiting.remove(&wid);
         let first_shape = Some(info.w as f64 / info.h.max(1.0) as f64);
         let mut fixed_now = false;
         let mut floated_now = false;
@@ -964,6 +981,8 @@ impl App {
                 }
             };
             let s = popup.wl_surface().clone();
+            // A sheet is said to be fixed before it's added: as a popup it's kept its size anyway.
+            self.pending_fixed.remove(&wid);
             (Role::Popup(popup), s)
         } else {
             let surface = self.compositor.create_surface(qh);
@@ -1158,6 +1177,7 @@ impl App {
             self.end_selection();
         }
         self.unfreeze(wid);
+        self.popups_waiting.retain(|_, i| i.parent != wid);
         let Some(w) = self.windows.remove(&wid) else { return };
         log::info!("window {wid} removed ({})", w.info.app_name);
         if w.display {
@@ -1601,10 +1621,26 @@ impl App {
             return;
         }
 
+        let first_picture = w.shown.is_none();
         w.shown = Some(buffer.id());
         w.picture = Some((frame.content, frame.px_per_pt));
         self.in_use.insert(buffer.id(), frame);
         self.lay_out(wid, Some(&buffer), true, qh);
+        if first_picture {
+            self.add_waiting_popups(wid, qh);
+        }
+    }
+
+    /// The popups that waited for their window to show (see popups_waiting), each with a fresh
+    /// picture: the frames sent meanwhile had no window to go to.
+    fn add_waiting_popups(&mut self, parent: u32, qh: &QueueHandle<Self>) {
+        let kids: Vec<u32> = self.popups_waiting.values().filter(|i| i.parent == parent).map(|i| i.wid).collect();
+        for k in kids {
+            if let Some(info) = self.popups_waiting.remove(&k) {
+                self.add_window(info, qh);
+                let _ = self.net.send(NetCmd::Subscribe(k));
+            }
+        }
     }
 
     /// The window's size here changed (or how Hyprland holds it) with no new picture yet: the
@@ -1990,6 +2026,10 @@ impl App {
         w.video.attach(Some(&buffer), 0, 0);
         w.video.damage_buffer(0, 0, fw as i32, fh as i32);
         w.video.commit();
+        // And the popup itself: Hyprland showed nothing of a popup's picture until the popup
+        // was committed again (a menu or Quick Look soon is, moved or resized; a sheet that
+        // just stays never was, and showed as nothing at all).
+        w.base().commit();
         // KWin uploads shm contents on commit; three generations is plenty of slack.
         w.raw_buffers.push_back((buffer, pool));
         while w.raw_buffers.len() > 3 {
@@ -3211,6 +3251,7 @@ impl WindowHandler for App {
             // the Mac happened to send one.
             self.relayout(wid, qh);
         }
+
     }
 }
 

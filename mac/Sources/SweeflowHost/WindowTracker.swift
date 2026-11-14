@@ -63,6 +63,8 @@ final class WindowTracker {
     /// by the session, asked with hasNoButtons.
     var isSheet: ((UInt32, pid_t) -> Bool)?
     private var sheetSeen: [UInt32: Bool] = [:]
+    /// Whether the window is a sheet (one attached to its parent window, as a save sheet is).
+    func isKnownSheet(_ wid: UInt32) -> Bool { sheetSeen[wid] == true }
     /// Untitled windows' answers, looked at for their first second (the list can lag a new
     /// window), then kept.
     private var appWindowSeen: [UInt32: (isApp: Bool?, first: DispatchTime)] = [:]
@@ -350,9 +352,13 @@ final class WindowTracker {
         // suggestions, which can hang off the bottom): listed as a window, but with no window
         // buttons, starting within a bigger window of the app. Shown attached to it, like a popover.
         for (wid, w) in seen where w.kind == .toplevel {
+            // Its top-left corner on it, or the middle of its top edge: a sheet hangs from the
+            // middle of its window's top, and sticks out both sides of a window narrower than it
+            // (a tile on Linux), taken for a window of its own then.
             let corner = CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)
+            let top = CGPoint(x: w.frame.midX, y: w.frame.minY + 1)
             let host = seen.values.contains {
-                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && $0.frame.contains(corner)
+                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && ($0.frame.contains(corner) || $0.frame.contains(top))
                     && $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
             }
             guard host else { continue }
@@ -371,10 +377,10 @@ final class WindowTracker {
             }
             guard none else { continue }
             var p = w
-            // A sheet is the app asking something of that window: a dialog of it (desktops
-            // keep a modal dialog over its window; GNOME attaches it like a sheet), not a
-            // popover, which a tiler may never show while its window is still being set up.
-            p.kind = sheetSeen[wid] == true ? .dialog : .popup
+            // A sheet (a save sheet) too: attached to its window on Linux, as on the Mac, it
+            // moves with it (a tiler scrolling, the window dragged) and keeps its size. Shown
+            // as a dialog of its own instead, it stayed behind on Plasma and could be resized.
+            p.kind = .popup
             popups.append(p)
             seen[wid] = nil
             order.removeAll { $0 == wid }

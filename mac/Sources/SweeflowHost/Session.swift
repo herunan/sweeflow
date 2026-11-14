@@ -1477,6 +1477,9 @@ final class Session {
 
     /// Brings a window to the front, then (on the main thread) does what needs it there.
     private func raiseThen(_ win: TrackedWindow, _ then: @escaping () -> Void) {
+        if tracker.isKnownSheet(win.wid), let parent = tracker.windows[win.parent], parent.kind == .toplevel {
+            return raiseThen(parent, then)
+        }
         guard win.kind == .toplevel else { return DispatchQueue.main.async(execute: then) }
         let control = control_
         raisedWid = win.wid
@@ -1493,6 +1496,12 @@ final class Session {
     private let raiseLock = NSLock()
 
     private func raise(_ win: TrackedWindow) {
+        // A sheet comes forward with its window, and is raised by raising that: put in front on
+        // its own (its window number to the window server), the app took no more clicks on it
+        // until its window was clicked.
+        if tracker.isKnownSheet(win.wid), let parent = tracker.windows[win.parent], parent.kind == .toplevel {
+            return raise(parent)
+        }
         log("raising \(win.wid) (\(win.appName))")
         let gen = raiseLock.withLock { raiseGeneration += 1; return raiseGeneration }
         // To the front in the window server at once, in the order asked: the rest (below) goes
@@ -1574,9 +1583,8 @@ final class Session {
         }
         tracker.isAppWindow = { [weak self] wid, pid in self?.control_.element(wid, pid: pid) != nil }
         tracker.isSheet = { [weak self] wid, pid in
-            // Not among the app's windows to Accessibility, but a child of the one it hangs from.
-            guard let self, self.control_.element(wid, pid: pid) == nil else { return false }
-            return self.control_.isSheet(wid, pid: pid)
+            // A child of the window it hangs from, or listed as a window with the role of one.
+            self?.control_.isSheet(wid, pid: pid) ?? false
         }
         tracker.hasNoButtons = { [weak self] wid, pid in
             guard let self, self.control_.element(wid, pid: pid) != nil else { return false }
@@ -1899,9 +1907,10 @@ final class Session {
         fixedSpots[w.wid] = fixedSpots[w.wid] ?? spot
         if let fixed = fixedKnown[w.wid] { return announce(w, fixed: fixed) }
         final class Once { var sent = false }
-        let once = Once(), control = control_, wid = w.wid, pid = w.pid
+        // A sheet keeps the size its app gives it (its window is resized, not it).
+        let once = Once(), control = control_, wid = w.wid, pid = w.pid, sheet = tracker.isKnownSheet(w.wid)
         appQueue(pid).async { [weak self] in
-            let fixed = control.fixedSize(wid, pid: pid) == true
+            let fixed = sheet || control.fixedSize(wid, pid: pid) == true
             self?.queue.async {
                 guard let self, let now = self.tracker.windows[wid] else { return }
                 self.fixedKnown[wid] = fixed

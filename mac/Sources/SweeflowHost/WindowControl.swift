@@ -48,6 +48,11 @@ final class WindowControl {
     /// Whether the window is a sheet (TextEdit's "Save changes?", a print or export sheet): to
     /// Accessibility it isn't one of the app's windows but a child of the window it hangs from.
     func isSheet(_ wid: UInt32, pid: pid_t) -> Bool {
+        // Listed among the app's windows all the same (after the app was looked at a while,
+        // or a restart of this host): its role says.
+        var role: CFTypeRef?
+        if let e = element(wid, pid: pid), AXUIElementCopyAttributeValue(e, kAXRoleAttribute as CFString, &role) == .success,
+           (role as? String) == "AXSheet" { return true }
         let app = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
