@@ -105,7 +105,19 @@ PlasmoidItem {
         // Streaming to another computer (as it says on the network).
         busy: !!m.busy,
         locked: !!m.locked,
+        // How it's reached (lan, tailscale, vm, internet, or ""), at what address, and whether
+        // that's now (connected) or when it was last.
+        via: m.via || "", address: m.address || "", viaNow: !!m.viaNow,
     })))
+    readonly property var viaIcons: ({ lan: "go-home-symbolic", tailscale: "network-vpn-symbolic", vm: "computer-symbolic", internet: "globe-symbolic" })
+    // The hover words for how a Mac is reached ("Over Tailscale · 100.64.0.3").
+    function viaTip(m) {
+        const way = ({ lan: "over the local network", tailscale: "over Tailscale", vm: "over a virtual machine's network", internet: "over the internet" })[m.via]
+        if (!way) return ""
+        const words = m.viaNow ? way.charAt(0).toUpperCase() + way.slice(1) : "Last reached " + way
+        return m.address ? words + " · " + m.address : words
+    }
+    readonly property var activeMac: linkedMacs.find(m => m.active) || null
     readonly property var linkedMacs: JSON.parse(macsJson)
     // The Mac being renamed, or asked about unlinking (fingerprints).
     property string editingMac: ""
@@ -169,6 +181,19 @@ PlasmoidItem {
         }
     }
 
+    component ViaSign: Kirigami.Icon {
+        // How a Mac is reached, as a small icon that says it on hover.
+        property var info: null
+        visible: !!info && info.via !== ""
+        source: info ? root.viaIcons[info.via] || "" : ""
+        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+        opacity: 0.7
+        MouseArea { id: viaHover; anchors.fill: parent; hoverEnabled: true }
+        PlasmaComponents3.ToolTip.text: info ? root.viaTip(info) : ""
+        PlasmaComponents3.ToolTip.visible: viaHover.containsMouse && PlasmaComponents3.ToolTip.text !== ""
+        PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
+    }
     // A streaming action as its sign, the way a player shows them. Its name stays as the text
     // (for screen readers) and is said on hover.
     component SignButton: PlasmaComponents3.ToolButton {
@@ -274,8 +299,10 @@ PlasmoidItem {
                             font: Kirigami.Theme.smallFont
                             opacity: 0.7
                             elide: Text.ElideRight
-                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
                         }
+                        ViaSign { info: root.activeMac }
+                        Item { Layout.fillWidth: true }
                     }
                 }
                 // What can be done in this state, as signs at the right of the name.
@@ -647,12 +674,13 @@ PlasmoidItem {
                                         }
                                         // The dot says it in colour; the words stay plain.
                                         RowLayout {
-                                            visible: nameCol.macState !== ""
+                                            visible: nameCol.macState !== "" || mac.modelData.via !== ""
                                             spacing: Kirigami.Units.smallSpacing
                                             // Streaming violet, Paused a violet ring (streaming to this
                                             // computer); Available green; Busy or Locked orange; Not online
                                             // a grey ring.
                                             Rectangle {
+                                                visible: nameCol.macState !== ""
                                                 readonly property color ink: root.macInk(nameCol.macState)
                                                 readonly property bool hollow: nameCol.macState === "paused" || nameCol.macState === "offline"
                                                 implicitWidth: Math.round(Kirigami.Units.smallSpacing * 2)
@@ -667,8 +695,10 @@ PlasmoidItem {
                                                 font: Kirigami.Theme.smallFont
                                                 opacity: 0.7
                                                 elide: Text.ElideRight
-                                                Layout.fillWidth: true
+                                                Layout.minimumWidth: 0
                                             }
+                                            ViaSign { info: mac.modelData }
+                                            Item { Layout.fillWidth: true }
                                         }
                                     }
                                     Repeater {

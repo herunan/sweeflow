@@ -163,6 +163,8 @@ struct Lights {
 pub enum Internal {
     /// The URI list of a drop was read: finish the offer.
     DropRead,
+    /// Told to stop (SIGTERM: a restart, Quit): the windows go first, then the process.
+    Shutdown,
 }
 
 enum Role {
@@ -450,6 +452,22 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
     crate::tray::set_net(net.clone());
     crate::pair::watch_links();
     crate::hyprland::watch_tiling();
+    // SIGTERM / SIGINT: the windows are taken down in order first (Internal::Shutdown).
+    {
+        let tx = int_tx.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(async {
+                use tokio::signal::unix::{signal, SignalKind};
+                let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+                tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+                let _ = tx.send(Internal::Shutdown);
+                // Not answered in time (the loop stuck): go anyway.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                std::process::exit(0);
+            });
+        });
+    }
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -583,13 +601,27 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
 
     event_loop
         .handle()
-        .insert_source(int_rx, |ev, _, app: &mut App| {
-            if let channel::Event::Msg(Internal::DropRead) = ev {
+        .insert_source(int_rx, |ev, _, app: &mut App| match ev {
+            channel::Event::Msg(Internal::DropRead) => {
                 if let Some(offer) = app.dnd_device.as_ref().and_then(|d| d.data().drag_offer()) {
                     offer.finish();
                     offer.destroy();
                 }
             }
+            channel::Event::Msg(Internal::Shutdown) => {
+                // Every window taken down here, children before parents, before the connection
+                // closes: left to the compositor, Hyprland 0.56 could crash tearing down a
+                // subsurface whose parent was already gone (wl_client_destroy).
+                let ids: Vec<u32> = app.windows.keys().copied().collect();
+                for wid in ids {
+                    app.remove_window(wid);
+                }
+                let _ = app.conn.flush();
+                let _ = app.conn.roundtrip();
+                log::info!("stopping: windows taken down");
+                std::process::exit(0);
+            }
+            _ => {}
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -933,7 +965,11 @@ impl App {
                     window.set_max_size(Some(size));
                     fixed_now = true;
                 }
-                if let Some(d) = &self.dialog_mgr {
+                // Not on GNOME for one with no parent: GNOME doesn't tile (nothing to float it
+                // out of), and it won't minimise a dialog (Calculator's yellow light did nothing).
+                let gnome = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME"));
+                let parented = self.windows.get(&info.parent).is_some();
+                if let Some(d) = self.dialog_mgr.as_ref().filter(|_| parented || !gnome) {
                     d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
                 }
                 // A dialog of one of its app's windows (a "Save changes?" sheet): its parent

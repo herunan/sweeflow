@@ -20,7 +20,7 @@ slint::slint! {
     export { Look }
 
     export struct AppRow { id: string, name: string, icon: image, has-icon: bool, initial: string, running: bool, pinned: bool, shown: bool, heading: string }
-    export struct MacItem { name: string, fingerprint: string, active: bool, online: string }
+    export struct MacItem { name: string, fingerprint: string, active: bool, online: string, via: string, via-tip: string }
     // tip: why it can't be chosen now (it's then shown faded, and says so on hover); empty: it can.
     export struct Action { id: string, label: string, tip: string }
     export struct Toggle { key: string, label: string, on: bool }
@@ -123,6 +123,47 @@ slint::slint! {
         }
     }
 
+    // How a Mac is reached (net::route_kind), as a small drawn sign that says it on hover:
+    // "lan" a house, "tailscale" a grid of dots, "vm" a screen, "internet" a globe; nothing else.
+    component Via inherits Rectangle {
+        in property <string> kind;
+        in property <string> tip;
+        width: root.kind == "" ? 0px : 12px;
+        height: 12px;
+        accessible-role: image;
+        accessible-label: root.tip;
+        if root.kind == "lan": Path {
+            width: 100%; height: 100%; viewbox-width: 12; viewbox-height: 12;
+            commands: "M 1 6.5 L 6 1.5 L 11 6.5 M 2.75 5 L 2.75 10.75 L 9.25 10.75 L 9.25 5";
+            stroke: Look.muted; stroke-width: 1.3px;
+        }
+        if root.kind == "tailscale": Path {
+            width: 100%; height: 100%; viewbox-width: 12; viewbox-height: 12;
+            commands: "M 1 6 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 4.75 6 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 8.5 6 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 4.75 9.75 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0";
+            fill: Look.muted;
+        }
+        if root.kind == "tailscale": Path {
+            width: 100%; height: 100%; viewbox-width: 12; viewbox-height: 12;
+            commands: "M 1 2.25 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 4.75 2.25 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 8.5 2.25 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 1 9.75 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0 M 8.5 9.75 a 1.25 1.25 0 1 0 2.5 0 a 1.25 1.25 0 1 0 -2.5 0";
+            fill: Look.muted.transparentize(0.6);
+        }
+        if root.kind == "vm": Path {
+            width: 100%; height: 100%; viewbox-width: 12; viewbox-height: 12;
+            commands: "M 1.25 1.75 L 10.75 1.75 L 10.75 8.25 L 1.25 8.25 Z M 6 8.25 L 6 10.75 M 3.5 10.75 L 8.5 10.75";
+            stroke: Look.muted; stroke-width: 1.3px;
+        }
+        if root.kind == "internet": Path {
+            width: 100%; height: 100%; viewbox-width: 12; viewbox-height: 12;
+            commands: "M 1 6 a 5 5 0 1 0 10 0 a 5 5 0 1 0 -10 0 M 1 6 L 11 6 M 6 1 C 3.5 3.5 3.5 8.5 6 11 M 6 1 C 8.5 3.5 8.5 8.5 6 11";
+            stroke: Look.muted; stroke-width: 1.1px;
+        }
+        TouchArea {
+            changed has-hover => {
+                if (self.has-hover && root.tip != "") { Tip.enter(root.tip, root.absolute-position.x, root.absolute-position.y, root.width, root.height); } else { Tip.leave(); }
+            }
+        }
+    }
+
     component Tab inherits Rectangle {
         in property <string> text;
         in property <bool> selected;
@@ -189,6 +230,9 @@ slint::slint! {
         in property <string> status;
         // Where the Mac in use stands (as MacItem.online): the status line takes its colour.
         in property <string> status-state;
+        // How the Mac in use is reached, and that said in words (as MacItem.via, via-tip).
+        in property <string> status-via;
+        in property <string> status-via-tip;
         // What can be done about the Mac in use (Pause and Stop, Resume and Stop, Start, or Stop).
         in property <[Action]> actions;
         in property <[AppRow]> apps;
@@ -267,7 +311,9 @@ slint::slint! {
                                     border-color: root.status-state == "" ? Look.muted : MacState.ink(root.status-state);
                                 }
                             }
-                            Text { text: root.status; color: Look.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; }
+                            Text { text: root.status; color: Look.muted; font-size: 12px; overflow: elide; horizontal-stretch: 0; }
+                            if root.status-via != "": VerticalLayout { alignment: center; Via { kind: root.status-via; tip: root.status-via-tip; } }
+                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
                     // What can be done in this state (pause and stop, resume and stop, or start),
@@ -499,9 +545,9 @@ slint::slint! {
                                                 overflow: elide;
                                             }
                                             // The dot says it in colour; the words stay plain.
-                                            if m.online != "": HorizontalLayout {
+                                            if m.online != "" || m.via != "": HorizontalLayout {
                                                 spacing: 5px;
-                                                VerticalLayout {
+                                                if m.online != "": VerticalLayout {
                                                     alignment: center;
                                                     Rectangle {
                                                         width: 8px;
@@ -517,8 +563,10 @@ slint::slint! {
                                                     color: Look.muted;
                                                     font-size: 11px;
                                                     overflow: elide;
-                                                    horizontal-stretch: 1;
+                                                    horizontal-stretch: 0;
                                                 }
+                                                if m.via != "": VerticalLayout { alignment: center; Via { kind: m.via; tip: m.via-tip; } }
+                                                Rectangle { horizontal-stretch: 1; }
                                             }
                                         }
                                         TouchArea {
@@ -730,6 +778,25 @@ struct Mac {
     busy: bool,
     /// Its screen is locked (the same).
     locked: bool,
+    /// How it's reached (net::route_kind), at what address, and whether that's now (connected)
+    /// or when it was last.
+    via: String,
+    address: String,
+    #[serde(rename = "viaNow")]
+    via_now: bool,
+}
+
+/// The hover words for how a Mac is reached ("Over Tailscale · 100.64.0.3").
+fn via_tip(m: &Mac) -> String {
+    let way = match m.via.as_str() {
+        "lan" => "over the local network",
+        "tailscale" => "over Tailscale",
+        "vm" => "over a virtual machine's network",
+        "internet" => "over the internet",
+        _ => return String::new(),
+    };
+    let words = if m.via_now { format!("{}{}", way[..1].to_uppercase(), &way[1..]) } else { format!("Last reached {way}") };
+    if m.address.is_empty() { words } else { format!("{words} · {}", m.address) }
 }
 
 fn parse_state(json: &str) -> Option<PanelState> {
@@ -981,6 +1048,9 @@ fn show(ui: &PanelWin, v: &mut View) {
     ui.set_status(s.status.as_str().into());
     let active_state = s.macs.iter().find(|m| m.active).map_or("", |m| mac_state(&s, m));
     ui.set_status_state(active_state.into());
+    let active = s.macs.iter().find(|m| m.active);
+    ui.set_status_via(active.map_or("", |m| m.via.as_str()).into());
+    ui.set_status_via_tip(active.map(via_tip).unwrap_or_default().into());
     let streaming = s.connected && s.settings.enabled;
     let actions: Vec<Action> =
         s.actions
@@ -1009,6 +1079,8 @@ fn show(ui: &PanelWin, v: &mut View) {
             fingerprint: m.fingerprint.as_str().into(),
             active: m.active,
             online: mac_state(&s, m).into(),
+            via: m.via.as_str().into(),
+            via_tip: via_tip(m).into(),
         })
         .collect();
     if macs != v.mac_rows {
@@ -1244,7 +1316,7 @@ mod tests {
         assert_eq!(s.settings.exclude, ["com.apple.Notes"]);
         assert_eq!(s.apps.len(), 4);
         assert_eq!(s.apps[1], App { id: "com.apple.Safari".into(), name: "Safari".into(), icon: "file:///nowhere/safari.png".into(), state: 3, pinned: false });
-        assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true), busy: false, locked: false });
+        assert_eq!(s.macs[0], Mac { name: "Studio".into(), fingerprint: "ab12".into(), active: true, online: Some(true), busy: false, locked: false, ..Default::default() });
         assert_eq!(s.macs[1].online, None);
         // The Mac in use streaming here; another not known yet; then each other state.
         assert_eq!(s.macs.iter().map(|m| mac_state(&s, m)).collect::<Vec<_>>(), ["streaming", ""]);

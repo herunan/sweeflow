@@ -231,6 +231,8 @@ static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = s
 /// The Mac's lock state as last reported (kept across reconnects).
 static MAC_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The address the Mac in use was reached at, while connected.
+static CONNECTED_TO: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
 /// Stopped on purpose (Stop): no connection until Start, so the Mac is free for another
 /// computer. Kept across restarts, in a file beside the config.
 static OFFLINE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
@@ -277,6 +279,107 @@ pub fn mac_online() -> Option<bool> {
         0 => None,
         n => Some(n == 2),
     }
+}
+
+/// The address the Mac in use is connected at, while it is.
+pub fn connected_to() -> Option<SocketAddr> {
+    *CONNECTED_TO.lock().unwrap()
+}
+
+/// How this computer reaches a Mac at `host` ("address:port", or a name with its port), for
+/// the sign beside it: "tailscale"; "vm" (a Mac in a virtual machine on this computer: this
+/// computer's own address with the VM's ports forwarded, or a VM network's bridge); "lan";
+/// "internet"; or "" (a name that doesn't say).
+pub fn route_kind(host: &str) -> &'static str {
+    use std::net::IpAddr;
+    let ip = host.parse::<SocketAddr>().map(|a| a.ip()).ok().or_else(|| host.parse::<IpAddr>().ok());
+    let Some(ip) = ip else {
+        let name = host.rsplit_once(':').map_or(host, |(n, _)| n).trim_end_matches('.').to_ascii_lowercase();
+        return if name.ends_with(".ts.net") {
+            "tailscale"
+        } else if name.ends_with(".local") {
+            "lan"
+        } else if name == "localhost" {
+            "vm"
+        } else {
+            ""
+        };
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if v4.is_loopback() {
+                "vm"
+            } else if o[0] == 100 && (o[1] & 0xc0) == 64 {
+                "tailscale"
+            } else if vm_bridge(v4) {
+                "vm"
+            } else if v4.is_private() || v4.is_link_local() {
+                "lan"
+            } else {
+                "internet"
+            }
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if v6.is_loopback() {
+                "vm"
+            } else if s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0 {
+                "tailscale"
+            } else if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                "lan"
+            } else {
+                "internet"
+            }
+        }
+    }
+}
+
+/// The address is on a virtual machines' network: the interface the kernel routes it through
+/// is a VM bridge here (libvirt's virbr, VirtualBox's vboxnet, VMware's vmnet, a tap), or this
+/// computer is itself a virtual machine and the address is its way out (its host, the Mac).
+fn vm_bridge(ip: std::net::Ipv4Addr) -> bool {
+    let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let bridge = route_iface(&routes, ip).is_some_and(|i| ["virbr", "vboxnet", "vmnet", "vnet", "tap", "incusbr", "lxdbr"].iter().any(|p| i.starts_with(p)));
+    bridge || (default_gateway(&routes) == Some(ip) && in_a_vm())
+}
+
+/// The default route's gateway in /proc/net/route's table.
+fn default_gateway(routes: &str) -> Option<std::net::Ipv4Addr> {
+    routes.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.get(1) == Some(&"00000000") && f.get(7) == Some(&"00000000")).then(|| u32::from_str_radix(f.get(2)?, 16).ok().map(|v| std::net::Ipv4Addr::from(v.to_le_bytes())))?
+    })
+}
+
+/// This computer is a virtual machine (as its firmware says: QEMU, UTM, Parallels, VMware,
+/// VirtualBox, Apple's Virtualization).
+fn in_a_vm() -> bool {
+    static VM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        ["sys_vendor", "product_name"].iter().any(|f| {
+            let v = std::fs::read_to_string(format!("/sys/class/dmi/id/{f}")).unwrap_or_default().to_lowercase();
+            ["qemu", "parallels", "vmware", "virtualbox", "innotek", "apple virtualization", "kvm", "utm"].iter().any(|n| v.contains(n))
+        })
+    });
+    *VM
+}
+
+/// The interface /proc/net/route's table sends `ip` through (the longest matching prefix, the
+/// default route left out: that's the way to everything else).
+fn route_iface(routes: &str, ip: std::net::Ipv4Addr) -> Option<&str> {
+    let ip = u32::from_be_bytes(ip.octets());
+    // Addresses in the table are the network's bytes printed as a little-endian number.
+    let field = |h: &str| u32::from_str_radix(h, 16).ok().map(|v| u32::from_be_bytes(v.to_le_bytes()));
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (dest, mask) = (field(f.get(1)?)?, field(f.get(7)?)?);
+            (mask != 0 && ip & mask == dest).then_some((mask.count_ones(), f[0]))
+        })
+        .max_by_key(|r| r.0)
+        .map(|r| r.1)
 }
 
 /// Whether a linked Mac is online: None until known.
@@ -351,7 +454,10 @@ fn watch_presence(in_use: &str) {
             if !found {
                 // Not seen announcing itself: asked at its last address instead (a virtual
                 // machine's network carries no announcements, some Wi-Fi drops them).
-                let stale = probed.get(fp.as_str()).is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(10));
+                // The Mac in use more often: a Start pressed just after it was stopped elsewhere
+                // was refused as "busy" for up to 10 s.
+                let every = if *fp == in_use { Duration::from_secs(4) } else { Duration::from_secs(10) };
+                let stale = probed.get(fp.as_str()).is_none_or(|(at, _)| at.elapsed() >= every);
                 if stale {
                     let mac = crate::config::Config::load_or_default().ok().and_then(|c| c.macs.into_iter().find(|m| &m.fingerprint == fp));
                     let answer = mac.as_ref().and_then(crate::pair::probe);
@@ -698,9 +804,11 @@ async fn session(
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
     let ip = addr.ip();
     std::thread::spawn(move || crate::wake::remember(ip));
+    *CONNECTED_TO.lock().unwrap() = Some(addr);
     struct Online;
     impl Drop for Online {
         fn drop(&mut self) {
+            *CONNECTED_TO.lock().unwrap() = None;
             set_online(false);
             crate::tray::connected(None);
         }
@@ -1472,6 +1580,33 @@ pub fn client_endpoint_offering(check: HostCheck, alpns: &[&[u8]]) -> Result<qui
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_kinds() {
+        assert_eq!(route_kind("100.64.0.3:44120"), "tailscale");
+        assert_eq!(route_kind("[fd7a:115c:a1e0::1]:44120"), "tailscale");
+        assert_eq!(route_kind("mac.tail1234.ts.net:44120"), "tailscale");
+        assert_eq!(route_kind("192.168.1.20:44120"), "lan");
+        assert_eq!(route_kind("10.0.0.5:44120"), "lan");
+        assert_eq!(route_kind("Air.local:44120"), "lan");
+        assert_eq!(route_kind("127.0.0.1:44120"), "vm");
+        assert_eq!(route_kind("localhost:44120"), "vm");
+        assert_eq!(route_kind("8.8.8.8:44120"), "internet");
+        assert_eq!(route_kind("100.128.0.1:44120"), "internet");
+        assert_eq!(route_kind("mac.example.com:44120"), "");
+    }
+
+    #[test]
+    fn routes_through_the_longest_prefix() {
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                     wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                     wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n\
+                     virbr0\t007AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(route_iface(table, "192.168.122.40".parse().unwrap()), Some("virbr0"));
+        assert_eq!(route_iface(table, "192.168.1.9".parse().unwrap()), Some("wlan0"));
+        assert_eq!(route_iface(table, "8.8.8.8".parse().unwrap()), None);
+        assert_eq!(default_gateway(table), Some("192.168.1.1".parse().unwrap()));
+    }
 
     #[test]
     fn busy_decodes() {

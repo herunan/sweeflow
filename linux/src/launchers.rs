@@ -141,6 +141,13 @@ fn entry_of(file: &str) -> Option<(&str, bool)> {
     })
 }
 
+/// The Quit action's name: "Quit on Mac" on GNOME, whose dash adds its own "Quit" under it (that
+/// one only closes the app's windows here), else "Quit".
+fn quit_label() -> &'static str {
+    let gnome = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME"));
+    if gnome { "Quit on Mac" } else { "Quit" }
+}
+
 /// A Mac app's launcher entry. Its Quit action quits the app on the Mac (KDE's task manager and
 /// GNOME's dash offer it on the app's right-click menu, window or not).
 fn entry(exe: &std::path::Path, bid: &str, name: &str, icon: &std::path::Path, visible: bool) -> String {
@@ -149,10 +156,11 @@ fn entry(exe: &std::path::Path, bid: &str, name: &str, icon: &std::path::Path, v
     format!(
         "[Desktop Entry]\nType=Application\nName={name} (Mac)\nExec={exe} launch {bid}\nIcon={}\n\
          StartupWMClass=sweeflow-{bid}\nCategories=X-Sweeflow;\nKeywords=mac;macos;\nTerminal=false\nActions=quit;\n{}\
-         \n[Desktop Action quit]\nName=Quit\nIcon=application-exit\nExec={exe} quit {bid}\n",
+         \n[Desktop Action quit]\nName={quit}\nIcon=application-exit\nExec={exe} quit {bid}\n",
         icon.display(),
         if visible { "" } else { "NoDisplay=true\n" },
         exe = exe.display(),
+        quit = quit_label(),
     )
 }
 

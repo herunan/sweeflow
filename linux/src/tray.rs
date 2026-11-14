@@ -457,13 +457,18 @@ fn menu_icon(name: &str) -> String {
     name.into()
 }
 
-/// A menu item's text, with its key after it on GNOME and Cinnamon: their tray menus don't show
-/// a menu item's shortcut (other desktops show it at the right).
+/// A menu item's text, with its key after it where the tray doesn't show a menu item's shortcut
+/// (everywhere but Plasma, which shows it at the right).
 fn with_key(label: &str, key: &Option<crate::keys::Key>, column: f32) -> String {
     match key {
-        // (Cinnamon's panel draws tray menus the same way: no shortcut column either.)
-        Some(k) if ["GNOME", "Cinnamon"].iter().any(|d| std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains(d)) => {
+        // Only Plasma's tray draws a menu item's shortcut; GNOME's, Cinnamon's and Omarchy's
+        // bar don't, so there the key goes in the text.
+        Some(k) if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") => {
             // Lined up in a column at the end of the rows, by tabs (key_column).
+            // Omarchy's bar draws its menus at a fixed width: tabs pushed the key out of sight.
+            if crate::hyprland::running() {
+                return format!("{label}  {}", k.shown(crate::setup::mac_keys_remapped(), "Super"));
+            }
             let tabs = (column - tab_stop(text_width(label))) as usize + 1;
             format!("{label}{}{}", "\t".repeat(tabs), k.shown(crate::setup::mac_keys_remapped(), "Super"))
         }
@@ -755,6 +760,18 @@ fn sort_apps(apps: &mut [serde_json::Value], pinned: &[String]) {
     apps.sort_by_key(|a| (pin_pos(a), a["state"].as_u64().unwrap_or(0) == 0, a["name"].as_str().unwrap_or_default().to_lowercase()));
 }
 
+/// Where a linked Mac is (or was last) reached: "address:port".
+fn reached(m: &crate::config::PairedMac, in_use: &str) -> String {
+    crate::net::connected_to().filter(|_| m.fingerprint == in_use).map_or_else(|| m.host.clone(), |a| a.to_string())
+}
+
+/// "address:port" without its port (and an IPv6 address without its brackets).
+fn address_only(host: &str) -> String {
+    host.parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| host.rsplit_once(':').map_or(host, |(n, _)| n).to_string())
+}
+
 /// Everything the tray widget shows.
 pub fn panel_state() -> serde_json::Value {
     let state = STATE.lock().unwrap();
@@ -770,7 +787,12 @@ pub fn panel_state() -> serde_json::Value {
                                 "online": crate::net::online(&m.fingerprint),
                                 // Streaming to another computer (as its network announcement says).
                                 "busy": crate::net::busy(&m.fingerprint),
-                                "locked": crate::net::locked(&m.fingerprint) })
+                                "locked": crate::net::locked(&m.fingerprint),
+                                // How it's reached (net::route_kind) and at what address: where it
+                                // is connected now for the Mac in use, else where it was last.
+                                "via": crate::net::route_kind(&reached(m, &cfg.host_fingerprint)),
+                                "address": address_only(&reached(m, &cfg.host_fingerprint)),
+                                "viaNow": m.fingerprint == cfg.host_fingerprint && crate::net::connected_to().is_some() })
         })
         .collect();
     let mac_name = mac_name(&state, &cfg);
