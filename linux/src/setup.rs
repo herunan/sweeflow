@@ -179,6 +179,17 @@ pub fn install() -> Result<()> {
     if !run(&["enable", "sweeflow.service"])?.success() {
         bail!("could not enable the sweeflow service");
     }
+    // Desktops whose session doesn't start systemd's graphical-session.target (Cinnamon, MATE,
+    // Xfce…) never started the service at login: an autostart entry hands it the session's
+    // display and starts it. Where the target does start it, this is a no-op.
+    let autostart = home.join(".config/autostart");
+    std::fs::create_dir_all(&autostart)?;
+    std::fs::write(
+        autostart.join("sweeflow.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Sweeflow\nComment=Mac windows on this desktop\nIcon=sweeflow\n\
+         Exec=sh -c 'dbus-update-activation-environment --systemd DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_CURRENT_DESKTOP; systemctl --user start sweeflow.service'\n\
+         NoDisplay=true\nX-GNOME-Autostart-enabled=true\n",
+    )?;
     // Before the service starts: a bar that looks an icon up before its file is there (Omarchy's)
     // keeps showing a placeholder.
     write_icons(&home)?;
