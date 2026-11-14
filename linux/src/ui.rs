@@ -2621,6 +2621,11 @@ impl App {
     /// Asks the compositor to focus one of the windows (the Mac's key window as they arrive):
     /// with an activation token asked for now, which a compositor may take only as a hint.
     fn activate(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        // GNOME takes a request not made from a click or key here only as "is ready", in a
+        // notification at every reconnect: there the Mac follows the focus at the first press.
+        if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME")) {
+            return;
+        }
         let (Some(activation), Some(w)) = (&self.activation, self.windows.get(&wid)) else { return };
         let Role::Toplevel(t) = &w.role else { return };
         log::info!("window {wid}: focused here, as the Mac's key window");
@@ -3903,7 +3908,9 @@ impl DataSourceHandler for App {
             if let Some(data) = self.cp_offers.as_ref().and_then(|o| o.get(&mime)).cloned() {
                 std::thread::spawn(move || {
                     use std::io::Write;
-                    let _ = fd.write_all(&data);
+                    if crate::clipboard::wait_for_files(&mime) {
+                        let _ = fd.write_all(&data);
+                    }
                 });
             }
             return;
@@ -4120,10 +4127,13 @@ impl Dispatch<ExtDataControlSourceV1, ClipData> for App {
         match e {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
                 if let Some(bytes) = d.0.get(&mime_type).cloned() {
-                    // A paste into a slow reader must not stall the UI.
+                    // A paste into a slow reader must not stall the UI (nor the Mac's files
+                    // being fetched for it).
                     std::thread::spawn(move || {
                         use std::io::Write;
-                        let _ = std::fs::File::from(fd).write_all(&bytes);
+                        if crate::clipboard::wait_for_files(&mime_type) {
+                            let _ = std::fs::File::from(fd).write_all(&bytes);
+                        }
                     });
                 }
             }
