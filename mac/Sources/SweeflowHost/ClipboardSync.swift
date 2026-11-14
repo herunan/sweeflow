@@ -14,6 +14,8 @@ final class ClipboardSync {
     var onChange: (([ClipItem]) -> Void)?
     private var lastChange = NSPasteboard.general.changeCount
     private var timer: Timer?
+    /// The last click or key from Linux (main thread).
+    private var lastInput = Date.distantPast
     /// Largest total we copy across (files included).
     static let maxBytes = 512 << 20
 
@@ -21,7 +23,10 @@ final class ClipboardSync {
         DispatchQueue.main.async {
             self.lastChange = NSPasteboard.general.changeCount
             // Copies happen after a click or key (see checkSoon); this only catches the rest.
-            let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.poll() }
+            let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.poll(fromLinux: Date().timeIntervalSince(self.lastInput) < 3)
+            }
             RunLoop.main.add(t, forMode: .common)
             self.timer = t
         }
@@ -34,26 +39,36 @@ final class ClipboardSync {
     /// Just after a click or key press (⌘C, a Copy menu item): look a little later, once the
     /// app has had time to write the clipboard.
     func checkSoon() {
+        DispatchQueue.main.async { self.lastInput = Date() }
         for delay in [0.15, 0.6] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.poll() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.poll(fromLinux: true) }
         }
     }
 
-    private func poll() {
+    /// `fromLinux`: just after a click or key from Linux. Files are read only then: a file copied
+    /// in the Mac's own Finder (in iCloud Drive, Documents…) made macOS ask whether Sweeflow may
+    /// open that folder, for a copy that had nothing to do with Linux. Its name goes as text.
+    private func poll(fromLinux: Bool) {
         let pb = NSPasteboard.general
         guard pb.changeCount != lastChange else { return }
         lastChange = pb.changeCount
         // Grab what's on the clipboard now (cheap), read files off the main thread (can be big).
-        let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        var urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        var names: String?
+        if !fromLinux, !urls.isEmpty {
+            log("clipboard: \(urls.count) file(s) copied on the Mac itself: only their names go across")
+            names = urls.map(\.lastPathComponent).joined(separator: "\n")
+            urls = []
+        }
         var image: Data?
-        if urls.isEmpty {
+        if urls.isEmpty, names == nil {
             if let png = pb.data(forType: .png) {
                 image = png
             } else if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff) {
                 image = rep.representation(using: .png, properties: [:])
             }
         }
-        let text = urls.isEmpty ? pb.string(forType: .string) : nil
+        let text = names ?? (urls.isEmpty ? pb.string(forType: .string) : nil)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var items: [ClipItem] = []
             var total = 0

@@ -86,6 +86,10 @@ use wayland_protocols::{
 };
 
 use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1};
+use wayland_protocols::xdg::activation::v1::client::{
+    xdg_activation_token_v1::{self, XdgActivationTokenV1},
+    xdg_activation_v1::XdgActivationV1,
+};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::ExtDataControlManagerV1,
@@ -314,6 +318,10 @@ pub struct App {
     /// For measuring hover latency (SWEEFLOW_TRACE=1): when traffic-light updates hit the screen.
     presentation: Option<WpPresentation>,
     appmenu_mgr: Option<OrgKdeKwinAppmenuManager>,
+    /// xdg-activation: brings a window back to the front (and unminimises it) on a launch.
+    activation: Option<XdgActivationV1>,
+    /// Launches whose app had no window here yet: their token, for the window when it comes.
+    launch_tokens: HashMap<String, (String, std::time::Instant)>,
     /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
     /// 10-bit video, and guesses darker). Usable once the compositor says it's ready.
     srgb: Option<WpImageDescriptionV1>,
@@ -488,6 +496,8 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_mgr: bind_opt("wp_cursor_shape_manager_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         presentation: bind_opt("wp_presentation").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
         appmenu_mgr: bind_opt("org_kde_kwin_appmenu_manager").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
+        activation: bind_opt("xdg_activation_v1").then(|| globals.bind(&qh, 1..=1, ()).ok()).flatten(),
+        launch_tokens: HashMap::new(),
         srgb: None,
         srgb_ready: false,
         color_mgr: bind_opt("wp_color_manager_v1").then(|| globals.bind(&qh, 1..=2, ()).ok()).flatten(),
@@ -853,6 +863,7 @@ impl App {
                     self.end_selection();
                 }
             }
+            UiEvent::Raise { bundle_id, token } => self.raise_app(&bundle_id, token, qh),
             UiEvent::Minimize(wid) => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.mac_minimized = true;
@@ -1109,6 +1120,17 @@ impl App {
         );
         if !is_popup {
             self.apply_icon(wid, qh);
+            // Launched here moments ago: the launcher's token puts it in front (and ends the
+            // launch feedback); without it a compositor may keep it behind.
+            let bid = self.windows[&wid].info.bundle_id.clone();
+            if let Some((token, at)) = self.launch_tokens.remove(&bid) {
+                if at.elapsed() < std::time::Duration::from_secs(20) {
+                    if let (Some(a), Role::Toplevel(t)) = (&self.activation, &self.windows[&wid].role) {
+                        log::info!("window {wid}: in front with the launch's token");
+                        a.activate(token, t.wl_surface());
+                    }
+                }
+            }
         }
         let _ = self.net.send(NetCmd::Subscribe(wid));
     }
@@ -2422,6 +2444,41 @@ impl App {
         st.surface.destroy();
         st.buffer.destroy();
         w.base().commit();
+    }
+
+    /// A launch of an app that already has windows here: its newest one (a minimised one first)
+    /// back in front. Wayland lets only the compositor do that, given an activation token: the
+    /// launcher's, or one asked for now (which a compositor may only take as a hint).
+    fn raise_app(&mut self, bundle_id: &str, token: Option<String>, qh: &QueueHandle<Self>) {
+        let Some(activation) = &self.activation else { return };
+        let Some(w) = self
+            .windows
+            .values()
+            .filter(|w| w.info.bundle_id == bundle_id && matches!(w.role, Role::Toplevel(_)))
+            .max_by_key(|w| (w.mac_minimized, w.info.wid))
+        else {
+            if let Some(t) = token {
+                self.launch_tokens.insert(bundle_id.to_string(), (t, std::time::Instant::now()));
+            }
+            return;
+        };
+        let Role::Toplevel(t) = &w.role else { return };
+        let surface = t.wl_surface().clone();
+        log::info!("launch of {bundle_id}: bringing window {} to the front ({})", w.info.wid,
+                   if token.is_some() { "launcher's token" } else { "own token" });
+        match token {
+            Some(t) => activation.activate(t, &surface),
+            None => {
+                let req = activation.get_activation_token(qh, surface.clone());
+                req.set_app_id(format!("sweeflow-{bundle_id}"));
+                if let Some(seat) = self.seat_state.seats().next() {
+                    if self.kb_serial != 0 {
+                        req.set_serial(self.kb_serial, &seat);
+                    }
+                }
+                req.commit();
+            }
+        }
     }
 
     fn toggle_maximize(&self, wid: u32) {
@@ -3743,6 +3800,19 @@ impl Dispatch<WpImageDescriptionV1, ()> for App {
     }
 }
 wayland_client::delegate_noop!(App: ignore OrgKdeKwinAppmenu);
+wayland_client::delegate_noop!(App: ignore XdgActivationV1);
+
+/// A token asked for ourselves (the launch came without one): used on the window as it arrives.
+impl Dispatch<XdgActivationTokenV1, wl_surface::WlSurface> for App {
+    fn event(state: &mut Self, token: &XdgActivationTokenV1, e: xdg_activation_token_v1::Event, surface: &wl_surface::WlSurface, _: &Connection, _: &QueueHandle<Self>) {
+        if let xdg_activation_token_v1::Event::Done { token: t } = e {
+            if let Some(a) = &state.activation {
+                a.activate(t, surface);
+            }
+            token.destroy();
+        }
+    }
+}
 
 /// Logs how long a traffic-light hover update took: input event → our commit → on screen.
 impl Dispatch<WpPresentationFeedback, (u32, f64)> for App {

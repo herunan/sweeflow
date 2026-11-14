@@ -81,8 +81,17 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                     log("audio output: \(error)"); return
                 }
                 self.stream = s
-                s.startCapture { err in
-                    if let err { log("audio capture failed: \(err)") } else { log("audio capture: \(ids.sorted())") }
+                s.startCapture { [weak self] err in
+                    guard let err else { return log("audio capture: \(ids.sorted())") }
+                    // Most often while the virtual display is being set up or changing. The failed
+                    // stream was kept and never started again: no Mac sound for the whole session.
+                    log("audio capture failed: \(err.localizedDescription); trying again in 2 s")
+                    self?.queue.async {
+                        guard let self, self.stream === s else { return }
+                        self.stream = nil
+                        self.apps = []
+                        self.queue.asyncAfter(deadline: .now() + 2) { self.refresh() }
+                    }
                 }
             }
         }
@@ -144,6 +153,11 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("audio stream stopped: \(error)")
-        queue.async { self.stream = nil }
+        queue.async {
+            guard self.stream === stream else { return }
+            self.stream = nil
+            self.apps = []
+            self.queue.asyncAfter(deadline: .now() + 2) { self.refresh() }
+        }
     }
 }

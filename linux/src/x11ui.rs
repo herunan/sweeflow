@@ -76,6 +76,7 @@ x11rb::atom_manager! {
         _NET_WM_STATE_MAXIMIZED_HORZ,
         _NET_WM_STATE_FULLSCREEN,
         _NET_WM_STATE_HIDDEN,
+        _NET_ACTIVE_WINDOW,
         _NET_WM_MOVERESIZE,
         _NET_WORKAREA,
         _MOTIF_WM_HINTS,
@@ -755,6 +756,7 @@ impl App {
                     self.end_selection();
                 }
             }
+            UiEvent::Raise { bundle_id, .. } => self.raise_app(&bundle_id),
             UiEvent::Minimize(wid) => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.mac_minimized = true;
@@ -1696,6 +1698,23 @@ impl App {
         let a = &self.atoms;
         let ev = xproto::ClientMessageEvent::new(32, w.xid, a._NET_WM_STATE, [if w.maximized { 0 } else { 1 }, a._NET_WM_STATE_MAXIMIZED_VERT, a._NET_WM_STATE_MAXIMIZED_HORZ, 1, 0]);
         let _ = self.conn.send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
+    }
+
+    /// A launch of an app that already has windows here: its newest one (a minimised one first)
+    /// back in front, asked of the window manager as a pager would (source 2).
+    fn raise_app(&self, bundle_id: &str) {
+        let Some(w) = self
+            .windows
+            .values()
+            .filter(|w| w.info.bundle_id == bundle_id && !w.popup && !w.display)
+            .max_by_key(|w| (w.mac_minimized, w.info.wid))
+        else {
+            return;
+        };
+        log::info!("launch of {bundle_id}: bringing window {} to the front", w.info.wid);
+        let ev = xproto::ClientMessageEvent::new(32, w.xid, self.atoms._NET_ACTIVE_WINDOW, [2, 0, 0, 0, 0]);
+        let _ = self.conn.send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
+        let _ = self.conn.flush();
     }
 
     fn iconify(&self, xid: u32) {

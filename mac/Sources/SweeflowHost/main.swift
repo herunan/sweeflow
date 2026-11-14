@@ -107,6 +107,14 @@ if CommandLine.arguments.contains("--pair") {
     exit(0)
 }
 
+// `SweeflowHost --hold-display`: keeps a stand-in display up while Sweeflow restarts (an update),
+// then quits once the new Sweeflow's own display is up (a minute at most). With the lid closed
+// and no monitor, the virtual display is the Mac's only one: it went with the old process, and
+// the Mac fell asleep and locked before the new one was up.
+if CommandLine.arguments.contains("--hold-display") {
+    VirtualDisplay.holdDuringRestart()
+}
+
 // Opened by hand (Finder, Launchpad): the copy macOS keeps running is the one that serves Linux.
 // Make sure that one is running (the login item), ask it to show its window, and step aside. If
 // macOS wants the login item approved first, or it won't start, carry on here; the setup window

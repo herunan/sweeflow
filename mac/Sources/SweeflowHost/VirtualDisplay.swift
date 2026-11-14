@@ -95,6 +95,49 @@ final class VirtualDisplay {
     }
 
     /// Creates or resizes the display to `points` (logical size of the Linux monitor).
+    /// Whether the Mac's own screen is shut (lid closed) and no other display than Sweeflow's is
+    /// on: then Sweeflow's virtual display is all that keeps the Mac awake and unlocked.
+    static var onlyDisplayLeft: Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &n)
+        return !ids.prefix(Int(n)).contains { CGDisplayVendorNumber($0) != 0x4D46 }
+    }
+
+    /// See `--hold-display` in main.swift. Never returns.
+    static func holdDuringRestart() -> Never {
+        guard onlyDisplayLeft else { exit(0) }
+        let desc = CGVirtualDisplayDescriptor()
+        desc.queue = DispatchQueue.main
+        desc.name = "Sweeflow (restarting)"
+        desc.maxPixelsWide = 1280; desc.maxPixelsHigh = 800
+        desc.sizeInMillimeters = CGSize(width: 300, height: 190)
+        desc.vendorID = 0x4D46
+        desc.productID = 0x0002
+        desc.serialNum = 2
+        guard let vd = CGVirtualDisplay(descriptor: desc) else { log("hold display: creation failed"); exit(1) }
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 0
+        settings.modes = [CGVirtualDisplayMode(width: 1280, height: 800, refreshRate: 60)]
+        guard vd.apply(settings) else { log("hold display: applySettings failed"); exit(1) }
+        log("hold display: up while Sweeflow restarts")
+        let mine = vd.displayID
+        let start = Date()
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+            CGGetOnlineDisplayList(16, &ids, &n)
+            let other = ids.prefix(Int(n)).contains { $0 != mine && CGDisplayVendorNumber($0) == 0x4D46 }
+            // The new Sweeflow's display has been up a little while (windows moved onto it).
+            if other { holdOther += 1 }
+            if holdOther >= 3 || Date().timeIntervalSince(start) > 60 {
+                log("hold display: \(holdOther >= 3 ? "Sweeflow's display is back" : "timed out"), letting go")
+                withExtendedLifetime(vd) { exit(0) }
+            }
+        }
+        RunLoop.main.run()
+        exit(0)
+    }
+    private static var holdOther = 0
+
     func ensure(points: CGSize) {
         let w = UInt32(points.width.rounded()), h = UInt32(points.height.rounded())
         guard w >= 640, h >= 480 else { return }

@@ -155,7 +155,7 @@ fn entry(exe: &std::path::Path, bid: &str, name: &str, icon: &std::path::Path, v
     // would be the same on every entry.
     format!(
         "[Desktop Entry]\nType=Application\nName={name} (Mac)\nExec={exe} launch {bid}\nIcon={}\n\
-         StartupWMClass=sweeflow-{bid}\nCategories=X-Sweeflow;\nKeywords=mac;macos;\nTerminal=false\nActions=quit;\n{}\
+         StartupWMClass=sweeflow-{bid}\nStartupNotify=true\nCategories=X-Sweeflow;\nKeywords=mac;macos;\nTerminal=false\nActions=quit;\n{}\
          \n[Desktop Action quit]\nName={quit}\nIcon=application-exit\nExec={exe} quit {bid}\n",
         icon.display(),
         if visible { "" } else { "NoDisplay=true\n" },
@@ -262,7 +262,16 @@ pub fn socket_path() -> PathBuf {
 
 /// `sweeflow launch <bundle id>`: asks the running client to open the app on the Mac.
 pub fn launch(bundle_id: &str) -> Result<()> {
-    tell(&format!("launch {bundle_id}"))
+    // The launcher's activation token (Wayland; DESKTOP_STARTUP_ID on X11): what lets the client
+    // bring the app's window to the front, unminimised, when the app already runs.
+    let token = std::env::var("XDG_ACTIVATION_TOKEN")
+        .or_else(|_| std::env::var("DESKTOP_STARTUP_ID"))
+        .ok()
+        .filter(|t| !t.is_empty() && !t.contains('\n'));
+    match token {
+        Some(t) => tell(&format!("launch {bundle_id} {t}")),
+        None => tell(&format!("launch {bundle_id}")),
+    }
 }
 
 /// `sweeflow quit <bundle id>` (the launchers' Quit action): asks the running client to quit

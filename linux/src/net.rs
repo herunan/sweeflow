@@ -66,6 +66,9 @@ pub enum UiEvent {
     DragSpot(u32, f32, f32, bool),
     ToggleMaximize(u32),
     Minimize(u32),
+    /// An app launched here that already has windows: bring its newest back (unminimised, in
+    /// front), with the launcher's activation token if it gave one.
+    Raise { bundle_id: String, token: Option<String> },
     /// macOS's screenshot selection started (true) or ended: drawn here, as the Mac's can't be captured.
     ScreenSelect(bool),
     /// An app's menu bar (JSON from the Mac).
@@ -107,6 +110,7 @@ impl UiEvent {
             UiEvent::DragSpot(..) => "drag spot",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
             UiEvent::Minimize(_) => "minimize",
+            UiEvent::Raise { .. } => "raise",
             UiEvent::ScreenSelect(_) => "screen select",
             UiEvent::MenuTree { .. } => "menu tree",
             UiEvent::Frame(..) => "video frame",
@@ -669,10 +673,15 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
         .spawn(move || {
             for conn in listener.incoming().flatten() {
                 for line in std::io::BufReader::new(conn).lines().map_while(Result::ok) {
-                    if let Some(bid) = line.strip_prefix("launch ") {
-                        let bid = bid.trim().to_string();
+                    if let Some(rest) = line.strip_prefix("launch ") {
+                        // "launch <bundle id> [activation token]" (GNOME's tokens hold the
+                        // entry's name, spaces and all: the rest of the line).
+                        let mut parts = rest.trim().splitn(2, ' ');
+                        let bid = parts.next().unwrap_or_default().to_string();
+                        let token = parts.next().map(str::to_string).filter(|t| !t.is_empty());
                         if CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
                             log::info!("launching {bid} on the Mac");
+                            tell_ui(UiEvent::Raise { bundle_id: bid.clone(), token });
                             let _ = tx.send(NetCmd::Control(W::new(t::LAUNCH_APP).str(&bid).finish()));
                             if mac_locked() {
                                 let name = crate::tray::app_name(&bid);
