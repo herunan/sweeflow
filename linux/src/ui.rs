@@ -1373,7 +1373,13 @@ impl App {
                     let buttons = w.buttons.clone();
                     self.pending_fixed.insert(wid, (None, false));
                     self.remove_window(wid);
+                    let (class, title) = (format!("sweeflow-{}", info.bundle_id), display_title(&info.app_name, &info.title));
                     self.add_window(info, qh);
+                    if crate::hyprland::running() {
+                        // Hyprland tiles a dialog with no parent all the same (the window came
+                        // back tiled, in a corner): floated by name, at the Mac's size, centred.
+                        crate::hyprland::float_window_sized(class, title, Some(mac));
+                    }
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.buttons = buttons;
                     }

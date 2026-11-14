@@ -319,10 +319,26 @@ pub fn watch_tiling() {
 /// Floats this process's window of that class (and title, if several share it): a Mac window
 /// its app won't let be resized, which a tile would cut off or leave empty around.
 pub fn float_window(class: String, title: String) {
+    float_window_sized(class, title, None);
+}
+
+/// As float_window, then at this size (points), centred: Hyprland floats a window at the size
+/// and place its tile had (a video player came back cut off, half off the screen's edge).
+pub fn float_window_sized(class: String, title: String, size: Option<(u32, u32)>) {
     std::thread::spawn(move || {
-        let Ok(out) = Command::new("hyprctl").args(["-j", "clients"]).output() else { return };
-        let Ok(serde_json::Value::Array(clients)) = serde_json::from_slice(&out.stdout) else { return };
+        // (A window just made may not be mapped yet: looked for again for up to a second.)
         let pid = u64::from(std::process::id());
+        let mut clients = Vec::new();
+        for _ in 0..10 {
+            let Ok(out) = Command::new("hyprctl").args(["-j", "clients"]).output() else { return };
+            if let Ok(serde_json::Value::Array(list)) = serde_json::from_slice(&out.stdout) {
+                clients = list;
+            }
+            if clients.iter().any(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class.as_str())) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         let ours: Vec<_> = clients.iter().filter(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class.as_str())).collect();
         let Some(c) = ours.iter().find(|c| c["title"].as_str() == Some(title.as_str())).or(ours.first()) else { return };
         if c["floating"].as_bool() == Some(true) {
@@ -333,6 +349,15 @@ pub fn float_window(class: String, title: String) {
         let done = Command::new("hyprctl").args(["dispatch", &lua]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok");
         if !done {
             let _ = Command::new("hyprctl").args(["dispatch", "setfloating", &format!("address:{address}")]).output();
+        }
+        if let Some((w, h)) = size {
+            let window = format!("address:{address}");
+            for lua in [
+                format!(r#"hl.dsp.window.resize({{ x = {w}, y = {h}, window = "{window}" }})"#),
+                format!(r#"hl.dsp.window.center({{ window = "{window}" }})"#),
+            ] {
+                let _ = Command::new("hyprctl").args(["dispatch", &lua]).output();
+            }
         }
     });
 }
