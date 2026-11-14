@@ -5,7 +5,7 @@
 
 use std::{path::PathBuf, process::Command};
 
-type Rgb = (u8, u8, u8);
+pub type Rgb = (u8, u8, u8);
 
 pub struct Look {
     pub bg: Rgb,
@@ -160,6 +160,9 @@ fn family(alias: &str) -> String {
     output("fc-match", &["-f", "%{family[0]}", alias]).unwrap_or_default()
 }
 
+/// Sweeflow's violet: the accent of its windows everywhere (the Plasma widget's too).
+pub const VIOLET: Rgb = (0x8b, 0x5c, 0xf6);
+
 /// Gives a window (whose Slint code exports look.slint's `Look`) this desktop's look.
 macro_rules! apply {
     ($ui:expr) => {{
@@ -168,8 +171,11 @@ macro_rules! apply {
         let global = $ui.global::<Look>();
         global.set_bg(color(look.bg));
         global.set_fg(color(look.fg));
-        global.set_accent(color(look.accent));
-        global.set_on_accent(color(look.on_accent));
+        // Sweeflow's own violet on every desktop (the owner's call), not the desktop's accent:
+        // the window's colours and font still follow the desktop.
+        let _ = (look.accent, look.on_accent);
+        global.set_accent(color($crate::look::VIOLET));
+        global.set_on_accent(color((0xff, 0xff, 0xff)));
         global.set_radius(look.radius);
         global.set_font(look.font.into());
         global.set_mono(look.mono.into());
