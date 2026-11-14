@@ -2038,50 +2038,7 @@ impl App {
     /// violet, with the number of files on it when there are several. 48 × 56 logical px.
     fn drag_picture(&self, qh: &QueueHandle<Self>) -> Option<(wl_surface::WlSurface, RawPool, wl_buffer::WlBuffer)> {
         let scale = self.scale.max(1.0).ceil() as i32;
-        let (w, h) = (48 * scale, 56 * scale);
-        let mut px = vec![0u8; (w * h * 4) as usize];
-        let fold = 14.0 * scale as f64;
-        let (violet, white) = ([0xf6u8, 0x5c, 0x8b], [0xffu8, 0xff, 0xff]);
-        for y in 0..h {
-            for x in 0..w {
-                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
-                let m = 2.0 * scale as f64;
-                let inside = fx > m && fy > m && fx < w as f64 - m && fy < h as f64 - m && !(fx > w as f64 - m - fold && fy < m + fold && (fx - (w as f64 - m - fold)) > (fy - m));
-                if !inside {
-                    continue;
-                }
-                let edge = fx < m + 2.0 * scale as f64 || fy < m + 2.0 * scale as f64 || fx > w as f64 - m - 2.0 * scale as f64 || fy > h as f64 - m - 2.0 * scale as f64;
-                let c = if edge { violet } else { white };
-                // BGRA, premultiplied (opaque here).
-                px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[c[0], c[1], c[2], 0xff]);
-            }
-        }
-        // The number of files: a violet disc at the bottom right with white bars for the
-        // count (up to 9; more shows as 9).
-        if self.drag_count > 1 {
-            let (cx, cy, r) = (w as f64 - 14.0 * scale as f64, h as f64 - 14.0 * scale as f64, 11.0 * scale as f64);
-            for y in 0..h {
-                for x in 0..w {
-                    let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
-                    if d <= r {
-                        px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[violet[0], violet[1], violet[2], 0xff]);
-                    }
-                }
-            }
-            let n = self.drag_count.min(9) as i32;
-            let bar_w = (2 * scale).max(1);
-            let total = n * bar_w + (n - 1) * scale;
-            let x0 = cx as i32 - total / 2;
-            for b in 0..n {
-                for y in (cy as i32 - 5 * scale)..(cy as i32 + 5 * scale) {
-                    for x in (x0 + b * (bar_w + scale))..(x0 + b * (bar_w + scale) + bar_w) {
-                        if x >= 0 && y >= 0 && x < w && y < h {
-                            px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[white[0], white[1], white[2], 0xff]);
-                        }
-                    }
-                }
-            }
-        }
+        let (w, h, px) = drag_picture_pixels(scale, self.drag_count);
         let mut pool = RawPool::new(px.len(), &self.shm).ok()?;
         pool.mmap().copy_from_slice(&px);
         let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, (), qh);
@@ -2910,6 +2867,57 @@ pub(crate) fn square_tiles(t: usize, mut px: Vec<u8>) -> Vec<u8> {
 }
 
 /// A pause sign (a dark disc with two white bars) drawn into an opaque BGRA picture.
+/// The picture a drag out of a Mac window carries (both frontends): a document in Sweeflow's
+/// violet with the number of files on it when there are several. `scale` px per logical px;
+/// 48 × 56 logical px, BGRA premultiplied.
+pub(crate) fn drag_picture_pixels(scale: i32, count: usize) -> (i32, i32, Vec<u8>) {
+        let (w, h) = (48 * scale, 56 * scale);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let fold = 14.0 * scale as f64;
+        let (violet, white) = ([0xf6u8, 0x5c, 0x8b], [0xffu8, 0xff, 0xff]);
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let m = 2.0 * scale as f64;
+                let inside = fx > m && fy > m && fx < w as f64 - m && fy < h as f64 - m && !(fx > w as f64 - m - fold && fy < m + fold && (fx - (w as f64 - m - fold)) > (fy - m));
+                if !inside {
+                    continue;
+                }
+                let edge = fx < m + 2.0 * scale as f64 || fy < m + 2.0 * scale as f64 || fx > w as f64 - m - 2.0 * scale as f64 || fy > h as f64 - m - 2.0 * scale as f64;
+                let c = if edge { violet } else { white };
+                // BGRA, premultiplied (opaque here).
+                px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[c[0], c[1], c[2], 0xff]);
+            }
+        }
+        // The number of files: a violet disc at the bottom right with white bars for the
+        // count (up to 9; more shows as 9).
+        if count > 1 {
+            let (cx, cy, r) = (w as f64 - 14.0 * scale as f64, h as f64 - 14.0 * scale as f64, 11.0 * scale as f64);
+            for y in 0..h {
+                for x in 0..w {
+                    let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+                    if d <= r {
+                        px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[violet[0], violet[1], violet[2], 0xff]);
+                    }
+                }
+            }
+            let n = count.min(9) as i32;
+            let bar_w = (2 * scale).max(1);
+            let total = n * bar_w + (n - 1) * scale;
+            let x0 = cx as i32 - total / 2;
+            for b in 0..n {
+                for y in (cy as i32 - 5 * scale)..(cy as i32 + 5 * scale) {
+                    for x in (x0 + b * (bar_w + scale))..(x0 + b * (bar_w + scale) + bar_w) {
+                        if x >= 0 && y >= 0 && x < w && y < h {
+                            px[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[white[0], white[1], white[2], 0xff]);
+                        }
+                    }
+                }
+            }
+        }
+        (w, h, px)
+}
+
 pub(crate) fn draw_pause(px: &mut [u8], stride_px: usize, cx: f64, cy: f64, r: f64) {
     let rows = px.len() / 4 / stride_px.max(1);
     let (bar_w, bar_h, gap) = (r * 0.2, r * 0.9, r * 0.2);

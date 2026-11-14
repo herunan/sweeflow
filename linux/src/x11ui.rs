@@ -81,6 +81,18 @@ x11rb::atom_manager! {
         _MOTIF_WM_HINTS,
         _KDE_NET_WM_APPMENU_SERVICE_NAME,
         _KDE_NET_WM_APPMENU_OBJECT_PATH,
+        XdndAware,
+        XdndEnter,
+        XdndPosition,
+        XdndStatus,
+        XdndLeave,
+        XdndDrop,
+        XdndFinished,
+        XdndSelection,
+        XdndTypeList,
+        XdndActionCopy,
+        SWEEFLOW_DROP,
+        INCR,
     }
 }
 
@@ -303,6 +315,31 @@ struct ScrollAxis {
     last: Option<f64>,
 }
 
+/// A file drag out of a Mac window, carried on to Linux apps (XDND, Sweeflow the source): the
+/// Mac window it came from, the Linux window under the pointer that takes drops (and whether it
+/// said it would take this one), the files once the Mac has sent them (as a URI list), and
+/// requests for them waiting on that.
+struct XdndOut {
+    wid: u32,
+    source: u32,
+    target: Option<u32>,
+    accepted: bool,
+    dropped: bool,
+    uris: Option<std::sync::Arc<Vec<u8>>>,
+    waiting: Vec<(u32, u32, u32, u32)>,
+    started: Instant,
+}
+
+/// A drag from a Linux app over a Mac window (XDND): who's dragging, what it offers, where it is,
+/// and, once dropped, the types still to read and what was read.
+struct XdndIn {
+    source: u32,
+    types: Vec<String>,
+    target: Option<(u32, f64, f64)>,
+    to_read: Vec<String>,
+    read: Vec<(String, Vec<u8>)>,
+}
+
 pub struct App {
     conn: RustConnection,
     screen: usize,
@@ -352,6 +389,13 @@ pub struct App {
     xi_pointer: Option<u16>,
     /// The keyboard is ours (see sync_keyboard_grab).
     kb_grabbed: bool,
+    /// A drag from Linux over a Mac window, or being dropped on one.
+    xdnd_in: Option<XdndIn>,
+    /// A Mac file drag carried on outside its window.
+    xdnd_out: Option<XdndOut>,
+    /// The number of files the Mac drag carries, and the picture following the pointer.
+    drag_count: usize,
+    drag_pic: Option<(u32, (i32, i32))>,
     press_time: Instant,
     press_known: bool,
     moved_here: Option<u32>,
@@ -475,6 +519,10 @@ impl App {
             drag_spot: None,
             xi_pointer: None,
             kb_grabbed: false,
+            xdnd_in: None,
+            xdnd_out: None,
+            drag_count: 1,
+            drag_pic: None,
             press_time: Instant::now(),
             press_known: false,
             moved_here: None,
@@ -681,11 +729,20 @@ impl App {
                 }
             }
             UiEvent::DragBegan { wid, names } => {
-                // TODO(x11 phase 2): continue a Mac file drag outside its window as an XDND drag.
-                log::info!("Mac drag in {wid}: {names:?} (file drags out aren't on X11 yet)");
+                log::info!("Mac drag in {wid}: {names:?}");
                 self.mac_drag = Some(wid);
+                self.drag_count = names.len().max(1);
             }
-            UiEvent::DragData(_) => {} // TODO(x11 phase 2): the XDND drag's data.
+            UiEvent::DragData(uris) => {
+                let uris = std::sync::Arc::new(uris);
+                let waiting = self.xdnd_out.as_mut().map(|o| {
+                    o.uris = Some(uris.clone());
+                    std::mem::take(&mut o.waiting)
+                });
+                for (requestor, property, target, time) in waiting.unwrap_or_default() {
+                    self.xdnd_answer(requestor, property, target, time, Some(&uris));
+                }
+            }
             UiEvent::MenuTree { pid, json } => {
                 if let Some(m) = self.menus.as_mut() {
                     m.update(pid, &json);
@@ -796,6 +853,8 @@ impl App {
         let class = if display { "sweeflow-display".to_string() } else { format!("sweeflow-{}", info.bundle_id) };
         self.conn.change_property8(PropMode::REPLACE, xid, xproto::AtomEnum::WM_CLASS, xproto::AtomEnum::STRING, format!("{class}\0{class}\0").as_bytes())?;
         self.conn.change_property32(PropMode::REPLACE, xid, a._NET_WM_PID, xproto::AtomEnum::CARDINAL, &[std::process::id()])?;
+        // Files dragged from Linux apps can be dropped on it (XDND, version 5).
+        self.conn.change_property32(PropMode::REPLACE, xid, a.XdndAware, xproto::AtomEnum::ATOM, &[5])?;
         self.conn.change_property8(PropMode::REPLACE, xid, a.WM_CLIENT_MACHINE, xproto::AtomEnum::STRING, self.hostname.as_bytes())?;
         self.conn.change_property32(PropMode::REPLACE, xid, a.WM_PROTOCOLS, xproto::AtomEnum::ATOM, &[a.WM_DELETE_WINDOW, a._NET_WM_PING])?;
         let mut hints = WmHints::new();
@@ -1796,6 +1855,294 @@ impl App {
 
     // --- X events ----------------------------------------------------------------------------
 
+    /// A Mac file drag has left its window with the button still held: carried on as an XDND
+    /// drag from here (the Mac is told it's taken; the files come when a Linux app asks).
+    fn xdnd_take(&mut self, wid: u32) {
+        let Some(xid) = self.windows.get(&wid).map(|w| w.xid) else { return };
+        let _ = self.conn.set_selection_owner(xid, self.atoms.XdndSelection, CURRENT_TIME);
+        self.xdnd_out = Some(XdndOut { wid, source: xid, target: None, accepted: false, dropped: false, uris: None, waiting: Vec::new(), started: Instant::now() });
+        self.mac_drag = None;
+        self.send(W::new(t::DRAG_TAKEN).u32(wid).finish());
+        log::info!("took over the Mac drag from window {wid}");
+        self.drag_picture_show();
+        self.xdnd_track();
+    }
+
+    /// A picture under the pointer while a file drag is out (as on Wayland): a window that
+    /// takes no input, kept just below and right of the pointer.
+    fn drag_picture_show(&mut self) {
+        let (w, h, px) = crate::ui::drag_picture_pixels(1, self.drag_count);
+        let Ok(xid) = self.conn.generate_id() else { return };
+        let aux = xproto::CreateWindowAux::new().background_pixel(0).border_pixel(0).colormap(self.colormap).override_redirect(1);
+        if self.conn.create_window(self.depth, xid, self.root, 0, 0, w as u16, h as u16, 0, xproto::WindowClass::INPUT_OUTPUT, self.gl.visual, &aux).is_err() {
+            return;
+        }
+        // Clicks and drops go through it (to what's under it).
+        let _ = self.conn.shape_rectangles(x11rb::protocol::shape::SO::SET, x11rb::protocol::shape::SK::INPUT, xproto::ClipOrdering::UNSORTED, xid, 0, 0, &[]);
+        let _ = self.conn.map_window(xid);
+        if let Ok(gc) = self.conn.generate_id() {
+            let _ = self.conn.create_gc(gc, xid, &xproto::CreateGCAux::new());
+            let _ = self.conn.put_image(xproto::ImageFormat::Z_PIXMAP, xid, gc, w as u16, h as u16, 0, 0, 0, self.depth, &px);
+            let _ = self.conn.free_gc(gc);
+        }
+        self.drag_pic = Some((xid, (w, h)));
+        let _ = self.conn.flush();
+    }
+
+    fn drag_picture_hide(&mut self) {
+        if let Some((xid, _)) = self.drag_pic.take() {
+            let _ = self.conn.destroy_window(xid);
+            let _ = self.conn.flush();
+        }
+    }
+
+    /// The window under the pointer that takes drops (XdndAware), not one of ours.
+    fn xdnd_window_at(&self) -> Option<u32> {
+        let mut w = self.root;
+        for _ in 0..8 {
+            let r = self.conn.query_pointer(w).ok()?.reply().ok()?;
+            if r.child == x11rb::NONE {
+                return None;
+            }
+            w = r.child;
+            if self.by_xid.contains_key(&w) {
+                return None;
+            }
+            let aware = self.conn.get_property(false, w, self.atoms.XdndAware, xproto::AtomEnum::ATOM, 0, 1).ok().and_then(|c| c.reply().ok());
+            if aware.is_some_and(|a| a.value_len > 0) {
+                return Some(w);
+            }
+        }
+        None
+    }
+
+    /// Tells the window under the pointer about the drag (enter / position; leave for the one
+    /// it left).
+    fn xdnd_track(&mut self) {
+        // One dropped long ago whose target never finished: forgotten.
+        if self.xdnd_out.as_ref().is_some_and(|o| o.dropped && o.started.elapsed() > Duration::from_secs(120)) {
+            self.xdnd_out = None;
+        }
+        let (rx, ry) = self.pointer_root;
+        if let Some((pic, _)) = self.drag_pic {
+            let _ = self.conn.configure_window(pic, &xproto::ConfigureWindowAux::new().x(rx as i32 + 14).y(ry as i32 + 14).stack_mode(xproto::StackMode::ABOVE));
+        }
+        let target = self.xdnd_window_at();
+        let a = &self.atoms;
+        let uri = self.atom("text/uri-list");
+        let Some(o) = self.xdnd_out.as_mut() else { return };
+        let msg = |to: u32, kind: u32, d: [u32; 5]| xproto::ClientMessageEvent::new(32, to, kind, d);
+        if o.target != target {
+            if let Some(old) = o.target {
+                let _ = self.conn.send_event(false, old, EventMask::NO_EVENT, msg(old, a.XdndLeave, [o.source, 0, 0, 0, 0]));
+            }
+            if let Some(new) = target {
+                let _ = self.conn.send_event(false, new, EventMask::NO_EVENT, msg(new, a.XdndEnter, [o.source, 5 << 24, uri, 0, 0]));
+            }
+            o.target = target;
+            o.accepted = false;
+        }
+        if let Some(t) = o.target {
+            let at = ((rx as u16 as u32) << 16) | (ry as u16 as u32);
+            let _ = self.conn.send_event(false, t, EventMask::NO_EVENT, msg(t, a.XdndPosition, [o.source, 0, at, CURRENT_TIME, a.XdndActionCopy]));
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// The button let go during a drag out: dropped on the window under it if it takes it,
+    /// otherwise the drag ends with nothing dropped.
+    fn xdnd_release(&mut self) {
+        self.drag_picture_hide();
+        let a = &self.atoms;
+        let Some(o) = self.xdnd_out.as_mut() else { return };
+        match (o.target, o.accepted) {
+            (Some(t), true) => {
+                let ev = xproto::ClientMessageEvent::new(32, t, a.XdndDrop, [o.source, 0, CURRENT_TIME, 0, 0]);
+                let _ = self.conn.send_event(false, t, EventMask::NO_EVENT, ev);
+                o.dropped = true;
+                log::info!("drag out of Mac window {}: dropped on window {t:#x}", o.wid);
+            }
+            (target, _) => {
+                if let Some(t) = target {
+                    let ev = xproto::ClientMessageEvent::new(32, t, a.XdndLeave, [o.source, 0, 0, 0, 0]);
+                    let _ = self.conn.send_event(false, t, EventMask::NO_EVENT, ev);
+                }
+                log::info!("drag out: let go where nothing takes it");
+                self.xdnd_out = None;
+            }
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// A Linux app asks for the dropped files: answered now if the Mac has sent them, else once
+    /// it has (asked for on the first request, as on Wayland).
+    fn xdnd_request(&mut self, e: xproto::SelectionRequestEvent) {
+        let property = if e.property == x11rb::NONE { e.target } else { e.property };
+        let targets = self.atom("TARGETS");
+        let uri = self.atom("text/uri-list");
+        if e.target == targets {
+            let _ = self.conn.change_property32(PropMode::REPLACE, e.requestor, property, xproto::AtomEnum::ATOM, &[targets, uri]);
+            self.xdnd_notify(e.requestor, e.target, property, e.time);
+            return;
+        }
+        let Some(o) = self.xdnd_out.as_mut() else {
+            self.xdnd_notify(e.requestor, e.target, x11rb::NONE, e.time);
+            return;
+        };
+        if e.target != uri {
+            self.xdnd_notify(e.requestor, e.target, x11rb::NONE, e.time);
+            return;
+        }
+        if let Some(uris) = o.uris.clone() {
+            self.xdnd_answer(e.requestor, property, e.target, e.time, Some(&uris));
+        } else {
+            if o.waiting.is_empty() {
+                let _ = self.net.send(NetCmd::ClipStream(W::new(t::DRAG_FETCH).finish()));
+            }
+            o.waiting.push((e.requestor, property, e.target, e.time));
+        }
+    }
+
+    fn xdnd_answer(&self, requestor: u32, property: u32, target: u32, time: u32, uris: Option<&std::sync::Arc<Vec<u8>>>) {
+        match uris {
+            Some(u) => {
+                let _ = self.conn.change_property8(PropMode::REPLACE, requestor, property, target, u);
+                self.xdnd_notify(requestor, target, property, time);
+            }
+            None => self.xdnd_notify(requestor, target, x11rb::NONE, time),
+        }
+    }
+
+    fn xdnd_notify(&self, requestor: u32, target: u32, property: u32, time: u32) {
+        let ev = xproto::SelectionNotifyEvent {
+            response_type: xproto::SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time,
+            requestor,
+            selection: self.atoms.XdndSelection,
+            target,
+            property,
+        };
+        let _ = self.conn.send_event(false, requestor, EventMask::NO_EVENT, ev);
+        let _ = self.conn.flush();
+    }
+
+    fn atom_name(&self, atom: u32) -> String {
+        self.conn.get_atom_name(atom).ok().and_then(|c| c.reply().ok()).map(|r| String::from_utf8_lossy(&r.name).into_owned()).unwrap_or_default()
+    }
+
+    fn atom(&self, name: &str) -> u32 {
+        self.conn.intern_atom(false, name.as_bytes()).ok().and_then(|c| c.reply().ok()).map(|r| r.atom).unwrap_or(0)
+    }
+
+    /// XDND messages from a Linux app dragging over a Mac window (the ones that drop files on
+    /// it): enter (what it offers), position (where; it's told whether we take it), leave, drop.
+    fn xdnd_message(&mut self, window: u32, kind: u32, d: [u32; 5]) {
+        let a = &self.atoms;
+        let source = d[0];
+        if kind == a.XdndEnter {
+            let types: Vec<u32> = if d[1] & 1 != 0 {
+                self.conn
+                    .get_property(false, source, a.XdndTypeList, xproto::AtomEnum::ATOM, 0, 1024)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .and_then(|r| r.value32().map(|v| v.collect()))
+                    .unwrap_or_default()
+            } else {
+                d[2..5].iter().copied().filter(|&t| t != 0).collect()
+            };
+            let types = types.into_iter().map(|t| self.atom_name(t)).collect();
+            self.xdnd_in = Some(XdndIn { source, types, target: None, to_read: Vec::new(), read: Vec::new() });
+        } else if kind == a.XdndPosition {
+            let wid = self.wid_of(window);
+            let (rx, ry) = ((d[2] >> 16) as i16, (d[2] & 0xffff) as i16);
+            let local = self.conn.translate_coordinates(self.root, window, rx, ry).ok().and_then(|c| c.reply().ok()).map(|r| (r.dst_x as f64, r.dst_y as f64));
+            let accept = match (&mut self.xdnd_in, wid, local) {
+                (Some(x), Some(wid), Some((lx, ly))) if crate::tray::allows_drag() && crate::clipboard::drop_mime(&x.types).is_some() => {
+                    x.target = Some((wid, lx, ly));
+                    true
+                }
+                _ => false,
+            };
+            let status = xproto::ClientMessageEvent::new(32, source, self.atoms.XdndStatus, [window, if accept { 1 | 2 } else { 2 }, 0, 0, if accept { self.atoms.XdndActionCopy } else { 0 }]);
+            let _ = self.conn.send_event(false, source, EventMask::NO_EVENT, status);
+            let _ = self.conn.flush();
+        } else if kind == a.XdndLeave {
+            self.xdnd_in = None;
+        } else if kind == a.XdndDrop {
+            let Some(x) = self.xdnd_in.as_mut() else { return };
+            if x.target.is_none() {
+                self.xdnd_finish(window, false);
+                return;
+            }
+            // Everything worth reading, one type at a time (SelectionNotify, xdnd_data).
+            x.to_read = crate::clipboard::drop_reads(&x.types);
+            self.xdnd_read_next(window, d[2]);
+        }
+    }
+
+    fn xdnd_read_next(&mut self, window: u32, time: u32) {
+        let Some(mime) = self.xdnd_in.as_mut().and_then(|x| x.to_read.first().cloned()) else {
+            self.xdnd_dropped(window);
+            return;
+        };
+        let target = self.atom(&mime);
+        let _ = self.conn.convert_selection(window, self.atoms.XdndSelection, target, self.atoms.SWEEFLOW_DROP, time);
+        let _ = self.conn.flush();
+    }
+
+    /// One type of a drop has arrived: the next, or, with all in, the drop goes to the Mac.
+    fn xdnd_data(&mut self, e: xproto::SelectionNotifyEvent) {
+        let Some(x) = self.xdnd_in.as_mut() else { return };
+        let mime = if x.to_read.is_empty() { return } else { x.to_read.remove(0) };
+        if e.property != x11rb::NONE {
+            if let Ok(Ok(r)) = self.conn.get_property(true, e.requestor, self.atoms.SWEEFLOW_DROP, xproto::AtomEnum::ANY, 0, (crate::clipboard::MAX_BYTES / 4) as u32).map(|c| c.reply()) {
+                if r.type_ != self.atoms.INCR && !r.value.is_empty() {
+                    if let Some(x) = self.xdnd_in.as_mut() {
+                        x.read.push((mime, r.value));
+                    }
+                }
+            }
+        }
+        self.xdnd_read_next(e.requestor, e.time);
+    }
+
+    /// Everything of a drop read: sent to the Mac like a Wayland drop (DROP_FILES), and the
+    /// source told it's done.
+    fn xdnd_dropped(&mut self, window: u32) {
+        let Some(x) = self.xdnd_in.take() else { return };
+        let ok = !x.read.is_empty();
+        if let Some((wid, lx, ly)) = x.target {
+            let (mx, my) = self.to_mac(wid, lx, ly);
+            let net = self.net.clone();
+            let data = x.read;
+            std::thread::spawn(move || {
+                let items = crate::clipboard::drop_items(data);
+                if items.is_empty() {
+                    log::info!("nothing usable in the drop on Mac window {wid}");
+                    return;
+                }
+                log::info!("dropping {:?} on Mac window {wid}", items.iter().map(|i| (&i.kind, &i.name)).collect::<Vec<_>>());
+                let mut w = W::new(t::DROP_FILES).u32(wid).f32(mx).f32(my).u16(items.len() as u16);
+                for it in &items {
+                    w = w.str(&it.kind).str(&it.name).bytes(&it.data);
+                }
+                let _ = net.send(NetCmd::ClipStream(w.finish()));
+            });
+        }
+        self.xdnd_in = Some(XdndIn { source: x.source, types: Vec::new(), target: None, to_read: Vec::new(), read: Vec::new() });
+        self.xdnd_finish(window, ok);
+        self.xdnd_in = None;
+    }
+
+    fn xdnd_finish(&mut self, window: u32, ok: bool) {
+        let Some(source) = self.xdnd_in.as_ref().map(|x| x.source) else { return };
+        let ev = xproto::ClientMessageEvent::new(32, source, self.atoms.XdndFinished, [window, ok as u32, if ok { self.atoms.XdndActionCopy } else { 0 }, 0, 0]);
+        let _ = self.conn.send_event(false, source, EventMask::NO_EVENT, ev);
+        let _ = self.conn.flush();
+        self.xdnd_in = None;
+    }
+
     fn wid_of(&self, xid: u32) -> Option<u32> {
         self.by_xid.get(&xid).copied()
     }
@@ -1836,6 +2183,17 @@ impl App {
                     if let Some(wid) = self.wid_of(e.window) {
                         self.close(wid);
                     }
+                } else if e.type_ == self.atoms.XdndStatus {
+                    if let Some(o) = self.xdnd_out.as_mut().filter(|o| o.target == Some(d[0])) {
+                        o.accepted = d[1] & 1 != 0;
+                    }
+                } else if e.type_ == self.atoms.XdndFinished {
+                    if self.xdnd_out.as_ref().is_some_and(|o| o.target == Some(d[0])) {
+                        log::info!("drag out: done ({})", if d[1] & 1 != 0 { "taken" } else { "refused" });
+                        self.xdnd_out = None;
+                    }
+                } else if [self.atoms.XdndEnter, self.atoms.XdndPosition, self.atoms.XdndLeave, self.atoms.XdndDrop].contains(&e.type_) {
+                    self.xdnd_message(e.window, e.type_, d);
                 } else if e.type_ == self.atoms.WM_PROTOCOLS && d[0] == self.atoms._NET_WM_PING {
                     let mut reply = e;
                     reply.window = self.root;
@@ -1843,6 +2201,8 @@ impl App {
                 }
             }
             Event::MappingNotify(_) => self.load_keymap(),
+            Event::SelectionNotify(e) if e.selection == self.atoms.XdndSelection => self.xdnd_data(e),
+            Event::SelectionRequest(e) if e.selection == self.atoms.XdndSelection => self.xdnd_request(e),
             Event::EnterNotify(e) => {
                 let Some(wid) = self.wid_of(e.event) else { return };
                 self.pointer_root = (e.root_x, e.root_y);
@@ -2003,6 +2363,18 @@ impl App {
             sel.now = (px, py);
             self.draw(wid);
         }
+        // A Mac file drag carried on outside its window: the Linux window under the pointer.
+        if self.xdnd_out.is_some() {
+            self.xdnd_track();
+            return;
+        }
+        if self.mac_drag == Some(wid) && self.left_down == Some(wid) {
+            let inside = self.windows.get(&wid).is_some_and(|w| px >= 0.0 && py >= 0.0 && px < w.size.0 as f64 && py < w.size.1 as f64);
+            if !inside {
+                self.xdnd_take(wid);
+                return;
+            }
+        }
         let edge = self.edge_of(wid, px, py);
         self.set_edge_cursor(wid, edge);
         self.lights_pointer(wid, px, py);
@@ -2086,6 +2458,12 @@ impl App {
                     }
                 }
                 self.lights_pointer(wid, px, py);
+                return;
+            }
+            if xb == 1 && self.xdnd_out.as_ref().is_some_and(|o| !o.dropped) {
+                // The drag out ends here: dropped where a Linux app said it would take it.
+                self.left_down = None;
+                self.xdnd_release();
                 return;
             }
             if xb == 1 {
