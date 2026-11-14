@@ -1082,6 +1082,13 @@ final class Session {
             let t0 = Date()
             if let o = t.origin { control.setPosition(wid, pid: t.pid, o) }
             control.setSize(wid, pid: t.pid, t.size)
+            // Moved first so it could grow: an app may size it against where it was, its move not
+            // landed yet (TextEdit stopped at the screen's edge from there). Once it's there, again.
+            if let o = t.origin, let f = self?.tracker.liveFrame(wid),
+               f.width < t.size.width - 2 || f.height < t.size.height - 2 {
+                for _ in 0..<10 where self?.tracker.liveFrame(wid)?.origin != o { usleep(20_000) }
+                control.setSize(wid, pid: t.pid, t.size)
+            }
             let ms = Date().timeIntervalSince(t0) * 1000
             if ms > 100 { log(String(format: "resize of %u took %.0f ms", wid, ms)) }
             // What the app made of it: some keep a size of their own (a minimum, a step).
