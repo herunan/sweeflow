@@ -1199,6 +1199,9 @@ pub fn run() -> Result<()> {
         if let Some((x, y)) = x11_corner(size) {
             ui.window().set_position(slint::PhysicalPosition::new(x, y));
         }
+        // Cinnamon may refuse it the focus even when asked, so a click elsewhere is also seen
+        // as another window becoming the active one.
+        close_when_another_is_active();
         // Cinnamon opens it (started by a shortcut or the tray) without the focus, and then a
         // click elsewhere couldn't close it: it asks for the focus once it's up.
         let weak = ui.as_weak();
@@ -1216,6 +1219,86 @@ pub fn run() -> Result<()> {
 /// Where a window this big goes on X11: in the usable area's corner by the panel (bottom right
 /// under a bottom panel, top right under a top one), 8 px in, from the window manager's
 /// _NET_WORKAREA.
+/// X11: closes the window on a click outside it (and outside the desktop's panels, where the
+/// tray icon that toggles it is), or once the window manager makes another window active. Cinnamon
+/// may never give it the focus, so losing the focus alone can't be relied on.
+fn close_when_another_is_active() {
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            xinput::{self, ConnectionExt as _},
+            xproto::{AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask},
+            Event,
+        },
+    };
+    std::thread::spawn(|| {
+        let Ok((conn, screen)) = x11rb::connect(None) else { return };
+        let root = conn.setup().roots[screen].root;
+        let atom = |n: &[u8]| conn.intern_atom(false, n).ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let (Some(active_atom), Some(pid_atom), Some(clients_atom), Some(workarea_atom)) =
+            (atom(b"_NET_ACTIVE_WINDOW"), atom(b"_NET_WM_PID"), atom(b"_NET_CLIENT_LIST"), atom(b"_NET_WORKAREA"))
+        else {
+            return;
+        };
+        let words = |w: u32, a: u32, ty: AtomEnum, n: u32| -> Vec<u32> {
+            conn.get_property(false, w, a, ty, 0, n).ok().and_then(|c| c.reply().ok())
+                .and_then(|r| r.value32().map(|v| v.collect())).unwrap_or_default()
+        };
+        let active = || words(root, active_atom, AtomEnum::WINDOW, 1).first().copied().unwrap_or(0);
+        let ours = |w: u32| words(w, pid_atom, AtomEnum::CARDINAL, 1).first() == Some(&std::process::id());
+        let close = || {
+            let _ = slint::invoke_from_event_loop(|| {
+                let _ = slint::quit_event_loop();
+            });
+        };
+        if conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE)).is_err() {
+            return;
+        }
+        let raw = conn.xinput_xi_query_version(2, 1).ok().and_then(|c| c.reply().ok()).is_some()
+            && conn
+                .xinput_xi_select_events(root, &[xinput::EventMask { deviceid: 1, mask: vec![xinput::XIEventMask::RAW_BUTTON_PRESS] }])
+                .is_ok();
+        let _ = conn.flush();
+        // What was active as it opened (it may never become active itself).
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let mut opened_over = active();
+        let window = words(root, clients_atom, AtomEnum::WINDOW, 1024).into_iter().rev().find(|w| ours(*w));
+        let inside = |x: i32, y: i32, w: u32| -> bool {
+            let Some(g) = conn.get_geometry(w).ok().and_then(|c| c.reply().ok()) else { return true };
+            let Some(t) = conn.translate_coordinates(w, root, 0, 0).ok().and_then(|c| c.reply().ok()) else { return true };
+            let (x0, y0) = (t.dst_x as i32, t.dst_y as i32);
+            x >= x0 && y >= y0 && x < x0 + g.width as i32 && y < y0 + g.height as i32
+        };
+        let in_workarea = |x: i32, y: i32| -> bool {
+            let a = words(root, workarea_atom, AtomEnum::CARDINAL, 4);
+            let [ax, ay, aw, ah] = a[..] else { return true };
+            x >= ax as i32 && y >= ay as i32 && x < (ax + aw) as i32 && y < (ay + ah) as i32
+        };
+        log::debug!("panel: closes on clicks elsewhere (XInput raw presses: {raw}, window {window:?})");
+        while let Ok(event) = conn.wait_for_event() {
+            match event {
+                Event::XinputRawButtonPress(e) if e.detail <= 3 => {
+                    let Some(p) = conn.query_pointer(root).ok().and_then(|c| c.reply().ok()) else { continue };
+                    let (x, y) = (p.root_x as i32, p.root_y as i32);
+                    if window.is_some_and(|w| !inside(x, y, w)) && in_workarea(x, y) {
+                        return close();
+                    }
+                }
+                Event::PropertyNotify(ev) if ev.atom == active_atom => {
+                    let now = active();
+                    if ours(now) {
+                        // Active itself now: any other window after this closes it.
+                        opened_over = 0;
+                    } else if now != 0 && now != opened_over {
+                        return close();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
 fn x11_corner(size: (u32, u32)) -> Option<(i32, i32)> {
     use x11rb::connection::Connection as _;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
