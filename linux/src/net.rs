@@ -335,6 +335,19 @@ pub fn route_kind(host: &str) -> &'static str {
     }
 }
 
+/// How a Mac is reached, in a few words (`kind` from `route_kind`): "Local: 192.168.1.20",
+/// "Remote: 100.64.0.3" (Tailscale or the internet), "VM: 127.0.0.1"; empty if not known.
+pub fn route_words(kind: &str, address: &str) -> String {
+    let word = match kind {
+        "lan" => "Local",
+        "tailscale" | "internet" => "Remote",
+        "vm" => "VM",
+        _ => return String::new(),
+    };
+    let address = address.trim();
+    if address.is_empty() { word.to_string() } else { format!("{word}: {address}") }
+}
+
 /// The address is on a virtual machines' network: the interface the kernel routes it through
 /// is a VM bridge here (libvirt's virbr, VirtualBox's vboxnet, VMware's vmnet, a tap), or this
 /// computer is itself a virtual machine and the address is its way out (its host, the Mac).
@@ -1580,6 +1593,16 @@ pub fn client_endpoint_offering(check: HostCheck, alpns: &[&[u8]]) -> Result<qui
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_words_say_where() {
+        assert_eq!(route_words("lan", "192.168.1.20"), "Local: 192.168.1.20");
+        assert_eq!(route_words("tailscale", "100.64.0.3"), "Remote: 100.64.0.3");
+        assert_eq!(route_words("internet", "8.8.8.8"), "Remote: 8.8.8.8");
+        assert_eq!(route_words("vm", "127.0.0.1"), "VM: 127.0.0.1");
+        assert_eq!(route_words("vm", ""), "VM");
+        assert_eq!(route_words("", "mac.example.com"), "");
+    }
 
     #[test]
     fn route_kinds() {

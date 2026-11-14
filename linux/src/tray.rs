@@ -383,6 +383,15 @@ impl ksni::Tray for Tray {
         // Where streaming stands, and what can be done about it.
         // The status line leads with the same coloured dot the window gives the Mac in use.
         let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, icon_name: dot.into(), ..Default::default() }.into()];
+        // How the Mac in use is reached ("Local: 192.168.1.20"), under it.
+        let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+        if let Some(m) = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint) {
+            let at = reached(m, &cfg.host_fingerprint);
+            let words = crate::net::route_words(crate::net::route_kind(&at), &address_only(&at));
+            if !words.is_empty() {
+                items.push(StandardItem { label: words.replace('_', "__"), enabled: false, ..Default::default() }.into());
+            }
+        }
         for &action in actions {
             if let (Some(other), "start") = (&elsewhere, action) {
                 items.push(StandardItem { label: start_hint(other).replace('_', "__"), enabled: false, ..Default::default() }.into());
@@ -660,7 +669,7 @@ pub fn status_line(mac: &str, s: Standing) -> String {
         Standing { stopped: true, online: Some(false), .. } => format!("Stopped · {mac} is not online"),
         // The first look on the network takes a moment.
         Standing { stopped: true, .. } => format!("Stopped · {mac}"),
-        Standing { elsewhere: Some(_), .. } => format!("{mac} is busy · streaming elsewhere"),
+        Standing { elsewhere: Some(_), .. } => format!("{mac} is streaming elsewhere"),
         Standing { connected: true, enabled: false, .. } => format!("Paused · {mac}"),
         Standing { connected: true, locked: true, .. } => format!("Streaming from {mac} · Mac locked"),
         Standing { connected: true, .. } => format!("Streaming from {mac}"),
@@ -1198,7 +1207,7 @@ mod tests {
         assert_eq!(status_line("Studio", Standing { online: Some(false), ..stopped }), "Stopped · Studio is not online");
         assert_eq!(status_line("Studio", stopped), "Stopped · Studio");
         let elsewhere = Standing { elsewhere: Some("workstation"), online: Some(true), ..Default::default() };
-        assert_eq!(status_line("Studio", elsewhere), "Studio is busy · streaming elsewhere");
+        assert_eq!(status_line("Studio", elsewhere), "Studio is streaming elsewhere");
         assert_eq!(status_short(elsewhere), "Streaming elsewhere");
 
         let waiting = Standing { enabled: true, online: Some(false), ..Default::default() };

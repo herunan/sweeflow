@@ -750,14 +750,7 @@ struct Mac {
 
 /// How a Mac is reached, in a few words: "Remote: 100.64.0.3".
 fn via_line(m: &Mac) -> String {
-    let word = match m.via.as_str() {
-        "lan" => "Local",
-        "tailscale" | "internet" => "Remote",
-        "vm" => "VM",
-        _ => return String::new(),
-    };
-    let place = &m.address;
-    if place.trim().is_empty() { word.to_string() } else { format!("{word}: {}", place.trim()) }
+    crate::net::route_words(&m.via, &m.address)
 }
 
 
