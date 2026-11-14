@@ -390,9 +390,9 @@ fn reload_widgets() {
 /// left to top right): filled, or a ring (paused, not online).
 pub(crate) fn tray_icon(colour: &str, hollow: bool) -> String {
     let dot = if hollow {
-        format!(r#"<circle cx="109" cy="109" r="13" fill="none" stroke="{colour}" stroke-width="10"/>"#)
+        format!(r#"<circle cx="105.5" cy="103.6" r="13" fill="none" stroke="{colour}" stroke-width="10"/>"#)
     } else {
-        format!(r#"<circle cx="109" cy="109" r="18" fill="{colour}"/>"#)
+        format!(r#"<circle cx="105.5" cy="103.6" r="18" fill="{colour}"/>"#)
     };
     TRAY_ICON.replacen("</svg>", &format!("  {dot}\n</svg>"), 1)
 }
