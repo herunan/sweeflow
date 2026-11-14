@@ -65,9 +65,11 @@ pub fn add_to_config() {
 /// The Global menu keeps the keyboard while it is open. Hyprland's focus follows the pointer, so
 /// a mouse resting on (or brushing) another window took the focus, and the menu, which closes
 /// when it loses the focus, was gone before a letter was typed. A window rule for that one
-/// window (by its title; Sweeflow's other windows have the same class).
+/// window (by its title; Sweeflow's other windows have the same class). Sweeflow's own window
+/// too: Esc (which closes it) went to whatever window the pointer had moved onto. A click
+/// outside either still closes it.
 fn keep_menu_focused() {
-    let rule = r#"hl.window_rule({ name = "sweeflow-menu-keeps-focus", enabled = true, match = { class = "sweeflow", title = "(.* - )?Global Menu" }, stay_focused = true })"#;
+    let rule = r#"hl.window_rule({ name = "sweeflow-menu-keeps-focus", enabled = true, match = { class = "sweeflow", title = "^((.* - )?Global Menu|Sweeflow)$" }, stay_focused = true })"#;
     match Command::new("hyprctl").args(["eval", rule]).output() {
         Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {}
         Ok(o) => log::warn!("Hyprland didn't take the rule that keeps the Global Menu focused: {}", String::from_utf8_lossy(&o.stdout).trim()),
