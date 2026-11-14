@@ -1552,6 +1552,11 @@ final class Session {
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
             let wid = w.wid
+            self.announced.remove(wid)
+            // Its popups waiting for it: told now, with whatever window they have by then.
+            for c in self.awaitingParent.removeValue(forKey: wid) ?? [] {
+                if let now = self.tracker.windows[c] { self.sendAdded(now) }
+            }
             self.lastFrames[wid] = nil
             self.refusedSizes[wid] = nil
             if self.minimized[wid] != nil { return }
@@ -1617,6 +1622,9 @@ final class Session {
             self.control?.send(m)
         }
         tracker.start()
+        // Which window is in front here, told as the client starts showing them: it focuses
+        // that one, not whichever its desktop focuses last as they arrive (linux arrival.rs).
+        tracker.burst(everyMs: 50, for: 3)
         // Displays come and go (the virtual one, the lid, a real monitor plugged in): macOS can
         // rearrange them and move the virtual display, so look up where it is now, bring the
         // windows back onto it, and capture at its scale.
@@ -1844,10 +1852,17 @@ final class Session {
         focusChecking = true
         let control = control_
         focusQueue.async { [weak self] in
-            let wid = control.focusedWindowID()
+            let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            let focused = control.focusedWindowID()
             self?.queue.async {
                 guard let self else { return }
                 self.focusChecking = false
+                // Not said (Finder with Quick Look up has no focused window for Accessibility):
+                // the app's frontmost window, from the window server's order.
+                var wid = focused ?? self.tracker.zOrder.first { self.tracker.windows[$0].map { $0.pid == pid && $0.kind == .toplevel } ?? false }
+                // A panel shown as a popup on Linux (Quick Look, when Accessibility names it)
+                // can't have the focus there: the window it's shown on.
+                if let w = wid.flatMap({ self.tracker.windows[$0] }), w.kind == .popup, w.parent != 0 { wid = w.parent }
                 guard let wid, wid != self.lastFocused, self.tracker.windows[wid] != nil else { return }
                 self.lastFocused = wid
                 var m = MsgWriter(.focused); m.u32(wid); self.control?.send(m)
@@ -1907,8 +1922,21 @@ final class Session {
     /// which desktops and tilers (Karousel) float instead of tiling, and they decide that only
     /// when a window appears. An app slow to answer doesn't hold the window up: after 60 ms it's
     /// added anyway, and said to be fixed when the answer comes.
+    /// Windows told to the client, and popups waiting for theirs to be told first, by window.
+    /// A window is told once its app has said whether it can be resized (a moment), a popup at
+    /// once: after a reconnect, Quick Look (open over its Finder window) got to the client
+    /// before that window, and was shown as a window of its own there.
+    private var announced: Set<UInt32> = []
+    private var awaitingParent: [UInt32: [UInt32]] = [:]
+
     private func sendAdded(_ w: TrackedWindow) {
-        if w.kind == .popup { return announce(w, fixed: false) }
+        if w.kind == .popup {
+            if w.parent != 0, !announced.contains(w.parent), tracker.windows[w.parent] != nil {
+                awaitingParent[w.parent, default: []].append(w.wid)
+                return
+            }
+            return announce(w, fixed: false)
+        }
         // Where the app put it, before it's moved onto the virtual display.
         let spot = Self.spot(of: w.frame)
         fixedSpots[w.wid] = fixedSpots[w.wid] ?? spot
@@ -1949,6 +1977,10 @@ final class Session {
         control?.send(m)
         lastFrames[w.wid] = w.frame
         sendButtonsNowAndSettled(w)
+        announced.insert(w.wid)
+        for c in awaitingParent.removeValue(forKey: w.wid) ?? [] {
+            if let now = tracker.windows[c] { sendAdded(now) }
+        }
     }
 
     /// The window's buttons now, and again shortly. An app that places them itself (an

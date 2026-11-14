@@ -1,3 +1,4 @@
+mod arrival;
 mod blind;
 mod clipboard;
 mod config;

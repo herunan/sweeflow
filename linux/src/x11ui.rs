@@ -380,6 +380,8 @@ pub struct App {
     pointer_root: (i16, i16),
     pointer_focus: Option<u32>,
     kb_focus: Option<u32>,
+    /// Focus while windows arrive after (re)connecting (see arrival.rs).
+    arrival: crate::arrival::Arrival,
     edge_cursor: bool,
     meta_down: u8,
     shift_down: u8,
@@ -517,6 +519,7 @@ impl App {
             pointer_root: (0, 0),
             pointer_focus: None,
             kb_focus: None,
+            arrival: Default::default(),
             edge_cursor: false,
             meta_down: 0,
             shift_down: 0,
@@ -616,6 +619,7 @@ impl App {
             UiEvent::Connected(name) => {
                 log::info!("connected to {name}");
                 self.connected = true;
+                self.arrival.connected();
                 self.send_screen_size();
                 for w in self.windows.values_mut() {
                     w.stale = true;
@@ -700,7 +704,11 @@ impl App {
                 }
             }
             UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png),
-            UiEvent::Focused => {}
+            UiEvent::Focused(wid) => {
+                if self.arrival.mac_focused(wid) && self.kb_focus != Some(wid) {
+                    self.activate(wid);
+                }
+            }
             UiEvent::CornersSetting => self.apply_corners_setting(),
             // Hyprland's own (it never runs under X11).
             UiEvent::Tiling(_) => {}
@@ -793,6 +801,7 @@ impl App {
 
     fn add_window(&mut self, info: WinInfo) {
         let wid = info.wid;
+        self.arrival.window_added();
         if self.closed_offline.remove(&wid) {
             log::info!("window {wid} was closed while the Mac was away: closing it there");
             self.send(W::new(t::CLOSE).u32(wid).finish());
@@ -1754,6 +1763,24 @@ impl App {
         let _ = self.conn.send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
     }
 
+    /// The user pressed a key or a button: a focus kept from the Mac while windows arrived is
+    /// passed on first (see arrival.rs).
+    fn user_pressed(&mut self) {
+        if let Some(wid) = self.arrival.input(self.kb_focus) {
+            self.send(W::new(t::FOCUS).u32(wid).finish());
+        }
+    }
+
+    /// Asks the window manager to focus one of the windows (the Mac's key window as they
+    /// arrive), as a pager would (source 2).
+    fn activate(&self, wid: u32) {
+        let Some(w) = self.windows.get(&wid).filter(|w| !w.popup && !w.display) else { return };
+        log::info!("window {wid}: focused here, as the Mac's key window");
+        let ev = xproto::ClientMessageEvent::new(32, w.xid, self.atoms._NET_ACTIVE_WINDOW, [2, 0, 0, 0, 0]);
+        let _ = self.conn.send_event(false, self.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
+        let _ = self.conn.flush();
+    }
+
     /// A launch of an app that already has windows here: its newest one (a minimised one first)
     /// back in front, asked of the window manager as a pager would (source 2).
     fn raise_app(&self, bundle_id: &str) {
@@ -2488,6 +2515,9 @@ impl App {
     }
 
     fn button(&mut self, wid: u32, xb: u8, down: bool, px: f64, py: f64) {
+        if down {
+            self.user_pressed();
+        }
         let (x, y) = self.to_mac(wid, px, py);
         if (4..=7).contains(&xb) {
             // The wheel as buttons, where XInput 2 doesn't give scroll valuators.
@@ -2680,7 +2710,14 @@ impl App {
         if let Some(info) = self.windows.get(&wid).map(|w| &w.info).filter(|i| i.kind != 3) {
             crate::menus::focused(info.pid, &info.app_name);
         }
-        self.send(W::new(t::FOCUS).u32(wid).finish());
+        match self.arrival.focus(wid) {
+            Ok(()) => self.send(W::new(t::FOCUS).u32(wid).finish()),
+            Err(mac_key) => {
+                if let Some(k) = mac_key {
+                    self.activate(k);
+                }
+            }
+        }
         self.update_lights(wid);
         self.schedule_menu_panel();
         self.sync_keyboard_grab();
@@ -2733,6 +2770,9 @@ impl App {
     }
 
     fn key(&mut self, keycode: u8, down: bool, state: u16) {
+        if down {
+            self.user_pressed();
+        }
         const KEY_SPACE: u32 = 57;
         let code = evdev_code(keycode);
         let is_meta = code == 125 || code == 126;

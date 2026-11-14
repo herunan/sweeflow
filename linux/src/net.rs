@@ -64,7 +64,8 @@ pub enum UiEvent {
     WindowFixed(u32, Option<(f32, f32)>, bool),
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
-    Focused,
+    /// The Mac's key window changed (sent too as a session starts).
+    Focused(u32),
     /// Square or rounded corners was switched (the tray): open windows follow now.
     CornersSetting,
     /// Keeping Mac windows at least as big as their app allows was switched (config.rs).
@@ -116,7 +117,7 @@ impl UiEvent {
             UiEvent::WindowFixed(..) => "window fixed",
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
-            UiEvent::Focused => "focused",
+            UiEvent::Focused(_) => "focused",
             UiEvent::CornersSetting => "corners setting",
             UiEvent::Tiling(_) => "tiling",
             UiEvent::WindowButtons(..) => "window buttons",
@@ -1140,10 +1141,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
-        t::FOCUSED => {
-            r.u32()?;
-            UiEvent::Focused
-        }
+        t::FOCUSED => UiEvent::Focused(r.u32()?),
         t::WINDOW_BUTTONS => {
             let wid = r.u32()?;
             let mut rects = [[0f32; 4]; 3];

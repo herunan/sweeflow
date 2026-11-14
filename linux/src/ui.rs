@@ -399,6 +399,8 @@ pub struct App {
     cursor_device: Option<WpCursorShapeDeviceV1>,
     pointer_focus: Option<u32>,
     kb_focus: Option<u32>,
+    /// Focus while windows arrive after (re)connecting (see arrival.rs).
+    arrival: crate::arrival::Arrival,
     scroll_active: bool,
     /// Serial of the last pointer enter, needed to set the cursor image.
     enter_serial: u32,
@@ -571,6 +573,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_device: None,
         pointer_focus: None,
         kb_focus: None,
+        arrival: Default::default(),
         scroll_active: false,
         enter_serial: 0,
         cursor_surface: None,
@@ -693,6 +696,7 @@ impl App {
             UiEvent::Connected(name) => {
                 log::info!("connected to {name}");
                 self.connected = true;
+                self.arrival.connected();
                 self.send_screen_size();
                 // Windows from before a reconnect are kept (so tiling positions survive a Wi-Fi
                 // blip) unless the Mac doesn't re-announce them shortly.
@@ -807,7 +811,11 @@ impl App {
                 }
             }
             UiEvent::Cursor { hot_x, hot_y, scale, png } => self.set_mac_cursor(hot_x, hot_y, scale, &png, qh),
-            UiEvent::Focused => {}
+            UiEvent::Focused(wid) => {
+                if self.arrival.mac_focused(wid) && self.kb_focus != Some(wid) {
+                    self.activate(wid, qh);
+                }
+            }
             UiEvent::CornersSetting => self.apply_corners_setting(qh),
             UiEvent::Tiling(seen) => {
                 let mut changed = Vec::new();
@@ -927,6 +935,7 @@ impl App {
 
     fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
+        self.arrival.window_added();
         if self.closed_offline.remove(&wid) {
             // Closed here while the Mac was away: close it there (it comes back if the app asks
             // first, e.g. to save).
@@ -2601,6 +2610,31 @@ impl App {
         self.sync_inhibitor(qh);
     }
 
+    /// The user pressed a key or a button: a focus kept from the Mac while windows arrived is
+    /// passed on first (see arrival.rs).
+    fn user_pressed(&mut self) {
+        if let Some(wid) = self.arrival.input(self.kb_focus) {
+            self.send(W::new(t::FOCUS).u32(wid).finish());
+        }
+    }
+
+    /// Asks the compositor to focus one of the windows (the Mac's key window as they arrive):
+    /// with an activation token asked for now, which a compositor may take only as a hint.
+    fn activate(&mut self, wid: u32, qh: &QueueHandle<Self>) {
+        let (Some(activation), Some(w)) = (&self.activation, self.windows.get(&wid)) else { return };
+        let Role::Toplevel(t) = &w.role else { return };
+        log::info!("window {wid}: focused here, as the Mac's key window");
+        let surface = t.wl_surface().clone();
+        let req = activation.get_activation_token(qh, surface);
+        req.set_app_id(format!("sweeflow-{}", w.info.bundle_id));
+        if let Some(seat) = self.seat_state.seats().next() {
+            if self.kb_serial != 0 {
+                req.set_serial(self.kb_serial, &seat);
+            }
+        }
+        req.commit();
+    }
+
     /// A launch of an app that already has windows here: its newest one (a minimised one first)
     /// back in front. Wayland lets only the compositor do that, given an activation token: the
     /// launcher's, or one asked for now (which a compositor may only take as a hint).
@@ -3401,6 +3435,7 @@ impl PointerHandler for App {
                     self.send(W::new(t::POINTER_MOVE).u32(wid).f32(x).f32(y).finish());
                 }
                 PointerEventKind::Press { button, serial, .. } => {
+                    self.user_pressed();
                     if button == BTN_LEFT {
                         if let Some(edge) = self.edge_at(wid, e.position.0, e.position.1) {
                             if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
@@ -3542,7 +3577,14 @@ impl KeyboardHandler for App {
             if let Some(info) = self.windows.get(&wid).map(|w| &w.info).filter(|i| i.kind != 3) {
                 crate::menus::focused(info.pid, &info.app_name);
             }
-            self.send(W::new(t::FOCUS).u32(wid).finish());
+            match self.arrival.focus(wid) {
+                Ok(()) => self.send(W::new(t::FOCUS).u32(wid).finish()),
+                Err(mac_key) => {
+                    if let Some(k) = mac_key {
+                        self.activate(k, qh);
+                    }
+                }
+            }
             self.update_lights(wid, qh);
         }
         self.sync_inhibitor(qh);
@@ -3567,6 +3609,7 @@ impl KeyboardHandler for App {
     }
 
     fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+        self.user_pressed();
         match e.raw_code {
             KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down += 1,
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down += 1,
