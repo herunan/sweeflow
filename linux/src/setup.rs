@@ -386,6 +386,17 @@ fn reload_widgets() {
     println!("    (the Sweeflow widgets were updated: log out and in again to see the changes)");
 }
 
+/// The tray logo with a status dot in its empty bottom-right corner (the sweet runs from bottom
+/// left to top right): filled, or a ring (paused, not online).
+pub(crate) fn tray_icon(colour: &str, hollow: bool) -> String {
+    let dot = if hollow {
+        format!(r#"<circle cx="109" cy="109" r="13" fill="none" stroke="{colour}" stroke-width="10"/>"#)
+    } else {
+        format!(r#"<circle cx="109" cy="109" r="18" fill="{colour}"/>"#)
+    };
+    TRAY_ICON.replacen("</svg>", &format!("  {dot}\n</svg>"), 1)
+}
+
 /// The icons, into the user's icon theme folder: the logo ("sweeflow") and the tray's
 /// ("sweeflow-symbolic").
 fn write_icons(home: &std::path::Path) -> Result<()> {
@@ -394,9 +405,16 @@ fn write_icons(home: &std::path::Path) -> Result<()> {
     std::fs::write(icons.join("sweeflow.svg"), APP_ICON)?;
     let symbolic = home.join(".local/share/icons/hicolor/symbolic/apps");
     std::fs::create_dir_all(&symbolic)?;
-    std::fs::write(symbolic.join("sweeflow-symbolic.svg"), TRAY_ICON)?;
-    // The same, translucent: the tray icon while paused or stopped.
-    std::fs::write(symbolic.join("sweeflow-paused-symbolic.svg"), TRAY_ICON.replacen("<g ", "<g opacity=\"0.4\" ", 1))?;
+    // The tray's logo with the dot for where the Mac stands, one per state (tray::icon_name),
+    // the same as Plasma's widget draws: solid, the dot in the main page's colours. Full colour
+    // (a bar recolours a symbolic icon, dot and all, to its text colour). Where the tray finds
+    // them (icon_theme_path).
+    for (name, colour, hollow) in crate::tray::STATE_DOTS {
+        std::fs::write(symbolic.join(format!("{}.svg", crate::tray::tray_icon_of(name))), tray_icon(colour, hollow))?;
+    }
+    for old in ["sweeflow-symbolic.svg", "sweeflow-paused-symbolic.svg"] {
+        let _ = std::fs::remove_file(symbolic.join(old));
+    }
     // The tray menu's dot for where the Mac stands (tray::state_dot), as named icons: GNOME's
     // tray extension can't show a menu item's picture sent as data (the whole menu fails).
     let status = home.join(".local/share/icons/hicolor/scalable/status");

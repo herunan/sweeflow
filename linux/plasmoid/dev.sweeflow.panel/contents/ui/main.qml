@@ -170,15 +170,28 @@ PlasmoidItem {
         onClicked: root.expanded = !root.expanded
         hoverEnabled: true
         Kirigami.Icon {
+            id: trayLogo
             anchors.fill: parent
             source: root.logo
             // In the panel's text colour, like the icons beside it.
             isMask: true
             color: Kirigami.Theme.textColor
             active: parent.containsMouse
-            // Streaming: solid. Paused, stopped, locked or away: translucent, nothing more (the
-            // tooltip and the popup say which).
-            opacity: root.streaming && !root.locked ? 1 : 0.4
+        }
+        // Where the Mac in use stands, in the empty bottom-right corner (the sweet runs from
+        // bottom left to top right): the main page's dot, as the other desktops' tray icon has it
+        // (setup.rs tray_icon).
+        Rectangle {
+            readonly property real side: Math.min(trayLogo.paintedWidth, trayLogo.paintedHeight)
+            readonly property bool hollow: ["", "paused", "offline"].includes(root.activeState)
+            width: Math.max(4, Math.round(side * 0.28))
+            height: width
+            radius: width / 2
+            x: (parent.width + side) / 2 - width
+            y: (parent.height + side) / 2 - height
+            color: hollow ? "transparent" : root.macInk(root.activeState)
+            border.width: hollow ? Math.max(1.5, width * 0.22) : 0
+            border.color: root.macInk(root.activeState)
         }
     }
 

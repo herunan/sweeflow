@@ -332,15 +332,12 @@ impl ksni::Tray for Tray {
         "Sweeflow".into()
     }
 
-    /// The logo in one colour (installed by `sweeflow install`), which each bar draws in its own
-    /// text colour, as Plasma's widget does. No overlay icon for the state (the tooltip and the
-    /// menu's first line say it): bars that get one draw the pair themselves, in the icons' own
-    /// colours instead of theirs (Omarchy's), and not every theme has the emblems.
+    /// The logo with the dot for where the Mac stands, as Plasma's widget draws it (installed by
+    /// `sweeflow install`, one icon per state). Not an overlay icon: bars that get one draw the
+    /// pair themselves, and not every theme has the emblems.
     fn icon_name(&self) -> String {
-        // Solid while streaming, translucent (a second copy of the icon) while paused, stopped or away.
         let state = STATE.lock().unwrap();
-        let st = standing(&state);
-        if st.connected && st.enabled && !st.stopped && !st.locked { "sweeflow-symbolic" } else { "sweeflow-paused-symbolic" }.into()
+        tray_icon_of(state_dot(status_short(standing(&state)).as_str()))
     }
 
     /// Where that icon is, for bars that haven't noticed them in the icon theme (one that
@@ -535,6 +532,11 @@ pub const STATE_DOTS: [(&str, &str, bool); 5] = [
     ("sweeflow-dot-busy", "#e8890c", false),
     ("sweeflow-dot-offline", "#9a96a3", true),
 ];
+
+/// The tray icon with that dot (setup.rs writes them): "sweeflow-tray-streaming"…
+pub fn tray_icon_of(dot: &str) -> String {
+    dot.replacen("sweeflow-dot-", "sweeflow-tray-", 1)
+}
 
 /// The dot's icon name for the status line.
 fn state_dot(status: &str) -> &'static str {
