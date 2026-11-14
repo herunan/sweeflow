@@ -911,6 +911,18 @@ impl App {
                         over_parent = Some((r.dst_x as i32 + info.rel_x.round() as i32, r.dst_y as i32 + info.rel_y.round() as i32));
                     }
                 }
+                // Nowhere on its window (a panel the Mac centred on its own display, Quick
+                // Look's, far off the window there): centred on the window here instead.
+                if let (None, None, Some(p)) = (parent, spot, self.windows.get(&info.parent).filter(|p| !p.popup)) {
+                    let (rx, ry) = info.spot_on(p.info.w, p.info.h);
+                    if let Ok(r) = self.conn.translate_coordinates(p.xid, self.root, 0, 0).map_err(anyhow::Error::from).and_then(|c| Ok(c.reply()?)) {
+                        let (ax, ay, aw, ah) = self.work_area();
+                        let x = (r.dst_x as i32 + rx.round() as i32).min(ax + aw - info.w.round() as i32).max(ax);
+                        let y = (r.dst_y as i32 + ry.round() as i32).min(ay + ah - info.h.round() as i32).max(ay);
+                        self.conn.change_property32(PropMode::REPLACE, xid, xproto::AtomEnum::WM_TRANSIENT_FOR, xproto::AtomEnum::WINDOW, &[p.xid])?;
+                        over_parent = Some((x, y));
+                    }
+                }
                 floated_now = true;
                 fixed_spot = spot;
                 if let (Some(spot), None) = (spot, parent) {
