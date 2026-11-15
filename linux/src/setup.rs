@@ -466,10 +466,7 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
         ["extraItems","knownItems"].forEach(function(k){ var v = w.readConfig(k, []); if (typeof v === "string") v = v.split(",");
             if (v.indexOf("dev.sweeflow.panel") < 0) { v.push("dev.sweeflow.panel"); w.writeConfig(k, v); } });
         w.reloadConfig(); }); });"#;
-    let ok = std::process::Command::new("qdbus6")
-        .args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = crate::desktop::plasma_eval(script).status().is_ok_and(|s| s.success());
     if !ok {
         println!("    (couldn't add the Sweeflow widget to the system tray: add it from the tray's settings)");
     }
@@ -716,11 +713,7 @@ where
 
 /// Runs a script in Plasma's shell (its scripting interface) and gives what it printed.
 fn plasma_script(script: &str) -> Result<String> {
-    let out = Command::new("qdbus6")
-        .args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
-        .stderr(Stdio::null())
-        .output()
-        .context("qdbus6")?;
+    let out = crate::desktop::plasma_eval(script).stderr(Stdio::null()).output().context("qdbus6")?;
     anyhow::ensure!(out.status.success(), "Plasma's shell didn't run the script");
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

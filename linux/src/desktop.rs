@@ -2,7 +2,7 @@
 //! Today that is only taking out the rules earlier versions wrote: Mac windows on a desktop of
 //! their own, and Mac windows kept out of the task manager. Both features are gone.
 
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::Result;
 
@@ -131,4 +131,17 @@ pub fn place_at_spot(class: String, title: String, spot: (f32, f32)) {
 /// "GNOME", "KDE"; whole names, so "GNOME-Classic" isn't "GNOME").
 pub fn is(name: &str) -> bool {
     std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case(name))
+}
+
+/// Runs a command with no output shown, and waits for it.
+pub fn run_quiet(cmd: &mut Command) -> std::io::Result<ExitStatus> {
+    cmd.stdout(Stdio::null()).stderr(Stdio::null()).status()
+}
+
+/// Plasma's shell scripting interface: the command that runs `script` in it (the caller picks
+/// how its output is handled).
+pub fn plasma_eval(script: &str) -> Command {
+    let mut c = Command::new("qdbus6");
+    c.args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script]);
+    c
 }

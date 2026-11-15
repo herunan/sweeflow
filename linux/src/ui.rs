@@ -2957,11 +2957,7 @@ pub(crate) fn set_menu_panel_visible(visible: bool) {
         "panels().forEach(function (p) {{ if (p.widgets().some(function (w) {{ return w.type == \"org.kde.plasma.appmenu\"; }})) p.hiding = \"{mode}\"; }});"
     );
     std::thread::spawn(move || {
-        let _ = std::process::Command::new("qdbus6")
-            .args(["org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", &script])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = crate::desktop::run_quiet(&mut crate::desktop::plasma_eval(&script));
     });
 }
 
@@ -2969,13 +2965,7 @@ pub(crate) fn set_menu_panel_visible(visible: bool) {
 /// the Mac), which also blocks Meta+Tab; invoke it explicitly instead.
 pub(crate) fn switch_windows(reverse: bool) {
     let name = if reverse { "Walk Through Windows (Reverse)" } else { "Walk Through Windows" };
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new("qdbus6")
-            .args(["org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    });
+    crate::deskkeys::plasma_invoke("kwin", name);
 }
 
 /// Cmd+Space: Linux's search (KRunner), not the Mac's Spotlight, wherever the focus is.
@@ -2993,7 +2983,7 @@ pub(crate) fn open_search() {
             c.args(["org.kde.krunner", "/App", "org.kde.krunner.App.toggleDisplay"]);
             c
         };
-        let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        let _ = crate::desktop::run_quiet(&mut cmd);
     });
 }
 

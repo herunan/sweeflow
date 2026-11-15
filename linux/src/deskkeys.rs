@@ -153,11 +153,9 @@ pub fn plasma_action(raw: u32, m: Mods) -> Option<(String, String)> {
 pub fn plasma_invoke(component: &str, action: &str) {
     let (path, action) = (format!("/component/{}", component.replace('.', "_")), action.to_string());
     std::thread::spawn(move || {
-        let _ = Command::new("busctl")
-            .args(["--user", "call", "org.kde.kglobalaccel", &path, "org.kde.kglobalaccel.Component", "invokeShortcut", "s", &action])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = crate::desktop::run_quiet(Command::new("busctl").args([
+            "--user", "call", "org.kde.kglobalaccel", &path, "org.kde.kglobalaccel.Component", "invokeShortcut", "s", &action,
+        ]));
     });
 }
 
