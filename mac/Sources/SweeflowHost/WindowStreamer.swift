@@ -967,6 +967,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// The last still sent by pollStills (a sample of its pixels), to send only changes.
     private var lastStillHash: UInt64 = 0
     private var pollingStills = false
+    private var stillsSince: UInt64 = 0
+
+    /// How soon the next still is taken: every 30 ms while a panel may be opening (Quick Look
+    /// zooming in), less often once it has stayed up: a popup the capture never feeds was taken
+    /// at full resolution 33 times a second for as long as it was open (a fifth of a core, idle).
+    private var stillPace: Double {
+        let up = Double(DispatchTime.now().uptimeNanoseconds - stillsSince) / 1e9
+        return up < 2 ? 0.03 : up < 10 ? 0.25 : 1
+    }
 
     /// Stills of a popup whose live capture delivers nothing (see startCapture), every 100 ms
     /// while that lasts; each one sent only when it differs from the last.
@@ -974,11 +983,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !stopped, stream === s, framesSinceStart == 0 else { pollingStills = false; return }
         if !pollingStills {
             pollingStills = true
+            stillsSince = DispatchTime.now().uptimeNanoseconds
             lastStillHash = 0
             log("stream \(wid): no frame from the capture: stills of it instead")
         }
         // At the size it has now (it may be growing: a panel zooming open).
         applySize(to: config)
+        let pace = stillPace
         let take = { [weak self] (pb: CVPixelBuffer?, again: Double) in
             guard let self else { return }
             self.queue.async {
@@ -1001,16 +1012,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let wid = self.wid
         if Self.windowImage != nil, quickMisses < 8 {
             stillQueue.async { [weak self] in
-                if let pb = Self.quickStill(wid) { return take(pb, 0.03) }
+                if let pb = Self.quickStill(wid) { return take(pb, pace) }
                 // None (the window not drawn yet): again shortly; after a few misses in all,
                 // ScreenCaptureKit's stills instead.
                 self?.queue.async { self?.quickMisses += 1 }
-                take(nil, 0.03)
+                take(nil, pace)
             }
             return
         }
         SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sb, _ in
-            take(sb.flatMap { CMSampleBufferGetImageBuffer($0) }, 0.1)
+            take(sb.flatMap { CMSampleBufferGetImageBuffer($0) }, max(0.1, pace))
         }
     }
 
