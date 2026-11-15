@@ -40,8 +40,6 @@ pub mod t {
     pub const RESIZE: u8 = 0x20;
     pub const FOCUS: u8 = 0x21;
     pub const CLOSE: u8 = 0x22;
-    /// u16 w, u16 h (points), f32 pixels per point: the largest screen, and its scale (1.5 at
-    /// 150%), so the Mac captures at what the screen can show.
     pub const SCREEN_SIZE: u8 = 0x23;
     pub const MENU_ACTIVATE: u8 = 0x24;
     pub const MENU_REFRESH: u8 = 0x25;

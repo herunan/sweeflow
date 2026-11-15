@@ -1545,8 +1545,7 @@ impl App {
             .and_then(|r| r.monitors.iter().map(|m| (m.width as u32, m.height as u32)).max_by_key(|(w, h)| w * h))
             .unwrap_or((s.width_in_pixels as u32, s.height_in_pixels as u32));
         let (w, h) = ((best.0 as f64 / self.scale) as u16, (best.1 as f64 / self.scale) as u16);
-        // A Mac point is `scale` X pixels.
-        self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).f32(self.scale as f32).finish());
+        self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).finish());
     }
 
     /// The desktop's work area (x, y, w, h): the screen less its panels.

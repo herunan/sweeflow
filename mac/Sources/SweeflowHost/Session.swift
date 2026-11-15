@@ -11,8 +11,6 @@ final class Session {
     let queue: DispatchQueue
     private var control: MsgStream?
     private var clientScale: CGFloat = 1
-    /// Pixels per point of the client's screen (1.5 at 150%); nil from older clients.
-    private var screenScale: CGFloat?
     private let tracker: WindowTracker
     private let control_ = WindowControl()
     private let input = InputInjector()
@@ -432,11 +430,6 @@ final class Session {
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
             clientScreen = CGSize(width: w, height: h)
-            if let px = try? m.f32(), px > 0, CGFloat(px) != screenScale {
-                screenScale = CGFloat(px)
-                log("client screen scale \(px)")
-                streamers.values.forEach { $0.checkScale() }
-            }
             let c = settings.config
             guard c.virtualDisplay, c.enabled else { return }
             log("client screen \(Int(w))x\(Int(h))")
@@ -1776,14 +1769,12 @@ final class Session {
         streamers.values.forEach { $0.checkScale() }
     }
 
-    /// What to capture a window at, drawn at `display` pixels per point on the Mac. "Match
-    /// resolution and depth": the client's screen's own scale (1× on a 1× screen, where more was
-    /// never seen, 2× on a HiDPI one, 1.5× at 150%), at most what the Mac draws. "Lower": 1×.
-    /// An older client, which doesn't say: the Mac's own.
+    /// What to capture a window at, drawn at `display` pixels per point on the Mac. High
+    /// quality: as the Mac draws it (2× on its Retina virtual display), even for a 1× Linux
+    /// screen: shrunk there by the compositor it reads sharper than captured at 1×, which the
+    /// Mac's window server shrinks softly. Low: 1×.
     private func captureScale(_ display: CGFloat) -> CGFloat {
-        if settings.config.quality == "light" { return 1 }
-        guard let s = screenScale else { return display }
-        return min(s, display)
+        settings.config.quality == "light" ? 1 : display
     }
 
     private func updateAudio() {
