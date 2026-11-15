@@ -699,6 +699,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // Out of date by the time it's shown again. The locked picture stays (it's current).
             if !showingPause { pendingBuffer = nil }
             log("stream \(wid): paused, capture stopped\(unshown)")
+            // Still paused in 10 s (not just passed over while switching windows): its encoder
+            // goes too, 200 MB for a big window. The next frame after a resume makes a new one,
+            // while the capture is starting again anyway.
+            queue.asyncAfter(deadline: .now() + 10) { [weak self] in
+                guard let self, self.paused, !self.stopped, !self.showingPause, !self.encoding, !self.makingEncoder, self.inEncoder == 0,
+                      self.pendingBuffer == nil, let e = self.encoder else { return }
+                self.encoder = nil
+                self.work.async { VTCompressionSessionInvalidate(e) }
+                log("stream \(self.wid): paused for 10 s, encoder given back")
+            }
             return
         }
         // Logged with its first frame (sendFrame, sendLossless).
@@ -1615,6 +1625,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
+            // One reference frame (the one before): half the encoder's memory. Four encoders of
+            // 3840x2688 in 10-bit held 1.64 GB in the system's encoder service with the default
+            // and 0.8 GB with this (410 → 200 MB each), and were no slower.
+            kVTCompressionPropertyKey_ReferenceBufferCount: 1,
             // 10-bit: subtle UI gradients (sidebars, glass) get four times the steps.
             kVTCompressionPropertyKey_ProfileLevel: encoderTenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: 100_000,

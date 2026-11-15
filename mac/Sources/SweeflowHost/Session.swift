@@ -1383,7 +1383,10 @@ final class Session {
     }
 
     private func sendButtons(_ w: TrackedWindow) {
-        guard w.kind == .toplevel else { return }
+        // Panels too (Activity Monitor's CPU History, a Fonts panel): they have their own small
+        // close button, under the capture badge like any window's, and without it drawn on
+        // Linux there was no way to close one from there.
+        guard w.kind == .toplevel || w.kind == .dialog else { return }
         // Looked up on the app's own queue: an app busy resizing answers late, and on the
         // session's queue every window's frames waited for it (a tiling relayout resizes them
         // all at once). One look per window at a time; changes meanwhile look once more after.

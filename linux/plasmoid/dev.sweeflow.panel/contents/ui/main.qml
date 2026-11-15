@@ -592,7 +592,7 @@ PlasmoidItem {
                     }
                     ToggleRow {
                         label: "High quality"
-                        hint: "Retina detail and 10-bit colour. Off: half the detail and 8-bit, for slower connections"
+                        hint: "Retina detail and 10-bit colour. Off: half the detail and 8-bit"
                         on: root.settings.quality !== "light"
                         onFlipped: (v) => root.set({ quality: v ? "sharp" : "light" })
                     }

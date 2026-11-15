@@ -90,7 +90,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
             menu.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(fp) })
         } else if let fp = refused.first {
-            menu.addItem(ClosureMenuItem(title: "Allow") { Self.connect(fp) })
+            menu.addItem(ClosureMenuItem(title: "Start") { Self.connect(fp) })
         }
         menu.addItem(.separator())
 
@@ -149,7 +149,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
                 computer.state = .on
                 options.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(p.fingerprint) })
             } else if refused.contains(p.fingerprint) {
-                options.addItem(ClosureMenuItem(title: "Allow") { Self.connect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Start") { Self.connect(p.fingerprint) })
             } else {
                 let idle = NSMenuItem(title: "Not streaming", action: nil, keyEquivalent: "")
                 idle.isEnabled = false
@@ -188,7 +188,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
-    /// Ends that computer's connection and refuses it until Connect (it shows "Disconnected on
+    /// Ends that computer's connection and refuses it until Start (it shows "Disconnected on
     /// the Mac" meanwhile).
     static func disconnect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, true)
