@@ -105,7 +105,8 @@ final class VirtualDisplay {
 
     /// See `--hold-display` in main.swift. Never returns.
     static func holdDuringRestart() -> Never {
-        guard onlyDisplayLeft else { exit(0) }
+        // SWEEFLOW_HOLD_ANYWAY: held with other displays up too (to try it with the lid open).
+        guard onlyDisplayLeft || ProcessInfo.processInfo.environment["SWEEFLOW_HOLD_ANYWAY"] != nil else { exit(0) }
         let desc = CGVirtualDisplayDescriptor()
         desc.queue = DispatchQueue.main
         desc.name = "Sweeflow (restarting)"
@@ -122,21 +123,25 @@ final class VirtualDisplay {
         log("hold display: up while Sweeflow restarts")
         let mine = vd.displayID
         let start = Date()
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+        // The old Sweeflow's display is still up as this starts (it goes when that copy is
+        // stopped): taken for the new one's, this let go before the new copy was there. So the
+        // old one must go first, then the new one be up for 3 s (looked at four times a second: the gap between them can be short). (The new one may
+        // get the old one's display number: same maker, model and serial.)
+        var oldGone = false, upFor = 0
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
             var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
             CGGetOnlineDisplayList(16, &ids, &n)
-            let other = ids.prefix(Int(n)).contains { $0 != mine && CGDisplayVendorNumber($0) == 0x4D46 }
-            // The new Sweeflow's display has been up a little while (windows moved onto it).
-            if other { holdOther += 1 }
-            if holdOther >= 3 || Date().timeIntervalSince(start) > 60 {
-                log("hold display: \(holdOther >= 3 ? "Sweeflow's display is back" : "timed out"), letting go")
+            let sweeflow = ids.prefix(Int(n)).contains { $0 != mine && CGDisplayVendorNumber($0) == 0x4D46 }
+            if !sweeflow, !oldGone { oldGone = true; log("hold display: the old copy's display is gone") }
+            upFor = oldGone && sweeflow ? upFor + 1 : 0
+            if upFor >= 12 || Date().timeIntervalSince(start) > 60 {
+                log("hold display: \(upFor >= 12 ? "Sweeflow's display is back" : "timed out"), letting go")
                 withExtendedLifetime(vd) { exit(0) }
             }
         }
         RunLoop.main.run()
         exit(0)
     }
-    private static var holdOther = 0
 
     func ensure(points: CGSize) {
         let w = UInt32(points.width.rounded()), h = UInt32(points.height.rounded())
