@@ -28,6 +28,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>LSUIElement</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>Sweeflow streams your app windows to your Linux desktop.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Sweeflow plays your Mac apps' sound on your Linux desktop.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Sweeflow lets your Linux computer find this Mac and connect to it.</string>
   <key>NSBonjourServices</key><array><string>_sweeflow._udp</string><string>_sweeflow-pair._udp</string></array>
 </dict></plist>

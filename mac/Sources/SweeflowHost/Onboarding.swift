@@ -221,6 +221,9 @@ final class Onboarding: NSObject, NSWindowDelegate {
             } catch {
                 log("setup: test capture failed: \(error)")
             }
+            // And the sound's own question ("record your system audio"), asked when a tap is
+            // first made: here rather than when Linux first connects.
+            DispatchQueue.global().async { log("setup: audio tap \(AudioTap.ask() ? "allowed" : "not made")") }
         }
     }
 

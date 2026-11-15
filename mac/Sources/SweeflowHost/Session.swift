@@ -17,7 +17,7 @@ final class Session {
     private let control_ = WindowControl()
     private let input = InputInjector()
     private var streamers: [ObjectIdentifier: WindowStreamer] = [:]
-    private var audio: (AudioCapture, ObjectIdentifier)?
+    private var audio: (SoundSource, ObjectIdentifier)?
     private var clipboard: (ClipboardSync, MsgStream)?
     /// Main-thread only.
     private let drag = DragBridge()
@@ -1782,8 +1782,7 @@ final class Session {
             return
         }
         guard audio == nil else { return }
-        let cap = AudioCapture(allowed: { settings.config.allows($0) })
-        cap.onPCM = { [weak self, weak s] pcm, ageUs in
+        let onPCM: (Data, UInt32) -> Void = { [weak self, weak s] pcm, ageUs in
             self?.queue.async {
                 // Drop rather than queue: late audio is worse than a tiny gap.
                 guard let s, s.pendingBytes < 64_000 else { return }
@@ -1793,8 +1792,21 @@ final class Session {
                 s.send(m)
             }
         }
-        cap.start()
-        audio = (cap, ObjectIdentifier(s))
+        // A Core Audio tap (~10 ms behind the sound); ScreenCaptureKit's (~55 ms) when there's none.
+        let allowed: (String) -> Bool = { settings.config.allows($0) }
+        let tap = AudioTap(allowed: allowed)
+        tap.onPCM = onPCM
+        audio = (tap, ObjectIdentifier(s))
+        tap.start { [weak self] ok in
+            guard !ok else { return }
+            self?.queue.async {
+                guard let self, let a = self.audio, a.0 === tap else { return }
+                let cap = AudioCapture(allowed: allowed)
+                cap.onPCM = onPCM
+                cap.start()
+                self.audio = (cap, a.1)
+            }
+        }
     }
 
     private func updateClipboard() {
