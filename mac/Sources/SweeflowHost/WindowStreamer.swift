@@ -810,7 +810,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             // The window outgrew the capture's size and macOS shrank it into it, with black
             // around (a TV window showed a black band at its bottom on Linux). Not sent: the
             // capture is started afresh at the window's size if no proper frame follows soon.
-            if self.scDisplay == nil && contentScale < 0.98 {
+            // (Relative to the scale asked for: a 1× capture of a window on a 2× display is
+            // always at 50%.)
+            if self.scDisplay == nil && contentScale * scaleFactor < 0.98 * self.scale {
                 if !self.shrunkSeen {
                     self.shrunkSeen = true
                     log(String(format: "stream %u: capture shrunk to %.0f%% (window outgrew it): dropped", self.wid, contentScale * 100))
@@ -894,11 +896,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, content: p.content, cache: p.cornerCache)
         fillCorners(pb, radiusPx: Int(28 * p.scale))
         fillEdges(pb, ring: max(2, Int(p.scale)))
-        // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
-        // drops alpha, which would leave them darkened. Restore their real colour.
-        // Most windows are fully opaque, and in the rest it's a sidebar or a toolbar: a sparse
-        // look (1 pixel in 64) says where, and only there is restored.
-        unpremultiply(pb, translucentAreas(pb, skip: Int(28 * p.scale)))
+        // Translucent areas (sidebars, a see-through Terminal) are left premultiplied as the
+        // encoder drops alpha. Restoring their colour cost 7-15 ms a frame for a see-through
+        // Terminal and changed nothing visible (Finder's sidebar the same in light and dark).
         return r
     }
 
@@ -1668,22 +1668,6 @@ func fillEdges(_ pb: CVPixelBuffer, ring: Int) {
     }
 }
 
-/// Premultiplied → straight BGRA in place (SIMD), in `areas` (rows, columns) of the buffer, so
-/// dropping alpha doesn't darken translucent pixels.
-func unpremultiply(_ pb: CVPixelBuffer, _ areas: [(rows: Range<Int>, cols: Range<Int>)]) {
-    guard !areas.isEmpty, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
-          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
-    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-    guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
-    let stride = CVPixelBufferGetBytesPerRow(pb)
-    for a in areas where !a.rows.isEmpty && !a.cols.isEmpty {
-        var buf = vImage_Buffer(data: base + a.rows.lowerBound * stride + a.cols.lowerBound * 4, height: vImagePixelCount(a.rows.count),
-                                width: vImagePixelCount(a.cols.count), rowBytes: stride)
-        // Alpha is last in BGRA as in RGBA; the colour order does not matter here.
-        vImageUnpremultiplyData_RGBA8888(&buf, &buf, vImage_Flags(kvImageNoFlags))
-    }
-}
-
 /// macOS windows have rounded, transparent corners. The Linux window is a plain rectangle, so
 /// composite the transparent corner pixels over the window's own edge colour; the corners then
 /// read as part of the window rather than as black specks.
@@ -2096,38 +2080,3 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     return out
 }
 
-/// Where a capture is semi-transparent away from its corners and edges, looking at one pixel in
-/// 64 (every 8th in both directions): bands of rows, each with the columns to restore. A band
-/// takes in its neighbours' samples and 8 pixels either side, so the unlooked-at pixels around a
-/// translucent one are covered; and each row is in one band only (restoring twice would be
-/// wrong). Empty: fully opaque. (It was the whole frame whenever any pixel was translucent: a
-/// Finder window's sidebar cost a full pass per frame.)
-func translucentAreas(_ pb: CVPixelBuffer, skip margin: Int) -> [(rows: Range<Int>, cols: Range<Int>)] {
-    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
-          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return [] }
-    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return [] }
-    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-    guard w > 2 * margin + 16, h > 2 * margin + 16 else { return [(0..<h, 0..<w)] }
-    let ys = Array(Swift.stride(from: margin, to: h - margin, by: 8))
-    // Per sample row: the first and last translucent sample's column (hi < 0: none).
-    var los = [Int](repeating: Int.max, count: ys.count), his = [Int](repeating: -1, count: ys.count)
-    for (k, y) in ys.enumerated() {
-        let row = base + y * stride
-        for x in Swift.stride(from: margin, to: w - margin, by: 8) where row[x * 4 + 3] < 250 {
-            if los[k] == Int.max { los[k] = x }
-            his[k] = x
-        }
-    }
-    var out: [(rows: Range<Int>, cols: Range<Int>)] = []
-    for k in ys.indices {
-        var lo = Int.max, hi = -1
-        for j in max(0, k - 1)...min(ys.count - 1, k + 1) { lo = min(lo, los[j]); hi = max(hi, his[j]) }
-        guard hi >= 0 else { continue }
-        let rows = (k == 0 ? 0 : ys[k])..<(k == ys.count - 1 ? h : ys[k + 1])
-        // Reaching the margins: out to the edge (a toolbar or sidebar runs on under them).
-        let cols = (lo - 8 <= margin ? 0 : lo - 8)..<(hi + 9 >= w - margin ? w : hi + 9)
-        out.append((rows, cols))
-    }
-    return out
-}

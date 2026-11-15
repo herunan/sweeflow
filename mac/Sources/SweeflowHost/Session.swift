@@ -268,8 +268,10 @@ final class Session {
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.badgeAbsent = { [weak tracker] in tracker?.badgeAbsent(wid) ?? false }
-            st.displayScale = { [weak tracker] in
+            st.displayScale = { [weak tracker, captureScale] in
                 if settings.config.quality == "light" { return 1 }
+                // The client's chosen capture scale holds wherever the window goes.
+                if captureScale > 0 { return captureScale }
                 guard let f = tracker?.windows[wid]?.frame else { return nil }
                 return displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40)))
             }
