@@ -1306,6 +1306,13 @@ final class Session {
         }
     }
 
+    func debugChanges(wid: UInt32, reply: @escaping (String) -> Void) {
+        queue.async {
+            guard let st = self.streamers.values.first(where: { $0.wid == wid }) else { return reply("no stream for \(wid)") }
+            st.recentChanges(reply)
+        }
+    }
+
     func debugPause(_ on: Bool, placeholder: Bool = false) {
         queue.async { self.streamers.values.forEach { $0.setScreenLocked(on, placeholder: placeholder) } }
     }

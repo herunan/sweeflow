@@ -140,6 +140,10 @@ final class DebugPort {
         case "scroll" where p.count == 3:
             guard let s = session, let x = Double(p[1]), let y = Double(p[2]) else { return reply("usage: scroll x y") }
             s.debugScroll(x: x, y: y, reply: reply)
+        case "changes" where p.count == 2:
+            // Why a window's captures lately counted as changed (or didn't): changes <wid>.
+            guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
+            s.debugChanges(wid: wid) { r in DispatchQueue.main.async { reply(r) } }
         case "pause" where p.count == 2:
             // Preview the locked look: pause on|off.
             session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")

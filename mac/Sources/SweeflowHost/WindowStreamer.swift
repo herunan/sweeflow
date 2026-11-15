@@ -102,6 +102,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func applyFrameRate() {
         config.minimumFrameInterval = CMTime(value: 1, timescale: frameRate)
+        let rate = frameRate
+        captureQueue.async { [weak self] in self?.note("capture rate \(rate) a second") }
         stream?.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
 
@@ -114,17 +116,29 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// that kept the encoder, this app and the window server busy all the time, and everything
     /// that waits on them (clicks, raises, resizes) slow.
     /// So each capture is compared with the one before, by a hash of every row, and dropped if
-    /// it's the same. When one differs the rows aren't all hashed (it stops at the first that
-    /// differs), so what the last one looked like isn't known again until the hashes are
-    /// rebuilt, at most every 250 ms: a window that keeps changing pays for one rebuild and
-    /// one comparison in that time, one that doesn't for a comparison per capture, and those
-    /// come less often after a second without a change. (All on captureQueue.)
+    /// it's the same; after a second without a change the captures come less often. (All on
+    /// captureQueue.)
     private var rowHashes: [UInt64] = []
     private var rowHashWidth = 0
     private var rowHashesValid = false
+    /// This frame's hashes while they're compared, and sampled rows of the last frame sent
+    /// (see compareWithLast).
+    private var scratchHashes: [UInt64] = []
+    private var samples: [UInt8] = []
     private var rowHashesRebuiltAt: UInt64 = 0
     private var lastChangeAt: UInt64 = 0
     private var slowedForNoChange = false
+
+    /// The last few things that counted as a change in this window's captures and the capture
+    /// rate's changes, for the debug port's `changes <wid>` (on captureQueue).
+    private var changeNotes: [String] = []
+    private func note(_ s: String) {
+        if changeNotes.count >= 30 { changeNotes.removeFirst() }
+        changeNotes.append(String(format: "%.2f ", Double(DispatchTime.now().uptimeNanoseconds) / 1e9) + s)
+    }
+    func recentChanges(_ reply: @escaping (String) -> Void) {
+        captureQueue.async { reply(self.changeNotes.joined(separator: "\n")) }
+    }
 
     private func differsFromLast(_ pb: CVPixelBuffer) -> Bool {
         let differs = compareWithLast(pb)
@@ -148,10 +162,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return true }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-        // Not the outer 2 pixels: fillEdges paints them over with their neighbours. Captured
-        // at less than the Mac draws, the last row takes in a little of what's below the window
-        // (a playing video): every window over one sent every frame, for a change never shown.
-        let edge = h > 8 && w > 8 ? 2 : 0
+        // Not the outer 6 pixels. The outermost 2 fillEdges paints over with their neighbours;
+        // captured at less than the Mac draws, the last row takes in a little of what's below
+        // the window (a playing video: every window over one sent every frame); and the rim
+        // inside them flickers by a level in its alpha (a pixel or two, 3 to 4 in from the
+        // edge, in a window otherwise still).
+        let edge = h > 64 && w > 64 ? 6 : 0
         let rowBytes = (w - 2 * edge) * 4
         guard rowHashesValid, rowHashes.count == h, rowHashWidth == w else {
             let now = DispatchTime.now().uptimeNanoseconds
@@ -163,21 +179,81 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             rowHashWidth = w
             rowHashesValid = true
+            takeSamples(base, stride: stride, w: w, h: h)
             return true
         }
-        // Every row, and the changed ones' hashes kept: the next frame is compared with this
-        // one. (It was the first changed row, then the hashes thrown away and every frame taken
-        // as changed until rebuilt 250 ms later: one small change four times a second, a Finder
-        // toolbar's glass over a playing video, made seven Finder windows send every frame and
-        // queue on the encoder.)
-        var changed = false
-        rowHashes.withUnsafeMutableBufferPointer { last in
-            for y in edge..<(h - edge) {
-                let v = Self.hashRow(base + y * stride + edge * 4, rowBytes)
-                if v != last[y] { last[y] = v; changed = true }
+        // Every row's hash, kept: the next frame is compared with this one. (It was the first
+        // changed row, then the hashes thrown away and every frame taken as changed until
+        // rebuilt 250 ms later: one small change four times a second made a window send every
+        // frame.)
+        if scratchHashes.count != h { scratchHashes = [UInt64](repeating: 0, count: h) }
+        var changedRows = 0, firstRow = -1, lastRow = -1
+        scratchHashes.withUnsafeMutableBufferPointer { cur in
+            rowHashes.withUnsafeBufferPointer { last in
+                for y in edge..<(h - edge) {
+                    let v = Self.hashRow(base + y * stride + edge * 4, rowBytes)
+                    cur[y] = v
+                    if v != last[y] { changedRows += 1; if firstRow < 0 { firstRow = y }; lastRow = y }
+                }
             }
         }
-        return changed
+        guard changedRows > 0 else { return false }
+        // A re-rendering, not a change? macOS hands over frames of a window nobody touched that
+        // differ from the one before by an amount no one could see: its toolbar and sidebar off
+        // by a level or two (five at most seen) in a colour over hundreds of rows, every second
+        // or two, all the windows on the display at the same moments. Taken for changes, each
+        // was prepared and encoded whole (a Retina window, 60 ms of the one encoder) and put
+        // the window's capture back to its fast rate, so with nine windows open the window
+        // server sat at 100% of a core, this app at 60%, and clicks and raises came seconds
+        // late. So when many rows differ but the sampled ones by no more than a few levels from
+        // the last frame *sent*, it isn't one. (From the last sent, not the last seen: a slow
+        // fade still adds up to a change.)
+        let maxDiff = changedRows * 20 >= h ? sampleDifference(base, stride: stride, w: w, h: h) : Int.max
+        let rerendered = maxDiff <= Self.unseenDifference
+        note("\(w)x\(h): \(changedRows) rows differ (\(firstRow)...\(lastRow)), samples by \(maxDiff == Int.max ? "?" : String(maxDiff)): \(rerendered ? "a re-rendering, not sent" : "a change")")
+        swap(&rowHashes, &scratchHashes)
+        if rerendered { return false }
+        takeSamples(base, stride: stride, w: w, h: h)
+        return true
+    }
+
+    /// Colour levels (of 255) a sampled pixel may differ by in a frame that isn't a change.
+    private static let unseenDifference = 6
+
+    /// The rows sampled to tell a re-rendering from a change: a few in the toolbar (a window
+    /// going inactive changes its title there), the rest spread down the window.
+    private static func sampleRows(_ h: Int) -> [Int] {
+        guard h >= 400 else { return [] }
+        let body = stride(from: 128, to: h - 64, by: max(1, (h - 192) / 24))
+        return [56, 64, 80, 100] + Array(body)
+    }
+
+    /// Keeps the sampled rows' pixels of a frame that is sent (less 8 pixels each end).
+    private func takeSamples(_ base: UnsafeRawPointer, stride: Int, w: Int, h: Int) {
+        let rows = Self.sampleRows(h), n = (w - 16) * 4
+        guard n > 0, !rows.isEmpty else { samples.removeAll(keepingCapacity: true); return }
+        if samples.count != rows.count * n { samples = [UInt8](repeating: 0, count: rows.count * n) }
+        samples.withUnsafeMutableBytes { out in
+            for (i, y) in rows.enumerated() { memcpy(out.baseAddress! + i * n, base + y * stride + 32, n) }
+        }
+    }
+
+    /// The most any byte of the sampled rows differs from the kept ones (Int.max: none kept).
+    private func sampleDifference(_ base: UnsafeRawPointer, stride: Int, w: Int, h: Int) -> Int {
+        let rows = Self.sampleRows(h), n = (w - 16) * 4
+        guard n > 0, !rows.isEmpty, samples.count == rows.count * n else { return Int.max }
+        var worst = 0
+        samples.withUnsafeBytes { kept in
+            let k = kept.bindMemory(to: UInt8.self).baseAddress!
+            for (i, y) in rows.enumerated() {
+                let p = (base + y * stride + 32).assumingMemoryBound(to: UInt8.self), q = k + i * n
+                var m: UInt8 = 0
+                for j in 0..<n { let a = p[j], b = q[j]; m = max(m, a > b ? a - b : b - a) }
+                worst = max(worst, Int(m))
+                if worst > Self.unseenDifference { return }
+            }
+        }
+        return worst
     }
 
     /// A fast hash of one row of pixels: sixteen 32-bit lanes, 64 bytes a step (NEON multiplies
