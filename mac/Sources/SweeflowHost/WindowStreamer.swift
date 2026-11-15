@@ -148,25 +148,36 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return true }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-        let rowBytes = w * 4
+        // Not the outer 2 pixels: fillEdges paints them over with their neighbours. Captured
+        // at less than the Mac draws, the last row takes in a little of what's below the window
+        // (a playing video): every window over one sent every frame, for a change never shown.
+        let edge = h > 8 && w > 8 ? 2 : 0
+        let rowBytes = (w - 2 * edge) * 4
         guard rowHashesValid, rowHashes.count == h, rowHashWidth == w else {
             let now = DispatchTime.now().uptimeNanoseconds
             guard now - rowHashesRebuiltAt > 250_000_000 else { return true }
             rowHashesRebuiltAt = now
             if rowHashes.count != h { rowHashes = [UInt64](repeating: 0, count: h) }
             rowHashes.withUnsafeMutableBufferPointer { out in
-                for y in 0..<h { out[y] = Self.hashRow(base + y * stride, rowBytes) }
+                for y in edge..<(h - edge) { out[y] = Self.hashRow(base + y * stride + edge * 4, rowBytes) }
             }
             rowHashWidth = w
             rowHashesValid = true
             return true
         }
-        let same = rowHashes.withUnsafeBufferPointer { last -> Bool in
-            for y in 0..<h where Self.hashRow(base + y * stride, rowBytes) != last[y] { return false }
-            return true
+        // Every row, and the changed ones' hashes kept: the next frame is compared with this
+        // one. (It was the first changed row, then the hashes thrown away and every frame taken
+        // as changed until rebuilt 250 ms later: one small change four times a second, a Finder
+        // toolbar's glass over a playing video, made seven Finder windows send every frame and
+        // queue on the encoder.)
+        var changed = false
+        rowHashes.withUnsafeMutableBufferPointer { last in
+            for y in edge..<(h - edge) {
+                let v = Self.hashRow(base + y * stride + edge * 4, rowBytes)
+                if v != last[y] { last[y] = v; changed = true }
+            }
         }
-        if !same { rowHashesValid = false }
-        return !same
+        return changed
     }
 
     /// A fast hash of one row of pixels: sixteen 32-bit lanes, 64 bytes a step (NEON multiplies
