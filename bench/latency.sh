@@ -29,8 +29,8 @@ pkill -f sweeflow-bench.command || true
 # The window asks whether to end its shell when closed while the command is still going.
 sleep 1
 dbg close "$wid" >/dev/null
-tail -n "+$start" "$LOG" | { grep "stream $wid: .* fps" || true; } | sed -E 's/.*: ([0-9.]+) fps.*p50 ([0-9.-]+), p95 ([0-9.-]+), max ([0-9.-]+); .*encode ([0-9.-]+).*/\1 \2 \3 \4 \5/' |
-  awk -v wid="$wid" '{fps+=$1; p50+=$2; p95+=$3; if ($4>mx) mx=$4; enc+=$5; n++}
+tail -n "+$start" "$LOG" | { grep "stream $wid: .* fps" || true; } | sed -E 's/.*: ([0-9.]+) fps, ([0-9.]+) Mbit.*p50 ([0-9.-]+), p95 ([0-9.-]+), max ([0-9.-]+); .*encode ([0-9.-]+).*/\1 \3 \4 \5 \6 \2/' |
+  awk -v wid="$wid" '{fps+=$1; p50+=$2; p95+=$3; if ($4>mx) mx=$4; enc+=$5; mb+=$6; n++}
     END { if (!n) { print "no stats for window " wid; exit 1 }
-          printf "window %s, %d samples of 5 s\n  frame rate  %.1f fps\n  latency     p50 %.1f ms, p95 %.1f ms, worst %.1f ms\n  encode      %.1f ms\n", wid, n, fps/n, p50/n, p95/n, mx, enc/n }'
+          printf "window %s, %d samples of 5 s\n  frame rate  %.1f fps\n  latency     p50 %.1f ms, p95 %.1f ms, worst %.1f ms\n  encode      %.1f ms\n  bandwidth   %.1f Mbit/s\n", wid, n, fps/n, p50/n, p95/n, mx, enc/n, mb/n }'
 REMOTE

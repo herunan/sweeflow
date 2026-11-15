@@ -816,7 +816,7 @@ fn toggles(s: &PanelState) -> Vec<Toggle> {
         t("dragDrop", "Drag and drop", s.settings.drag_drop),
         t("launcher", "Mac apps in app launcher", s.settings.launcher),
         t("square", "Square window corners", s.square),
-        t("sharp", "High quality", s.settings.quality != "light"),
+        t("sharp", "Match resolution and depth", s.settings.quality != "light"),
         t("login", "Open at login", s.open_at_login),
     ]
 }
@@ -1413,7 +1413,7 @@ mod tests {
         assert_eq!(flip_call("login", &s), Some(act("login", "off")));
         assert_eq!(flip_call("nonsense", &s), None);
         let shown: Vec<(String, bool)> = toggles(&s).into_iter().map(|t| (t.label.to_string(), t.on)).collect();
-        assert_eq!(shown[5], ("High quality".to_string(), false));
+        assert_eq!(shown[5], ("Match resolution and depth".to_string(), false));
         assert_eq!(shown.len(), 7);
     }
 }

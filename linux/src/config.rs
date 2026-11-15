@@ -35,9 +35,6 @@ pub struct Config {
     pub macs: Vec<PairedMac>,
     /// Mac points → Linux pixels. 1.0 on a scale-1 monitor.
     pub scale: f64,
-    /// Pixels per point the Mac captures at; 0 = the window's native Retina resolution. Higher
-    /// than `scale` means the compositor downsamples, which gives sharper text and full-res colour.
-    pub capture_scale: f64,
     /// DRM render node of the GPU the compositor uses (decode there for zero-copy).
     pub render_node: String,
     /// Mac windows with square corners (true) or the Mac's rounded ones (false). Not set: what
@@ -144,7 +141,6 @@ impl Default for Config {
             service: String::new(),
             macs: Vec::new(),
             scale: 1.0,
-            capture_scale: 0.0,
             render_node: default_render_node(),
             square_corners: None,
         }
@@ -210,7 +206,8 @@ impl Config {
                 "host" => legacy.0 = v,
                 "host_fingerprint" => legacy.1 = v.to_lowercase(),
                 "scale" => c.scale = v.parse().context("scale")?,
-                "capture_scale" => c.capture_scale = v.parse().context("capture_scale")?,
+                // Gone: the capture now follows the screen (the quality setting).
+                "capture_scale" => {}
                 "render_node" => c.render_node = v,
                 "square_corners" => c.square_corners = Some(v != "false"),
                 _ => {}
@@ -281,10 +278,8 @@ impl Config {
 
     pub fn render(&self) -> String {
         let mut out = format!(
-            "# sweeflow client configuration\nactive = \"{}\"\nscale = {}\n\
-             # 0 = capture at the Mac's native Retina resolution (sharpest); 1 = half the bandwidth\n\
-             capture_scale = {}\nrender_node = \"{}\"\n",
-            self.host_fingerprint, self.scale, self.capture_scale, self.render_node
+            "# sweeflow client configuration\nactive = \"{}\"\nscale = {}\nrender_node = \"{}\"\n",
+            self.host_fingerprint, self.scale, self.render_node
         );
         if let Some(square) = self.square_corners {
             out += &format!("square_corners = {square}\n");

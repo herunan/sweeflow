@@ -11,8 +11,8 @@ final class Session {
     let queue: DispatchQueue
     private var control: MsgStream?
     private var clientScale: CGFloat = 1
-    /// Pixels per point to capture at; 0 = the window's native (Retina) backing scale.
-    private var captureScale: CGFloat = 0
+    /// Pixels per point of the client's screen (1.5 at 150%); nil from older clients.
+    private var screenScale: CGFloat?
     private let tracker: WindowTracker
     private let control_ = WindowControl()
     private let input = InputInjector()
@@ -164,8 +164,7 @@ final class Session {
         case .hello:
             let v = try m.u16()
             clientScale = try m.f32()
-            captureScale = (try? m.f32()) ?? 0
-            log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
+            log("client hello v\(v) scale \(clientScale)")
             if let fp = Server.peerFingerprint(s.conn), fp != clientFingerprint {
                 log("client is \(fp.prefix(8)), not \(clientFingerprint?.prefix(8) ?? "unknown") (the latest handshake was another computer's)")
                 clientFingerprint = fp
@@ -262,18 +261,16 @@ final class Session {
             // A new window is about to move onto the virtual display (see placeOnVirtualDisplay):
             // capture at its scale from the start, not at wherever it opened and then again.
             let vdScale = vdArea.flatMap { win.kind == .popup ? nil : displayScale(at: CGPoint(x: $0.midX, y: $0.midY)) }
-            let scale = settings.config.quality == "light" ? 1 : captureScale > 0 ? captureScale : vdScale ?? backingScale(of: win.frame)
+            let scale = captureScale(vdScale ?? backingScale(of: win.frame))
             let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, lossless: win.kind == .popup,
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
             st.badgeAbsent = { [weak tracker] in tracker?.badgeAbsent(wid) ?? false }
-            st.displayScale = { [weak tracker, captureScale] in
-                if settings.config.quality == "light" { return 1 }
-                // The client's chosen capture scale holds wherever the window goes.
-                if captureScale > 0 { return captureScale }
-                guard let f = tracker?.windows[wid]?.frame else { return nil }
-                return displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40)))
+            st.displayScale = { [weak self, weak tracker] in
+                guard let self, let f = tracker?.windows[wid]?.frame,
+                      let d = displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40))) else { return nil }
+                return self.captureScale(d)
             }
             if let app = NSRunningApplication(processIdentifier: win.pid) {
                 var r = CGRect(x: 0, y: 0, width: 256, height: 256)
@@ -435,6 +432,11 @@ final class Session {
         case .screenSize:
             let w = CGFloat(try m.u16()), h = CGFloat(try m.u16())
             clientScreen = CGSize(width: w, height: h)
+            if let px = try? m.f32(), px > 0, CGFloat(px) != screenScale {
+                screenScale = CGFloat(px)
+                log("client screen scale \(px)")
+                streamers.values.forEach { $0.checkScale() }
+            }
             let c = settings.config
             guard c.virtualDisplay, c.enabled else { return }
             log("client screen \(Int(w))x\(Int(h))")
@@ -1772,6 +1774,16 @@ final class Session {
         updateClipboard()
         // Quality: captures move to its scale (and encoders to its bit depth).
         streamers.values.forEach { $0.checkScale() }
+    }
+
+    /// What to capture a window at, drawn at `display` pixels per point on the Mac. "Match
+    /// resolution and depth": the client's screen's own scale (1× on a 1× screen, where more was
+    /// never seen, 2× on a HiDPI one, 1.5× at 150%), at most what the Mac draws. "Lower": 1×.
+    /// An older client, which doesn't say: the Mac's own.
+    private func captureScale(_ display: CGFloat) -> CGFloat {
+        if settings.config.quality == "light" { return 1 }
+        guard let s = screenScale else { return display }
+        return min(s, display)
     }
 
     private func updateAudio() {

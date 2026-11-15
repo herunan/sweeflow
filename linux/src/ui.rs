@@ -2367,12 +2367,20 @@ impl App {
         let best = self
             .output_state
             .outputs()
-            .filter_map(|o| self.output_state.info(&o)?.logical_size)
-            .max_by_key(|(w, h)| w * h);
-        if let Some((w, h)) = best {
+            .filter_map(|o| {
+                let info = self.output_state.info(&o)?;
+                let (w, h) = info.logical_size?;
+                // Its pixels per logical pixel: the current mode against the logical size (1.5
+                // at 150%; wl_output's own scale is a whole number).
+                let mode = info.modes.iter().find(|m| m.current).map(|m| m.dimensions);
+                let px = mode.map_or(info.scale_factor as f64, |(mw, mh)| pixel_scale((mw, mh), (w, h)));
+                Some(((w, h), px))
+            })
+            .max_by_key(|((w, h), _)| w * h);
+        if let Some(((w, h), px)) = best {
             // Mac points == our logical pixels.
             let (w, h) = ((w as f64 / self.scale) as u16, (h as f64 / self.scale) as u16);
-            self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).finish());
+            self.send(W::new(t::SCREEN_SIZE).u16(w).u16(h).f32((px * self.scale) as f32).finish());
         }
     }
 
@@ -4037,6 +4045,17 @@ impl DmabufHandler for App {
     }
 }
 
+/// Pixels per logical pixel of a screen whose mode is `mode` and logical size `logical`
+/// (either way round: a turned screen's mode is not). 1 when unknown.
+fn pixel_scale(mode: (i32, i32), logical: (i32, i32)) -> f64 {
+    let (m, l) = (mode.0.max(mode.1), logical.0.max(logical.1));
+    if m <= 0 || l <= 0 {
+        return 1.0;
+    }
+    // To the nearest 1/8: logical sizes are rounded (2560 / 1707 at 150%).
+    ((m as f64 / l as f64) * 8.0).round() / 8.0
+}
+
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -4270,3 +4289,19 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod pixel_scale_tests {
+    use super::pixel_scale;
+
+    #[test]
+    fn screens_scale_from_mode_and_logical_size() {
+        assert_eq!(pixel_scale((3440, 1440), (3440, 1440)), 1.0);
+        assert_eq!(pixel_scale((2560, 1600), (1280, 800)), 2.0);
+        assert_eq!(pixel_scale((2560, 1600), (1707, 1067)), 1.5);
+        assert_eq!(pixel_scale((2880, 1800), (2304, 1440)), 1.25);
+        // Turned a quarter: the mode stays landscape, the logical size doesn't.
+        assert_eq!(pixel_scale((3840, 2160), (1080, 1920)), 2.0);
+        assert_eq!(pixel_scale((0, 0), (1280, 800)), 1.0);
+    }
+}

@@ -907,7 +907,7 @@ async fn session(
     let _online = Online;
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
-    let hello = W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(cfg.capture_scale as f32);
+    let hello = W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(0.0);   // (was the capture scale: the screen's own scale now goes with SCREEN_SIZE)
     ctl_tx.write_all(&hello.str(&this_computer()).finish()).await?;
     let held: Vec<String> = if busy { Vec::new() } else { PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect() };
     for bid in held {
