@@ -144,6 +144,11 @@ final class DebugPort {
             // Why a window's captures lately counted as changed (or didn't): changes <wid>.
             guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
             s.debugChanges(wid: wid) { r in DispatchQueue.main.async { reply(r) } }
+        case "dump" where p.count == 3:
+            // The next n captures of a window that differ from the one before, raw, into
+            // /tmp/sweeflow-dump (see WindowStreamer.dumpChanges): dump <wid> <n>.
+            guard let s = session, let wid = UInt32(p[1]), let n = Int(p[2]) else { return reply("no session") }
+            reply(s.debugDump(wid: wid, n: n))
         case "pause" where p.count == 2:
             // Preview the locked look: pause on|off.
             session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")

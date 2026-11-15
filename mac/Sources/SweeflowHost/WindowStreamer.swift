@@ -5,6 +5,7 @@ import VideoToolbox
 import CoreMedia
 import Compression
 import Accelerate
+import os
 
 /// Captures one window with ScreenCaptureKit, encodes it with the hardware HEVC encoder and
 /// writes frames to a video stream. Flow control is end-to-end: at most `maxInFlight` frames may
@@ -100,10 +101,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         active ? (unchanging ? Self.activeIdleFps : Self.activeFps) : (unchanging ? Self.backgroundIdleFps : Self.backgroundFps)
     }
 
+    /// When any window's capture was last reconfigured (uptime, ns). Reconfiguring one makes
+    /// macOS tell the apps their windows' sharing started again: they rebuild the purple
+    /// "being shared" badge (a small window of its own over each), and every captured window's
+    /// title bar is drawn again a level or two different (see compareWithLast).
+    private static let reconfiguredAt = OSAllocatedUnfairLock(initialState: UInt64(0))
+
     private func applyFrameRate() {
         config.minimumFrameInterval = CMTime(value: 1, timescale: frameRate)
         let rate = frameRate
         captureQueue.async { [weak self] in self?.note("capture rate \(rate) a second") }
+        Self.reconfiguredAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
         stream?.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
 
@@ -136,6 +144,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         if changeNotes.count >= 30 { changeNotes.removeFirst() }
         changeNotes.append(String(format: "%.2f ", Double(DispatchTime.now().uptimeNanoseconds) / 1e9) + s)
     }
+    private var dumpLeft = 0, dumpIndex = 0
+    func dumpChanges(_ n: Int) {
+        captureQueue.async { self.dumpLeft = n; self.dumpIndex = 0 }
+    }
     func recentChanges(_ reply: @escaping (String) -> Void) {
         captureQueue.async { reply(self.changeNotes.joined(separator: "\n")) }
     }
@@ -143,8 +155,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func differsFromLast(_ pb: CVPixelBuffer) -> Bool {
         let differs = compareWithLast(pb)
         let now = DispatchTime.now().uptimeNanoseconds
+        // Back to the fast rate only for a window that keeps changing: two changed captures
+        // within half a second. One by itself (a clock's digit, a list refreshing once a
+        // second) is sent at the idle rate, and changing the rate for it cost more than it
+        // saved: every change of rate redraws every window's title bar (see reconfiguredAt).
+        let keepsChanging = differs && now - lastChangeAt < 500_000_000
         if differs { lastChangeAt = now }
-        let slow = !differs && now - lastChangeAt > 1_000_000_000
+        let slow = slowedForNoChange ? !keepsChanging : !differs && now - lastChangeAt > 1_000_000_000
         if slow != slowedForNoChange {
             slowedForNoChange = slow
             queue.async { [weak self] in
@@ -187,30 +204,53 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // rebuilt 250 ms later: one small change four times a second made a window send every
         // frame.)
         if scratchHashes.count != h { scratchHashes = [UInt64](repeating: 0, count: h) }
-        var changedRows = 0, firstRow = -1, lastRow = -1
+        var changedRows = 0, firstRow = -1, lastRow = -1, bodyRows = 0
+        let band = Self.titleBand
         scratchHashes.withUnsafeMutableBufferPointer { cur in
             rowHashes.withUnsafeBufferPointer { last in
                 for y in edge..<(h - edge) {
                     let v = Self.hashRow(base + y * stride + edge * 4, rowBytes)
                     cur[y] = v
-                    if v != last[y] { changedRows += 1; if firstRow < 0 { firstRow = y }; lastRow = y }
+                    if v != last[y] {
+                        changedRows += 1; if firstRow < 0 { firstRow = y }; lastRow = y
+                        if y >= band && y < h - 60 { bodyRows += 1 }
+                    }
                 }
             }
         }
         guard changedRows > 0 else { return false }
-        // A re-rendering, not a change? macOS hands over frames of a window nobody touched that
-        // differ from the one before by an amount no one could see: its toolbar and sidebar off
-        // by a level or two (five at most seen) in a colour over hundreds of rows, every second
-        // or two, all the windows on the display at the same moments. Taken for changes, each
-        // was prepared and encoded whole (a Retina window, 60 ms of the one encoder) and put
-        // the window's capture back to its fast rate, so with nine windows open the window
-        // server sat at 100% of a core, this app at 60%, and clicks and raises came seconds
-        // late. So when many rows differ but the sampled ones by no more than a few levels from
-        // the last frame *sent*, it isn't one. (From the last sent, not the last seen: a slow
-        // fade still adds up to a change.)
-        let maxDiff = changedRows * 20 >= h ? sampleDifference(base, stride: stride, w: w, h: h) : Int.max
+        // A redraw, not a change? Each time a capture is reconfigured (its rate changed), macOS
+        // tells every app its windows' sharing started again, and they redraw: title bars a
+        // level or two different in a colour (Terminal's rows 0 to 63 across its whole width,
+        // TextEdit's badge faded in again), Finder's toolbar and sidebar too (500 to 1000 rows,
+        // five levels at most seen). Taken for changes, each was prepared and encoded whole (a
+        // Retina window, 60 ms of the one encoder) and put that window's capture back to its
+        // fast rate, which is another reconfigure: with nine windows open they never stopped,
+        // the window server sat at 100% of a core, this app at 60%, Finder's main thread was
+        // busy rebuilding badges, and clicks and raises came seconds late. With the rate left
+        // alone, no idle window changed at all in a minute.
+        // So a frame isn't a change when its sampled rows are within a few levels of the last
+        // frame *sent* (not the last seen: a slow fade still adds up) and either many rows
+        // differ (the toolbar-and-sidebar kind), or only rows of the title bar and the bottom
+        // rim do, shortly after a reconfigure.
+        let sinceReconfigure = DispatchTime.now().uptimeNanoseconds &- Self.reconfiguredAt.withLock { $0 }
+        let titleOnly = bodyRows == 0 && sinceReconfigure < 2_500_000_000
+        let maxDiff = changedRows * 20 >= h || titleOnly ? sampleDifference(base, stride: stride, w: w, h: h) : Int.max
         let rerendered = maxDiff <= Self.unseenDifference
-        note("\(w)x\(h): \(changedRows) rows differ (\(firstRow)...\(lastRow)), samples by \(maxDiff == Int.max ? "?" : String(maxDiff)): \(rerendered ? "a re-rendering, not sent" : "a change")")
+        note("\(w)x\(h): \(changedRows) rows differ (\(firstRow)...\(lastRow), \(bodyRows) below the title bar), samples by \(maxDiff == Int.max ? "?" : String(maxDiff)): \(rerendered ? "a redraw, not sent" : "a change")")
+        if dumpLeft > 0 {
+            // Debug port `dump <wid> <n>`: the next n frames that differ from the one before,
+            // raw, with what was in front and where the pointer was.
+            let n = dumpIndex; dumpIndex += 1; dumpLeft -= 1
+            try? FileManager.default.createDirectory(atPath: "/tmp/sweeflow-dump", withIntermediateDirectories: true)
+            try? Data(bytes: base, count: stride * h).write(to: URL(fileURLWithPath: "/tmp/sweeflow-dump/\(wid)-\(n).bgra"))
+            let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+            let order = list.filter { ($0[kCGWindowLayer as String] as? Int) == 0 }.prefix(12).map { "\($0[kCGWindowNumber as String] ?? 0)" }.joined(separator: ",")
+            let mouse = CGEvent(source: nil)?.location ?? .zero
+            log(String(format: "DUMP %u frame %d at %.2f: %dx%d stride %d, %d rows differ, samples by %d, front %@, order %@, pointer %.0f,%.0f", wid, n,
+                       Double(DispatchTime.now().uptimeNanoseconds) / 1e9, w, h, stride, changedRows, maxDiff == Int.max ? -1 : maxDiff,
+                       NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?", order, mouse.x, mouse.y))
+        }
         swap(&rowHashes, &scratchHashes)
         if rerendered { return false }
         takeSamples(base, stride: stride, w: w, h: h)
@@ -220,35 +260,48 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Colour levels (of 255) a sampled pixel may differ by in a frame that isn't a change.
     private static let unseenDifference = 6
 
-    /// The rows sampled to tell a re-rendering from a change: a few in the toolbar (a window
-    /// going inactive changes its title there), the rest spread down the window.
+    /// Rows from the top that count as the title bar (and toolbar) for a redraw after a
+    /// reconfigure, in capture pixels.
+    private static let titleBand = 140
+
+    /// The rows sampled to tell a redraw from a change: several through the title bar and
+    /// toolbar (a window going inactive, a title changing or a toolbar button pressed show
+    /// there), the rest spread down the window.
     private static func sampleRows(_ h: Int) -> [Int] {
         guard h >= 400 else { return [] }
-        let body = stride(from: 128, to: h - 64, by: max(1, (h - 192) / 24))
-        return [56, 64, 80, 100] + Array(body)
+        let body = stride(from: 160, to: h - 64, by: max(1, (h - 224) / 24))
+        return [40, 48, 56, 64, 72, 80, 100, 120] + Array(body)
     }
 
-    /// Keeps the sampled rows' pixels of a frame that is sent (less 8 pixels each end).
+    /// The part of a sampled row that is kept: not the 8 pixels at each end (the rim), and in
+    /// the title bar not the left end either, where the badge fades in again and the traffic
+    /// lights are (those are painted by us, not taken from the capture).
+    private static func sampleSpan(row y: Int, w: Int) -> Range<Int> {
+        (y < titleBand && w > 700 ? 260 : 8)..<(w - 8)
+    }
+
+    /// Keeps the sampled rows' pixels of a frame that is sent.
     private func takeSamples(_ base: UnsafeRawPointer, stride: Int, w: Int, h: Int) {
-        let rows = Self.sampleRows(h), n = (w - 16) * 4
-        guard n > 0, !rows.isEmpty else { samples.removeAll(keepingCapacity: true); return }
+        let rows = Self.sampleRows(h), n = w * 4
+        guard w > 16, !rows.isEmpty else { samples.removeAll(keepingCapacity: true); return }
         if samples.count != rows.count * n { samples = [UInt8](repeating: 0, count: rows.count * n) }
         samples.withUnsafeMutableBytes { out in
-            for (i, y) in rows.enumerated() { memcpy(out.baseAddress! + i * n, base + y * stride + 32, n) }
+            for (i, y) in rows.enumerated() { memcpy(out.baseAddress! + i * n, base + y * stride, n) }
         }
     }
 
     /// The most any byte of the sampled rows differs from the kept ones (Int.max: none kept).
     private func sampleDifference(_ base: UnsafeRawPointer, stride: Int, w: Int, h: Int) -> Int {
-        let rows = Self.sampleRows(h), n = (w - 16) * 4
-        guard n > 0, !rows.isEmpty, samples.count == rows.count * n else { return Int.max }
+        let rows = Self.sampleRows(h), n = w * 4
+        guard w > 16, !rows.isEmpty, samples.count == rows.count * n else { return Int.max }
         var worst = 0
         samples.withUnsafeBytes { kept in
             let k = kept.bindMemory(to: UInt8.self).baseAddress!
             for (i, y) in rows.enumerated() {
-                let p = (base + y * stride + 32).assumingMemoryBound(to: UInt8.self), q = k + i * n
+                let span = Self.sampleSpan(row: y, w: w)
+                let p = (base + y * stride).assumingMemoryBound(to: UInt8.self), q = k + i * n
                 var m: UInt8 = 0
-                for j in 0..<n { let a = p[j], b = q[j]; m = max(m, a > b ? a - b : b - a) }
+                for j in (span.lowerBound * 4)..<(span.upperBound * 4) { let a = p[j], b = q[j]; m = max(m, a > b ? a - b : b - a) }
                 worst = max(worst, Int(m))
                 if worst > Self.unseenDifference { return }
             }

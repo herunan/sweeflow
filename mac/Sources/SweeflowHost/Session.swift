@@ -1306,6 +1306,11 @@ final class Session {
         }
     }
 
+    func debugDump(wid: UInt32, n: Int) -> String {
+        queue.async { self.streamers.values.first(where: { $0.wid == wid })?.dumpChanges(n) }
+        return "ok"
+    }
+
     func debugChanges(wid: UInt32, reply: @escaping (String) -> Void) {
         queue.async {
             guard let st = self.streamers.values.first(where: { $0.wid == wid }) else { return reply("no stream for \(wid)") }
