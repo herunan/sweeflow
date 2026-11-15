@@ -133,6 +133,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// (see compareWithLast).
     private var scratchHashes: [UInt64] = []
     private var samples: [UInt8] = []
+    /// The capture just compared was dropped as a redraw (not as identical).
+    private var droppedAsRedraw = false
     private var rowHashesRebuiltAt: UInt64 = 0
     private var lastChangeAt: UInt64 = 0
     private var slowedForNoChange = false
@@ -218,6 +220,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
+        droppedAsRedraw = false
         guard changedRows > 0 else { return false }
         // A redraw, not a change? Each time a capture is reconfigured (its rate changed), macOS
         // tells every app its windows' sharing started again, and they redraw: title bars a
@@ -252,6 +255,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                        NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?", order, mouse.x, mouse.y))
         }
         swap(&rowHashes, &scratchHashes)
+        droppedAsRedraw = rerendered
         if rerendered { return false }
         takeSamples(base, stride: stride, w: w, h: h)
         return true
@@ -484,6 +488,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         unchanging = false
         captureQueue.async { [weak self] in
             self?.rowHashesValid = false
+            self?.heldBack = nil
             self?.rowHashesRebuiltAt = 0
             self?.slowedForNoChange = false
             self?.lastChangeAt = DispatchTime.now().uptimeNanoseconds
@@ -910,6 +915,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !stopped else { return }
         stopped = true
         refineTimer?.cancel()
+        captureQueue.async { [weak self] in
+            self?.heldBackTimer?.cancel()
+            self?.heldBack = nil
+        }
         stream?.stopCapture { _ in }
         stream = nil
         // Dropped on the stream's own queue: it waits for a frame still inside the encoder.
@@ -929,12 +938,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // Counted before the unchanged ones are dropped: the capture is alive (see
         // expectFrameAfterInput).
         queue.async { [weak self] in if let self, stream === self.stream { self.delivered &+= 1 } }
-        guard differsFromLast(pb) else { return }
-        // Where the window's content actually is in the buffer: when it doesn't fill it (the
-        // configured size is stale), ScreenCaptureKit pads with black.
         let info = attachments.first ?? [:]
-        let contentRect = (info[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
-        let contentScale = info[.contentScale] as? CGFloat ?? 1
+        guard differsFromLast(pb) else {
+            if droppedAsRedraw { holdBack(pb, info: info, from: stream) }
+            return
+        }
+        heldBack = nil
         // How long ScreenCaptureKit took to hand us the frame (its timestamp is host time).
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         let lagUs: UInt64 = {
@@ -943,6 +952,48 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let d = CMTimeGetSeconds(CMTimeSubtract(now, pts))
             return d > 0 && d < 1 ? UInt64(d * 1e6) : 0
         }()
+        send(pb, info: info, lagUs: lagUs, from: stream)
+    }
+
+    /// The latest capture dropped as a redraw since a frame was last sent (on captureQueue).
+    /// Dropping it is a guess (see compareWithLast): should it have been a real change, faint
+    /// and spread wide, Linux would show the picture before it until the window next changed.
+    /// So 10 s after the first is dropped the latest is sent after all: one frame, and only
+    /// for a window that had any.
+    private var heldBack: (pb: CVPixelBuffer, info: [SCStreamFrameInfo: Any], stream: SCStream)?
+    private var heldBackTimer: DispatchSourceTimer?
+
+    private func holdBack(_ pb: CVPixelBuffer, info: [SCStreamFrameInfo: Any], from stream: SCStream) {
+        heldBack = (pb, info, stream)
+        guard heldBackTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: captureQueue)
+        t.schedule(deadline: .now() + 10)
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.heldBackTimer = nil
+            guard let held = self.heldBack else { return }
+            self.heldBack = nil
+            // It's the last frame sent now: what the next captures' samples are compared with.
+            if CVPixelBufferLockBaseAddress(held.pb, .readOnly) == kCVReturnSuccess {
+                if let base = CVPixelBufferGetBaseAddress(held.pb) {
+                    self.takeSamples(base, stride: CVPixelBufferGetBytesPerRow(held.pb), w: CVPixelBufferGetWidth(held.pb),
+                                     h: CVPixelBufferGetHeight(held.pb))
+                }
+                CVPixelBufferUnlockBaseAddress(held.pb, .readOnly)
+            }
+            self.note("the picture held back as a redraw, sent after 10 s")
+            self.send(held.pb, info: held.info, lagUs: 0, from: held.stream)
+        }
+        t.resume()
+        heldBackTimer = t
+    }
+
+    /// Hands a capture that is to be sent over to `queue`.
+    private func send(_ pb: CVPixelBuffer, info: [SCStreamFrameInfo: Any], lagUs: UInt64, from stream: SCStream) {
+        // Where the window's content actually is in the buffer: when it doesn't fill it (the
+        // configured size is stale), ScreenCaptureKit pads with black.
+        let contentRect = (info[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        let contentScale = info[.contentScale] as? CGFloat ?? 1
         let scaleFactor = info[.scaleFactor] as? CGFloat ?? 1
         queue.async { [weak self] in
             // Only the current capture's frames (a replaced one can still deliver a few).
