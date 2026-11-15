@@ -52,7 +52,7 @@ pub fn rgb_output() -> bool {
     static RGB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| match std::env::var("SWEEFLOW_VIDEO").as_deref() {
         Ok("rgb") => true,
         Ok("yuv") => false,
-        _ => std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
+        _ => crate::hyprland::running(),
     });
     *RGB
 }

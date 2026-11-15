@@ -30,7 +30,7 @@ fn events() -> Option<impl Iterator<Item = String>> {
 /// Global menu's key is caught by the Mac windows themselves, ui.rs: a Hyprland binding never
 /// fires while one has focus, as they pass every shortcut through to the Mac.)
 pub fn add_to_config() {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+    if !running() {
         return;
     }
     std::thread::spawn(|| {
@@ -389,7 +389,7 @@ pub fn place_window(class: &str, title: &str, spot: (f32, f32)) {
 /// window's rounded corners would leave gaps inside that frame. Looked at once.
 pub fn square_windows() -> bool {
     static SQUARE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+        running()
             && Command::new("hyprctl")
                 .args(["-j", "getoption", "decoration:rounding"])
                 .output()
@@ -404,7 +404,7 @@ pub fn square_windows() -> bool {
 /// isn't Hyprland (the window then asks its desktop the usual way). For a Mac window's green
 /// button: the click has just focused that window.
 pub fn toggle_maximise() -> bool {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+    if !running() {
         return false;
     }
     std::thread::spawn(|| {
@@ -424,7 +424,7 @@ pub fn toggle_maximise() -> bool {
 /// (the button in Omarchy's title bars, a key), whatever size the window says it has. Hyprland
 /// says so on its event socket the moment it happens, and the window is taken straight back out.
 pub fn keep_window_size() {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+    if !running() {
         return;
     }
     std::thread::spawn(|| {

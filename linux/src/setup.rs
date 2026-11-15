@@ -583,7 +583,7 @@ fn register_stream_keys(home: &std::path::Path) {
         println!("    (other keys for them: Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts)");
     } else if set && desktop.contains("Cinnamon") {
         println!("    (other keys for them: System Settings → Keyboard → Shortcuts → Custom Shortcuts)");
-    } else if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+    } else if crate::hyprland::running() {
         // The client binds them as it starts (hyprland.rs), so which ones it could isn't known here.
         let keys: Vec<String> = STREAM_KEYS.iter().map(|k| format!("SUPER + ALT + {} {}", k.letter, k.does)).collect();
         println!("    SUPER + ALT + O opens Sweeflow from any window; {} where the key isn't bound already", keys.join(", "));

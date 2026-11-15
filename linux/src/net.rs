@@ -158,6 +158,13 @@ pub enum NetCmd {
     Goodbye(std::sync::mpsc::Sender<()>),
 }
 
+impl NetCmd {
+    /// The Mac window `wid` resized to `size` (points), as it's shown here.
+    pub fn resize(wid: u32, size: (u32, u32)) -> Self {
+        NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish())
+    }
+}
+
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
 
 /// The way to the window side, for the few things that start elsewhere (a setting in the tray).

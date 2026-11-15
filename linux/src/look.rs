@@ -46,7 +46,7 @@ pub fn detect() -> Look {
 
 fn desktop_look() -> Look {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let hyprland = desktop.contains("Hyprland") || std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some();
+    let hyprland = desktop.contains("Hyprland") || crate::hyprland::running();
     if hyprland {
         if let Some(look) = omarchy() {
             return look;

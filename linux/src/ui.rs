@@ -1355,7 +1355,7 @@ impl App {
         } else {
             log::debug!("window {wid}: its tile settled at {}x{}: asking the Mac", size.0, size.1);
             w.requested = Some((size, Instant::now()));
-            let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+            let _ = self.net.send(NetCmd::resize(wid, size));
             // Check it took (a Mac window that can't follow reports no change).
             Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
         }
@@ -1446,7 +1446,7 @@ impl App {
                 if w.refusal != Some((size, mac)) {
                     w.refusal = Some((size, mac));
                     w.requested = Some((size, Instant::now()));
-                    let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                    let _ = self.net.send(NetCmd::resize(wid, size));
                     Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
                 }
                 return;
@@ -1497,7 +1497,7 @@ impl App {
                 w.requested = Some((size, Instant::now()));
             w.followed = false;
                 log::info!("window {wid}: {}x{} on the Mac, {}x{} here: asking again", mac.0, mac.1, size.0, size.1);
-                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                let _ = self.net.send(NetCmd::resize(wid, size));
                 // If the Mac doesn't follow (and so reports no change), look again later. Only
                 // when far off: an app that snaps to its own steps (Terminal's character cells)
                 // is left alone.
@@ -2488,45 +2488,12 @@ impl App {
             return;
         }
         let Some(frame) = w.shown.as_ref().and_then(|id| self.in_use.get(id)) else { return };
-        let Some(mut px) = frame.grey() else {
+        let (fw, fh) = (frame.width, frame.height);
+        let Some(PausedStill { px, pos, src, dst }) =
+            paused_still(frame, &w.info, w.display, w.fit, w.size, self.scale, w.corners.as_ref().and_then(|c| c.last_tiles.as_ref()))
+        else {
             return log::warn!("window {wid}: couldn't read its picture back for the paused still");
         };
-        let (fw, fh) = (frame.width, frame.height);
-        // Where the picture sits, as the video's (see present), and which of its corners are
-        // the window's own (lay_out).
-        let mut rounded = [true; 4];
-        let (pos, src, dst) = if w.display {
-            let (k, ox, oy) = w.fit;
-            ((ox.round() as i32, oy.round() as i32), (frame.content.0 as f64, frame.content.1 as f64),
-             ((w.info.w as f64 * k).round().max(1.0) as i32, (w.info.h as f64 * k).round().max(1.0) as i32))
-        } else {
-            let s = self.scale;
-            let ppp = px_per_pt(frame.px_per_pt, frame.content.0, w.info.w, s);
-            let (src, dst, (cut_r, cut_b)) = shown_part(frame.content, ppp, w.size, s);
-            rounded = [true, !cut_r, !cut_b, !cut_r && !cut_b];
-            ((0, 0), src, dst)
-        };
-        let (sw, sh) = (src.0.max(1.0) as usize, src.1.max(1.0) as usize);
-        // Rounded corners: the alpha of the Mac's own corner tiles.
-        if let Some((t, tiles)) = w.corners.as_ref().and_then(|c| c.last_tiles.as_ref()) {
-            let t = *t as usize;
-            if sw > 2 * t && sh > 2 * t {
-                let n = t * t * 4;
-                for (i, (ox, oy)) in [(0, 0), (sw - t, 0), (0, sh - t), (sw - t, sh - t)].into_iter().enumerate().filter(|(i, _)| rounded[*i]) {
-                    for y in 0..t {
-                        for x in 0..t {
-                            let a = tiles[i * n + (y * t + x) * 4 + 3] as u32;
-                            let p = &mut px[((oy + y) * fw as usize + ox + x) * 4..][..4];
-                            for c in &mut p[..3] {
-                                *c = (*c as u32 * a / 255) as u8;
-                            }
-                            p[3] = a as u8;
-                        }
-                    }
-                }
-            }
-        }
-        draw_pause(&mut px, fw as usize, sw as f64 / 2.0, sh as f64 / 2.0, (sw.min(sh) as f64 * 0.11).clamp(24.0, 96.0));
         let Ok(mut pool) = RawPool::new(px.len(), &self.shm) else { return };
         pool.mmap().copy_from_slice(&px);
         let buffer = pool.create_buffer(0, fw as i32, fh as i32, (fw * 4) as i32, wl_shm::Format::Argb8888, (), qh);
@@ -2709,28 +2676,22 @@ impl App {
         }
     }
 
-    fn edge_at(&self, wid: u32, x: f64, y: f64) -> Option<xdg_toplevel::ResizeEdge> {
+    fn resize_edge(&self, wid: u32, x: f64, y: f64) -> Option<xdg_toplevel::ResizeEdge> {
         use xdg_toplevel::ResizeEdge as E;
         let w = self.windows.get(&wid)?;
         // The display view has a KDE frame to resize by.
         if !matches!(w.role, Role::Toplevel(_)) || w.maximized || w.display {
             return None;
         }
-        const EDGE: f64 = 5.0;
-        const CORNER: f64 = 14.0;
-        let (bw, bh) = (w.size.0 as f64, w.size.1 as f64);
-        let (l, r, t, b) = (x < EDGE, x > bw - EDGE, y < EDGE, y > bh - EDGE);
-        let (lc, rc, tc, bc) = (x < CORNER, x > bw - CORNER, y < CORNER, y > bh - CORNER);
-        Some(match () {
-            _ if (t && lc) || (l && tc) => E::TopLeft,
-            _ if (t && rc) || (r && tc) => E::TopRight,
-            _ if (b && lc) || (l && bc) => E::BottomLeft,
-            _ if (b && rc) || (r && bc) => E::BottomRight,
-            _ if t => E::Top,
-            _ if b => E::Bottom,
-            _ if l => E::Left,
-            _ if r => E::Right,
-            _ => return None,
+        Some(match edge_at(w.size, x, y)? {
+            Edge::TopLeft => E::TopLeft,
+            Edge::Top => E::Top,
+            Edge::TopRight => E::TopRight,
+            Edge::Right => E::Right,
+            Edge::BottomRight => E::BottomRight,
+            Edge::Bottom => E::Bottom,
+            Edge::BottomLeft => E::BottomLeft,
+            Edge::Left => E::Left,
         })
     }
 
@@ -2986,7 +2947,7 @@ pub(crate) const MIN_SIZE: (u32, u32) = (100, 60);
 const SETTLE: Duration = Duration::from_millis(120);
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
-const KEY_SPACE: u32 = 57;
+pub(crate) const KEY_SPACE: u32 = 57;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
@@ -3213,6 +3174,56 @@ pub(crate) fn drag_picture_pixels(scale: i32, count: usize) -> (i32, i32, Vec<u8
         (w, h, px)
 }
 
+/// A paused window's still: its last picture in grey, the Mac's rounded corners cut out where
+/// they're the window's own, and the pause sign. With where it goes as the video's (pos, src,
+/// dst; see present / lay_out). None: the picture couldn't be read back.
+pub(crate) struct PausedStill {
+    pub px: Vec<u8>,
+    pub pos: (i32, i32),
+    pub src: (f64, f64),
+    pub dst: (i32, i32),
+}
+
+/// `display`: the Mac's display (fitted with `fit`), not a window; `tiles`: the Mac's corner tiles.
+pub(crate) fn paused_still(frame: &GpuFrame, info: &WinInfo, display: bool, fit: (f64, f64, f64), size: (u32, u32), scale: f64,
+                           tiles: Option<&(u32, Vec<u8>)>) -> Option<PausedStill> {
+    let mut px = frame.grey()?;
+    let fw = frame.width;
+    let mut rounded = [true; 4];
+    let (pos, src, dst) = if display {
+        let (k, ox, oy) = fit;
+        ((ox.round() as i32, oy.round() as i32), (frame.content.0 as f64, frame.content.1 as f64),
+         ((info.w as f64 * k).round().max(1.0) as i32, (info.h as f64 * k).round().max(1.0) as i32))
+    } else {
+        let ppp = px_per_pt(frame.px_per_pt, frame.content.0, info.w, scale);
+        let (src, dst, (cut_r, cut_b)) = shown_part(frame.content, ppp, size, scale);
+        rounded = [true, !cut_r, !cut_b, !cut_r && !cut_b];
+        ((0, 0), src, dst)
+    };
+    let (sw, sh) = (src.0.max(1.0) as usize, src.1.max(1.0) as usize);
+    // Rounded corners: the alpha of the Mac's own corner tiles.
+    if let Some((t, tiles)) = tiles {
+        let t = *t as usize;
+        if sw > 2 * t && sh > 2 * t {
+            let n = t * t * 4;
+            for (i, (ox, oy)) in [(0, 0), (sw - t, 0), (0, sh - t), (sw - t, sh - t)].into_iter().enumerate().filter(|(i, _)| rounded[*i]) {
+                for y in 0..t {
+                    for x in 0..t {
+                        let a = tiles[i * n + (y * t + x) * 4 + 3] as u32;
+                        let p = &mut px[((oy + y) * fw as usize + ox + x) * 4..][..4];
+                        for c in &mut p[..3] {
+                            *c = (*c as u32 * a / 255) as u8;
+                        }
+                        p[3] = a as u8;
+                    }
+                }
+            }
+        }
+    }
+    draw_pause(&mut px, fw as usize, sw as f64 / 2.0, sh as f64 / 2.0, (sw.min(sh) as f64 * 0.11).clamp(24.0, 96.0));
+    Some(PausedStill { px, pos, src, dst })
+}
+
 pub(crate) fn draw_pause(px: &mut [u8], stride_px: usize, cx: f64, cy: f64, r: f64) {
     let rows = px.len() / 4 / stride_px.max(1);
     let (bar_w, bar_h, gap) = (r * 0.2, r * 0.9, r * 0.2);
@@ -3297,7 +3308,7 @@ impl WindowHandler for App {
                 Self::arm_settle(&self.loop_handle, &mut w.settling, wid, qh);
             } else {
                 w.requested = Some((size, Instant::now()));
-                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                let _ = self.net.send(NetCmd::resize(wid, size));
                 // Check it took (a Mac window that can't follow reports no change).
                 Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
             }
@@ -3361,7 +3372,41 @@ impl PopupHandler for App {
 
 // --- input -----------------------------------------------------------------------------
 
-fn mac_button(linux: u32) -> u8 {
+/// A window edge or corner (numbered as X11's _NET_WM_MOVERESIZE directions).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Edge {
+    TopLeft = 0,
+    Top = 1,
+    TopRight = 2,
+    Right = 3,
+    BottomRight = 4,
+    Bottom = 5,
+    BottomLeft = 6,
+    Left = 7,
+}
+
+/// The edge or corner under (x, y) of a window `size` big, where a press resizes it: 5 px in
+/// from its sides, 14 px along them from a corner.
+pub(crate) fn edge_at(size: (u32, u32), x: f64, y: f64) -> Option<Edge> {
+    const EDGE: f64 = 5.0;
+    const CORNER: f64 = 14.0;
+    let (bw, bh) = (size.0 as f64, size.1 as f64);
+    let (l, r, t, b) = (x < EDGE, x > bw - EDGE, y < EDGE, y > bh - EDGE);
+    let (lc, rc, tc, bc) = (x < CORNER, x > bw - CORNER, y < CORNER, y > bh - CORNER);
+    Some(match () {
+        _ if (t && lc) || (l && tc) => Edge::TopLeft,
+        _ if (t && rc) || (r && tc) => Edge::TopRight,
+        _ if (b && lc) || (l && bc) => Edge::BottomLeft,
+        _ if (b && rc) || (r && bc) => Edge::BottomRight,
+        _ if t => Edge::Top,
+        _ if b => Edge::Bottom,
+        _ if l => Edge::Left,
+        _ if r => Edge::Right,
+        _ => return None,
+    })
+}
+
+pub(crate) fn mac_button(linux: u32) -> u8 {
     match linux {
         0x110 => 0, // BTN_LEFT
         0x111 => 1, // BTN_RIGHT
@@ -3416,7 +3461,7 @@ impl PointerHandler for App {
                     if self.mac_drag.is_some() {
                         self.maybe_take_drag(qh);
                     }
-                    let edge = self.edge_at(wid, e.position.0, e.position.1);
+                    let edge = self.resize_edge(wid, e.position.0, e.position.1);
                     self.set_edge_cursor(edge, pointer, qh);
                     self.lights_pointer_at(wid, px, py, Some(time), qh);
                     if self.windows.get(&wid).is_some_and(|w| w.lights_pressed.is_some()) {
@@ -3442,7 +3487,7 @@ impl PointerHandler for App {
                 PointerEventKind::Press { button, serial, .. } => {
                     self.user_pressed();
                     if button == BTN_LEFT {
-                        if let Some(edge) = self.edge_at(wid, e.position.0, e.position.1) {
+                        if let Some(edge) = self.resize_edge(wid, e.position.0, e.position.1) {
                             if let (Some(w), Some(seat)) = (self.windows.get(&wid), &self.seat) {
                                 if let Role::Toplevel(t) = &w.role {
                                     t.resize(seat, serial, edge);

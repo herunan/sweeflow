@@ -51,7 +51,7 @@ use crate::{
     menus::Menus,
     net::{NetCmd, UiEvent, WinInfo},
     proto::{t, W},
-    ui::{display_title, draw_pause, px_per_pt, shown_part, square_tiles, MIN_SIZE},
+    ui::{display_title, edge_at, mac_button, Edge, paused_still, px_per_pt, shown_part, square_tiles, PausedStill, KEY_SPACE, MIN_SIZE},
     x11gl::{Blend, Gl, Quad, Target, Tex, Video},
 };
 
@@ -155,27 +155,6 @@ fn linux_button(x: u8) -> Option<u32> {
     })
 }
 
-fn mac_button(linux: u32) -> u8 {
-    match linux {
-        0x110 => 0,
-        0x111 => 1,
-        0x112 => 2,
-        b => (b.saturating_sub(0x110)).min(31) as u8,
-    }
-}
-
-/// Window edge → _NET_WM_MOVERESIZE direction.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Edge {
-    TopLeft = 0,
-    Top = 1,
-    TopRight = 2,
-    Right = 3,
-    BottomRight = 4,
-    Bottom = 5,
-    BottomLeft = 6,
-    Left = 7,
-}
 
 impl Edge {
     fn cursor(self) -> &'static str {
@@ -194,25 +173,6 @@ impl Edge {
 
 const MOVERESIZE_MOVE: u32 = 8;
 
-/// The resize edge under (x, y) of a window `size` big (as ui.rs's edge_at).
-fn edge_at(size: (u32, u32), x: f64, y: f64) -> Option<Edge> {
-    const EDGE: f64 = 5.0;
-    const CORNER: f64 = 14.0;
-    let (bw, bh) = (size.0 as f64, size.1 as f64);
-    let (l, r, t, b) = (x < EDGE, x > bw - EDGE, y < EDGE, y > bh - EDGE);
-    let (lc, rc, tc, bc) = (x < CORNER, x > bw - CORNER, y < CORNER, y > bh - CORNER);
-    Some(match () {
-        _ if (t && lc) || (l && tc) => Edge::TopLeft,
-        _ if (t && rc) || (r && tc) => Edge::TopRight,
-        _ if (b && lc) || (l && bc) => Edge::BottomLeft,
-        _ if (b && rc) || (r && bc) => Edge::BottomRight,
-        _ if t => Edge::Top,
-        _ if b => Edge::Bottom,
-        _ if l => Edge::Left,
-        _ if r => Edge::Right,
-        _ => return None,
-    })
-}
 
 /// Where a floating window goes for a spot on the Mac's screen (fractions of the room around
 /// it), in a work area (x, y, w, h).
@@ -1185,7 +1145,7 @@ impl App {
                 if w.refusal != Some((size, mac)) {
                     w.refusal = Some((size, mac));
                     w.requested = Some((size, Instant::now()));
-                    let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                    let _ = self.net.send(NetCmd::resize(wid, size));
                     Self::arm_check(&self.loop_handle, &mut w.check_pending, wid);
                 }
                 return;
@@ -1224,7 +1184,7 @@ impl App {
         w.requested = Some((size, Instant::now()));
         w.followed = false;
         log::info!("window {wid}: {}x{} on the Mac, {}x{} here: asking again", mac.0, mac.1, size.0, size.1);
-        let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+        let _ = self.net.send(NetCmd::resize(wid, size));
         if mac.0.abs_diff(size.0) > 40 || mac.1.abs_diff(size.1) > 40 {
             Self::arm_check(&self.loop_handle, &mut w.check_pending, wid);
         }
@@ -1702,40 +1662,12 @@ impl App {
             return;
         }
         let Some((frame, _)) = &w.shown else { return };
-        let Some(mut px) = frame.grey() else {
+        let (fw, fh) = (frame.width, frame.height);
+        let Some(PausedStill { px, pos, src, dst }) =
+            paused_still(frame, &w.info, w.display, w.fit, w.size, s, w.corners.as_ref().and_then(|c| c.last.as_ref()))
+        else {
             return log::warn!("window {wid}: couldn't read its picture back for the paused still");
         };
-        let (fw, fh) = (frame.width, frame.height);
-        let mut rounded = [true; 4];
-        let (pos, src, dst) = if w.display {
-            let (k, ox, oy) = w.fit;
-            ((ox.round() as i32, oy.round() as i32), (frame.content.0 as f64, frame.content.1 as f64), ((w.info.w as f64 * k).round().max(1.0) as i32, (w.info.h as f64 * k).round().max(1.0) as i32))
-        } else {
-            let ppp = px_per_pt(frame.px_per_pt, frame.content.0, w.info.w, s);
-            let (src, dst, (cut_r, cut_b)) = shown_part(frame.content, ppp, w.size, s);
-            rounded = [true, !cut_r, !cut_b, !cut_r && !cut_b];
-            ((0, 0), src, dst)
-        };
-        let (sw, sh) = (src.0.max(1.0) as usize, src.1.max(1.0) as usize);
-        if let Some((t, tiles)) = w.corners.as_ref().and_then(|c| c.last.as_ref()) {
-            let t = *t as usize;
-            if sw > 2 * t && sh > 2 * t {
-                let n = t * t * 4;
-                for (i, (ox, oy)) in [(0, 0), (sw - t, 0), (0, sh - t), (sw - t, sh - t)].into_iter().enumerate().filter(|(i, _)| rounded[*i]) {
-                    for y in 0..t {
-                        for x in 0..t {
-                            let a = tiles[i * n + (y * t + x) * 4 + 3] as u32;
-                            let p = &mut px[((oy + y) * fw as usize + ox + x) * 4..][..4];
-                            for c in &mut p[..3] {
-                                *c = (*c as u32 * a / 255) as u8;
-                            }
-                            p[3] = a as u8;
-                        }
-                    }
-                }
-            }
-        }
-        draw_pause(&mut px, fw as usize, sw as f64 / 2.0, sh as f64 / 2.0, (sw.min(sh) as f64 * 0.11).clamp(24.0, 96.0));
         w.still = Some(Still { slot: Slot { pending: Some((fw, fh, px)), tex: None }, pos, src, dst });
         log::info!("window {wid}: paused still shown");
         self.draw(wid);
@@ -2415,7 +2347,7 @@ impl App {
                 w.size = size;
                 w.followed = false;
                 w.requested = Some((size, Instant::now()));
-                let _ = self.net.send(NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish()));
+                let _ = self.net.send(NetCmd::resize(wid, size));
                 Self::arm_check(&self.loop_handle, &mut w.check_pending, wid);
             }
         }
@@ -2773,7 +2705,6 @@ impl App {
         if down {
             self.user_pressed();
         }
-        const KEY_SPACE: u32 = 57;
         let code = evdev_code(keycode);
         let is_meta = code == 125 || code == 126;
         let is_shift = code == 42 || code == 54;
