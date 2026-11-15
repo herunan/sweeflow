@@ -58,6 +58,9 @@ pub enum UiEvent {
     WindowAdded(WinInfo),
     WindowChanged { wid: u32, title: String, w: f32, h: f32, rel_x: f32, rel_y: f32 },
     WindowRemoved(u32),
+    /// (old wid, new window): the Mac swapped that window for this one at the same frame (a
+    /// tabbed window's tab switched). The window here stays and becomes the new one's.
+    WindowReplaced(u32, WinInfo),
     /// The app won't let this window be resized; where its app put it on the Mac's screen
     /// (fractions of the room there: 0 left/top, 1 right/bottom), if said.
     /// The bool: fixed (false: a floating panel that can be resized, floated all the same).
@@ -114,6 +117,7 @@ impl UiEvent {
             UiEvent::WindowAdded(_) => "window added",
             UiEvent::WindowChanged { .. } => "window changed",
             UiEvent::WindowRemoved(_) => "window removed",
+            UiEvent::WindowReplaced(..) => "window replaced",
             UiEvent::WindowFixed(..) => "window fixed",
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
@@ -1098,6 +1102,23 @@ async fn session(
     result
 }
 
+/// A WINDOW_ADDED body (also the tail of WINDOW_REPLACED's).
+fn read_win_info(r: &mut R) -> Result<WinInfo> {
+    Ok(WinInfo {
+        wid: r.u32()?,
+        pid: r.i32()?,
+        bundle_id: r.str()?,
+        app_name: r.str()?,
+        title: r.str()?,
+        w: r.f32()?,
+        h: r.f32()?,
+        parent: r.u32()?,
+        rel_x: r.f32()?,
+        rel_y: r.f32()?,
+        kind: r.u8()?,
+    })
+}
+
 fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     let mut r = R::new(body);
     let ev = match ty {
@@ -1131,22 +1152,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             crate::tray::connected(Some(name.clone()));
             UiEvent::Connected(name)
         }
-        t::WINDOW_ADDED => {
-            let wid = r.u32()?;
-            let pid = r.i32()?;
-            UiEvent::WindowAdded(WinInfo {
-                wid,
-                pid,
-                bundle_id: r.str()?,
-                app_name: r.str()?,
-                title: r.str()?,
-                w: r.f32()?,
-                h: r.f32()?,
-                parent: r.u32()?,
-                rel_x: r.f32()?,
-                rel_y: r.f32()?,
-                kind: r.u8()?,
-            })
+        t::WINDOW_ADDED => UiEvent::WindowAdded(read_win_info(&mut r)?),
+        t::WINDOW_REPLACED => {
+            let old = r.u32()?;
+            UiEvent::WindowReplaced(old, read_win_info(&mut r)?)
         }
         t::WINDOW_CHANGED => UiEvent::WindowChanged {
             wid: r.u32()?,
@@ -1769,6 +1778,40 @@ mod tests {
         assert_eq!(route_words("vm", "127.0.0.1"), "VM: 127.0.0.1");
         assert_eq!(route_words("vm", ""), "VM");
         assert_eq!(route_words("", "mac.example.com"), "");
+    }
+
+    /// What handle_control makes of one message from the Mac.
+    fn control_event(msg: Vec<u8>) -> UiEvent {
+        use smithay_client_toolkit::reexports::calloop::{channel, EventLoop};
+        let (tx, rx) = channel::channel();
+        handle_control(msg[4], &msg[5..], &tx).unwrap();
+        let mut got = Vec::new();
+        let mut el: EventLoop<Vec<UiEvent>> = EventLoop::try_new().unwrap();
+        el.handle().insert_source(rx, |e, _, got: &mut Vec<UiEvent>| {
+            if let channel::Event::Msg(e) = e {
+                got.push(e);
+            }
+        }).unwrap();
+        el.dispatch(Some(Duration::ZERO), &mut got).unwrap();
+        assert_eq!(got.len(), 1);
+        got.pop().unwrap()
+    }
+
+    #[test]
+    fn window_replaced_carries_the_old_id_and_the_new_window() {
+        let added = |m: W| m.u32(42).i32(7).str("com.apple.finder").str("Finder").str("Downloads").f32(800.0).f32(500.0).u32(0).f32(1.0).f32(2.0).u8(0);
+        let check = |i: &WinInfo| {
+            assert_eq!((i.wid, i.pid, i.bundle_id.as_str(), i.app_name.as_str(), i.title.as_str()), (42, 7, "com.apple.finder", "Finder", "Downloads"));
+            assert_eq!((i.w, i.h, i.parent, i.rel_x, i.rel_y, i.kind), (800.0, 500.0, 0, 1.0, 2.0, 0));
+        };
+        match control_event(added(W::new(t::WINDOW_REPLACED).u32(41)).finish()) {
+            UiEvent::WindowReplaced(41, info) => check(&info),
+            e => panic!("got {}", e.kind()),
+        }
+        match control_event(added(W::new(t::WINDOW_ADDED)).finish()) {
+            UiEvent::WindowAdded(info) => check(&info),
+            e => panic!("got {}", e.kind()),
+        }
     }
 
     #[test]

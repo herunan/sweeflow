@@ -44,6 +44,8 @@ final class Session {
     private let menuQueue = DispatchQueue(label: "sweeflow.menus", qos: .userInitiated)
     /// The window with keyboard focus on the Linux side (0 = none of ours).
     private var clientFocus: UInt32 = 0
+    /// The protocol version the client said in its hello (2: knows windowReplaced).
+    private var clientVersion: UInt16 = 1
 
     /// The Linux screen's size (points), for (re)creating the virtual display.
     private var clientScreen: CGSize?
@@ -161,6 +163,7 @@ final class Session {
             leaving = true
         case .hello:
             let v = try m.u16()
+            clientVersion = v
             clientScale = try m.f32()
             log("client hello v\(v) scale \(clientScale)")
             if let fp = Server.peerFingerprint(s.conn), fp != clientFingerprint {
@@ -1571,6 +1574,7 @@ final class Session {
             self?.sendAdded(w)
         }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
+        tracker.onReplaced = { [weak self] old, w in self?.windowReplaced(old, by: w) }
         tracker.onRemoved = { [weak self] w in
             guard let self else { return }
             self.fixedKnown[w.wid] = nil
@@ -2018,16 +2022,65 @@ final class Session {
         // A floating panel (picture in picture, a palette) floats on Linux too, resizable.
         if fixed || w.kind == .dialog { sendFixed(w.wid, fixed: fixed) }
         var m = MsgWriter(.windowAdded)
-        m.u32(w.wid); m.i32(w.pid)
-        m.str(w.bundleId); m.str(w.appName); m.str(w.title)
-        m.f32(w.frame.width); m.f32(w.frame.height)
-        m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
-        m.u8(w.kind.rawValue)
+        Self.describe(w, into: &m)
         control?.send(m)
         lastFrames[w.wid] = w.frame
         sendButtonsNowAndSettled(w)
         announced.insert(w.wid)
         for c in awaitingParent.removeValue(forKey: w.wid) ?? [] {
+            if let now = tracker.windows[c] { sendAdded(now) }
+        }
+    }
+
+    /// A window as windowAdded and windowReplaced carry it.
+    private static func describe(_ w: TrackedWindow, into m: inout MsgWriter) {
+        m.u32(w.wid); m.i32(w.pid)
+        m.str(w.bundleId); m.str(w.appName); m.str(w.title)
+        m.f32(w.frame.width); m.f32(w.frame.height)
+        m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
+        m.u8(w.kind.rawValue)
+    }
+
+    /// A tab switched (see WindowTracker.onReplaced): `w` is where `old` was. Linux is told in
+    /// one message and keeps its window, which becomes `w`. As an addition and a removal, the
+    /// new window came up beside the old one, which went most of a second later (that long is
+    /// waited to see whether a window that left the screen was only minimised).
+    private func windowReplaced(_ old: TrackedWindow, by w: TrackedWindow) {
+        guard clientVersion >= 2, announced.contains(old.wid), minimized[old.wid] == nil else {
+            // A client that doesn't know the message, or a window Linux doesn't have: the two.
+            tracker.onRemoved?(old)
+            tracker.onAdded?(w)
+            return
+        }
+        log("window \(old.wid) (\(old.appName)) replaced by \(w.wid) at the same place (a tab switched)")
+        WindowStreamer.prefetch(w.wid)
+        goneWindows.remove(w.wid)
+        minimized[w.wid] = nil
+        // What's known about the window Linux shows goes with it; the rest of the old one's is
+        // forgotten as when a window goes.
+        fixedKnown[w.wid] = fixedKnown.removeValue(forKey: old.wid)
+        fixedSpots[w.wid] = fixedSpots.removeValue(forKey: old.wid)
+        requestedSizes[w.wid] = requestedSizes.removeValue(forKey: old.wid)
+        if clientFocus == old.wid { clientFocus = w.wid }
+        if lastFocused == old.wid { lastFocused = w.wid }
+        if raisedWid == old.wid { raisedWid = w.wid }
+        announced.remove(old.wid)
+        lastFrames[old.wid] = nil
+        refusedSizes[old.wid] = nil
+        goneWindows.insert(old.wid)
+        control_.forget(old.wid)
+        sentButtons[old.wid] = nil
+        buttonHistory[old.wid] = nil
+        buttonsKept[old.wid] = nil
+        var m = MsgWriter(.windowReplaced)
+        m.u32(old.wid)
+        Self.describe(w, into: &m)
+        control?.send(m)
+        lastFrames[w.wid] = w.frame
+        sendButtonsNowAndSettled(w)
+        announced.insert(w.wid)
+        // Popups that were waiting for the old one: told now, with whatever window they have.
+        for c in awaitingParent.removeValue(forKey: old.wid) ?? [] {
             if let now = tracker.windows[c] { sendAdded(now) }
         }
     }

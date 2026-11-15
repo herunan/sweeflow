@@ -63,6 +63,13 @@ impl Arrival {
         arriving
     }
 
+    /// Mac window `old` was replaced by `new` (WINDOW_REPLACED): the same window here.
+    pub fn replaced(&mut self, old: u32, new: u32) {
+        for slot in [&mut self.mac_key, &mut self.held] {
+            crate::ui::follow_wid(slot.as_mut(), old, new);
+        }
+    }
+
     /// The user pressed a key or a button: arriving is over. A focus held back, if it's still
     /// where the focus is, is passed on now (returned).
     pub fn input(&mut self, focus: Option<u32>) -> Option<u32> {
@@ -97,5 +104,17 @@ mod tests {
         assert_eq!(a.focus(3), Err(Some(2)));
         assert_eq!(a.input(Some(3)), Some(3));
         assert!(!a.mac_focused(2), "arriving over");
+    }
+
+    #[test]
+    fn a_replaced_window_keeps_its_place() {
+        let mut a = Arrival::default();
+        a.connected();
+        a.mac_focused(2);
+        assert_eq!(a.focus(3), Err(Some(2)));
+        a.replaced(3, 4);
+        a.replaced(2, 5);
+        assert_eq!(a.input(Some(4)), Some(4), "the held focus follows its window");
+        assert_eq!(a.mac_key, Some(5));
     }
 }

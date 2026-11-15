@@ -13,6 +13,10 @@ enum Msg: UInt8 {
     /// that one stops.
     case busy = 0x06
     case windowAdded = 0x10, windowChanged = 0x11, windowRemoved = 0x12, appIcon = 0x13, cursor = 0x14, focused = 0x15
+    /// To Linux (from version 2): u32 old wid, then a window as in windowAdded. That window has
+    /// taken the old one's place (a tab switched): Linux keeps the window it shows and makes it
+    /// this one. The old one isn't mentioned again.
+    case windowReplaced = 0x38
     case windowButtons = 0x16, moveStarted = 0x17, toggleMaximize = 0x18, minimize = 0x1A, menuTree = 0x1B, appList = 0x1C, screenLocked = 0x1D, settings = 0x1E, blindShow = 0x1F, blindGone = 0x19
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23, menuActivate = 0x24, menuRefresh = 0x25, restore = 0x26, launchApp = 0x27, setSettings = 0x28, blindPress = 0x29, showDisplay = 0x2A, quitApp = 0x2B, runningApps = 0x2C, screenSelect = 0x2D
     /// To Linux: the press just made drags the window; it starts its move on the first motion.

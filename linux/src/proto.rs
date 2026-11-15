@@ -2,7 +2,8 @@
 
 use anyhow::{bail, Result};
 
-pub const VERSION: u16 = 1;
+/// 2: understands WINDOW_REPLACED (the Mac sends it only to clients that say 2 or more).
+pub const VERSION: u16 = 2;
 
 pub mod t {
     pub const HELLO: u8 = 0x01;
@@ -30,6 +31,10 @@ pub mod t {
     /// u32 wid, f32 x, f32 y (window points), u8 drags: what the Mac found under the pointer as
     /// it hovered the title-bar strip, ahead of any press (see DRAG_SPOT in ui.rs).
     pub const DRAG_SPOT: u8 = 0x37;
+    /// u32 old wid, then a WINDOW_ADDED body for the new window: the Mac swapped one window for
+    /// another at the same frame in one step (switching a tabbed window's tab). The window here
+    /// stays on screen and becomes the new one's; the old wid is never mentioned again.
+    pub const WINDOW_REPLACED: u8 = 0x38;
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;

@@ -742,6 +742,7 @@ impl App {
                 self.freeze_all(qh);
             }
             UiEvent::WindowAdded(info) => self.add_window(info, qh),
+            UiEvent::WindowReplaced(old, info) => self.replace_window(old, info, qh),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
                 if let Some(i) = self.popups_waiting.get_mut(&wid) {
                     (i.title, i.w, i.h, i.rel_x, i.rel_y) = (title.clone(), w, h, rel_x, rel_y);
@@ -1193,6 +1194,132 @@ impl App {
             }
         }
         let _ = self.net.send(NetCmd::Subscribe(wid));
+    }
+
+    /// The Mac swapped window `old` for `info` at the same frame (WINDOW_REPLACED: a tabbed
+    /// window's tab switched). The window here stays as it is (place, size, tiling, focus, its
+    /// last picture until the new one's first frame) and from now on shows the new one.
+    fn replace_window(&mut self, old: u32, info: WinInfo, qh: &QueueHandle<Self>) {
+        let new = info.wid;
+        if self.closed_offline.remove(&old) {
+            // Closed here while the Mac was away: so is what took its place (add_window).
+            self.closed_offline.insert(new);
+        }
+        self.pending_fixed.remove(&old);
+        self.popups_waiting.remove(&old);
+        for i in self.popups_waiting.values_mut().filter(|i| i.parent == old) {
+            i.parent = new;
+        }
+        let same_kind = self.windows.get(&old).is_some_and(|w| {
+            matches!(w.role, Role::Toplevel(_)) && info.kind != 1 && w.display == (info.kind == 3)
+        });
+        if old == new || !same_kind || self.windows.contains_key(&new) {
+            // Not a window shown here (or a popup, or another sort of window): as one added.
+            if old != new {
+                self.remove_window(old);
+            }
+            return self.add_window(info, qh);
+        }
+        let Some(mut w) = self.windows.remove(&old) else { return };
+        log::info!("window {old} replaced by {new} ({}): the same window here", info.app_name);
+        let was = std::mem::replace(&mut w.info, info);
+        if let Role::Toplevel(t) = &w.role {
+            if w.display {
+                if was.title != w.info.title {
+                    t.set_title(format!("Mac display — {}", w.info.title));
+                }
+            } else {
+                if (&was.app_name, &was.title) != (&w.info.app_name, &w.info.title) {
+                    t.set_title(display_title(&w.info.app_name, &w.info.title));
+                }
+                if was.bundle_id != w.info.bundle_id {
+                    t.set_app_id(format!("sweeflow-{}", w.info.bundle_id));
+                    gnome_allow_shortcuts(&w.info.bundle_id);
+                }
+            }
+        }
+        if was.pid != w.info.pid {
+            if let (Some(am), Some(menus)) = (&w.appmenu, &self.menus) {
+                am.set_address(menus.service(), Menus::object_path(w.info.pid));
+            }
+        }
+        // Back from a reconnect or a pause as this window, and nothing asked of the old one
+        // counts for it. Timers set for the old one find nothing: theirs are set again below.
+        w.stale = false;
+        w.requested = None;
+        w.refusal = None;
+        w.lights_pressed = None;
+        // Pictures of the old window not shown yet (hidden, or not configured): shown later,
+        // they would be acknowledged on the new window's stream. Its own first frame comes.
+        w.pending = None;
+        w.pending_raw = None;
+        let check = std::mem::take(&mut w.check_pending);
+        let settling = w.settling.take().is_some();
+        let hidden = w.hidden.is_some();
+        let suspended = w.suspended;
+        let resized = (was.w, was.h) != (w.info.w, w.info.h);
+        self.windows.insert(new, w);
+        for v in self.surfaces.values_mut().filter(|v| **v == old) {
+            *v = new;
+        }
+        for c in self.windows.values_mut().filter(|c| c.info.parent == old) {
+            c.info.parent = new;
+        }
+        if let Some(s) = self.selection.as_mut() {
+            follow_wid(Some(&mut s.wid), old, new);
+        }
+        for slot in [
+            self.pointer_focus.as_mut(),
+            self.kb_focus.as_mut(),
+            self.left_down.as_mut(),
+            self.mac_drag.as_mut(),
+            self.moved_here.as_mut(),
+            Some(&mut self.pointer_at.0),
+            self.dnd_target.as_mut().map(|t| &mut t.0),
+            self.popup_drag.as_mut().map(|p| &mut p.0),
+        ] {
+            follow_wid(slot, old, new);
+        }
+        self.arrival.replaced(old, new);
+        // What the Mac found under the pointer was in the old window.
+        if self.drag_spot.is_some_and(|s| s.0 == old) {
+            self.drag_spot = None;
+        }
+        if was.pid != self.windows[&new].info.pid && !self.windows.values().any(|o| o.info.pid == was.pid) {
+            crate::menus::app_gone(was.pid);
+        }
+        if was.bundle_id != self.windows[&new].info.bundle_id {
+            self.apply_icon(new, qh);
+        }
+        // The new window's video. The old one's last picture stays attached until its first
+        // frame replaces it (present); a minimised window's stays paused.
+        let _ = self.net.send(NetCmd::Unsubscribe(old));
+        let _ = self.net.send(NetCmd::Subscribe(new));
+        if suspended {
+            let _ = self.net.send(NetCmd::Video(new, W::new(t::PAUSE).u8(1).finish()));
+        }
+        self.clip_input(new, qh);
+        if resized {
+            self.relayout(new, qh);
+        }
+        if let Some(w) = self.windows.get(&new) {
+            w.base().commit();
+        }
+        if check {
+            self.schedule_check(new, qh);
+        }
+        if settling {
+            if let Some(w) = self.windows.get_mut(&new) {
+                Self::arm_settle(&self.loop_handle, &mut w.settling, new, qh);
+            }
+        }
+        if hidden {
+            // Asked to close, and its app showed another window in its place (the next tab).
+            self.unhide(new, "another window took its place", qh);
+        }
+        if let Some((spot, fixed)) = self.pending_fixed.remove(&new) {
+            self.on_net(UiEvent::WindowFixed(new, spot, fixed), qh);
+        }
     }
 
     fn remove_window(&mut self, wid: u32) {
@@ -3054,6 +3181,13 @@ fn monotonic_ms() -> f64 {
 
 unsafe extern "C" {
     fn clock_gettime(clk: i32, ts: *mut i64) -> i32;
+}
+
+/// A reference to Mac window `old` now names `new` (WINDOW_REPLACED: the same window here).
+pub(crate) fn follow_wid(slot: Option<&mut u32>, old: u32, new: u32) {
+    if let Some(w) = slot.filter(|w| **w == old) {
+        *w = new;
+    }
 }
 
 pub(crate) fn display_title(app: &str, title: &str) -> String {

@@ -51,7 +51,7 @@ use crate::{
     menus::Menus,
     net::{NetCmd, UiEvent, WinInfo},
     proto::{t, W},
-    ui::{display_title, edge_at, mac_button, refused, resize_wait, Edge, Refused, paused_still, px_per_pt, shown_part, square_tiles, PausedStill, KEY_SPACE, MIN_SIZE},
+    ui::{display_title, edge_at, follow_wid, mac_button, refused, resize_wait, Edge, Refused, paused_still, px_per_pt, shown_part, square_tiles, PausedStill, KEY_SPACE, MIN_SIZE},
     x11gl::{Blend, Gl, Quad, Target, Tex, Video},
 };
 
@@ -613,6 +613,7 @@ impl App {
                 self.freeze_all();
             }
             UiEvent::WindowAdded(info) => self.add_window(info),
+            UiEvent::WindowReplaced(old, info) => self.replace_window(old, info),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
                 let Some(win) = self.windows.get_mut(&wid) else { return };
                 let retitle = title != win.info.title;
@@ -789,6 +790,105 @@ impl App {
             return;
         }
         let _ = self.net.send(NetCmd::Subscribe(wid));
+    }
+
+    /// As ui.rs's replace_window: the Mac swapped window `old` for `info` at the same frame (a
+    /// tab switched); the X window stays as it is and from now on shows the new one.
+    fn replace_window(&mut self, old: u32, info: WinInfo) {
+        let new = info.wid;
+        if self.closed_offline.remove(&old) {
+            self.closed_offline.insert(new);
+        }
+        self.pending_fixed.remove(&old);
+        let same_kind = self.windows.get(&old).is_some_and(|w| !w.popup && info.kind != 1 && w.display == (info.kind == 3));
+        if old == new || !same_kind || self.windows.contains_key(&new) {
+            if old != new {
+                self.remove_window(old);
+            }
+            return self.add_window(info);
+        }
+        let Some(mut w) = self.windows.remove(&old) else { return };
+        log::info!("window {old} replaced by {new} ({}): the same window here", info.app_name);
+        let was = std::mem::replace(&mut w.info, info);
+        let xid = w.xid;
+        w.stale = false;
+        w.requested = None;
+        w.refusal = None;
+        w.lights_pressed = None;
+        // Pictures of the old window not shown yet: they'd be acknowledged on the new stream.
+        w.pending = None;
+        w.pending_raw = None;
+        let check = std::mem::take(&mut w.check_pending);
+        let hidden = w.hidden.is_some();
+        let suspended = w.suspended;
+        let resized = (was.w, was.h) != (w.info.w, w.info.h);
+        let (display, pid, bundle_id) = (w.display, w.info.pid, w.info.bundle_id.clone());
+        let title = if display { format!("Mac display — {}", w.info.title) } else { display_title(&w.info.app_name, &w.info.title) };
+        let retitle = (&was.app_name, &was.title) != (&w.info.app_name, &w.info.title);
+        self.windows.insert(new, w);
+        for v in self.by_xid.values_mut().filter(|v| **v == old) {
+            *v = new;
+        }
+        for c in self.windows.values_mut().filter(|c| c.info.parent == old) {
+            c.info.parent = new;
+        }
+        if let Some(s) = self.selection.as_mut() {
+            follow_wid(Some(&mut s.wid), old, new);
+        }
+        for slot in [
+            self.pointer_focus.as_mut(),
+            self.kb_focus.as_mut(),
+            self.left_down.as_mut(),
+            self.mac_drag.as_mut(),
+            self.moved_here.as_mut(),
+            Some(&mut self.pointer_at.0),
+            self.popup_drag.as_mut().map(|p| &mut p.0),
+            self.scroll_active.as_mut().map(|s| &mut s.0),
+            self.xdnd_out.as_mut().map(|o| &mut o.wid),
+            self.xdnd_in.as_mut().and_then(|i| i.target.as_mut()).map(|t| &mut t.0),
+            self.probe.as_mut().map(|p| &mut p.0),
+        ] {
+            follow_wid(slot, old, new);
+        }
+        self.arrival.replaced(old, new);
+        if self.drag_spot.is_some_and(|s| s.0 == old) {
+            self.drag_spot = None;
+        }
+        if retitle {
+            self.set_title(xid, &title);
+        }
+        if was.bundle_id != bundle_id && !display {
+            let class = format!("sweeflow-{bundle_id}");
+            let _ = self.conn.change_property8(PropMode::REPLACE, xid, xproto::AtomEnum::WM_CLASS, xproto::AtomEnum::STRING, format!("{class}\0{class}\0").as_bytes());
+            self.apply_icon(new);
+        }
+        if was.pid != pid {
+            if !display && self.menus.is_some() {
+                let _ = self.conn.change_property8(PropMode::REPLACE, xid, self.atoms._KDE_NET_WM_APPMENU_OBJECT_PATH, xproto::AtomEnum::STRING, Menus::object_path(pid).as_bytes());
+            }
+            if !self.windows.values().any(|o| o.info.pid == was.pid) {
+                crate::menus::app_gone(was.pid);
+            }
+        }
+        // The new window's video; until its first frame the old one's last picture is drawn.
+        let _ = self.net.send(NetCmd::Unsubscribe(old));
+        let _ = self.net.send(NetCmd::Subscribe(new));
+        if suspended {
+            let _ = self.net.send(NetCmd::Video(new, W::new(t::PAUSE).u8(1).finish()));
+        }
+        self.clip_input(new);
+        if resized {
+            self.draw(new);
+        }
+        if check {
+            self.schedule_check(new);
+        }
+        if hidden {
+            self.unhide(new, "another window took its place");
+        }
+        if let Some((spot, fixed)) = self.pending_fixed.remove(&new) {
+            self.on_net(UiEvent::WindowFixed(new, spot, fixed));
+        }
     }
 
     fn create_window(&mut self, info: WinInfo) -> Result<()> {
@@ -2907,6 +3007,29 @@ pub fn selftest(args: &[String]) -> Result<()> {
         app.draw(wid);
         checks.push((wid, app.probe.take().and_then(|p| p.1)));
     }
+    // A tab switched on the Mac: window 2 becomes window 4, the same X window, which shows
+    // window 2's last picture until window 4's first frame.
+    let xid2 = app.windows.get(&2).map(|w| w.xid);
+    let mut tab = app.windows.get(&2).map(|w| w.info.clone()).ok_or_else(|| anyhow!("window 2 wasn't made"))?;
+    (tab.wid, tab.title) = (4, "P010 tab".into());
+    app.on_net(UiEvent::WindowReplaced(2, tab));
+    let xid4 = app.windows.get(&4).map(|w| w.xid);
+    if app.windows.contains_key(&2) || xid4.is_none() || xid4 != xid2 || xid4.and_then(|x| app.by_xid.get(&x)) != Some(&4) {
+        failures.push(format!("replaced window: X window {xid2:?} now {xid4:?}, window 2 still there: {}", app.windows.contains_key(&2)));
+    }
+    app.probe = Some((4, None));
+    app.draw(4);
+    match app.probe.take().and_then(|p| p.1) {
+        Some((px, (w, _))) => {
+            let i = (((fh / 4) * w + w / 10) * 4) as usize;
+            let p = &px[i..i + 4];
+            println!("replaced window, red band: RGBA {p:?} (expected the old picture's red)");
+            if p[..3].iter().zip(expected[0]).any(|(a, b)| a.abs_diff(b) > 6) {
+                failures.push(format!("replaced window: {p:?}, not the old picture"));
+            }
+        }
+        None => failures.push("replaced window never drawn".into()),
+    }
     // Paused: the windows become black-and-white stills (read back from the GPU).
     app.on_net(UiEvent::Streaming(false));
     app.probe = Some((1, None));
@@ -2993,7 +3116,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
         *sent.entry(k).or_default() += 1;
     }
     println!("sent to the (absent) Mac: {sent:?}");
-    for wid in [3, 2, 1] {
+    for wid in [3, 4, 1] {
         app.remove_window(wid);
     }
     app.conn.flush()?;

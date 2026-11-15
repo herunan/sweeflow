@@ -24,6 +24,11 @@ final class WindowTracker {
     var onAdded: ((TrackedWindow) -> Void)?
     var onChanged: ((TrackedWindow) -> Void)?
     var onRemoved: ((TrackedWindow) -> Void)?
+    /// A window went and another of the same app came at the very same frame, in one look at
+    /// the window list: (old, new). A tab switched: each tab is a window of its own, and macOS
+    /// swaps one for the other in a single step. Without this they are a removal and an
+    /// addition.
+    var onReplaced: ((TrackedWindow, TrackedWindow) -> Void)?
 
     private(set) var windows: [UInt32: TrackedWindow] = [:]
     /// Window ids in front-to-back order from the last poll.
@@ -452,10 +457,20 @@ final class WindowTracker {
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         noButtonsSeen = noButtonsSeen.filter { live.contains($0.key) }
         sheetSeen = sheetSeen.filter { live.contains($0.key) }
+        // New windows that took a gone one's place (see onReplaced): new wid → the old window.
+        var replaced: [UInt32: TrackedWindow] = [:]
+        if onReplaced != nil {
+            var gone = windows.values.filter { seen[$0.wid] == nil && $0.kind == .toplevel }
+            for wid in order {
+                guard windows[wid] == nil, let w = seen[wid], w.kind == .toplevel,
+                      let i = gone.firstIndex(where: { $0.pid == w.pid && $0.frame == w.frame }) else { continue }
+                replaced[wid] = gone.remove(at: i)
+            }
+        }
+        let replacedOld = Set(replaced.values.map(\.wid))
         for (wid, old) in windows where seen[wid] == nil {
-
             windows[wid] = nil
-            onRemoved?(old)
+            if !replacedOld.contains(wid) { onRemoved?(old) }
         }
         // Parents before children so the client can attach popups.
         for wid in order {
@@ -464,7 +479,7 @@ final class WindowTracker {
                 if old != w { windows[wid] = w; onChanged?(w) }
             } else {
                 windows[wid] = w
-                onAdded?(w)
+                if let old = replaced[wid] { onReplaced?(old, w) } else { onAdded?(w) }
             }
         }
         zOrder = order
