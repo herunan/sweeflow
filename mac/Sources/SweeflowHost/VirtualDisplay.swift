@@ -209,16 +209,18 @@ final class Wakefulness {
             }
         }
         // Closing the lid sleeps a MacBook regardless of assertions; `pmset disablesleep` is the
-        // only switch. `sweeflow setup` installs a sudoers rule allowing exactly these two calls.
-        lidSleepDisabled = setLidSleep(disabled: true)
+        // only switch, run through sudo: it needs a sudoers rule allowing exactly these two calls
+        // (none is installed yet; without it, closing the lid on battery sleeps the Mac).
+        lidSleepDisabled = true
+        Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
     }
 
     func release() {
         assertions.forEach { IOPMAssertionRelease($0) }
         assertions.removeAll()
         if lidSleepDisabled {
-            _ = setLidSleep(disabled: false)
             lidSleepDisabled = false
+            Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: false) }
         }
     }
 
@@ -240,6 +242,10 @@ final class Wakefulness {
         if let id = reachable { IOPMAssertionRelease(id) }
         reachable = nil
     }
+
+    /// `sudo pmset` is another process: waited for here, not on the main thread (hold and release
+    /// are called there). One at a time, in order, so a release never lands before its hold.
+    private static let pmsetQueue = DispatchQueue(label: "sweeflow.pmset")
 
     /// Restores normal lid-close sleep (e.g. after a crash left it disabled).
     static func resetLidSleep() { _ = Wakefulness().setLidSleep(disabled: false) }

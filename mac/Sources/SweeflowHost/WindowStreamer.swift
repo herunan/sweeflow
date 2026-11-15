@@ -51,10 +51,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Pixel work on a frame (overlays, corners, the 10-bit conversion: 5–15 ms on a Retina
     /// window) runs here, off the session queue, so input never waits behind video.
     private let work = DispatchQueue(label: "sweeflow.frame", qos: .userInteractive)
+    /// The last corner tiles worked out (used on `work` only).
+    private let cornerCache = CornerTileCache()
     /// The focus changed while a frame was being prepared: repaint the lights once it's done.
     private var repaintAfter = false
     private var lastBuffer: CVPixelBuffer?      // last encoded capture, reused for refinement
-    private var lastEncodeAt = DispatchTime.now()
     private var refinementsLeft = 0
     private var refineTimer: DispatchSourceTimer?
     private var forceKeyframe = true
@@ -168,21 +169,29 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         return !same
     }
 
-    /// A fast hash of one row of pixels (two independent multiply chains, 16 bytes a step).
+    /// A fast hash of one row of pixels: sixteen 32-bit lanes, 64 bytes a step (NEON multiplies
+    /// four lanes at once; 3.5 times the speed of two 64-bit chains, 0.6 ms for a Retina frame on
+    /// an M1). Each step is a bijection of its lane, so a change to any one word always changes
+    /// the result.
     @inline(__always)
-    private static func hashRow(_ p: UnsafeRawPointer, _ n: Int) -> UInt64 {
-        var a: UInt64 = 0x9E37_79B9_7F4A_7C15, b: UInt64 = 0xC2B2_AE3D_27D4_EB4F
+    fileprivate static func hashRow(_ p: UnsafeRawPointer, _ n: Int) -> UInt64 {
+        let k = SIMD8<UInt32>(repeating: 0x0100_0193)
+        var a = SIMD8<UInt32>(0x9E37_79B9, 0x7F4A_7C15, 0xC2B2_AE3D, 0x27D4_EB4F, 0x1656_67B1, 0x85EB_CA77, 0x27D4_EB2F, 0x1656_67C5)
+        var b = a &+ 1
         var i = 0
-        while i + 16 <= n {
-            a = (a ^ p.loadUnaligned(fromByteOffset: i, as: UInt64.self)) &* 0x0000_0100_0000_01B3
-            b = (b ^ p.loadUnaligned(fromByteOffset: i + 8, as: UInt64.self)) &* 0x9E37_79B9_7F4A_7C15
-            i += 16
+        while i + 64 <= n {
+            a = (a ^ p.loadUnaligned(fromByteOffset: i, as: SIMD8<UInt32>.self)) &* k
+            b = (b ^ p.loadUnaligned(fromByteOffset: i + 32, as: SIMD8<UInt32>.self)) &* k
+            i += 64
         }
+        var h: UInt64 = 0xC2B2_AE3D_27D4_EB4F
         while i + 4 <= n {
-            a = (a ^ UInt64(p.loadUnaligned(fromByteOffset: i, as: UInt32.self))) &* 0x0000_0100_0000_01B3
+            h = (h ^ UInt64(p.loadUnaligned(fromByteOffset: i, as: UInt32.self))) &* 0x0000_0100_0000_01B3
             i += 4
         }
-        return a ^ (b << 31 | b >> 33)
+        let c = a ^ (b &* 0x85EB_CA77)
+        for j in 0..<8 { h = (h ^ UInt64(c[j])) &* 0x9E37_79B9_7F4A_7C15 }
+        return h
     }
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
@@ -853,6 +862,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let buttons: [CGRect], badge: CGRect?, scale: CGFloat, content: CGSize?, radiusPx: Int
         let detect: Bool, measure: Bool
         let clean: CleanCorner
+        let cornerCache: CornerTileCache
         let noBadge: Bool
         let still: Bool
     }
@@ -881,14 +891,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                                    noBadge: p.noBadge, still: p.still)
         // A few radius measurements per window (not every frame) feed the shared vote.
         if p.measure { r.radiusPx = measureCornerRadius(pb, scale: p.scale) }
-        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, content: p.content)
+        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, content: p.content, cache: p.cornerCache)
         fillCorners(pb, radiusPx: Int(28 * p.scale))
         fillEdges(pb, ring: max(2, Int(p.scale)))
         // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
         // drops alpha, which would leave them darkened. Restore their real colour.
-        // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
-        // the full pass is needed.
-        if hasTranslucency(pb, skip: Int(28 * p.scale)) { unpremultiply(pb) }
+        // Most windows are fully opaque, and in the rest it's a sidebar or a toolbar: a sparse
+        // look (1 pixel in 64) says where, and only there is restored.
+        unpremultiply(pb, translucentAreas(pb, skip: Int(28 * p.scale)))
         return r
     }
 
@@ -1103,10 +1113,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let badge = badgeRect()
             prep = Prep(buttons: buttons, badge: badge, scale: scale, content: captureContent,
                         radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure,
-                        clean: cleanCorner, noBadge: badge == nil && badgeAbsent(), still: pendingStill)
+                        clean: cleanCorner, cornerCache: cornerCache, noBadge: badge == nil && badgeAbsent(), still: pendingStill)
         }
         lastBuffer = pb
-        lastEncodeAt = .now()
         encoding = true
         encodingSince = .now()
         let startUs = hostMicros()
@@ -1336,7 +1345,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard n > 0 else { log("lz4 failed for \(wid)"); return }
         let captureUs = hostMicros()
         inFlight.append(captureUs)
-        lastEncodeAt = .now()
         scheduleRefine()
         logStatsIfDue()
         var m = MsgWriter(.frame)
@@ -1465,7 +1473,17 @@ func measureCornerRadius(_ pb: CVPixelBuffer, scale: CGFloat) -> Int? {
 /// window, so whatever the capture has in the corner (transparency, an erased badge, an app's own
 /// square edge) can't leak through. `content`: where the window ends in the buffer (px), when
 /// macOS padded a capture of a stale size. Returns (tile px, tiles, hash).
-func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, content: CGSize? = nil) -> (Int, Data, UInt64)? {
+/// The corner tiles last worked out for a window, and what they were worked out from.
+final class CornerTileCache {
+    fileprivate var key: [UInt64] = []
+    fileprivate var tiles: (Int, Data, UInt64)?
+}
+
+/// `cache`: tiles depend only on the pixels in the four corner squares (and the sizes), which
+/// rarely change: when a hash of those is what it was, the last tiles are given again (working
+/// them out, 4x4 supersampled with a walk inward per see-through pixel, was the host's biggest
+/// cost per frame after the capture itself).
+func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, content: CGSize? = nil, cache: CornerTileCache? = nil) -> (Int, Data, UInt64)? {
     guard r > 0, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -1477,6 +1495,15 @@ func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, content: CG
     let s = max(1, Int(scale.rounded()))
     let t = ((r + s - 1) / s) * s          // whole points, so the client can place it exactly
     guard t <= w / 3, t <= h / 3 else { return nil }
+    var key: [UInt64] = [UInt64(w), UInt64(h), UInt64(t), UInt64(r)]
+    if let cache {
+        var hash: UInt64 = 0
+        for (ox, oy) in [(0, 0), (w - t, 0), (0, h - t), (w - t, h - t)] {
+            for y in oy..<(oy + t) { hash = (hash ^ WindowStreamer.hashRow(UnsafeRawPointer(base + y * stride + ox * 4), t * 4)) &* 0x100000001b3 }
+        }
+        key.append(hash)
+        if key == cache.key, let last = cache.tiles { return last }
+    }
     let rf = Double(r)
     var tiles = Data(count: t * t * 4 * 4)
     tiles.withUnsafeMutableBytes { raw in
@@ -1535,8 +1562,8 @@ func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, content: CG
             }
         }
     }
-    var hash: UInt64 = 0xcbf29ce484222325
-    for b in tiles { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
+    let hash = tiles.withUnsafeBytes { WindowStreamer.hashRow($0.baseAddress!, $0.count) }
+    if let cache { cache.key = key; cache.tiles = (t, tiles, hash) }
     return (t, tiles, hash)
 }
 
@@ -1630,17 +1657,20 @@ func fillEdges(_ pb: CVPixelBuffer, ring: Int) {
     }
 }
 
-/// Premultiplied → straight BGRA in place (SIMD), so dropping alpha doesn't darken translucent
-/// pixels.
-func unpremultiply(_ pb: CVPixelBuffer) {
-    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+/// Premultiplied → straight BGRA in place (SIMD), in `areas` (rows, columns) of the buffer, so
+/// dropping alpha doesn't darken translucent pixels.
+func unpremultiply(_ pb: CVPixelBuffer, _ areas: [(rows: Range<Int>, cols: Range<Int>)]) {
+    guard !areas.isEmpty, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
     guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
-    var buf = vImage_Buffer(data: base, height: vImagePixelCount(CVPixelBufferGetHeight(pb)),
-                            width: vImagePixelCount(CVPixelBufferGetWidth(pb)), rowBytes: CVPixelBufferGetBytesPerRow(pb))
-    // Alpha is last in BGRA as in RGBA; the colour order does not matter here.
-    vImageUnpremultiplyData_RGBA8888(&buf, &buf, vImage_Flags(kvImageNoFlags))
+    let stride = CVPixelBufferGetBytesPerRow(pb)
+    for a in areas where !a.rows.isEmpty && !a.cols.isEmpty {
+        var buf = vImage_Buffer(data: base + a.rows.lowerBound * stride + a.cols.lowerBound * 4, height: vImagePixelCount(a.rows.count),
+                                width: vImagePixelCount(a.cols.count), rowBytes: stride)
+        // Alpha is last in BGRA as in RGBA; the colour order does not matter here.
+        vImageUnpremultiplyData_RGBA8888(&buf, &buf, vImage_Flags(kvImageNoFlags))
+    }
 }
 
 /// macOS windows have rounded, transparent corners. The Linux window is a plain rectangle, so
@@ -1752,45 +1782,62 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
 
-    /// Whether a pixel lies in the bar with round ends that fills `region` (the badge's shape).
-    func inPill(_ region: CGRect, _ x: Int, _ y: Int) -> Bool {
-        let radius = Double(region.height * scale) / 2
-        let leftX = Double(region.minX * scale) + radius, rightX = Double(region.maxX * scale) - radius
-        let px = Double(x) + 0.5, dy = Double(y) + 0.5 - Double(region.midY * scale)
-        let dx = px < leftX ? leftX - px : px > rightX ? px - rightX : 0
-        return dx * dx + dy * dy <= radius * radius
+    /// The bar with round ends that fills a region (the badge's shape), in pixels: worked out
+    /// once per region, not at every pixel it's asked about.
+    struct Pill {
+        let radius2: Double, leftX: Double, rightX: Double, midY: Double
+        init(_ region: CGRect, _ scale: CGFloat) {
+            let radius = Double(region.height * scale) / 2
+            radius2 = radius * radius
+            leftX = Double(region.minX * scale) + radius; rightX = Double(region.maxX * scale) - radius
+            midY = Double(region.midY * scale)
+        }
+        @inline(__always) func contains(_ x: Int, _ y: Int) -> Bool {
+            let px = Double(x) + 0.5, dy = Double(y) + 0.5 - midY
+            let dx = px < leftX ? leftX - px : px > rightX ? px - rightX : 0
+            return dx * dx + dy * dy <= radius2
+        }
     }
 
     // The remembered corner: learnt from a fresh capture wherever the badge (with a margin)
-    // isn't, once the badge has stayed put; and held for the covering below.
+    // isn't, once the badge has stayed put; and held for the covering below. Its pixels are
+    // taken out of `clean` while they're worked on (and put back at the end): read and written
+    // in place there, each access paid for a check of the class's storage.
     let cornerW = min(w, Int(112 * scale)), cornerH = min(h, Int(50 * scale))
     clean?.lock.lock()
     defer { clean?.lock.unlock() }
+    var cpx: [UInt8] = [], known: [Bool] = []
     if let clean {
         if clean.shape != (cornerW, cornerH) {
             clean.shape = (cornerW, cornerH)
             clean.px = [UInt8](repeating: 0, count: cornerW * cornerH * 4)
             clean.known = [Bool](repeating: false, count: cornerW * cornerH)
         }
+        swap(&cpx, &clean.px); swap(&known, &clean.known)
+    }
+    defer { if let clean { swap(&cpx, &clean.px); swap(&known, &clean.known) } }
+    if let clean {
         // What is remembered must still be what the app shows there (its toolbar may have
         // changed): where the corner is in plain view now, away from the badge and the
         // buttons, it has to match, or the lot is forgotten and learnt again.
-        let hidden = (badge.map { [$0.insetBy(dx: -3, dy: -3)] } ?? []) + rects.map { $0.insetBy(dx: -8, dy: -8) }
+        // (In pixels: x, maxX, y, maxY.)
+        let hidden = ((badge.map { [$0.insetBy(dx: -3, dy: -3)] } ?? []) + rects.map { $0.insetBy(dx: -8, dy: -8) })
+            .map { (Double($0.minX * scale), Double($0.maxX * scale), Double($0.minY * scale), Double($0.maxY * scale)) }
         if fresh {
             var seen = 0, differ = 0
             for y in Swift.stride(from: 0, to: cornerH, by: 2) {
-                let row = base + y * stride
-                for x in Swift.stride(from: 0, to: cornerW, by: 2) where clean.known[y * cornerW + x] {
-                    let pt = CGPoint(x: CGFloat(x) / scale, y: CGFloat(y) / scale)
-                    if hidden.contains(where: { $0.contains(pt) }) { continue }
+                let row = base + y * stride, fy = Double(y)
+                for x in Swift.stride(from: 0, to: cornerW, by: 2) where known[y * cornerW + x] {
+                    let fx = Double(x)
+                    if hidden.contains(where: { fx >= $0.0 && fx < $0.1 && fy >= $0.2 && fy < $0.3 }) { continue }
                     seen += 1
                     let i = (y * cornerW + x) * 4
-                    if abs(Int(row[x * 4]) - Int(clean.px[i])) > 40 || abs(Int(row[x * 4 + 1]) - Int(clean.px[i + 1])) > 40
-                        || abs(Int(row[x * 4 + 2]) - Int(clean.px[i + 2])) > 40 { differ += 1 }
+                    if abs(Int(row[x * 4]) - Int(cpx[i])) > 40 || abs(Int(row[x * 4 + 1]) - Int(cpx[i + 1])) > 40
+                        || abs(Int(row[x * 4 + 2]) - Int(cpx[i + 2])) > 40 { differ += 1 }
                 }
             }
             if seen > 50, differ * 5 > seen {
-                clean.known = [Bool](repeating: false, count: cornerW * cornerH)
+                known = [Bool](repeating: false, count: cornerW * cornerH)
             }
         }
         // The still taken as a capture starts often has no badge on it yet, though the window
@@ -1813,12 +1860,17 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
         // otherwise wherever the badge (with a margin) isn't, once it has stayed put.
         let around = stillClear ? nil : badge?.insetBy(dx: -3, dy: -3)
         if fresh, (badge == nil && noBadge) || stillClear || (badge.map { clean.settled(at: $0) } ?? false) {
-            for y in 0..<cornerH {
-                let row = base + y * stride
-                for x in 0..<cornerW where around.map({ !inPill($0, x, y) }) ?? true {
-                    let i = y * cornerW + x
-                    for c in 0..<4 { clean.px[i * 4 + c] = row[x * 4 + c] }
-                    clean.known[i] = true
+            let pill = around.map { Pill($0, scale) }
+            cpx.withUnsafeMutableBufferPointer { cp in
+                known.withUnsafeMutableBufferPointer { kn in
+                    for y in 0..<cornerH {
+                        let row = base + y * stride
+                        for x in 0..<cornerW where !(pill?.contains(x, y) ?? false) {
+                            let i = y * cornerW + x
+                            for c in 0..<4 { cp[i * 4 + c] = row[x * 4 + c] }
+                            kn[i] = true
+                        }
+                    }
                 }
             }
             if !clean.saidLearnt || stillClear {
@@ -1853,29 +1905,36 @@ func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, s
         let bb = samples.map { $0.0 }.sorted()[mid]
         let bgc = samples.map { $0.1 }.sorted()[mid]
         let br = samples.map { $0.2 }.sorted()[mid]
-        for y in y0..<y1 {
-            let row = base + y * stride
-            for x in x0..<x1 {
-                if pill, !inPill(region, x, y) { continue }
-                let p = row + x * 4
-                // Under the badge: what was there when the badge wasn't, where that's known.
-                if pill, let clean, x < cornerW, y < cornerH, clean.known[y * cornerW + x] {
-                    let i = (y * cornerW + x) * 4
-                    for c in 0..<4 { p[c] = clean.px[i + c] }
-                    continue
-                }
-                if pill, let clean, !clean.saidUnknown, let corner = regions.first, CGFloat(x) / scale > corner.maxX {
-                    clean.saidUnknown = true
-                    log("capture badge at \(region): what's under it past the buttons isn't known (covered plain)")
-                }
-                // The window's own shape stays: where its rounded corner is see-through (the
-                // badge can reach into it), the pixel keeps its alpha and takes the colour
-                // through it (the buffer is premultiplied).
-                let a = Int(p[3])
-                if a == 255 {
-                    p[0] = bb; p[1] = bgc; p[2] = br
-                } else if a > 0 {
-                    p[0] = UInt8(Int(bb) * a / 255); p[1] = UInt8(Int(bgc) * a / 255); p[2] = UInt8(Int(br) * a / 255)
+        let shape = pill ? Pill(region, scale) : nil
+        let pastButtons = regions.first.map { Double($0.maxX * scale) }
+        let remembered = pill && clean != nil
+        cpx.withUnsafeBufferPointer { cp in
+            known.withUnsafeBufferPointer { kn in
+                for y in y0..<y1 {
+                    let row = base + y * stride
+                    for x in x0..<x1 {
+                        if let shape, !shape.contains(x, y) { continue }
+                        let p = row + x * 4
+                        // Under the badge: what was there when the badge wasn't, where that's known.
+                        if remembered, x < cornerW, y < cornerH, kn[y * cornerW + x] {
+                            let i = (y * cornerW + x) * 4
+                            for c in 0..<4 { p[c] = cp[i + c] }
+                            continue
+                        }
+                        if remembered, let clean, !clean.saidUnknown, let past = pastButtons, Double(x) > past {
+                            clean.saidUnknown = true
+                            log("capture badge at \(region): what's under it past the buttons isn't known (covered plain)")
+                        }
+                        // The window's own shape stays: where its rounded corner is see-through (the
+                        // badge can reach into it), the pixel keeps its alpha and takes the colour
+                        // through it (the buffer is premultiplied).
+                        let a = Int(p[3])
+                        if a == 255 {
+                            p[0] = bb; p[1] = bgc; p[2] = br
+                        } else if a > 0 {
+                            p[0] = UInt8(Int(bb) * a / 255); p[1] = UInt8(Int(bgc) * a / 255); p[2] = UInt8(Int(br) * a / 255)
+                        }
+                    }
                 }
             }
         }
@@ -2026,20 +2085,38 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     return out
 }
 
-/// Whether any pixel away from the corners and edges is semi-transparent, looking at one pixel
-/// in 64 (every 8th in both directions).
-func hasTranslucency(_ pb: CVPixelBuffer, skip margin: Int) -> Bool {
+/// Where a capture is semi-transparent away from its corners and edges, looking at one pixel in
+/// 64 (every 8th in both directions): bands of rows, each with the columns to restore. A band
+/// takes in its neighbours' samples and 8 pixels either side, so the unlooked-at pixels around a
+/// translucent one are covered; and each row is in one band only (restoring twice would be
+/// wrong). Empty: fully opaque. (It was the whole frame whenever any pixel was translucent: a
+/// Finder window's sidebar cost a full pass per frame.)
+func translucentAreas(_ pb: CVPixelBuffer, skip margin: Int) -> [(rows: Range<Int>, cols: Range<Int>)] {
     guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
-          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return true }
+          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return [] }
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return true }
+    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return [] }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-    guard w > 2 * margin, h > 2 * margin else { return true }
-    for y in Swift.stride(from: margin, to: h - margin, by: 8) {
+    guard w > 2 * margin + 16, h > 2 * margin + 16 else { return [(0..<h, 0..<w)] }
+    let ys = Array(Swift.stride(from: margin, to: h - margin, by: 8))
+    // Per sample row: the first and last translucent sample's column (hi < 0: none).
+    var los = [Int](repeating: Int.max, count: ys.count), his = [Int](repeating: -1, count: ys.count)
+    for (k, y) in ys.enumerated() {
         let row = base + y * stride
         for x in Swift.stride(from: margin, to: w - margin, by: 8) where row[x * 4 + 3] < 250 {
-            return true
+            if los[k] == Int.max { los[k] = x }
+            his[k] = x
         }
     }
-    return false
+    var out: [(rows: Range<Int>, cols: Range<Int>)] = []
+    for k in ys.indices {
+        var lo = Int.max, hi = -1
+        for j in max(0, k - 1)...min(ys.count - 1, k + 1) { lo = min(lo, los[j]); hi = max(hi, his[j]) }
+        guard hi >= 0 else { continue }
+        let rows = (k == 0 ? 0 : ys[k])..<(k == ys.count - 1 ? h : ys[k + 1])
+        // Reaching the margins: out to the edge (a toolbar or sidebar runs on under them).
+        let cols = (lo - 8 <= margin ? 0 : lo - 8)..<(hi + 9 >= w - margin ? w : hi + 9)
+        out.append((rows, cols))
+    }
+    return out
 }

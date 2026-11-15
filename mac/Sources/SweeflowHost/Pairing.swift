@@ -185,7 +185,7 @@ final class Pairing {
             return reply(stream, .version)
         }
         guard let said = try? m.str() else { return log("pairing: malformed request") }
-        guard let fp = (peerFingerprint(conn) ?? lastPeer)?.lowercased() else {
+        guard let fp = (Server.peerFingerprint(conn) ?? lastPeer)?.lowercased() else {
             log("pairing: no client certificate")
             return reply(stream, .busy)
         }
@@ -294,7 +294,7 @@ final class Pairing {
     /// A linked computer unlinked this Mac: it's forgotten here too. Only ever the computer whose
     /// certificate made this connection (from the handshake itself, never `lastPeer`).
     private func unlink(on stream: MsgStream, _ conn: NWConnection) {
-        guard let fp = peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
+        guard let fp = Server.peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
         if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) {
             log("pairing: \(Identity.clientName(fp)) unlinked this Mac")
             Identity.removeClient(fp)
@@ -307,7 +307,7 @@ final class Pairing {
     /// A computer asks whether it's still linked here (it looks now and then, for a Mac it isn't
     /// streaming from: one unlinked here then forgets this Mac too).
     private func check(on stream: MsgStream, _ conn: NWConnection) {
-        guard let fp = peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
+        guard let fp = Server.peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
         if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) { return reply(stream, .linked) }
         // Told now: no need to tell it when it next connects.
         if Identity.forgottenClients().contains(fp) { Identity.setForgotten(fp, false) }
@@ -326,15 +326,6 @@ final class Pairing {
         w.u8(Server.serving ? 1 : 0)
         w.u8(ScreenLock.isLocked ? 1 : 0)
         stream.send(w)
-    }
-
-    private func peerFingerprint(_ conn: NWConnection) -> String? {
-        guard let md = conn.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata else { return nil }
-        var fp: String?
-        sec_protocol_metadata_access_peer_certificate_chain(md.securityProtocolMetadata) { cert in
-            if fp == nil { fp = Self.fingerprint(sec_certificate_copy_ref(cert).takeRetainedValue()) }
-        }
-        return fp
     }
 
     static func fingerprint(_ cert: SecCertificate) -> String {
@@ -504,9 +495,9 @@ final class PairingWindow: NSObject, NSWindowDelegate {
     /// This Mac's IPv4 addresses another computer can use: not its own loopback, nor the ones
     /// made up on a network that hands none out.
     private static func addresses() -> [String] {
-        Host.current().addresses.filter {
-            $0.contains(".") && !$0.contains(":") && !$0.hasPrefix("127.") && !$0.hasPrefix("169.254.")
-        }
+        // The interfaces' own (getifaddrs): Host.current() can wait on name lookups, here on
+        // the main thread. Not the .local name the list ends with.
+        Session.ownAddresses().filter { !$0.hasSuffix(".local") }
     }
 
     @objc private func clickedDone() { window?.close() }

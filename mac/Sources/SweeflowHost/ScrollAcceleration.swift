@@ -61,7 +61,31 @@ struct ScrollAcceleration {
 
     enum Device { case trackpad, mouse }
 
-    static func load(_ device: Device) -> ScrollAcceleration {
+    /// The curves as last loaded, for all sessions. Loading walks the whole I/O registry, which
+    /// took seconds under load; done as each session started, on the queue every session shares
+    /// (input included), a computer asking every few seconds whether the Mac was free (one
+    /// linked but not streaming) held up clicks for that long. So it's done off that queue,
+    /// when Sweeflow starts and again as a computer connects (the setting may have changed).
+    private static let lock = NSLock()
+    private static var loaded: [Device: ScrollAcceleration] = [:]
+    private static var loading = false
+
+    static func current(_ device: Device) -> ScrollAcceleration {
+        lock.withLock { loaded[device] } ?? ScrollAcceleration(device == .trackpad ? defaultTrackpad : defaultMouse)
+    }
+
+    static func reload() {
+        guard lock.withLock({ let was = loading; loading = true; return !was }) else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let both = [Device.trackpad, .mouse].map { ($0, load($0)) }
+            lock.withLock {
+                for (d, a) in both { loaded[d] = a }
+                loading = false
+            }
+        }
+    }
+
+    private static func load(_ device: Device) -> ScrollAcceleration {
         let (typeName, prefKey, fallback) = device == .trackpad
             ? ("HIDTrackpadScrollAcceleration", "com.apple.trackpad.scrolling", defaultTrackpad)
             : ("HIDMouseScrollAcceleration", "com.apple.scrollwheel.scaling", defaultMouse)

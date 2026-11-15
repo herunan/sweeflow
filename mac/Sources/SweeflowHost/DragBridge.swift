@@ -33,7 +33,8 @@ final class DragBridge: NSObject, NSDraggingSource {
     private static func replay(for seconds: Double) {
         replayLock.lock(); replayUntil = .now() + seconds; replayLock.unlock()
     }
-    private var dragChangeCount = NSPasteboard(name: .drag).changeCount
+    /// (Lazy: asking the pasteboard server as a session is made held up the queue all sessions share.)
+    private lazy var dragChangeCount = NSPasteboard(name: .drag).changeCount
     /// Files of the Mac drag in progress (for Linux to fetch on drop).
     private(set) var draggedFiles: [URL] = []
 

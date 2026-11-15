@@ -9,6 +9,14 @@ struct ClipItem {
     let data: Data
 }
 
+extension MsgWriter {
+    /// A clipboard item list as the wire has it: u16 count, then (str kind, str name, bytes data) each.
+    mutating func items(_ items: [ClipItem]) {
+        u16(UInt16(items.count))
+        for it in items { str(it.kind.rawValue); str(it.name); bytes(it.data) }
+    }
+}
+
 /// Mirrors the Mac clipboard with the Linux one: text, images and files, both directions.
 final class ClipboardSync {
     /// Called with the new Mac clipboard contents (on a background queue).

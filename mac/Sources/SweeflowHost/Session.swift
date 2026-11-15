@@ -193,6 +193,7 @@ final class Session {
                 Identity.renameClient(fp, to: clientName)
             }
             if let claim = onHello, !claim(self) { return }
+            ScrollAcceleration.reload()   // the scroll settings may have changed meanwhile
             DebugPort.session = self
             if !started {
                 started = true
@@ -203,7 +204,8 @@ final class Session {
             if let st = streamers.removeValue(forKey: key) { st.stop() }
             var w = MsgWriter(.welcome)
             w.u16(protocolVersion)
-            w.str(Host.current().localizedName ?? "Mac")
+            // The Mac's name as set in its settings, from configd (Host.current() can wait on name lookups).
+            w.str(SCDynamicStoreCopyComputerName(nil, nil) as String? ?? macName)
             w.str(Self.macKind)
             s.send(w)
             var a = MsgWriter(.addresses)
@@ -278,10 +280,7 @@ final class Session {
             st.onDetectedButtons = { [weak self] rects in
                 guard let self else { return }
                 self.sentButtons[wid] = rects
-                var m = MsgWriter(.windowButtons)
-                m.u32(wid)
-                for r in rects { m.f32(r.minX); m.f32(r.minY); m.f32(r.width); m.f32(r.height) }
-                self.control?.send(m)
+                self.sendWindowButtons(wid, rects)
             }
             st.active = wid == clientFocus
             if let flow = datagrams {
@@ -311,8 +310,7 @@ final class Session {
                     }
                     self.queue.async {
                         var out = MsgWriter(.dragData)
-                        out.u16(UInt16(items.count))
-                        for it in items { out.str(it.kind.rawValue); out.str(it.name); out.bytes(it.data) }
+                        out.items(items)
                         s.send(out)
                         log("drag to Linux: \(items.map(\.name))")
                     }
@@ -325,8 +323,7 @@ final class Session {
                 self?.queue.async {
                     var out = MsgWriter(.clipFiles)
                     out.u32(number)
-                    out.u16(UInt16(items?.count ?? 0))
-                    for it in items ?? [] { out.str(it.kind.rawValue); out.str(it.name); out.bytes(it.data) }
+                    out.items(items ?? [])
                     s.send(out)
                     log("clipboard: pasted on Linux: \(items.map { $0.map(\.name) } ?? ["(gone)"])")
                 }
@@ -1488,8 +1485,13 @@ final class Session {
         sentButtons[w.wid] = rects
         for st in streamers.values where st.wid == w.wid { st.buttons = rects }
         log("window \(w.wid) (\(w.appName)) buttons \(rects.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" })")
+        sendWindowButtons(w.wid, rects)
+    }
+
+    /// Where a window's close, minimise and zoom buttons are (window points).
+    private func sendWindowButtons(_ wid: UInt32, _ rects: [CGRect]) {
         var m = MsgWriter(.windowButtons)
-        m.u32(w.wid)
+        m.u32(wid)
         for r in rects { m.f32(r.minX); m.f32(r.minY); m.f32(r.width); m.f32(r.height) }
         control?.send(m)
     }
@@ -1620,6 +1622,9 @@ final class Session {
         tracker.onBadgeAppeared = { [weak self] wid in
             guard let self, let w = self.tracker.windows[wid] else { return }
             self.sendButtons(w)
+        }
+        tracker.onBadgeFound = { [weak self] wid in
+            self?.streamers.values.filter { $0.wid == wid }.forEach { $0.requestRepaint() }
         }
         tracker.onBlindAdded = { [weak self] b in self?.blindAdded(b) }
         tracker.onScreenSelect = { [weak self] on in
@@ -1803,8 +1808,7 @@ final class Session {
             self?.queue.async {
                 guard let s else { return }
                 var m = MsgWriter(.clipboard)
-                m.u16(UInt16(items.count))
-                for it in items { m.str(it.kind.rawValue); m.str(it.name); m.bytes(it.data) }
+                m.items(items)
                 s.send(m)
                 log("clipboard to Linux: \(items.map { $0.kind == .fileRef ? $0.name : $0.kind.rawValue })")
             }
@@ -1866,7 +1870,7 @@ final class Session {
         let control = control_
         focusQueue.async { [weak self] in
             let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            let focused = control.focusedWindowID()
+            let focused = pid.flatMap { control.focusedWindowID(of: $0) }
             self?.queue.async {
                 guard let self else { return }
                 self.focusChecking = false
@@ -1929,12 +1933,6 @@ final class Session {
         return (f(frame.minX, b.minX, b.width - frame.width), f(frame.minY, b.minY, b.height - frame.height))
     }
 
-    /// Tells Linux about a new window. Whether its app lets it be resized is looked at first
-    /// (Accessibility, off this queue), so a fixed one (a reminder, a dialog) is said to be
-    /// fixed before it's added: Linux then shows it as a dialog of its own size from the start,
-    /// which desktops and tilers (Karousel) float instead of tiling, and they decide that only
-    /// when a window appears. An app slow to answer doesn't hold the window up: after 60 ms it's
-    /// added anyway, and said to be fixed when the answer comes.
     /// Windows told to the client, and popups waiting for theirs to be told first, by window.
     /// A window is told once its app has said whether it can be resized (a moment), a popup at
     /// once: after a reconnect, Quick Look (open over its Finder window) got to the client
@@ -1942,6 +1940,12 @@ final class Session {
     private var announced: Set<UInt32> = []
     private var awaitingParent: [UInt32: [UInt32]] = [:]
 
+    /// Tells Linux about a new window. Whether its app lets it be resized is looked at first
+    /// (Accessibility, off this queue), so a fixed one (a reminder, a dialog) is said to be
+    /// fixed before it's added: Linux then shows it as a dialog of its own size from the start,
+    /// which desktops and tilers (Karousel) float instead of tiling, and they decide that only
+    /// when a window appears. An app slow to answer doesn't hold the window up: after 60 ms it's
+    /// added anyway, and said to be fixed when the answer comes.
     private func sendAdded(_ w: TrackedWindow) {
         if w.kind == .popup {
             if w.parent != 0, !announced.contains(w.parent), tracker.windows[w.parent] != nil {

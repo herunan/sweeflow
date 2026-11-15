@@ -179,10 +179,6 @@ final class WindowTracker {
 
     func stop() { timer?.cancel(); timer = nil }
 
-    /// A window over more than one display (a drag's image layer, which covers the whole
-    /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
-    /// Linux desktop and take the pointer. It covers whole displays; a real window that merely
-    /// straddles two (a video-call app's meeting window, left across a display edge) is no drag layer.
     /// Whether a window covers at least one whole display.
     static func coversDisplay(_ r: CGRect) -> Bool {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
@@ -191,6 +187,10 @@ final class WindowTracker {
         return ids.prefix(Int(n)).contains { r.insetBy(dx: -4, dy: -4).contains(CGDisplayBounds($0)) }
     }
 
+    /// A window over more than one display (a drag's image layer, which covers the whole
+    /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
+    /// Linux desktop and take the pointer. It covers whole displays; a real window that merely
+    /// straddles two (a video-call app's meeting window, left across a display edge) is no drag layer.
     static func spansDisplays(_ r: CGRect) -> Bool {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
         var n: UInt32 = 0
@@ -496,32 +496,43 @@ final class WindowTracker {
         // Not there at the last look at the window list. macOS puts the badge up a moment after
         // a capture starts, and that changes the picture: the capture with the badge in it gets
         // here before the next look, and for a window that then stays as it is, that picture
-        // (badge and all) was the one Linux kept showing. So ask the window server now, every
-        // two seconds at most per window (the question takes a few milliseconds, on the queue
-        // input goes through).
+        // (badge and all) was the one Linux kept showing. So the window server is asked again,
+        // every two seconds at most per window: off this queue (input goes through it, and the
+        // answer took tens of ms with many windows), and a badge found is said (onBadgeFound),
+        // so the window's last picture is painted again without it.
         let now = DispatchTime.now().uptimeNanoseconds
         if let asked = badgeAsked[wid], now - asked < 2_000_000_000 { return nil }
         badgeAsked[wid] = now
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]] else { return nil }
-        var frame = w.frame
-        var found: [CGRect] = []
-        for info in list {
-            guard (info[kCGWindowOwnerPID as String] as? pid_t) == w.pid, (info[kCGWindowLayer as String] as? Int) == 0,
-                  let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd) else { continue }
-            if (info[kCGWindowNumber as String] as? UInt32) == wid {
-                frame = b
-            } else if (60...72).contains(b.width), (17...23).contains(b.height) {
-                found.append(b)   // the badge's fixed size (see update)
+        let pid = w.pid, frame = w.frame
+        listQueue.async { [weak self] in
+            guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                    as? [[String: Any]] else { return }
+            var frame = frame
+            var found: [CGRect] = []
+            for info in list {
+                guard (info[kCGWindowOwnerPID as String] as? pid_t) == pid, (info[kCGWindowLayer as String] as? Int) == 0,
+                      let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd) else { continue }
+                if (info[kCGWindowNumber as String] as? UInt32) == wid {
+                    frame = b
+                } else if (60...72).contains(b.width), (17...23).contains(b.height) {
+                    found.append(b)   // the badge's fixed size (see update)
+                }
+            }
+            self?.queue.async {
+                guard let self, self.windows[wid] != nil else { return }
+                guard Self.badge(among: found, over: frame) != nil else {
+                    self.badgeAbsentAt[wid] = DispatchTime.now().uptimeNanoseconds   // asked just now, and it isn't there
+                    return
+                }
+                self.badges[pid, default: []].append(contentsOf: found)   // until the next look, which lists them itself
+                self.onBadgeFound?(wid)
             }
         }
-        guard let r = Self.badge(among: found, over: frame) else {
-            badgeAbsentAt[wid] = now   // asked just now, and it isn't there
-            return nil
-        }
-        badges[w.pid, default: []].append(contentsOf: found)   // until the next look, which lists them itself
-        return r
+        return nil
     }
+
+    /// A badge found on a window by asking the window server (badgeRect), on the tracker's queue.
+    var onBadgeFound: ((UInt32) -> Void)?
 
     /// Whether the window server said, within the last moment, that `wid` has no badge on it
     /// (as right after its capture starts): what is captured then is the window as it is.

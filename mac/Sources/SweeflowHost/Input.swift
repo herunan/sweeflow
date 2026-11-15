@@ -72,7 +72,7 @@ final class InputInjector {
             let rate = min(Double(hypot(dx, dy)) / dt, 200)   // notches per second
             notchRate = dt > 0.3 ? rate : notchRate + (rate - notchRate) * 0.4
             // The Mac's mouse curve by spin rate: ~10 notches/s is the knee, faster multiplies.
-            let per = Self.pointsPerNotch * max(1, CGFloat(wheelAccel.gain(notchRate * 0.6)))
+            let per = Self.pointsPerNotch * max(1, CGFloat(ScrollAcceleration.current(.mouse).gain(notchRate * 0.6)))
             wheel.add(dx: dx * per, dy: dy * per)
             return
         }
@@ -87,7 +87,6 @@ final class InputInjector {
     static let pointsPerNotch: CGFloat = 40
     private var lastNotchAt: CFTimeInterval = 0
     private var notchRate: Double = 0
-    private let wheelAccel = ScrollAcceleration.load(.mouse)
 
     private lazy var wheel = SmoothWheel { [weak self] dx, dy, phase in self?.postPixelScroll(dx: dx, dy: dy, phase: phase, gesture: false) }
 
@@ -321,7 +320,7 @@ final class TrackpadScroller {
     private var glideTotal: CGFloat = 0
     private var coasting = false
     /// The Mac's trackpad acceleration and its running velocity.
-    private let accel = ScrollAcceleration.load(.trackpad)
+    private let accel = ScrollAcceleration.current(.trackpad)
     private var fingerSpeed = ScrollVelocity()
     private static let unitsPerPoint = 0.4
 

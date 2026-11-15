@@ -290,6 +290,7 @@ final class HostState {
 
 let host = HostState()
 Wakefulness.resetLidSleep()   // in case a previous run died while streaming
+ScrollAcceleration.reload()
 BuiltInScreen.restore()
 // Started afresh (after a crash, an update): never dimmed from the start.
 if settings.config.dimMacScreenWhileStreaming { settings.update { $0.dimMacScreenWhileStreaming = false } }

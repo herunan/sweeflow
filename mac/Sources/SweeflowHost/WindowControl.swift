@@ -72,7 +72,6 @@ final class WindowControl {
         return false
     }
 
-    @discardableResult
     /// The app won't let the window be resized (macOS says its size can't be set): a reminder,
     /// an About or settings window, a fixed dialog. Nil if the window can't be looked at.
     func fixedSize(_ wid: UInt32, pid: pid_t) -> Bool? {
@@ -82,6 +81,7 @@ final class WindowControl {
         return !settable.boolValue
     }
 
+    @discardableResult
     func setSize(_ wid: UInt32, pid: pid_t, _ size: CGSize) -> Bool {
         guard let e = element(wid, pid: pid) else { return false }
         var s = size
@@ -184,9 +184,9 @@ final class WindowControl {
     }
 
     /// The window the user is typing into on the Mac, if any.
-    func focusedWindowID() -> UInt32? {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        let ax = AXUIElementCreateApplication(app.processIdentifier)
+    /// The focused window of the app `pid` (the frontmost one, as the caller found it).
+    func focusedWindowID(of pid: pid_t) -> UInt32? {
+        let ax = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let v = value else { return nil }

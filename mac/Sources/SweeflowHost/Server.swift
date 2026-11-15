@@ -1,7 +1,6 @@
 import Foundation
 import Network
 import Security
-import CryptoKit
 
 /// One QUIC stream with message framing and send-side byte accounting (for backpressure).
 final class MsgStream {
@@ -123,11 +122,11 @@ final class Server {
     /// and with several connecting or looking at once it can be another one's).
     static func peerFingerprint(_ conn: NWConnection) -> String? {
         guard let m = conn.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata else { return nil }
-        var leaf: Data?
+        var fp: String?
         _ = sec_protocol_metadata_access_peer_certificate_chain(m.securityProtocolMetadata) { cert in
-            if leaf == nil { leaf = SecCertificateCopyData(sec_certificate_copy_ref(cert).takeRetainedValue()) as Data }
+            if fp == nil { fp = Pairing.fingerprint(sec_certificate_copy_ref(cert).takeRetainedValue()) }
         }
-        return leaf.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
+        return fp
     }
 
     /// Ends the connection of that client, if it's the one connected.
@@ -165,7 +164,7 @@ final class Server {
             guard let chain = SecTrustCopyCertificateChain(t) as? [SecCertificate], let leaf = chain.first else {
                 return complete(false)
             }
-            let fp = SHA256.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
+            let fp = Pairing.fingerprint(leaf)
             let ok = authorized().contains(fp)
             if !ok { log("rejected client certificate \(fp)") } else { self?.lastVerified = fp }
             complete(ok)
@@ -290,7 +289,7 @@ struct Identity {
         let secIdent = ident as! SecIdentity
         var leaf: SecCertificate?
         SecIdentityCopyCertificate(secIdent, &leaf)
-        let fp = SHA256.hash(data: SecCertificateCopyData(leaf!) as Data).map { String(format: "%02x", $0) }.joined()
+        let fp = Pairing.fingerprint(leaf!)
         try fp.write(to: dir.appendingPathComponent("fingerprint"), atomically: true, encoding: .utf8)
 
         return Identity(secIdentity: sec_identity_create(secIdent)!, fingerprint: fp, authorizedClients: {
