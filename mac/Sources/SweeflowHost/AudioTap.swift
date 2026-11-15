@@ -4,6 +4,12 @@ import CoreAudio
 import AudioToolbox
 import AVFoundation
 
+/// Where the streamed apps' sound comes from.
+protocol SoundSource: AnyObject {
+    func stop()
+}
+extension AudioCapture: SoundSource {}
+
 /// The streamed apps' sound through a Core Audio process tap: handed over ~10 ms after it plays
 /// (ScreenCaptureKit's audio took ~55 ms). Same output as AudioCapture: 48 kHz stereo 16-bit
 /// PCM, with how long after it played each piece was captured.
@@ -11,14 +17,8 @@ import AVFoundation
 /// The tap takes every process's sound but those whose app isn't allowed (Sweeflow's own among
 /// them). A helper plays for the app it works for (Safari's sound comes from a WebKit process,
 /// Chrome's from a helper): it counts as that app. The list follows Core Audio's own list of
-/// processes, which a process joins before it plays. The tap is read through a private aggregate device
-/// clocked by the default output, made again when the default output changes.
-/// Where the streamed apps' sound comes from.
-protocol SoundSource: AnyObject {
-    func stop()
-}
-extension AudioCapture: SoundSource {}
-
+/// processes, which a process joins before it plays. The tap is read through a private
+/// aggregate device of its own (see startDevice).
 final class AudioTap: SoundSource {
     var onPCM: ((Data, UInt32) -> Void)?
     private let allowed: (String) -> Bool
@@ -71,12 +71,6 @@ final class AudioTap: SoundSource {
             }
             listen(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) { [weak self] in
                 self?.updateProcesses()
-            }
-            listen(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
-                guard let self, !self.stopped else { return }
-                log("audio tap: default output changed")
-                self.stopDevice()
-                if !self.startDevice() { log("audio tap: no device after the output changed") }
             }
             // Apps launching or quitting don't always change the process list (an app that
             // hasn't played yet isn't in it), but the allowed set may change with them.
@@ -163,17 +157,17 @@ final class AudioTap: SoundSource {
 
     // MARK: device
 
-    /// A private aggregate device with the tap in it, clocked by the default output. (Not with
-    /// "tap auto-start": with it the device never ran, on macOS 27.)
+    /// A private aggregate device of the tap alone. Not with the output device in it: with
+    /// the C34J79x's sound as the output, starting it timed out (10 s, twice, and no sound
+    /// until the output changed again); and the output's own inputs (the RØDE's microphone)
+    /// came in ahead of the tap. Not with "tap auto-start" either: with it the device never ran
+    /// (macOS 27).
     private func startDevice() -> Bool {
-        guard let output = defaultOutputUID() else { log("audio tap: no output device"); return false }
         let desc: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Sweeflow sound",
             kAudioAggregateDeviceUIDKey: "sweeflow-tap-\(UUID().uuidString)",
-            kAudioAggregateDeviceMainSubDeviceKey: output,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: output]],
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: tapUUID.uuidString]],
         ]
         var agg = AudioObjectID(kAudioObjectUnknown)
@@ -203,8 +197,8 @@ final class AudioTap: SoundSource {
         procID = proc
         err = AudioDeviceStart(agg, proc)
         guard err == noErr else { log("audio tap: not started (\(err))"); stopDevice(); return false }
-        log(String(format: "audio tap: %d processes left out, %.0f Hz, %d channels, through %@", excluded.count, fmt.mSampleRate,
-                   fmt.mChannelsPerFrame, output))
+        log(String(format: "audio tap: %d processes left out, %.0f Hz, %d channels", excluded.count, fmt.mSampleRate,
+                   fmt.mChannelsPerFrame))
         return true
     }
 
@@ -234,17 +228,23 @@ final class AudioTap: SoundSource {
 
     private func received(_ input: UnsafePointer<AudioBufferList>, now: AudioTimeStamp, at time: AudioTimeStamp) {
         guard !stopped else { return }
-        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
-        guard let first = abl.first, first.mDataByteSize > 0 else { return }
+        // The tap's buffers (the last ones, should the device ever have others ahead of them).
         let nonInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
         let channels = Int(format.mChannelsPerFrame)
+        let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+        let n = nonInterleaved ? channels : 1
+        guard all.count >= n else { return }
+        let abl = AudioBufferList.allocate(maximumBuffers: n)
+        defer { free(abl.unsafeMutablePointer) }
+        for i in 0..<n { abl[i] = all[all.count - n + i] }
+        guard let first = abl.first, first.mDataByteSize > 0 else { return }
         let inFrames = Int(first.mDataByteSize) / 4 / (nonInterleaved ? 1 : channels)
         guard inFrames > 0 else { return }
 
         // Float32 → interleaved stereo s16le, through the converter when not 48 kHz stereo.
         var out: Data
         if let converter {
-            guard let inBuf = AVAudioPCMBuffer(pcmFormat: converter.inputFormat, bufferListNoCopy: input),
+            guard let inBuf = AVAudioPCMBuffer(pcmFormat: converter.inputFormat, bufferListNoCopy: abl.unsafePointer),
                   let outBuf = AVAudioPCMBuffer(pcmFormat: converter.outputFormat,
                                                 frameCapacity: AVAudioFrameCount(Double(inFrames) * 48_000 / format.mSampleRate) + 16)
             else { return }
@@ -332,20 +332,6 @@ private func audioProcessPID(_ obj: AudioObjectID) -> pid_t? {
     var pid: pid_t = 0
     var size = UInt32(MemoryLayout<pid_t>.size)
     return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &pid) == noErr ? pid : nil
-}
-
-private func defaultOutputUID() -> String? {
-    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal,
-                                          mElement: kAudioObjectPropertyElementMain)
-    var dev = AudioObjectID(kAudioObjectUnknown)
-    var size = UInt32(MemoryLayout<AudioObjectID>.size)
-    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr,
-          dev != kAudioObjectUnknown else { return nil }
-    addr.mSelector = kAudioDevicePropertyDeviceUID
-    var uid: Unmanaged<CFString>?
-    size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &uid) == noErr, let uid else { return nil }
-    return uid.takeRetainedValue() as String
 }
 
 /// The app a process works for (Safari for its WebKit processes): what macOS holds responsible
