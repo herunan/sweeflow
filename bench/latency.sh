@@ -26,6 +26,8 @@ done
 start=$(( $(wc -l < "$LOG" | tr -d " ") + 1 ))
 sleep "$SECS"
 pkill -f sweeflow-bench.command || true
+# The window asks whether to end its shell when closed while the command is still going.
+sleep 1
 dbg close "$wid" >/dev/null
 tail -n "+$start" "$LOG" | { grep "stream $wid: .* fps" || true; } | sed -E 's/.*: ([0-9.]+) fps.*p50 ([0-9.-]+), p95 ([0-9.-]+), max ([0-9.-]+); .*encode ([0-9.-]+).*/\1 \2 \3 \4 \5/' |
   awk -v wid="$wid" '{fps+=$1; p50+=$2; p95+=$3; if ($4>mx) mx=$4; enc+=$5; n++}
