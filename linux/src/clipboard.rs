@@ -177,9 +177,7 @@ pub fn files_arrived(body: &[u8]) {
 /// ~/.cache/sweeflow/<area>/<n>: a new directory per copy or drag. Older ones are removed once
 /// they're 10 minutes old, so a paste or drop that's still copying from one isn't cut short.
 fn fresh_cache_dir(area: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"))
+    let base = crate::config::xdg_home("XDG_CACHE_HOME", ".cache")
         .join("sweeflow")
         .join(area);
     for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {

@@ -88,7 +88,7 @@ mod tests {
 /// after the window opens, once the desktop has it.
 pub fn place_at_spot(class: String, title: String, spot: (f32, f32)) {
     let (fx, fy) = (spot.0.clamp(0.0, 1.0), spot.1.clamp(0.0, 1.0));
-    let kde = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("KDE"));
+    let kde = crate::desktop::is("KDE");
     if !kde && !crate::hyprland::running() {
         return;
     }
@@ -108,7 +108,7 @@ pub fn place_at_spot(class: String, title: String, spot: (f32, f32)) {
         // A file of its own each time: KWin keeps a loaded script's code by its path.
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dir = crate::config::runtime_dir();
         let (path, name) = (dir.join(format!("sweeflow-place-{}-{n}.js", std::process::id())), format!("sweeflow-place-{n}"));
         if std::fs::write(&path, js).is_err() {
             return;
@@ -125,4 +125,10 @@ pub fn place_at_spot(class: String, title: String, spot: (f32, f32)) {
         let _ = bus.call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "unloadScript", &(name.as_str(),));
         let _ = std::fs::remove_file(&path);
     });
+}
+
+/// This session's desktop is `name` (one of the names in $XDG_CURRENT_DESKTOP, any case:
+/// "GNOME", "KDE"; whole names, so "GNOME-Classic" isn't "GNOME").
+pub fn is(name: &str) -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case(name))
 }

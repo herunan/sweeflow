@@ -65,7 +65,7 @@ fn single_instance() -> Result<std::fs::File> {
 /// None when another process holds it.
 pub(crate) fn lock(name: &str) -> Result<Option<std::fs::File>> {
     use std::os::fd::AsRawFd;
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = crate::config::runtime_dir();
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(name))?;
     // SAFETY: flock on a valid, owned descriptor.
     Ok((unsafe { libc_flock(f.as_raw_fd(), 2 | 4) } == 0).then_some(f))

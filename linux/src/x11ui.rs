@@ -51,7 +51,7 @@ use crate::{
     menus::Menus,
     net::{NetCmd, UiEvent, WinInfo},
     proto::{t, W},
-    ui::{display_title, edge_at, mac_button, Edge, paused_still, px_per_pt, shown_part, square_tiles, PausedStill, KEY_SPACE, MIN_SIZE},
+    ui::{display_title, edge_at, mac_button, refused, resize_wait, Edge, Refused, paused_still, px_per_pt, shown_part, square_tiles, PausedStill, KEY_SPACE, MIN_SIZE},
     x11gl::{Blend, Gl, Quad, Target, Tex, Video},
 };
 
@@ -1099,8 +1099,7 @@ impl App {
             return;
         }
         if let Some((_, at)) = w.requested {
-            let wait = if !w.popup && !w.floating { 3000 } else { 1500 };
-            if at.elapsed() < Duration::from_millis(wait) {
+            if at.elapsed() < resize_wait(!w.popup && !w.floating) {
                 return;
             }
         }
@@ -1126,10 +1125,9 @@ impl App {
                 return;
             }
             let size = w.size;
-            if !w.followed && w.requested.is_some_and(|(r, _)| r == size) {
-                let shape = |a: (u32, u32)| a.0 as f64 / a.1.max(1) as f64;
-                let kept_shape = w.first_shape.is_some_and(|f| (shape(mac) / f - 1.0).abs() < 0.015);
-                if w.refusal == Some((size, mac)) && !w.floated && kept_shape && (shape(size) / shape(mac) - 1.0).abs() > 0.03 {
+            match refused(size, mac, w.followed, w.requested, w.refusal, w.floated, w.first_shape) {
+                None => {}
+                Some(Refused::FloatAtMacSize) => {
                     log::info!("window {wid}: keeps its shape ({}x{}, asked {}x{}): floating it at that size", mac.0, mac.1, size.0, size.1);
                     let info = w.info.clone();
                     let buttons = w.buttons;
@@ -1142,13 +1140,14 @@ impl App {
                     self.update_lights(wid);
                     return;
                 }
-                if w.refusal != Some((size, mac)) {
+                Some(Refused::AskOnceMore) => {
                     w.refusal = Some((size, mac));
                     w.requested = Some((size, Instant::now()));
                     let _ = self.net.send(NetCmd::resize(wid, size));
                     Self::arm_check(&self.loop_handle, &mut w.check_pending, wid);
+                    return;
                 }
-                return;
+                Some(Refused::Wait) => return,
             }
         }
         if w.popup && !w.popup_settled {
@@ -2923,7 +2922,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
         }
         None => failures.push("paused still never drawn".into()),
     }
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let runtime = crate::config::runtime_dir();
     // Rounded corners show the desktop through them (unless the setting squares them).
     let rounded = !app.square_corners();
     println!("corners: {}", if rounded { "rounded (see-through)" } else { "square (the setting, or no 32-bit visual)" });

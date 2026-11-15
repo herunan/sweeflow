@@ -12,9 +12,7 @@ use std::{
 use anyhow::Result;
 
 fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
+    crate::config::xdg_home("XDG_DATA_HOME", ".local/share")
 }
 
 /// The Mac display window's entry (see setup::write_launcher), kept when Mac apps' go.
@@ -144,7 +142,7 @@ fn entry_of(file: &str) -> Option<(&str, bool)> {
 /// The Quit action's name: "Quit on Mac" on GNOME, whose dash adds its own "Quit" under it (that
 /// one only closes the app's windows here), else "Quit".
 fn quit_label() -> &'static str {
-    let gnome = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME"));
+    let gnome = crate::desktop::is("GNOME");
     if gnome { "Quit on Mac" } else { "Quit" }
 }
 
@@ -187,9 +185,7 @@ fn with_visibility(text: &str, visible: bool) -> String {
 }
 
 fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+    crate::config::xdg_home("XDG_CONFIG_HOME", ".config")
 }
 
 /// A "Mac Apps" folder in the app menu (like Chromium's "Chromium Apps"), holding every entry
@@ -257,7 +253,7 @@ fn refresh_menu() {
 }
 
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("sweeflow.sock")
+    crate::config::runtime_dir().join("sweeflow.sock")
 }
 
 /// `sweeflow launch <bundle id>`: asks the running client to open the app on the Mac.

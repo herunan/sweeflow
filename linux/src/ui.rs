@@ -1037,7 +1037,7 @@ impl App {
                 }
                 // Not on GNOME for one with no parent: GNOME doesn't tile (nothing to float it
                 // out of), and it won't minimise a dialog (Calculator's yellow light did nothing).
-                let gnome = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME"));
+                let gnome = crate::desktop::is("GNOME");
                 let parented = self.windows.get(&info.parent).is_some();
                 if let Some(d) = self.dialog_mgr.as_ref().filter(|_| parented || !gnome) {
                     d.get_xdg_dialog(window.xdg_toplevel(), qh, ()).set_modal();
@@ -1394,8 +1394,7 @@ impl App {
             return; // a new size is about to be asked for (arm_settle)
         }
         if let Some((_, at)) = w.requested {
-            let wait = if matches!(w.role, Role::Toplevel(_)) && !w.floating { 3000 } else { 1500 };
-            if at.elapsed() < Duration::from_millis(wait) {
+            if at.elapsed() < resize_wait(matches!(w.role, Role::Toplevel(_)) && !w.floating) {
                 return;
             }
         }
@@ -1414,16 +1413,11 @@ impl App {
             // Asked for this size and the app kept another: the window here keeps the
             // desktop's size all the same (no limits are declared from it). What fits of the
             // picture shows, cut off at the window's edge, or the rest is see-through
-            // (lay_out). Seen once, it's asked once more first: during a drag (or right after
-            // a reconnect) the Mac lags, and a real refusal comes back the same.
+            // (lay_out). See `refused` for what's done then.
             let size = w.size;
-            if !w.followed && w.requested.is_some_and(|(r, _)| r == size) {
-                // The same answer twice, in the shape the window had (a video player keeps its
-                // video's shape): it's opened again as a floating window of the Mac's size, as a
-                // floating panel is, instead of a tile it leaves mostly empty.
-                let shape = |a: (u32, u32)| a.0 as f64 / a.1.max(1) as f64;
-                let kept_shape = w.first_shape.is_some_and(|f| (shape(mac) / f - 1.0).abs() < 0.015);
-                if w.refusal == Some((size, mac)) && !w.floated && kept_shape && (shape(size) / shape(mac) - 1.0).abs() > 0.03 {
+            match refused(size, mac, w.followed, w.requested, w.refusal, w.floated, w.first_shape) {
+                None => {}
+                Some(Refused::FloatAtMacSize) => {
                     log::info!("window {wid}: keeps its shape ({}x{}, asked {}x{}): floating it at that size", mac.0, mac.1, size.0, size.1);
                     let info = w.info.clone();
                     // What the Mac said of it once, which it won't say again for the new one.
@@ -1443,13 +1437,14 @@ impl App {
                     self.update_lights(wid, qh);
                     return;
                 }
-                if w.refusal != Some((size, mac)) {
+                Some(Refused::AskOnceMore) => {
                     w.refusal = Some((size, mac));
                     w.requested = Some((size, Instant::now()));
                     let _ = self.net.send(NetCmd::resize(wid, size));
                     Self::arm_check(&self.loop_handle, &mut w.check_pending, wid, qh);
+                    return;
                 }
-                return;
+                Some(Refused::Wait) => return,
             }
         }
         match &w.role {
@@ -2590,7 +2585,7 @@ impl App {
     fn activate(&mut self, wid: u32, qh: &QueueHandle<Self>) {
         // GNOME takes a request not made from a click or key here only as "is ready", in a
         // notification at every reconnect: there the Mac follows the focus at the first press.
-        if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME")) {
+        if crate::desktop::is("GNOME") {
             return;
         }
         let (Some(activation), Some(w)) = (&self.activation, self.windows.get(&wid)) else { return };
@@ -2907,7 +2902,7 @@ const SLIVER: f64 = 2.0;
 /// it for its own Mac windows before asking. Once per app per run; only on GNOME.
 fn gnome_allow_shortcuts(bundle_id: &str) {
     static DONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|d| d.eq_ignore_ascii_case("GNOME")) {
+    if !crate::desktop::is("GNOME") {
         return;
     }
     {
@@ -3371,6 +3366,40 @@ impl PopupHandler for App {
 }
 
 // --- input -----------------------------------------------------------------------------
+
+/// A Mac window asked for the size it has here (`size`) that came back `mac` instead, as the
+/// Wayland and X11 windows both handle it. Seen once, it's asked once more first: during a drag
+/// (or right after a reconnect) the Mac lags, and a real refusal comes back the same. The same
+/// answer twice, in the shape the window opened with (a video player keeps its video's shape):
+/// it's opened again floating at the Mac's size, as a floating panel is, instead of a tile it
+/// leaves mostly empty. None: not an answer to what was asked (or the window has followed since).
+pub(crate) enum Refused {
+    FloatAtMacSize,
+    AskOnceMore,
+    Wait,
+}
+
+pub(crate) fn refused(size: (u32, u32), mac: (u32, u32), followed: bool, requested: Option<((u32, u32), Instant)>,
+                      refusal: Option<((u32, u32), (u32, u32))>, floated: bool, first_shape: Option<f64>) -> Option<Refused> {
+    if followed || !requested.is_some_and(|(r, _)| r == size) {
+        return None;
+    }
+    let shape = |a: (u32, u32)| a.0 as f64 / a.1.max(1) as f64;
+    let kept_shape = first_shape.is_some_and(|f| (shape(mac) / f - 1.0).abs() < 0.015);
+    Some(if refusal == Some((size, mac)) && !floated && kept_shape && (shape(size) / shape(mac) - 1.0).abs() > 0.03 {
+        Refused::FloatAtMacSize
+    } else if refusal != Some((size, mac)) {
+        Refused::AskOnceMore
+    } else {
+        Refused::Wait
+    })
+}
+
+/// How long a size asked of the Mac is given before the window's size there is looked at again:
+/// longer for a tiled window (a tiler resizes those in steps).
+pub(crate) fn resize_wait(tiled: bool) -> Duration {
+    Duration::from_millis(if tiled { 3000 } else { 1500 })
+}
 
 /// A window edge or corner (numbered as X11's _NET_WM_MOVERESIZE directions).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4201,6 +4230,25 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for App {
 
 #[cfg(test)]
 mod tests {
+    use super::{refused, Refused};
+    use std::time::Instant;
+
+    #[test]
+    fn a_refused_size_is_asked_again_then_floated() {
+        let (size, mac, now) = ((800, 600), (1280, 720), Instant::now());
+        let first_shape = Some(1280.0 / 720.0);
+        // Not what was asked, or followed since: nothing to do.
+        assert!(refused(size, mac, false, None, None, false, first_shape).is_none());
+        assert!(refused(size, mac, true, Some((size, now)), None, false, first_shape).is_none());
+        // First time: once more.
+        assert!(matches!(refused(size, mac, false, Some((size, now)), None, false, first_shape), Some(Refused::AskOnceMore)));
+        // Same answer again, the shape it opened with: floated at the Mac's size.
+        assert!(matches!(refused(size, mac, false, Some((size, now)), Some((size, mac)), false, first_shape), Some(Refused::FloatAtMacSize)));
+        // Already floated once, or a shape it didn't open with: left as it is.
+        assert!(matches!(refused(size, mac, false, Some((size, now)), Some((size, mac)), true, first_shape), Some(Refused::Wait)));
+        assert!(matches!(refused(size, mac, false, Some((size, now)), Some((size, mac)), false, Some(1.0)), Some(Refused::Wait)));
+    }
+
     use super::*;
 
     #[test]

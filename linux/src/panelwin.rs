@@ -1085,7 +1085,7 @@ pub fn run() -> Result<()> {
     // One at a time, and opening it again closes it: the tray icon clicked again, or the key
     // (Cmd+Opt+O) pressed again, puts it away. The open one leaves its process id in the lock
     // file for that.
-    let lock_path = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("sweeflow-panel.lock");
+    let lock_path = crate::config::runtime_dir().join("sweeflow-panel.lock");
     let Some(_only) = crate::lock("sweeflow-panel.lock")? else {
         if let Some(pid) = std::fs::read_to_string(&lock_path).ok().and_then(|p| p.trim().parse::<u32>().ok()) {
             log::info!("Sweeflow's window is open: closing it");

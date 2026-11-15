@@ -120,10 +120,20 @@ pub fn set_square_corners(on: bool) {
 }
 
 pub fn dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
+    xdg_home("XDG_CONFIG_HOME", ".config").join("sweeflow")
+}
+
+/// One of the XDG base folders: `var` if set, else `fallback` under the home folder
+/// ($XDG_CONFIG_HOME or ~/.config, $XDG_DATA_HOME or ~/.local/share, $XDG_CACHE_HOME or ~/.cache).
+pub fn xdg_home(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
-        .join("sweeflow")
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(fallback))
+}
+
+/// Where this session's sockets and locks go: $XDG_RUNTIME_DIR, or the temporary folder.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
 impl Default for Config {
