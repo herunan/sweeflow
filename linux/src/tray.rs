@@ -144,14 +144,30 @@ pub fn start() {
                     }
                 }
             };
-            while rx.recv().is_ok() {
-                // Several changes at once: one redraw.
-                while rx.try_recv().is_ok() {}
-                if let Some(h) = &handle {
-                    h.update(|_| {});
-                }
-                if let Some(p) = &panel {
-                    p.changed();
+            // Whether the icon is to be shown again once things are quiet (see TWIN).
+            let mut again = false;
+            loop {
+                let got = if again { rx.recv_timeout(std::time::Duration::from_secs(2)) } else { rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected) };
+                match got {
+                    Ok(()) => {
+                        // Several changes at once: one redraw.
+                        while rx.try_recv().is_ok() {}
+                        if let Some(h) = &handle {
+                            h.update(|_| {});
+                        }
+                        if let Some(p) = &panel {
+                            p.changed();
+                        }
+                        again = handle.is_some();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        again = false;
+                        ICON_TWIN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(h) = &handle {
+                            h.update(|_| {});
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         })
@@ -337,7 +353,8 @@ impl ksni::Tray for Tray {
     /// pair themselves, and not every theme has the emblems.
     fn icon_name(&self) -> String {
         let state = STATE.lock().unwrap();
-        tray_icon_of(state_dot(status_short(standing(&state)).as_str()))
+        let name = tray_icon_of(state_dot(status_short(standing(&state)).as_str()));
+        if ICON_TWIN.load(std::sync::atomic::Ordering::Relaxed) { name + TWIN } else { name }
     }
 
     /// Where that icon is, for bars that haven't noticed them in the icon theme (one that
@@ -581,6 +598,13 @@ pub const STATE_DOTS: [(&str, &str, bool); 5] = [
     ("sweeflow-dot-busy", "#e8890c", false),
     ("sweeflow-dot-offline", "#9a96a3", true),
 ];
+
+/// The suffix of each tray icon's twin, the same picture under a second name. Ubuntu's tray
+/// extension can miss a change of icon (offline and back within seconds: it went on showing
+/// offline while streaming), and an icon sent again under the same name changes nothing. So a
+/// moment after each change the icon is sent again as its twin, and the tray loads it afresh.
+pub const TWIN: &str = "-again";
+static ICON_TWIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The tray icon with that dot (setup.rs writes them): "sweeflow-tray-streaming"…
 pub fn tray_icon_of(dot: &str) -> String {

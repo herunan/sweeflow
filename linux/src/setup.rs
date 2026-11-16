@@ -409,7 +409,10 @@ fn write_icons(home: &std::path::Path) -> Result<()> {
     // (a bar recolours a symbolic icon, dot and all, to its text colour). Where the tray finds
     // them (icon_theme_path).
     for (name, colour, hollow) in crate::tray::STATE_DOTS {
-        std::fs::write(symbolic.join(format!("{}.svg", crate::tray::tray_icon_of(name))), tray_icon(colour, hollow))?;
+        // And a twin under a second name, for showing it again (see tray::TWIN).
+        for icon in [crate::tray::tray_icon_of(name), format!("{}{}", crate::tray::tray_icon_of(name), crate::tray::TWIN)] {
+            std::fs::write(symbolic.join(format!("{icon}.svg")), tray_icon(colour, hollow))?;
+        }
     }
     for old in ["sweeflow-symbolic.svg", "sweeflow-paused-symbolic.svg"] {
         let _ = std::fs::remove_file(symbolic.join(old));
