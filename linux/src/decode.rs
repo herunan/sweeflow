@@ -311,6 +311,12 @@ unsafe extern "C" fn pick_vaapi(_: *mut AVCodecContext, mut fmts: *const AVPixel
     last
 }
 
+/// The bytes per row swscale is given for a CPU picture `w` pixels wide: its SIMD converters write
+/// whole blocks of pixels (16 for yuv420p → RGBA), so rows padded to 64 bytes.
+fn padded_row(w: i32) -> usize {
+    (w as usize * 4 + 63) & !63
+}
+
 impl Decoder {
     /// `render_node` is the DRM render node of the GPU the compositor scans out from.
     pub fn new(render_node: &str) -> Result<Self> {
@@ -408,10 +414,23 @@ impl Decoder {
             let full = f.color_range == AVColorRange::AVCOL_RANGE_JPEG;
             let coeffs = sws_getCoefficients(1 /* SWS_CS_ITU709 */);
             sws_setColorspaceDetails(ctx, coeffs, full as i32, sws_getCoefficients(5 /* SWS_CS_DEFAULT */), 1, 0, 1 << 16, 1 << 16);
-            let mut rgba = vec![0u8; w as usize * h as usize * 4];
+            // swscale's SIMD converters write past the end of a row whose width isn't a multiple
+            // of their block: into a tight buffer, the last row's tail went past its end (16
+            // bytes for 780 px), damaging the heap, a crash on every start wherever "light"
+            // pictures (8-bit 4:2:0, 1×, so any width) were decoded on the CPU. So padded rows
+            // and two spare rows, then the rows packed tight in place.
+            let row = w as usize * 4;
+            let padded = padded_row(w);
+            let mut rgba = vec![0u8; padded * (h as usize + 2)];
             let dst = [rgba.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
-            let stride = [w * 4, 0, 0, 0];
+            let stride = [padded as i32, 0, 0, 0];
             sws_scale(ctx, f.data.as_ptr() as *const *const u8, f.linesize.as_ptr(), 0, h, dst.as_ptr(), stride.as_ptr());
+            if padded != row {
+                for y in 1..h as usize {
+                    rgba.copy_within(y * padded..y * padded + row, y * row);
+                }
+            }
+            rgba.truncate(row * h as usize);
             if !self.logged {
                 self.logged = true;
                 log::info!("decoding on the CPU: {}x{} format {} range {:?}", w, h, f.format, f.color_range);
@@ -698,5 +717,76 @@ pub fn synthetic_frame(
             rgb: false,
             cpu_rgba: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A yuv420p picture `w`×`h` of one grey, in a decoder's frame.
+    unsafe fn grey_frame(d: &mut Decoder, w: i32, h: i32) {
+        unsafe {
+            let f = &mut *d.frame;
+            f.width = w;
+            f.height = h;
+            f.format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+            f.color_range = AVColorRange::AVCOL_RANGE_JPEG;
+            assert!(av_frame_get_buffer(d.frame, 0) >= 0);
+            for (plane, rows, v) in [(0, h, 200u8), (1, (h + 1) / 2, 128), (2, (h + 1) / 2, 128)] {
+                ptr::write_bytes(f.data[plane], v, (f.linesize[plane] * rows) as usize);
+            }
+        }
+    }
+
+    /// How far past `stride` × `h` swscale writes, converting a `w`×`h` yuv420p picture.
+    unsafe fn overrun(w: i32, h: i32, out: AVPixelFormat, full: bool, stride: usize) -> usize {
+        unsafe {
+            let mut d = Decoder::software().unwrap();
+            grey_frame(&mut d, w, h);
+            let f = &*d.frame;
+            let ctx = sws_getContext(w, h, AVPixelFormat::AV_PIX_FMT_YUV420P, w, h, out, 2,
+                                     ptr::null_mut(), ptr::null_mut(), ptr::null());
+            sws_setColorspaceDetails(ctx, sws_getCoefficients(1), full as i32, sws_getCoefficients(5), 1, 0, 1 << 16, 1 << 16);
+            let end = stride * h as usize;
+            let mut buf = vec![0xA5u8; end + 4096];
+            let dst = [buf.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
+            let stride = [stride as i32, 0, 0, 0];
+            sws_scale(ctx, f.data.as_ptr() as *const *const u8, f.linesize.as_ptr(), 0, h, dst.as_ptr(), stride.as_ptr());
+            sws_freeContext(ctx);
+            buf[end..].iter().rposition(|&b| b != 0xA5).map_or(0, |i| i + 1)
+        }
+    }
+
+    /// Padded rows take everything swscale writes (a tight 780 px row doesn't: 16 bytes over,
+    /// the "light" crash on Mint and Ubuntu).
+    #[test]
+    fn padded_rows_hold_what_swscale_writes() {
+        let sizes = (1..=80).map(|w| (w, 6)).chain((760..=800).map(|w| (w, 40))).chain([(780, 870), (1001, 701), (1431, 858)]);
+        for (w, h) in sizes {
+            for out in [AVPixelFormat::AV_PIX_FMT_RGBA, AVPixelFormat::AV_PIX_FMT_BGRA] {
+                for full in [false, true] {
+                    assert_eq!(unsafe { overrun(w, h, out, full, padded_row(w)) }, 0, "{w}x{h} {out:?}");
+                }
+            }
+        }
+        eprintln!("tight 780x870: {} bytes past the end", unsafe { overrun(780, 870, AVPixelFormat::AV_PIX_FMT_BGRA, false, 780 * 4) });
+    }
+
+    #[test]
+    fn cpu_pictures_are_tight_and_whole() {
+        for (w, h) in [(1001, 7), (1366, 9), (803, 5), (1600, 960), (1431, 858), (2, 2)] {
+            unsafe {
+                let mut d = Decoder::software().unwrap();
+                grey_frame(&mut d, w, h);
+                let out = d.export_cpu(0).unwrap();
+                let px = out.cpu_rgba.as_ref().unwrap();
+                assert_eq!(px.len(), w as usize * h as usize * 4, "{w}x{h}");
+                // Every pixel the same grey, the last row's last one included.
+                let first = [px[0], px[1], px[2], px[3]];
+                assert!(first[0] > 150 && first[0] == first[1] && first[1] == first[2], "{w}x{h}: {first:?}");
+                assert!(px.chunks_exact(4).all(|p| p == first), "{w}x{h}: rows not packed");
+            }
+        }
     }
 }

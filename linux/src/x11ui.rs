@@ -77,6 +77,7 @@ x11rb::atom_manager! {
         _NET_WM_STATE_FULLSCREEN,
         _NET_WM_STATE_HIDDEN,
         _NET_ACTIVE_WINDOW,
+        _NET_CLIENT_LIST_STACKING,
         _NET_WM_MOVERESIZE,
         _NET_WORKAREA,
         _MOTIF_WM_HINTS,
@@ -330,6 +331,9 @@ pub struct App {
     windows: HashMap<u32, Win>,
     by_xid: HashMap<u32, u32>,
     pending_fixed: HashMap<u32, (Option<(f32, f32)>, bool)>,
+    /// Mac popups hidden while another window covers them (see `cover_popups`).
+    covered: std::collections::HashSet<u32>,
+    watching_covers: bool,
     icon_pngs: HashMap<String, Vec<u8>>,
     noted_apps: HashSet<String>,
     screen_select: bool,
@@ -414,6 +418,9 @@ impl App {
         let atoms = Atoms::new(&conn)?.reply()?;
         let s = &conn.setup().roots[screen];
         let root = s.root;
+        // The window manager's stacking order and active window, for the Mac's popups (see
+        // `cover_popups`).
+        conn.change_window_attributes(root, &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE))?;
         // 32-bit TrueColor visuals: windows that are see-through where nothing is drawn.
         let argb: Vec<u32> = s
             .allowed_depths
@@ -469,6 +476,8 @@ impl App {
             windows: HashMap::new(),
             by_xid: HashMap::new(),
             pending_fixed: HashMap::new(),
+            covered: Default::default(),
+            watching_covers: false,
             icon_pngs: HashMap::new(),
             noted_apps: HashSet::new(),
             screen_select: false,
@@ -605,14 +614,17 @@ impl App {
                 log::warn!("disconnected: {why}");
                 self.screen_select = false;
                 self.end_selection();
-                let on_purpose = crate::net::offline() || crate::tray::mac_refused() || crate::tray::elsewhere().is_some();
+                let on_purpose = crate::net::offline() || crate::tray::mac_refused() || crate::tray::elsewhere();
                 let gone: Vec<u32> = self.windows.values().filter(|w| on_purpose || w.popup).map(|w| w.info.wid).collect();
                 for wid in gone {
                     self.remove_window(wid);
                 }
                 self.freeze_all();
             }
-            UiEvent::WindowAdded(info) => self.add_window(info),
+            UiEvent::WindowAdded(info) => {
+                self.add_window(info);
+                self.watch_covers();
+            }
             UiEvent::WindowReplaced(old, info) => self.replace_window(old, info),
             UiEvent::WindowChanged { wid, title, w, h, rel_x, rel_y } => {
                 let Some(win) = self.windows.get_mut(&wid) else { return };
@@ -762,7 +774,7 @@ impl App {
 
     fn add_window(&mut self, info: WinInfo) {
         let wid = info.wid;
-        self.arrival.window_added();
+        self.arrival.window_added(wid, info.parent == 0);
         if self.closed_offline.remove(&wid) {
             log::info!("window {wid} was closed while the Mac was away: closing it there");
             self.send(W::new(t::CLOSE).u32(wid).finish());
@@ -1102,6 +1114,7 @@ impl App {
     }
 
     fn remove_window(&mut self, wid: u32) {
+        self.arrival.window_removed(wid);
         if self.selection.as_ref().is_some_and(|s| s.wid == wid) {
             self.end_selection();
         }
@@ -1202,6 +1215,12 @@ impl App {
             if at.elapsed() < resize_wait(!w.popup && !w.floating) {
                 return;
             }
+        }
+        // The Mac can't always make a window exactly as asked (maximised, one came back 1 px
+        // short of the screen): within a couple of pixels it's followed, not asked again and again.
+        if !w.popup && !w.floating && !w.fixed && mac.0.abs_diff(w.size.0) <= 2 && mac.1.abs_diff(w.size.1) <= 2 {
+            w.followed = true;
+            return;
         }
         if !w.popup {
             if w.fixed {
@@ -1318,6 +1337,90 @@ impl App {
             y = y.min(g.height as i32 - info.h.round() as i32).max(0);
         }
         Some((x, y))
+    }
+
+    /// The window manager's frame around one of our windows (the window itself if it has none).
+    fn frame_of(&self, xid: u32) -> u32 {
+        let mut at = xid;
+        for _ in 0..8 {
+            match self.conn.query_tree(at).ok().and_then(|c| c.reply().ok()) {
+                Some(t) if t.parent != self.root && t.parent != 0 => at = t.parent,
+                _ => break,
+            }
+        }
+        at
+    }
+
+    /// Hides each Mac popup (sheets, popovers, alerts, menus: windows the window manager doesn't
+    /// manage) while a window stacked above the window it belongs to covers it, and shows it
+    /// again once uncovered. Left alone they stayed above everything: a TextEdit sheet drawn over
+    /// Nemo clicked to the front. Stacking them under that window doesn't hold: Cinnamon puts
+    /// windows it doesn't manage back on top as it restacks its own.
+    fn cover_popups(&mut self) {
+        let stacking: Vec<u32> = self
+            .conn
+            .get_property(false, self.root, self.atoms._NET_CLIENT_LIST_STACKING, xproto::AtomEnum::WINDOW, 0, 1024)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default();
+        let rect = |conn: &RustConnection, xid: u32| -> Option<(i32, i32, i32, i32)> {
+            let g = conn.get_geometry(xid).ok()?.reply().ok()?;
+            Some((g.x as i32, g.y as i32, g.width as i32 + 2 * g.border_width as i32, g.height as i32 + 2 * g.border_width as i32))
+        };
+        let mut changes = Vec::new();
+        for w in self.windows.values().filter(|w| w.popup) {
+            // The managed window it belongs to (through its menu, for a submenu).
+            let mut base = self.windows.get(&w.info.parent);
+            for _ in 0..8 {
+                match base {
+                    Some(b) if b.popup => base = self.windows.get(&b.info.parent),
+                    _ => break,
+                }
+            }
+            let Some(base) = base else { continue };
+            let covered = stacking.iter().position(|&x| x == base.xid).is_some_and(|i| {
+                let Some((px, py, pw, ph)) = rect(&self.conn, w.xid) else { return false };
+                stacking[i + 1..].iter().any(|&above| {
+                    let frame = self.frame_of(above);
+                    let shown = self.conn.get_window_attributes(frame).ok().and_then(|c| c.reply().ok())
+                        .is_some_and(|a| a.map_state == xproto::MapState::VIEWABLE);
+                    shown && rect(&self.conn, frame).is_some_and(|(x, y, fw, fh)| x < px + pw && px < x + fw && y < py + ph && py < y + fh)
+                })
+            });
+            if covered != self.covered.contains(&w.xid) {
+                changes.push((w.xid, covered));
+            }
+        }
+        for (xid, covered) in changes {
+            if covered {
+                let _ = self.conn.unmap_window(xid);
+                self.covered.insert(xid);
+            } else {
+                let _ = self.conn.map_window(xid);
+                let _ = self.conn.configure_window(xid, &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE));
+                self.covered.remove(&xid);
+            }
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// Looks at the popups' cover (`cover_popups`) a few times a second while there are any:
+    /// a window moved over one says nothing to the windows it covers.
+    fn watch_covers(&mut self) {
+        if self.watching_covers || !self.windows.values().any(|w| w.popup) {
+            return;
+        }
+        self.watching_covers = true;
+        let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(300)), |_, _, app| {
+            app.covered.retain(|x| app.by_xid.contains_key(x));
+            if !app.windows.values().any(|w| w.popup) {
+                app.watching_covers = false;
+                return TimeoutAction::Drop;
+            }
+            app.cover_popups();
+            TimeoutAction::ToDuration(Duration::from_millis(300))
+        });
     }
 
     fn place_popup(&self, wid: u32) {
@@ -2303,6 +2406,11 @@ impl App {
                     self.place_popup(k);
                 }
             }
+            Event::PropertyNotify(e) if e.window == self.root => {
+                if e.atom == self.atoms._NET_CLIENT_LIST_STACKING || e.atom == self.atoms._NET_ACTIVE_WINDOW {
+                    self.cover_popups();
+                }
+            }
             Event::PropertyNotify(e) if e.atom == self.atoms._NET_WM_STATE => {
                 if let Some(wid) = self.wid_of(e.window) {
                     self.read_state(wid);
@@ -2473,6 +2581,12 @@ impl App {
         let maximized = (has(a._NET_WM_STATE_MAXIMIZED_VERT) && has(a._NET_WM_STATE_MAXIMIZED_HORZ)) || has(a._NET_WM_STATE_FULLSCREEN);
         let suspended = has(a._NET_WM_STATE_HIDDEN);
         let Some(w) = self.windows.get_mut(&wid) else { return };
+        if w.maximized != maximized {
+            // Maximised or put back: the window manager's new size comes next, in its own event.
+            // Until then the Mac's size is the old one, and a window put back (floating again)
+            // would follow it: restored, it took its maximised size from the Mac and lost its own.
+            w.requested = Some((w.size, Instant::now()));
+        }
         w.maximized = maximized;
         w.floating = !maximized;
         let was = w.suspended;

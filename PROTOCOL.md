@@ -27,7 +27,7 @@ The first bidirectional stream the client opens. Carries everything except video
 | 0x03 | S→C | MacDisconnected | — Stop on the Mac (its menu) for this client: a client from version 3 stops as its own Stop would, and connects again only on Start, pressed there or on the Mac (the Mac then announces `start` = the start of the client's fingerprint in its TXT record, and in the PairResult of a PairCheck, until that client connects); the Mac lets a version-3 client in again on connecting. Older clients are refused until Start on the Mac |
 | 0x05 | C→S | Goodbye | — leaving on purpose (switching Macs, disconnecting, quitting): the Mac tidies up at once |
 | 0x04 | S→C | Forgotten | — the Mac forgot this client; it forgets the Mac too |
-| 0x06 | S→C | Busy | str computerName — the host is streaming to that computer: this one is turned away (closed half a second later; what it sends meanwhile is ignored) |
+| 0x06 | S→C | Busy | str (empty) — the host is streaming to another computer, which it doesn't name: this one is turned away (closed half a second later; what it sends meanwhile is ignored). Hosts before 16 Nov 2026 put the served computer's name here; clients ignore it |
 | 0x10 | S→C | WindowAdded | u32 wid, i32 pid, str bundleId, str appName, str title, f32 w, f32 h, u32 parent, f32 relX, f32 relY, u8 kind |
 | 0x11 | S→C | WindowChanged | u32 wid, str title, f32 w, f32 h, f32 relX, f32 relY |
 | 0x12 | S→C | WindowRemoved | u32 wid |
@@ -88,11 +88,11 @@ there, quitting, or its connection dropping). A hello from another client while 
   certificate alone doesn't tell computers apart, as one can be copied), or a served client the
   host hasn't heard from for 8 s (clients ping every 2 s): the old connection is closed and the
   new one served;
-- any other: Busy, naming the computer served, and nothing else. The served computer doesn't
-  notice.
+- any other: Busy, and nothing else. It doesn't name the computer served (for privacy: no other
+  computer learns which one streams). The served computer doesn't notice.
 
-A client told Busy shows "In use by ‹computerName›" with Start unavailable ("Stop streaming on
-‹computerName› first"), and looks again with a fresh hello after 5 s, 10 s, 20 s, then every
+A client told Busy shows "Streaming elsewhere" with Start unavailable ("Stop streaming elsewhere
+first"), and looks again with a fresh hello after 5 s, 10 s, 20 s, then every
 30 s; once it is let in it streams (unless Stop was chosen there meanwhile). Older clients (no
 `computerName`) are turned away the same way and just see the connection close. A host older
 than Busy replaces the session on every new connection.

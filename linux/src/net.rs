@@ -174,6 +174,21 @@ pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEv
 /// The way to the window side, for the few things that start elsewhere (a setting in the tray).
 static UI: std::sync::Mutex<Option<UiTx>> = std::sync::Mutex::new(None);
 
+/// Whether streaming is on, as the UI was last told: 2 not told yet, taken as streaming.
+static STREAMING_TOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Tells the UI whether streaming is on, if that changed: as the Mac confirms its settings, and
+/// first the moment Pause or Resume is chosen here. A Pause must find the UI paused before the
+/// Mac lets go of the windows, or they go instead of staying as stills: when the Mac's
+/// confirmation came after its window removals (seen on GNOME, right after a Stop and Start on
+/// the Mac's menu, 4 s late), every window went.
+pub fn tell_streaming(now: bool) {
+    let before = STREAMING_TOLD.swap(now as u8, std::sync::atomic::Ordering::SeqCst);
+    if before != now as u8 && !(before == 2 && now) {
+        tell_ui(UiEvent::Streaming(now));
+    }
+}
+
 pub fn tell_ui(event: UiEvent) {
     if let Some(ui) = UI.lock().unwrap().as_ref() {
         let _ = ui.send(event);
@@ -598,7 +613,7 @@ pub fn mac_locked() -> bool {
 /// and stays so, or starts again.
 pub fn set_offline(on: bool) {
     // Stop ends waiting for a Mac in use elsewhere; Start looks afresh.
-    crate::tray::set_elsewhere(None);
+    crate::tray::set_elsewhere(false);
     if OFFLINE.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
         return;
     }
@@ -631,28 +646,25 @@ fn refused_wait(checks: u32) -> Duration {
     Duration::from_secs((5u64 << checks.min(2)).min(20))
 }
 
-/// Busy's payload: the computer the Mac is streaming to.
-fn parse_busy(body: &[u8]) -> Result<String> {
-    R::new(body).str()
-}
-
-/// The notifications: on first finding the Mac in use, and when it's free again.
-fn busy_message(mac: &str, _other: &str) -> (String, String) {
+/// The notifications: on first finding the Mac in use, and when it's free again. Neither names
+/// the other computer (for privacy, nothing here knows or keeps which one it is).
+fn busy_message(mac: &str) -> (String, String) {
     (format!("{mac} is busy"), format!("It's streaming elsewhere. Stop it there first; Sweeflow streams here once {mac} is free."))
 }
 
-fn free_message(mac: &str, other: &str) -> (String, String) {
-    (format!("{mac} is free: streaming here now"), format!("{other} stopped streaming."))
+fn free_message(mac: &str) -> (String, String) {
+    (format!("{mac} is free: streaming here now"), "It stopped streaming elsewhere.".into())
 }
 
-/// The Mac turned this computer away: another one has it. Said once (not at every look).
-fn mac_busy(other: String) {
-    if crate::tray::elsewhere().is_none() {
-        log::info!("the Mac is streaming to {other}: waiting until it's free");
-        let (summary, body) = busy_message(&crate::tray::mac_display_name(), &other);
+/// The Mac turned this computer away: another one has it. Said once (not at every look). Older
+/// Macs name that computer in Busy: not read, so its name is neither shown nor kept.
+fn mac_busy() {
+    if !crate::tray::elsewhere() {
+        log::info!("the Mac is streaming elsewhere: waiting until it's free");
+        let (summary, body) = busy_message(&crate::tray::mac_display_name());
         std::thread::spawn(move || notify(&summary, &body));
     }
-    crate::tray::set_elsewhere(Some(other));
+    crate::tray::set_elsewhere(true);
 }
 
 /// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
@@ -807,7 +819,7 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
             Err(e) => {
                 let _ = ui.send(UiEvent::Disconnected(format!("{e:#}")));
                 // Stopped on purpose, or turned away (the Mac was there a moment ago): still online.
-                if offline() || crate::tray::elsewhere().is_some() {
+                if offline() || crate::tray::elsewhere() {
                     log::info!("connection closed: {e:#}");
                 } else {
                     log::warn!("connection lost: {e:#}");
@@ -820,7 +832,7 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         if offline() {
             continue;
         }
-        if crate::tray::elsewhere().is_some() {
+        if crate::tray::elsewhere() {
             // In use by another computer: look again in a while (Stop here ends the waiting).
             let until = tokio::time::Instant::now() + busy_wait(busy_checks);
             busy_checks += 1;
@@ -859,50 +871,85 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
     }
 }
 
+/// Connects to the Mac in use wherever it answers first: at its last known address, and a moment
+/// later at once at the other addresses it said it has (a network with no Bonjour: a VM's) and
+/// where its announcement on the network says it is. All at once, so an address gone stale (a
+/// new DHCP lease) costs nothing; it waited 5 s on every Start when tried one after another. The
+/// config is read afresh for these: the address reached last becomes its address there.
+async fn reach(cfg: &Config, endpoint: &quinn::Endpoint) -> Result<(SocketAddr, quinn::Connection)> {
+    let fresh = Config::load_or_default().ok();
+    let mac = fresh.as_ref().unwrap_or(cfg).macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint)
+        .or_else(|| cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint));
+    let places = mac.map(crate::config::places).unwrap_or_else(|| vec![cfg.host.clone()]);
+    let saved = places[0].clone();
+    // The last known address first: when it and another both answer (the local network and a
+    // VPN), it's the one used.
+    const HEAD_START: Duration = Duration::from_millis(300);
+    let mut tries = tokio::task::JoinSet::new();
+    for (i, place) in places.into_iter().enumerate() {
+        let endpoint = endpoint.clone();
+        tries.spawn(async move {
+            let attempt = async {
+                if i > 0 {
+                    tokio::time::sleep(HEAD_START).await;
+                }
+                // Its name (Air.local) can take a while over multicast; numbers resolve at once.
+                let wait = Duration::from_secs(if i == 0 { 5 } else { 2 });
+                let addrs: Vec<SocketAddr> = tokio::time::timeout(wait, tokio::net::lookup_host(&place)).await.context("not found")??.collect();
+                // The Mac's name can resolve to IPv6 addresses first; IPv4 is what the local
+                // network (and a VPN's local-network exception) reliably carries.
+                let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
+                // Not for ever: a handshake the Mac never answers would hold Start up indefinitely.
+                let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(addr, "sweeflow")?).await.context("no answer")?;
+                anyhow::Ok((addr, conn.context("connect")?))
+            };
+            let result = attempt.await;
+            (place, result)
+        });
+    }
+    // Where the network says it is now, found by its certificate.
+    let fp = cfg.host_fingerprint.clone();
+    let ep = endpoint.clone();
+    tries.spawn(async move {
+        let attempt = async {
+            tokio::time::sleep(HEAD_START).await;
+            let addr = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?.context("not announced")?;
+            let conn = tokio::time::timeout(Duration::from_secs(5), ep.connect(addr, "sweeflow")?).await.context("no answer")?;
+            anyhow::Ok((addr, conn.context("connect")?))
+        };
+        (String::new(), attempt.await)
+    });
+    let mut saved_err = None;
+    while let Some(done) = tries.join_next().await {
+        let Ok((place, result)) = done else { continue };
+        match result {
+            Ok((addr, conn)) => {
+                if place != saved {
+                    let how = if place.is_empty() { format!("found the Mac at {addr}") } else { format!("reached the Mac at {place}") };
+                    match &saved_err {
+                        Some(e) => log::info!("{saved} not reachable ({e:#}); {how}"),
+                        None => log::info!("{saved} slower to answer; {how}"),
+                    }
+                    // Its address from now on.
+                    crate::config::remember_addresses(&cfg.host_fingerprint, Vec::new(), Some(addr.to_string()));
+                }
+                // The other attempts end with the set.
+                return Ok((addr, conn));
+            }
+            Err(e) if place == saved => saved_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    Err(saved_err.unwrap_or_else(|| anyhow::anyhow!("{saved}: no answer")))
+}
+
 async fn session(
     cfg: &Config,
     endpoint: &quinn::Endpoint,
     ui: &UiTx,
     cmds: &mut mpsc::UnboundedReceiver<NetCmd>,
 ) -> Result<()> {
-    // The Mac's name can resolve to IPv6 addresses first; IPv4 is what the local network (and a
-    // VPN's local-network exception) reliably carries.
-    let saved = async {
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.host).await?.collect();
-        let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
-        // Not for ever: a handshake the Mac never answers would hold Start up indefinitely.
-        let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(addr, "sweeflow")?).await.context("no answer")?;
-        anyhow::Ok((addr, conn.context("connect")?))
-    };
-    let (addr, conn) = match saved.await {
-        Ok(c) => c,
-        Err(e) => {
-            // The Mac may have a new address: look for it on the network by its certificate,
-            // then at the other addresses it said it has (a network with no Bonjour: a VM's).
-            let fp = cfg.host_fingerprint.clone();
-            let found = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?;
-            let mut reached = None;
-            if let Some(addr) = found {
-                log::info!("{} not reachable ({e:#}); found the Mac at {addr}", cfg.host);
-                reached = Some((addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?));
-            } else if let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint) {
-                for place in crate::config::places(mac).into_iter().skip(1) {
-                    let Ok(Ok(mut addrs)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(place.clone())).await else { continue };
-                    let Some(addr) = addrs.find(|a| a.is_ipv4()) else { continue };
-                    let Ok(connecting) = endpoint.connect(addr, "sweeflow") else { continue };
-                    if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(3), connecting).await {
-                        log::info!("{} not reachable ({e:#}); reached the Mac at {place}", cfg.host);
-                        reached = Some((addr, conn));
-                        break;
-                    }
-                }
-            }
-            let Some(r) = reached else { return Err(e) };
-            // Its address from now on.
-            crate::config::remember_addresses(&cfg.host_fingerprint, Vec::new(), Some(r.0.to_string()));
-            r
-        }
-    };
+    let (addr, conn) = reach(cfg, endpoint).await?;
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
     let ip = addr.ip();
     std::thread::spawn(move || crate::wake::remember(ip));
@@ -922,7 +969,7 @@ async fn session(
     }
     // A look at a Mac in use by another computer: online only once it lets this one in (the
     // app menu's Mac apps don't come and go at every look), and launches wait.
-    let busy = crate::tray::elsewhere().is_some();
+    let busy = crate::tray::elsewhere();
     if !busy {
         set_online(true);
     }
@@ -1161,11 +1208,11 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             if let Ok(kind) = r.str() {
                 crate::tray::set_mac_kind(&kind);
             }
-            if let Some(other) = crate::tray::elsewhere() {
+            if crate::tray::elsewhere() {
                 log::info!("the Mac is free again: streaming here");
-                crate::tray::set_elsewhere(None);
+                crate::tray::set_elsewhere(false);
                 set_online(true);
-                let (summary, body) = free_message(&crate::tray::mac_display_name(), &other);
+                let (summary, body) = free_message(&crate::tray::mac_display_name());
                 std::thread::spawn(move || notify(&summary, &body));
             }
             crate::tray::connected(Some(name.clone()));
@@ -1232,7 +1279,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             return Ok(());
         }
         t::BUSY => {
-            mac_busy(parse_busy(body)?);
+            mac_busy();
             return Ok(());
         }
         t::MAC_DISCONNECTED => {
@@ -1275,14 +1322,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::SETTINGS => {
             crate::tray::set_settings(r.bytes()?);
-            // Compared with what the UI was last told (the tray already shows a change made here
-            // before the Mac confirms it). 2 = not told yet, taken as streaming.
-            static TOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-            let now = crate::tray::streaming();
-            let before = TOLD.swap(now as u8, std::sync::atomic::Ordering::SeqCst);
-            if before != now as u8 && !(before == 2 && now) {
-                let _ = ui.send(UiEvent::Streaming(now));
-            }
+            tell_streaming(crate::tray::streaming());
             return Ok(());
         }
         t::RUNNING_APPS => {
@@ -1863,14 +1903,6 @@ mod tests {
     }
 
     #[test]
-    fn busy_decodes() {
-        let m = W::new(t::BUSY).str("Größe-VM").finish();
-        assert_eq!(m[4], 0x06);
-        assert_eq!(parse_busy(&m[5..]).unwrap(), "Größe-VM");
-        assert!(parse_busy(&[]).is_err(), "Busy names the other computer");
-    }
-
-    #[test]
     fn hello_ends_with_the_computer_name() {
         // What the Mac reads after the older fields.
         let m = W::new(t::HELLO).u16(1).f32(1.0).f32(0.0).str("box").finish();
@@ -1893,9 +1925,10 @@ mod tests {
 
     #[test]
     fn the_notifications_say_the_mac_is_busy() {
-        assert_eq!(busy_message("Studio", "workstation").0, "Studio is busy");
-        assert!(busy_message("Studio", "workstation").1.starts_with("It's streaming elsewhere"));
-        assert_eq!(free_message("Studio", "workstation").0, "Studio is free: streaming here now");
+        assert_eq!(busy_message("Studio").0, "Studio is busy");
+        assert!(busy_message("Studio").1.starts_with("It's streaming elsewhere"));
+        assert_eq!(free_message("Studio").0, "Studio is free: streaming here now");
+        assert!(!free_message("Studio").1.contains("workstation"));
     }
 
     #[test]

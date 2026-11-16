@@ -228,7 +228,8 @@ final class Server {
         case .busy:
             log("\(Self.name(of: s)) connected while \(Self.name(of: held)) has the session: busy")
             var w = MsgWriter(.busy)
-            w.str(Self.name(of: held))
+            // Which computer has the session isn't said: no other computer learns its name.
+            w.str("")
             s.sendAndClose(w)
             return false
         }

@@ -79,9 +79,9 @@ struct State {
     show_at: u64,
     /// The Mac stopped this computer from its own menu (it refuses until allowed there again).
     mac_refused: bool,
-    /// The Mac is streaming to another computer (its name): this one waits, looking again now
-    /// and then, and streams once it's free. Start can't be chosen meanwhile.
-    elsewhere: Option<String>,
+    /// The Mac is streaming to another computer (never named, for privacy): this one waits,
+    /// looking again now and then, and streams once it's free. Start can't be chosen meanwhile.
+    elsewhere: bool,
 }
 
 static STATE: LazyLock<Mutex<State>> =
@@ -312,7 +312,10 @@ fn change(f: impl FnOnce(&mut Settings)) {
     if let Some(s) = state.settings.as_mut() {
         f(s);
         let json = serde_json::to_vec(s).unwrap_or_default();
+        let streaming = s.enabled;
         drop(state);
+        // The UI first, then the Mac (see net::tell_streaming).
+        crate::net::tell_streaming(streaming);
         if let Some(net) = NET.get() {
             let _ = net.send(NetCmd::Control(W::new(t::SET_SETTINGS).bytes(&json).finish()));
         }
@@ -398,7 +401,7 @@ impl ksni::Tray for Tray {
         let column = key_column(&status);
         let dot = state_dot(status_short(standing(&state)).as_str());
         let actions = stream_actions(standing(&state));
-        let elsewhere = state.elsewhere.clone();
+        let elsewhere = state.elsewhere;
         drop(state);
         // Each item shows the key the desktop has for it now (the user may have changed it).
         let keys = crate::keys::current();
@@ -415,8 +418,8 @@ impl ksni::Tray for Tray {
             }
         }
         for &action in actions {
-            if let (Some(other), "start") = (&elsewhere, action) {
-                items.push(StandardItem { label: start_hint(other).replace('_', "__"), enabled: false, ..Default::default() }.into());
+            if elsewhere && action == "start" {
+                items.push(StandardItem { label: start_hint(), enabled: false, ..Default::default() }.into());
                 continue;
             }
             let key = match action {
@@ -705,11 +708,11 @@ fn save_last(s: &Settings) {
 
 /// Where streaming stands: what the status line says.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Standing<'a> {
+pub struct Standing {
     /// Stop was chosen (no connection is held).
     pub stopped: bool,
-    /// The Mac is streaming to that other computer (and turns this one away until it stops).
-    pub elsewhere: Option<&'a str>,
+    /// The Mac is streaming to another computer (and turns this one away until it stops).
+    pub elsewhere: bool,
     /// Connected, and the Mac's settings known.
     pub connected: bool,
     /// Not paused (Pause / Resume).
@@ -725,12 +728,12 @@ pub struct Standing<'a> {
 /// The same status where the Mac's name stands right above it (the widget and Sweeflow's own
 /// window): without the name, which only repeated it.
 pub fn status_short(s: Standing) -> String {
-    if let Standing { stopped: false, elsewhere: Some(_), .. } = s {
+    if let Standing { stopped: false, elsewhere: true, .. } = s {
         return "Streaming elsewhere".into();
     }
     // The same words as the Mac's line in the list of Macs.
     match s {
-        Standing { stopped: true, online: Some(true), elsewhere: Some(_), .. } => "Streaming elsewhere",
+        Standing { stopped: true, online: Some(true), elsewhere: true, .. } => "Streaming elsewhere",
         Standing { stopped: true, online: Some(true), locked: true, .. } => "Locked",
         Standing { stopped: true, online: Some(true), .. } => "Available",
         Standing { stopped: true, online: Some(false), .. } => "Not online",
@@ -752,7 +755,7 @@ pub fn status_line(mac: &str, s: Standing) -> String {
         Standing { stopped: true, online: Some(false), .. } => format!("Stopped · {mac} is not online"),
         // The first look on the network takes a moment.
         Standing { stopped: true, .. } => format!("Stopped · {mac}"),
-        Standing { elsewhere: Some(_), .. } => format!("{mac} is streaming elsewhere"),
+        Standing { elsewhere: true, .. } => format!("{mac} is streaming elsewhere"),
         Standing { connected: true, enabled: false, .. } => format!("Paused · {mac}"),
         // The state first, as "Paused · …": narrow menus (Omarchy's) cut the end off.
         Standing { connected: true, locked: true, .. } => format!("Locked · {mac}"),
@@ -771,7 +774,7 @@ pub fn stream_actions(s: Standing) -> &'static [&'static str] {
     match s {
         Standing { stopped: true, .. } => &["start"],
         // Start shown, but not to be chosen (see can_start); Stop ends the waiting.
-        Standing { elsewhere: Some(_), .. } => &["start", "stop"],
+        Standing { elsewhere: true, .. } => &["start", "stop"],
         Standing { connected: false, .. } => &["stop"],
         Standing { enabled: true, .. } => &["pause", "stop"],
         _ => &["resume", "stop"],
@@ -781,7 +784,7 @@ pub fn stream_actions(s: Standing) -> &'static [&'static str] {
 /// Start can be chosen: not while the Mac streams to another computer (it has to be stopped
 /// there first).
 pub fn can_start(s: Standing) -> bool {
-    s.elsewhere.is_none()
+    !s.elsewhere
 }
 
 /// What a shortcut's toggle (Do "pause-toggle" / "stream-toggle", see `panel_do`) does now: one
@@ -798,7 +801,7 @@ pub fn toggle_action(toggle: &str, s: Standing) -> Option<&'static str> {
 }
 
 /// What a Start that can't be chosen says instead.
-pub fn start_hint(_other: &str) -> String {
+pub fn start_hint() -> String {
     "Stop streaming elsewhere first".into()
 }
 
@@ -811,13 +814,13 @@ pub fn action_label(action: &str) -> &'static str {
     }
 }
 
-fn standing(state: &State) -> Standing<'_> {
+fn standing(state: &State) -> Standing {
     let stopped = crate::net::offline();
     // Stopped here, the Mac in use still says on the network whether it's busy or locked.
     let (busy, locked) = if stopped { crate::net::in_use_says() } else { (false, false) };
     Standing {
         stopped,
-        elsewhere: state.elsewhere.as_deref().or(busy.then_some("")),
+        elsewhere: state.elsewhere || busy,
         connected: state.settings.is_some(),
         enabled: state.settings.as_ref().is_none_or(|s| s.enabled),
         locked: crate::net::mac_locked() || locked,
@@ -927,8 +930,8 @@ pub fn panel_state() -> serde_json::Value {
         "status": status_short(standing),
         "actions": stream_actions(standing),
         "macRefused": state.mac_refused,
-        // The Mac is streaming to this other computer (its name), or null; Start can't be chosen
-        // meanwhile ("Stop streaming on <name> first").
+        // The Mac is streaming to another computer (never named: nothing here knows which);
+        // Start can't be chosen meanwhile ("Stop streaming elsewhere first").
         "elsewhere": state.elsewhere,
         "canStart": can_start(standing),
         "showAt": state.show_at,
@@ -961,7 +964,7 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
-        "start" if elsewhere().is_some() => log::info!("Start: the Mac is streaming to another computer"),
+        "start" if elsewhere() => log::info!("Start: the Mac is streaming to another computer"),
         "start" | "stop" => set_started(action == "start"),
         // What a widget from before Start / Stop still sends, until Plasma reloads it.
         "connect" | "disconnect" => set_started(action == "connect"),
@@ -1075,19 +1078,18 @@ pub fn mac_refused() -> bool {
     STATE.lock().unwrap().mac_refused
 }
 
-/// The Mac is streaming to another computer (Some: its name); None once it streams here, or
-/// Stop is chosen.
-pub fn set_elsewhere(other: Option<String>) {
+/// The Mac is streaming to another computer; false once it streams here, or Stop is chosen.
+pub fn set_elsewhere(on: bool) {
     let mut s = STATE.lock().unwrap();
-    if s.elsewhere != other {
-        s.elsewhere = other;
+    if s.elsewhere != on {
+        s.elsewhere = on;
         drop(s);
         refresh();
     }
 }
 
-pub fn elsewhere() -> Option<String> {
-    STATE.lock().unwrap().elsewhere.clone()
+pub fn elsewhere() -> bool {
+    STATE.lock().unwrap().elsewhere
 }
 
 /// The Mac in use, as this computer shows it.
@@ -1288,7 +1290,7 @@ mod tests {
         assert_eq!(status_line("Studio", Standing { online: Some(true), ..stopped }), "Stopped · Studio is online");
         assert_eq!(status_line("Studio", Standing { online: Some(false), ..stopped }), "Stopped · Studio is not online");
         assert_eq!(status_line("Studio", stopped), "Stopped · Studio");
-        let elsewhere = Standing { elsewhere: Some("workstation"), online: Some(true), ..Default::default() };
+        let elsewhere = Standing { elsewhere: true, online: Some(true), ..Default::default() };
         assert_eq!(status_line("Studio", elsewhere), "Studio is streaming elsewhere");
         assert_eq!(status_short(elsewhere), "Streaming elsewhere");
 
@@ -1306,11 +1308,11 @@ mod tests {
         assert_eq!(stream_actions(Standing { enabled: false, ..streaming }), ["resume", "stop"]);
         assert_eq!(stream_actions(Standing { stopped: true, online: Some(false), ..Default::default() }), ["start"]);
         // In use by another computer: Start shown but not to be chosen; Stop ends the waiting.
-        let elsewhere = Standing { elsewhere: Some("box"), online: Some(true), ..Default::default() };
+        let elsewhere = Standing { elsewhere: true, online: Some(true), ..Default::default() };
         assert_eq!(stream_actions(elsewhere), ["start", "stop"]);
         assert!(!can_start(elsewhere));
         assert!(can_start(Standing { stopped: true, ..Default::default() }));
-        assert_eq!(start_hint("box"), "Stop streaming elsewhere first");
+        assert_eq!(start_hint(), "Stop streaming elsewhere first");
         assert_eq!(stream_actions(Standing { online: Some(false), ..Default::default() }), ["stop"]);
         let labels: Vec<&str> = ["start", "pause", "resume", "stop"].into_iter().map(action_label).collect();
         assert_eq!(labels, ["Start", "Pause", "Resume", "Stop"]);
@@ -1322,8 +1324,8 @@ mod tests {
         let paused = Standing { enabled: false, ..streaming };
         let stopped = Standing { stopped: true, online: Some(true), ..Default::default() };
         let waiting = Standing { online: Some(false), ..Default::default() };
-        let busy = Standing { stopped: true, elsewhere: Some("box"), ..Default::default() };
-        let started_elsewhere = Standing { elsewhere: Some("box"), online: Some(true), ..Default::default() };
+        let busy = Standing { stopped: true, elsewhere: true, ..Default::default() };
+        let started_elsewhere = Standing { elsewhere: true, online: Some(true), ..Default::default() };
         assert_eq!(toggle_action("pause-toggle", streaming), Some("pause"));
         assert_eq!(toggle_action("pause-toggle", Standing { locked: true, ..streaming }), Some("pause"));
         assert_eq!(toggle_action("pause-toggle", paused), Some("resume"));

@@ -7,11 +7,21 @@
 //! does something here, a focus is passed on only for the window the Mac has in front, and
 //! that one is focused here as the Mac says which it is. Held back, the focus is passed on at
 //! the user's first press (a key or a click), so what they act on is the Mac's key window then.
+//!
+//! Where a window can't be focused from here (GNOME takes that only as "is ready"), the desktop
+//! kept the focus it gave the last window shown, and the user's first key moved the Mac's front
+//! window there. So the Mac's key window is shown last: its first picture waits, for a moment
+//! at most, until the other arriving windows have shown theirs, and the desktop focuses it as
+//! it comes up.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// How long after the last window arrived the desktop's focusing it counts as its arriving.
 const SETTLE: Duration = Duration::from_millis(2000);
+
+/// The longest the key window's first picture waits for the others'.
+pub const HOLD: Duration = Duration::from_millis(600);
 
 #[derive(Default)]
 pub struct Arrival {
@@ -21,6 +31,10 @@ pub struct Arrival {
     mac_key: Option<u32>,
     /// A focus not passed on.
     held: Option<u32>,
+    /// Windows (not a window's sheets or popups) that arrived and haven't been shown yet.
+    unshown: HashSet<u32>,
+    /// Since when the key window's first picture has been waiting for the others'.
+    key_waits: Option<Instant>,
 }
 
 impl Arrival {
@@ -28,10 +42,52 @@ impl Arrival {
         *self = Self { until: Some(Instant::now() + SETTLE), ..Self::default() };
     }
 
-    pub fn window_added(&mut self) {
+    /// Window `wid` arrived; `own` if it's a window of its own (not a sheet or popup).
+    pub fn window_added(&mut self, wid: u32, own: bool) {
         if self.until.is_some() {
             self.until = Some(Instant::now() + SETTLE);
+            if own {
+                self.unshown.insert(wid);
+            }
         }
+    }
+
+    pub fn window_removed(&mut self, wid: u32) {
+        self.unshown.remove(&wid);
+    }
+
+    /// Whether `wid`'s picture is to wait: it's the Mac's key window, not shown yet, and other
+    /// windows that are arriving haven't been shown either. Some(true) the first time: the
+    /// caller then looks again (`release`) when `HOLD` is up.
+    pub fn hold_first(&mut self, wid: u32) -> Option<bool> {
+        if !self.unshown.contains(&wid) || self.mac_key != Some(wid) || !self.arriving() {
+            return None;
+        }
+        if !self.unshown.iter().any(|&w| w != wid) {
+            return None;
+        }
+        let first = self.key_waits.is_none();
+        let since = *self.key_waits.get_or_insert_with(Instant::now);
+        (since.elapsed() < HOLD).then_some(first)
+    }
+
+    /// Window `wid` was shown.
+    pub fn shown(&mut self, wid: u32) {
+        self.unshown.remove(&wid);
+    }
+
+    /// The key window, if its first picture waited and need wait no longer (the others are
+    /// shown, or it waited `HOLD`): to be shown now. Once.
+    pub fn release(&mut self) -> Option<u32> {
+        let since = self.key_waits?;
+        let key = self.mac_key.filter(|k| self.unshown.contains(k))?;
+        if self.unshown.iter().any(|&w| w != key) && since.elapsed() < HOLD {
+            return None;
+        }
+        self.key_waits = None;
+        // Shown now, whatever is still to come.
+        self.unshown.remove(&key);
+        Some(key)
     }
 
     fn arriving(&mut self) -> bool {
@@ -68,6 +124,9 @@ impl Arrival {
         for slot in [&mut self.mac_key, &mut self.held] {
             crate::ui::follow_wid(slot.as_mut(), old, new);
         }
+        if self.unshown.remove(&old) {
+            self.unshown.insert(new);
+        }
     }
 
     /// The user pressed a key or a button: arriving is over. A focus held back, if it's still
@@ -87,7 +146,7 @@ mod tests {
         let mut a = Arrival::default();
         assert_eq!(a.focus(1), Ok(()), "not connected: passed on");
         a.connected();
-        a.window_added();
+        a.window_added(1, true);
         assert_eq!(a.focus(1), Err(None), "the Mac hasn't said yet");
         assert!(a.mac_focused(2));
         assert_eq!(a.focus(3), Err(Some(2)));
@@ -104,6 +163,44 @@ mod tests {
         assert_eq!(a.focus(3), Err(Some(2)));
         assert_eq!(a.input(Some(3)), Some(3));
         assert!(!a.mac_focused(2), "arriving over");
+    }
+
+    #[test]
+    fn the_key_window_is_shown_last() {
+        let mut a = Arrival::default();
+        a.connected();
+        for w in [1, 2, 3] {
+            a.window_added(w, true);
+        }
+        a.window_added(9, false);
+        a.mac_focused(2);
+        assert_eq!(a.hold_first(1), None, "not the key window");
+        a.shown(1);
+        assert_eq!(a.hold_first(2), Some(true), "3 isn't shown yet");
+        assert_eq!(a.hold_first(2), Some(false), "still waiting");
+        assert_eq!(a.release(), None);
+        a.shown(3);
+        assert_eq!(a.release(), Some(2), "the others are shown");
+        assert_eq!(a.release(), None, "once");
+        assert_eq!(a.hold_first(2), None);
+        a.shown(2);
+    }
+
+    #[test]
+    fn the_key_window_waits_only_so_long() {
+        let mut a = Arrival::default();
+        a.connected();
+        a.window_added(1, true);
+        a.window_added(2, true);
+        a.mac_focused(2);
+        assert_eq!(a.hold_first(2), Some(true));
+        a.key_waits = Some(Instant::now() - HOLD);
+        assert_eq!(a.hold_first(2), None, "waited long enough");
+        assert_eq!(a.release(), Some(2));
+        let mut b = Arrival::default();
+        b.window_added(1, true);
+        b.mac_focused(1);
+        assert_eq!(b.hold_first(1), None, "not arriving");
     }
 
     #[test]

@@ -729,7 +729,7 @@ impl App {
                 // close them meanwhile, and they sit above everything else).
                 // Stopped on purpose (Stop here, or the Mac's menu), or the Mac went to another
                 // computer: nothing waits, paused stills go too.
-                let on_purpose = crate::net::offline() || crate::tray::mac_refused() || crate::tray::elsewhere().is_some();
+                let on_purpose = crate::net::offline() || crate::tray::mac_refused() || crate::tray::elsewhere();
                 let gone: Vec<u32> = self
                     .windows
                     .values()
@@ -917,10 +917,8 @@ impl App {
             UiEvent::Minimize(wid) => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.mac_minimized = true;
-                    if let Role::Toplevel(t) = &w.role {
-                        t.set_minimized();
-                    }
                 }
+                self.minimise(wid);
             }
             UiEvent::Frame(wid, frame) => self.present(wid, frame, qh),
             UiEvent::RawFrame { wid, w, h, px_per_pt, capture_us, bgra } => {
@@ -936,7 +934,7 @@ impl App {
 
     fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
-        self.arrival.window_added();
+        self.arrival.window_added(wid, info.parent == 0);
         if self.closed_offline.remove(&wid) {
             // Closed here while the Mac was away: close it there (it comes back if the app asks
             // first, e.g. to save).
@@ -1323,6 +1321,7 @@ impl App {
     }
 
     fn remove_window(&mut self, wid: u32) {
+        self.arrival.window_removed(wid);
         if self.selection.as_ref().is_some_and(|s| s.wid == wid) {
             self.end_selection();
         }
@@ -1671,6 +1670,21 @@ impl App {
     }
 
     fn present(&mut self, wid: u32, frame: GpuFrame, qh: &QueueHandle<Self>) {
+        self.present_frame(wid, frame, qh);
+        self.show_key_window(qh);
+    }
+
+    /// The Mac's key window, its first picture held while the other windows arrived (see
+    /// arrival.rs), shown once they have been.
+    fn show_key_window(&mut self, qh: &QueueHandle<Self>) {
+        let Some(key) = self.arrival.release() else { return };
+        if let Some(frame) = self.windows.get_mut(&key).and_then(|w| w.pending.take()) {
+            log::info!("window {key}: shown after the others, as the Mac's key window");
+            self.present_frame(key, frame, qh);
+        }
+    }
+
+    fn present_frame(&mut self, wid: u32, frame: GpuFrame, qh: &QueueHandle<Self>) {
         if self.paused && self.windows.get(&wid).is_some_and(|w| w.still.is_some()) {
             // Frames still in flight as the Mac lets go (from its own screen by then, at another
             // size): the still stays.
@@ -1729,6 +1743,21 @@ impl App {
         }
         if w.suspended {
             return;
+        }
+        match self.arrival.hold_first(wid) {
+            Some(first) => {
+                // The Mac's key window waits for the others to come up (arrival.rs).
+                w.pending = Some(frame);
+                if first {
+                    let qh = qh.clone();
+                    let _ = self.loop_handle.insert_source(Timer::from_duration(crate::arrival::HOLD), move |_, _, app| {
+                        app.show_key_window(&qh);
+                        TimeoutAction::Drop
+                    });
+                }
+                return;
+            }
+            None => self.arrival.shown(wid),
         }
 
         let buffer = if let Some(bgra) = &frame.cpu_rgba {
@@ -2765,6 +2794,13 @@ impl App {
             return;
         };
         let Role::Toplevel(t) = &w.role else { return };
+        if crate::hyprland::running() {
+            // Minimised here (hyprland::minimise): Hyprland brings it back itself, and lets it be
+            // focused without a token.
+            log::info!("launch of {bundle_id}: bringing window {} to the front", w.info.wid);
+            crate::hyprland::unminimise(format!("sweeflow-{bundle_id}"), display_title(&w.info.app_name, &w.info.title));
+            return;
+        }
         let surface = t.wl_surface().clone();
         log::info!("launch of {bundle_id}: bringing window {} to the front ({})", w.info.wid,
                    if token.is_some() { "launcher's token" } else { "own token" });
@@ -2780,6 +2816,15 @@ impl App {
                 }
                 req.commit();
             }
+        }
+    }
+
+    /// Minimises a Mac window here, the desktop's way.
+    fn minimise(&self, wid: u32) {
+        let Some(w) = self.windows.get(&wid) else { return };
+        let Role::Toplevel(t) = &w.role else { return };
+        if !crate::hyprland::minimise(format!("sweeflow-{}", w.info.bundle_id), display_title(&w.info.app_name, &w.info.title)) {
+            t.set_minimized();
         }
     }
 
@@ -3710,11 +3755,7 @@ impl PointerHandler for App {
                             // minimise/fullscreen the window out of the stream.
                             match b {
                                 0 => self.close(wid, qh),
-                                1 => {
-                                    if let Some(Role::Toplevel(t)) = self.windows.get(&wid).map(|w| &w.role) {
-                                        t.set_minimized();
-                                    }
-                                }
+                                1 => self.minimise(wid),
                                 _ => self.toggle_maximize(wid),
                             }
                         }

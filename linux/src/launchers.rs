@@ -2,6 +2,12 @@
 //! shown in KDE's app menu / KRunner with the plain icon, and a hidden taskbar entry
 //! (`sweeflow-<bundle id>`, the windows' app_id, which the taskbar matches first) that carries the
 //! icon. The taskbar takes a window's icon from its entry.
+//!
+//! Only one of the two names the windows' class (StartupWMClass): GNOME's shell matches windows
+//! to apps by that before file names, and with two entries claiming it each window went to
+//! whichever it had read first, so the Ubuntu Dock showed an app twice (the windows there at
+//! connect in one, later ones in the other). The menu entry has it, so the windows go to the
+//! entry that can be pinned; KDE's taskbar matches the taskbar entry by its file name first.
 
 use std::{
     fs,
@@ -63,7 +69,7 @@ pub fn seen(bid: &str, name: &str, png: &[u8]) -> Result<()> {
     }
     let exe = std::env::current_exe()?;
     let text = entry(&exe, bid, name, &task_icon_path(bid), false).replacen("NoDisplay=true\n", &format!("NoDisplay=true\n{SEEN_MARK}"), 1);
-    fs::write(&path, text)?;
+    write_whole(&path, &text)?;
     log::info!("taskbar entry for {name} ({bid}): not among the Mac's listed apps");
     refresh_menu();
     Ok(())
@@ -90,13 +96,13 @@ pub fn sync(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
         }
         // The taskbar's: always hidden from the menu.
         let entries = [
-            (task_file(bid), entry(&exe, bid, name, &task_icon_path(bid), false)),
+            (task_file(bid), entry(&exe, bid, name, &task_icon_path(bid), false).replacen(&wm_class_line(bid), "", 1)),
             (menu_file(bid), entry(&exe, bid, name, &original, VISIBLE.load(Ordering::SeqCst))),
         ];
         for (file, entry) in entries {
             let path = apps_dir.join(&file);
             if fs::read_to_string(&path).ok().as_deref() != Some(entry.as_str()) {
-                fs::write(&path, entry)?;
+                write_whole(&path, &entry)?;
             }
             keep.insert(file);
         }
@@ -137,6 +143,11 @@ fn entry_of(file: &str) -> Option<(&str, bool)> {
         Some(bid) => (bid, true),
         None => (rest, false),
     })
+}
+
+/// An entry's claim to the windows of `bid` (see the top).
+fn wm_class_line(bid: &str) -> String {
+    format!("StartupWMClass=sweeflow-{bid}\n")
 }
 
 /// The Quit action's name: "Quit on Mac" on GNOME, whose dash adds its own "Quit" under it (that
@@ -231,7 +242,7 @@ pub fn set_visible(visible: bool) {
         let Some((_, menu)) = entry_of(&name) else { continue };
         let Ok(text) = fs::read_to_string(e.path()) else { continue };
         let new = with_visibility(&text, visible && menu);
-        if new != text && fs::write(e.path(), new).is_ok() {
+        if new != text && write_whole(&e.path(), &new).is_ok() {
             changed += 1;
         }
     }
@@ -241,7 +252,27 @@ pub fn set_visible(visible: bool) {
     }
 }
 
-/// Tells KDE to pick up the changes now rather than whenever it notices.
+/// An entry written whole: a new file renamed over the old, so a launcher reading the folder
+/// meanwhile sees the old entry or the new one, never half of one, and every folder watcher
+/// hears of it (a rename into the folder, not only a change to a file).
+fn write_whole(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // Not ending in .desktop: not an entry while it's being written.
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Changes to the entries, counted: a later change makes an earlier one's settle nudge moot.
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tells the launchers to pick up the changes: KDE now (rather than whenever it notices), and
+/// every launcher once more when the changes have settled. Omarchy's reads which entries are
+/// hidden with a scan that ignores changes made while it runs: hidden and shown again quickly
+/// (Pause, Resume), its menu kept the Mac apps hidden for minutes, until some other entry
+/// changed. So a moment after the last change, one of ours is written again.
 fn refresh_menu() {
     if cfg!(test) {
         return;
@@ -250,6 +281,17 @@ fn refresh_menu() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    let n = CHANGES.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if CHANGES.load(Ordering::SeqCst) != n {
+            return;
+        }
+        let path = data_dir().join("applications").join(DISPLAY_ENTRY);
+        if let Ok(text) = fs::read_to_string(&path) {
+            let _ = write_whole(&path, &text);
+        }
+    });
 }
 
 pub fn socket_path() -> PathBuf {
@@ -307,6 +349,9 @@ mod tests {
         assert!(!menu.contains("NoDisplay=true"), "{menu}");
         assert!(task.contains(&format!("Icon={}", original_path("com.apple.mail").display())), "{task}");
         assert!(menu.contains(&format!("Icon={}", original_path("com.apple.mail").display())), "{menu}");
+        // One entry names the windows' class: the menu one (GNOME matches by it first).
+        assert!(menu.contains("StartupWMClass=sweeflow-com.apple.mail\n"), "{menu}");
+        assert!(!task.contains("StartupWMClass"), "{task}");
         // An app the Mac doesn't list, seen with a window: a taskbar entry only, kept when the listed apps are synced again. A listed app's is left alone.
         let png = include_bytes!("../assets/traffic-lights.png").to_vec();
         seen("com.apple.iphonesimulator", "Simulator", &png).unwrap();

@@ -70,7 +70,7 @@ PlasmoidItem {
     readonly property var streamActions: actionsKey === "" ? [] : actionsKey.split(",")
     // The Mac is streaming to another computer: Start is shown but can't be chosen until it's
     // stopped there.
-    readonly property string elsewhere: st.elsewhere || ""
+    readonly property bool elsewhere: st.elsewhere === true
     readonly property bool canStart: st.canStart !== false
     // Why Start can't be pressed for this Mac ("" if it can): it's streaming to another computer,
     // or it can't be reached (or isn't known to be reachable yet). `online`: true, false or null.
@@ -80,7 +80,7 @@ PlasmoidItem {
         if (m.active && connected) return st.locked ? "locked" : st.settings && st.settings.enabled === false ? "paused" : "streaming"
         if (m.online === null || m.online === undefined) return ""
         if (m.online === false) return "offline"
-        if (m.busy || (m.active && elsewhere !== "")) return "busy"
+        if (m.busy || (m.active && elsewhere)) return "busy"
         if (m.locked || (m.active && st.locked)) return "locked"
         return "available"
     }
@@ -91,7 +91,7 @@ PlasmoidItem {
     readonly property string activeState: { const a = linkedMacs.find(m => m.active); return a ? macStateOf(a) : "" }
 
     function startBlocked(name, online, active, busy) {
-        if ((active && !canStart && elsewhere !== "") || busy) return "Stop streaming elsewhere first"
+        if ((active && !canStart && elsewhere) || busy) return "Stop streaming elsewhere first"
         if (online === false) return name + " is not online"
         if (online === null || online === undefined) return "Checking whether " + name + " is online"
         return ""

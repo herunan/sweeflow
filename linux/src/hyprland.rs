@@ -385,6 +385,87 @@ pub fn place_window(class: &str, title: &str, spot: (f32, f32)) {
     let _ = Command::new("hyprctl").args(["dispatch", &lua]).output();
 }
 
+/// Runs a dispatcher: Hyprland 0.5x takes Lua (`lua`), earlier ones the plain form (`legacy`).
+fn dispatch(lua: &str, legacy: &[&str]) {
+    let done = Command::new("hyprctl").args(["dispatch", lua]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok");
+    if !done {
+        let _ = Command::new("hyprctl").arg("dispatch").args(legacy).output();
+    }
+}
+
+/// This process's window of that class (and title, if several share it), as `hyprctl clients`
+/// lists it.
+fn our_client(class: &str, title: &str) -> Option<serde_json::Value> {
+    our_client_where(class, |c| c["title"].as_str() == Some(title))
+}
+
+/// As `our_client`, the first that `best` picks (else the first of that class).
+fn our_client_where(class: &str, best: impl Fn(&serde_json::Value) -> bool) -> Option<serde_json::Value> {
+    let out = Command::new("hyprctl").args(["-j", "clients"]).output().ok()?;
+    let serde_json::Value::Array(clients) = serde_json::from_slice(&out.stdout).ok()? else { return None };
+    let pid = u64::from(std::process::id());
+    let ours: Vec<_> = clients.into_iter().filter(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class)).collect();
+    let i = ours.iter().position(best).unwrap_or(0);
+    ours.into_iter().nth(i)
+}
+
+/// Where minimised windows wait: Hyprland's usual stand-in for minimising, and where Omarchy's
+/// own minimise puts them (its dock brings them back from there).
+const MINIMIZED: &str = "special:minimized";
+
+/// Minimises this process's window of that class (and title): Hyprland has no minimise of its
+/// own and ignores a window asking to be, so the Mac's yellow button did nothing. As Omarchy's
+/// own minimise does: to the hidden "minimized" workspace, tagged with where it came from (its
+/// dock lists it and brings it back there). On any workspace, tiled ones too, where Omarchy's
+/// own Super+M does nothing: launching the app brings it back (`unminimise`). False when this
+/// isn't Hyprland.
+pub fn minimise(class: String, title: String) -> bool {
+    if !running() {
+        return false;
+    }
+    std::thread::spawn(move || {
+        let Some(c) = our_client(&class, &title) else { return };
+        let Some(address) = c["address"].as_str() else { return };
+        let window = format!("address:{address}");
+        let from = c["workspace"]["id"].as_i64().filter(|&w| w >= 1);
+        if let Some(ws) = from {
+            let tag = format!("+omarchy-minimized-from-{ws}");
+            dispatch(&format!(r#"hl.dsp.window.tag({{ tag = "{tag}", window = "{window}" }})"#), &["tagwindow", &tag, &window]);
+        }
+        dispatch(
+            &format!(r#"hl.dsp.window.move({{ workspace = "{MINIMIZED}", follow = false, window = "{window}" }})"#),
+            &["movetoworkspacesilent", &format!("{MINIMIZED},{window}")],
+        );
+        // The focus would otherwise stay with the hidden window.
+        if let Some(ws) = from {
+            dispatch(&format!(r#"hl.dsp.focus({{ workspace = "{ws}" }})"#), &["workspace", &ws.to_string()]);
+        }
+    });
+    true
+}
+
+/// Brings this process's window of that class back from the "minimized" workspace to the one
+/// in front, on top and focused, as Omarchy's dock does: a minimised one first, else the one
+/// with that title. For a launch of the app.
+pub fn unminimise(class: String, title: String) {
+    std::thread::spawn(move || {
+        let minimised = our_client_where(&class, |c| c["workspace"]["name"].as_str() == Some(MINIMIZED));
+        let Some(c) = minimised.filter(|c| c["workspace"]["name"].as_str() == Some(MINIMIZED)).or_else(|| our_client(&class, &title)) else { return };
+        let Some(address) = c["address"].as_str() else { return };
+        let window = format!("address:{address}");
+        if c["workspace"]["name"].as_str() == Some(MINIMIZED) {
+            let Ok(out) = Command::new("hyprctl").args(["-j", "activeworkspace"]).output() else { return };
+            let Some(ws) = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok().and_then(|w| w["id"].as_i64()).filter(|&w| w >= 1) else { return };
+            dispatch(
+                &format!(r#"hl.dsp.window.move({{ workspace = "{ws}", window = "{window}" }})"#),
+                &["movetoworkspace", &format!("{ws},{window}")],
+            );
+        }
+        dispatch(&format!(r#"hl.dsp.focus({{ window = "{window}" }})"#), &["focuswindow", &window]);
+        dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
+    });
+}
+
 /// Hyprland frames every window as a plain rectangle (no rounding set, as on Omarchy): a Mac
 /// window's rounded corners would leave gaps inside that frame. Looked at once.
 pub fn square_windows() -> bool {

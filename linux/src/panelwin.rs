@@ -695,8 +695,9 @@ struct PanelState {
     status: String,
     /// What can be done about the Mac in use (Do actions), in order.
     actions: Vec<String>,
-    /// The Mac is streaming to this other computer: Start can't be chosen.
-    elsewhere: Option<String>,
+    /// The Mac is streaming to another computer: Start can't be chosen.
+    #[serde(default)]
+    elsewhere: bool,
     /// The Mac in use has its screen locked.
     locked: bool,
     mac: String,
@@ -966,11 +967,11 @@ fn start_blocked(s: &PanelState, action: &str) -> Option<String> {
     }
     let mac = if s.mac.is_empty() { "The Mac" } else { s.mac.as_str() };
     let busy = s.macs.iter().any(|m| m.active && m.busy);
-    match (&s.elsewhere, s.online) {
-        (Some(other), _) => Some(crate::tray::start_hint(other)),
-        (None, Some(true)) if busy => Some(crate::tray::start_hint("")),
-        (None, Some(false)) => Some(format!("{mac} is not online")),
-        (None, None) => Some(format!("Checking whether {mac} is online")),
+    match (s.elsewhere, s.online) {
+        (true, _) => Some(crate::tray::start_hint()),
+        (false, Some(true)) if busy => Some(crate::tray::start_hint()),
+        (false, Some(false)) => Some(format!("{mac} is not online")),
+        (false, None) => Some(format!("Checking whether {mac} is online")),
         _ => None,
     }
 }
@@ -983,7 +984,7 @@ fn mac_state(s: &PanelState, m: &Mac) -> &'static str {
         return if s.locked { "locked" } else if s.settings.enabled { "streaming" } else { "paused" };
     }
     match m.online {
-        Some(true) if m.busy || (m.active && s.elsewhere.is_some()) => "busy",
+        Some(true) if m.busy || (m.active && s.elsewhere) => "busy",
         Some(true) if m.locked => "locked",
         Some(true) => "available",
         Some(false) => "offline",
@@ -1366,9 +1367,9 @@ mod tests {
         let s = parse_state(STATE).unwrap();
         assert!(s.paired && s.connected && !s.offline);
         assert_eq!(s.actions, ["pause", "stop"]);
-        assert_eq!(s.elsewhere, None);
-        let busy = parse_state(&STATE.replace(r#""showAt": 0"#, r#""showAt": 0, "elsewhere": "box", "canStart": false"#)).unwrap();
-        assert_eq!(busy.elsewhere.as_deref(), Some("box"));
+        assert!(!s.elsewhere);
+        let busy = parse_state(&STATE.replace(r#""showAt": 0"#, r#""showAt": 0, "elsewhere": true, "canStart": false"#)).unwrap();
+        assert!(busy.elsewhere);
         assert_eq!(s.online, Some(true));
         assert_eq!(s.status, "Streaming from Studio");
         assert_eq!(s.mac, "Studio");
