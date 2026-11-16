@@ -136,6 +136,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         login.state = LoginItem.enabled ? .on : .off
         login.isEnabled = !LoginItem.devInstall
         menu.addItem(login)
+        // A MacBook sleeps when its lid closes, whatever an app asks, unless pmset is told
+        // otherwise (as root: see LidSleepRule).
+        let lid = ClosureMenuItem(title: "Stream with the lid closed") {
+            LidSleepRule.set(!LidSleepRule.installed) { ok in
+                if ok, LidSleepRule.installed { host.wake.lidRuleInstalled() }
+            }
+        }
+        lid.state = LidSleepRule.installed ? .on : .off
+        if LidSleepRule.hasLid { menu.addItem(lid) }
         menu.addItem(.separator())
 
         let linked = NSMenuItem(title: "Linux machines", action: nil, keyEquivalent: "")

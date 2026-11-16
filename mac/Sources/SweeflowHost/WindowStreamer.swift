@@ -524,11 +524,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         if (still || !sentStill) && !lossless {
             sentStill = true
             let t0 = Date()
+            stillAsked = ObjectIdentifier(s)
+            stillWaits = 0
             SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
                 log(String(format: "stream %u: still taken in %.0f ms", self?.wid ?? 0, Date().timeIntervalSince(t0) * 1000))
                 guard let self, let sb, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
                 self.queue.async {
                     guard !self.stopped, !self.showingPause, self.stream === s, self.framesSinceStart == 0, !ScreenLock.isLocked else { return }
+                    self.stillShown = ObjectIdentifier(s)
                     self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
                 }
             }
@@ -938,10 +941,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: capture
 
+    /// The capture whose frame last came through (on captureQueue): a new one's first frame always
+    /// goes on.
+    private var lastFedCapture: ObjectIdentifier?
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        // A frame marked "started" (a capture's first, on some macOS versions) counts too, if it
+        // has a picture.
         guard type == .screen, sb.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let raw = attachments.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw),
+              status == .complete || status == .started,
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         // A locked Mac captures as blank: keep showing the last real frame instead.
         guard !ScreenLock.isLocked else { return }
@@ -949,7 +959,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // expectFrameAfterInput).
         queue.async { [weak self] in if let self, stream === self.stream { self.delivered &+= 1 } }
         let info = attachments.first ?? [:]
-        guard differsFromLast(pb) else {
+        // Each capture's first frame goes through, unchanged or not: it's what tells the capture
+        // has started (expectFirstFrame). Its picture is often the one sent last, and the
+        // capture it replaces can still deliver a frame just after the new one began, so
+        // compared with the last it was dropped, and the capture restarted up to three times.
+        let id = ObjectIdentifier(stream)
+        let firstOfCapture = lastFedCapture != id
+        lastFedCapture = id
+        guard differsFromLast(pb) || firstOfCapture else {
             if droppedAsRedraw { holdBack(pb, info: info, from: stream) }
             return
         }
@@ -1353,6 +1370,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// the virtual display came back): if none has come within a second, start again (at most
     /// three times). A one-off check, nothing keeps running.
     private var framesSinceStart = 0
+    /// The capture a still was sent ahead of (it showed the window before any frame came), and
+    /// the one a still was asked for (it may take a second), with how often it was waited for.
+    private var stillShown: ObjectIdentifier?
+    private var stillAsked: ObjectIdentifier?
+    private var stillWaits = 0
     /// A still was sent ahead of the first capture (once per window).
     private var sentStill = false
     private var startRetries = 0
@@ -1360,14 +1382,31 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func expectFirstFrame(from s: SCStream) {
         let win = scWindow
         framesSinceStart = 0
+        let deliveredBefore = delivered
         queue.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, !self.stopped, self.stream === s, self.framesSinceStart == 0 else {
                 self?.startRetries = 0
                 return
             }
+            // Frames came, none sent yet (dropped as shrunk while a resumed window's scale
+            // settles, which restarts it by itself): the capture is alive.
+            if self.delivered != deliveredBefore { return }
             // A popup the capture won't feed is shown by stills (pollStills): restarting the
             // capture would only make it flicker.
             if self.lossless { return }
+            // A still of it went out for this capture: Linux shows the window as it is. A window
+            // that isn't changing often gets no frame from a new capture (Finder, on resuming),
+            // and restarting it rebuilt the sharing badge each time for nothing. A capture that
+            // really is stuck is caught when input gets no frame (expectFrameAfterInput).
+            if self.stillShown == ObjectIdentifier(s) {
+                log("stream \(self.wid): no first frame yet: its still stands until the window changes")
+                return
+            }
+            // Its still is on its way (the window server took up to 1.3 s under load): waited for.
+            if self.stillAsked == ObjectIdentifier(s), self.stillWaits < 2 {
+                self.stillWaits += 1
+                return self.expectFirstFrame(from: s)
+            }
             guard self.startRetries < 3 else {
                 log("stream \(self.wid): still no frame after 3 restarts")
                 CaptureHealth.captureGaveNothing()

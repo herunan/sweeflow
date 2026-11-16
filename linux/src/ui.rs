@@ -993,7 +993,10 @@ impl App {
             pos.set_anchor_rect(x.round() as i32, y.round() as i32, 1, 1);
             pos.set_anchor(xdg_positioner::Anchor::TopLeft);
             pos.set_gravity(xdg_positioner::Gravity::BottomRight);
-            pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);
+            // Kept on the screen, as X11's popups are (popup_origin there): a menu opened near
+            // the bottom edge ran off it on Omarchy, its last items out of reach. Clicks land
+            // the same wherever it's shown (they're in its own coordinates).
+            pos.set_constraint_adjustment(on_screen());
             let popup = match Popup::new(&parent_xdg, &pos, qh, &self.compositor, &self.xdg) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1605,7 +1608,8 @@ impl App {
                 pos.set_anchor_rect(x.round() as i32, y.round() as i32, 1, 1);
                 pos.set_anchor(xdg_positioner::Anchor::TopLeft);
                 pos.set_gravity(xdg_positioner::Gravity::BottomRight);
-                pos.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::None);
+                // Dragged by the user: where they put it; else kept on the screen.
+                pos.set_constraint_adjustment(if w.moved_to.is_some() { xdg_positioner::ConstraintAdjustment::None } else { on_screen() });
                 p.reposition(&pos, 0);
                 w.size = mac;
                 self.draw_base(wid, qh);
@@ -3187,6 +3191,12 @@ fn is_global_menu_key(mods: &Modifiers, key: Keysym) -> bool {
 
 /// Cmd+Opt+O (Super+Alt+O), with no other modifier: opens Sweeflow itself (its window, or on
 /// Plasma its tray popup), as `sweeflow open` does.
+/// A popup the compositor moves back onto the screen (slid, not flipped: it stays by what opened
+/// it) when it would run off an edge.
+fn on_screen() -> xdg_positioner::ConstraintAdjustment {
+    xdg_positioner::ConstraintAdjustment::SlideX | xdg_positioner::ConstraintAdjustment::SlideY
+}
+
 fn is_open_sweeflow_key(mods: &Modifiers, key: Keysym) -> bool {
     mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::o | Keysym::O)
 }

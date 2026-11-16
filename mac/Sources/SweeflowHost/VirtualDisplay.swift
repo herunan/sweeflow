@@ -209,9 +209,16 @@ final class Wakefulness {
             }
         }
         // Closing the lid sleeps a MacBook regardless of assertions; `pmset disablesleep` is the
-        // only switch, run through sudo: it needs a sudoers rule allowing exactly these two calls
-        // (none is installed yet; without it, closing the lid on battery sleeps the Mac).
+        // only switch, run through sudo: it needs the sudoers rule allowing exactly these two
+        // calls, installed from the menu (LidSleepRule). Without it, closing the lid on battery
+        // sleeps the Mac.
         lidSleepDisabled = true
+        Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
+    }
+
+    /// The rule was just installed: applied at once if streaming already.
+    func lidRuleInstalled() {
+        guard lidSleepDisabled else { return }
         Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
     }
 
@@ -257,7 +264,7 @@ final class Wakefulness {
             log("lid-close sleep \(disabled ? "disabled" : "restored")")
             return true
         } catch {
-            if disabled { log("cannot disable lid-close sleep (no sudoers rule; run `sweeflow setup` in a terminal)") }
+            if disabled { log("cannot disable lid-close sleep (no rule: \"Stream with the lid closed\" in Sweeflow's menu installs it)") }
             return false
         }
     }

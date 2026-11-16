@@ -1593,6 +1593,7 @@ final class Session {
             guard let self else { return }
             self.fixedKnown[w.wid] = nil
             self.fixedSpots[w.wid] = nil
+            if w.kind != .popup { Self.lastFrames[w.bundleId] = w.frame }
             let now = DispatchTime.now()
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
@@ -1961,6 +1962,15 @@ final class Session {
         return out
     }
 
+    /// Where each app's last window was when it went (see sendAdded), kept across restarts.
+    private static var lastFrames: [String: CGRect] {
+        get {
+            let saved = UserDefaults.standard.dictionary(forKey: "lastWindowFrames") as? [String: String] ?? [:]
+            return saved.mapValues { NSRectToCGRect(NSRectFromString($0)) }
+        }
+        set { UserDefaults.standard.set(newValue.mapValues { NSStringFromRect(NSRectFromCGRect($0)) }, forKey: "lastWindowFrames") }
+    }
+
     /// Whether each window's app lets it be resized (looked at once per window).
     private var fixedKnown: [UInt32: Bool] = [:]
     /// Where each window first appeared on its screen (see spot(of:)).
@@ -2004,8 +2014,12 @@ final class Session {
             }
             return announce(w, fixed: false)
         }
-        // Where the app put it, before it's moved onto the virtual display.
-        let spot = Self.spot(of: w.frame)
+        // Where the app put it, before it's moved onto the virtual display. Reopened just where
+        // its last window was (Calculator does), that's where Sweeflow had arranged it on the
+        // virtual display, not the app's wish: centred then, as Linux desktops place a dialog.
+        // (Calculator opened at the lower-left edge on Mint, lower-right on Omarchy.)
+        let reopened = Self.lastFrames[w.bundleId].map { abs($0.minX - w.frame.minX) < 3 && abs($0.minY - w.frame.minY) < 3 } ?? false
+        let spot = reopened ? (Float(0.5), Float(0.5)) : Self.spot(of: w.frame)
         fixedSpots[w.wid] = fixedSpots[w.wid] ?? spot
         if let fixed = fixedKnown[w.wid] { return announce(w, fixed: fixed) }
         final class Once { var sent = false }

@@ -229,12 +229,58 @@ static BEST_PING: std::sync::Mutex<Option<(i64, i64)>> = std::sync::Mutex::new(N
 /// How long a picture takes from its capture on the Mac to being shown here (µs, smoothed).
 static VIDEO_LAG_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// When the last picture was shown (µs since EPOCH), and the time between pictures (smoothed).
+static LAST_PICTURE_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static PICTURE_GAP_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Pictures are moving now (a video playing, something scrolling): over 12 a second lately.
+fn pictures_moving() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let since = EPOCH.elapsed().as_micros() as i64 - LAST_PICTURE_US.load(Relaxed);
+    since < 200_000 && (1..83_000).contains(&PICTURE_GAP_US.load(Relaxed))
+}
+
+/// How much later than the pictures the sound may be heard and still seem to go with them.
+const SYNC_SLACK_US: i64 = 60_000;
+
+/// What sound spends on its way to being heard, besides the sound waiting for the player (µs):
+/// the network to here (the last pings' average), the time this Mac took to hand it over, and
+/// the player's own buffer.
+fn sound_way_us() -> i64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = *PINGS.lock().unwrap();
+    let transit = if p.0 > 0 { (p.4 / p.0 as i64).max(0) } else { 0 };
+    transit + MAC_AUDIO_AGE_US.load(Relaxed) + PLAYER_LATENCY_MS as i64 * 1000
+}
+
+/// The most sound kept waiting for the player that still lets it be heard with the pictures
+/// (give or take SYNC_SLACK_US), while pictures are moving; None otherwise. The cushion against
+/// pieces arriving unevenly (audio_task) stays within it then: during a Quick Look video, pieces
+/// came up to 173 ms apart, the cushion grew to 183 ms and the sound trailed the picture by
+/// ~0.2 s. A gap now and then is the lesser harm there; with nothing moving (music), the full
+/// cushion keeps the sound whole.
+fn cushion_room_us() -> Option<u64> {
+    if !pictures_moving() {
+        return None;
+    }
+    let video = VIDEO_LAG_US.load(std::sync::atomic::Ordering::Relaxed);
+    (video > 0).then(|| (video + SYNC_SLACK_US - sound_way_us()).max(0) as u64)
+}
+
 /// A picture captured at `capture_us` (the Mac's clock) was just shown: how long that took,
 /// for keeping the sound in step with the pictures (audio_task). Smoothed, so one slow frame
 /// doesn't move the sound.
 pub fn video_shown(capture_us: u64) {
-    let Some((_, offset)) = *BEST_PING.lock().unwrap() else { return };
+    use std::sync::atomic::Ordering::Relaxed;
     let now = EPOCH.elapsed().as_micros() as i64;
+    // How often pictures come (smoothed), for whether something is moving (`pictures_moving`).
+    let last = LAST_PICTURE_US.swap(now, Relaxed);
+    if last > 0 {
+        let gap = (now - last).min(1_000_000);
+        let old = PICTURE_GAP_US.load(Relaxed);
+        PICTURE_GAP_US.store(if old == 0 { gap } else { old + (gap - old) / 8 }, Relaxed);
+    }
+    let Some((_, offset)) = *BEST_PING.lock().unwrap() else { return };
     let lag = now - (capture_us as i64 - offset);
     if !(0..1_000_000).contains(&lag) {
         return; // the clocks aren't matched up yet
@@ -265,10 +311,7 @@ const AUDIO_BYTES_PER_MS: usize = 48 * 2 * 2;
 fn audio_delay(queued_us: u64) -> std::time::Duration {
     use std::sync::atomic::Ordering::Relaxed;
     let video = VIDEO_LAG_US.load(Relaxed);
-    let p = *PINGS.lock().unwrap();
-    // The way back from the Mac, as the last pings measured it (their average).
-    let transit = if p.0 > 0 { (p.4 / p.0 as i64).max(0) } else { 0 };
-    let sound = transit + MAC_AUDIO_AGE_US.load(Relaxed) + queued_us as i64 + PLAYER_LATENCY_MS as i64 * 1000;
+    let sound = sound_way_us() + queued_us as i64;
     std::time::Duration::from_micros((video - sound).clamp(0, video.max(0)) as u64)
 }
 
@@ -1573,7 +1616,11 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
         return;
     }
     const UNIT: &str = "sweeflow-audio";
-    let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).status();
+    // Quietly: on a first connect there's none to stop, which systemctl says in the journal.
+    let stop = || {
+        let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).stderr(std::process::Stdio::null()).status();
+    };
+    stop();
     let started = std::process::Command::new("systemd-run")
         .args(["--user", "--quiet", "--collect", "--unit", UNIT])
         .args(audio_player())
@@ -1587,7 +1634,7 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     struct Player;
     impl Drop for Player {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).status();
+            let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).stderr(std::process::Stdio::null()).status();
         }
     }
     let _player = Player;
@@ -1611,8 +1658,12 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
         let us_of = |bytes: usize| (bytes as u64 * 1000) / AUDIO_BYTES_PER_MS as u64;
         let bytes_of = |us: u64| (us * AUDIO_BYTES_PER_MS as u64 / 1000) as usize;
         // The cushion in bytes: what the network has made pieces wait lately (AUDIO_CUSHION_US),
-        // and never less than two pieces.
-        let cushion = |piece: usize| bytes_of(AUDIO_CUSHION_US.load(Relaxed)).max(2 * piece);
+        // within what keeps the sound with moving pictures (cushion_room_us), and never less
+        // than two pieces.
+        let cushion = |piece: usize| {
+            let us = AUDIO_CUSHION_US.load(Relaxed);
+            bytes_of(cushion_room_us().map_or(us, |room| us.min(room))).max(2 * piece)
+        };
         let mut dropped = 0u32;
         // Run dry (or just started): written again only once the cushion's worth is ready.
         let mut priming = true;
@@ -1723,7 +1774,8 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
             let old = AUDIO_CUSHION_US.load(Relaxed);
             let new = ((old + gap_max.as_micros() as u64 + piece_us) / 2).max(2 * piece_us).min(old);
             AUDIO_CUSHION_US.store(new, Relaxed);
-            log::info!("audio: longest wait between pieces {} ms: cushion {} → {} ms; the Mac hands sound over {} ms after it plays",
+            let room = cushion_room_us().map_or(String::new(), |r| format!(" (at most {} ms while pictures move)", r / 1000));
+            log::info!("audio: longest wait between pieces {} ms: cushion {} → {} ms{room}; the Mac hands sound over {} ms after it plays",
                        gap_max.as_millis(), old / 1000, new / 1000, MAC_AUDIO_AGE_US.load(Relaxed) / 1000);
             (pieces, gap_max, gap_logged) = (0, std::time::Duration::ZERO, std::time::Instant::now());
         }
