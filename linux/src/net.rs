@@ -278,6 +278,9 @@ static MAC_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The address the Mac in use was reached at, while connected.
 static CONNECTED_TO: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+/// The address each Mac (by fingerprint) was last reached at: still shown once it goes offline,
+/// rather than the name it was linked by.
+static LAST_REACHED: std::sync::Mutex<Vec<(String, SocketAddr)>> = std::sync::Mutex::new(Vec::new());
 /// Stopped on purpose (Stop): no connection until Start, so the Mac is free for another
 /// computer. Kept across restarts, in a file beside the config.
 static OFFLINE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
@@ -329,6 +332,11 @@ pub fn mac_online() -> Option<bool> {
 /// The address the Mac in use is connected at, while it is.
 pub fn connected_to() -> Option<SocketAddr> {
     *CONNECTED_TO.lock().unwrap()
+}
+
+/// The address the Mac with `fingerprint` was last reached at by this run, connected or not.
+pub fn last_reached(fingerprint: &str) -> Option<SocketAddr> {
+    LAST_REACHED.lock().unwrap().iter().find(|(f, _)| f == fingerprint).map(|(_, a)| *a)
 }
 
 /// How this computer reaches a Mac at `host` ("address:port", or a name with its port), for
@@ -893,6 +901,11 @@ async fn session(
     let ip = addr.ip();
     std::thread::spawn(move || crate::wake::remember(ip));
     *CONNECTED_TO.lock().unwrap() = Some(addr);
+    {
+        let mut last = LAST_REACHED.lock().unwrap();
+        last.retain(|(f, _)| *f != cfg.host_fingerprint);
+        last.push((cfg.host_fingerprint.clone(), addr));
+    }
     struct Online;
     impl Drop for Online {
         fn drop(&mut self) {
@@ -1381,8 +1394,9 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                 }
                 waiting_for_key = false;
                 if dec.is_none() {
-                    // The X11 frontend can show pictures decoded on the CPU, for a GPU that can't.
-                    match Decoder::new_or_software(&render_node, crate::x11ui::wanted()) {
+                    // Pictures decoded on the CPU, for a GPU that can't: X11 draws them as
+                    // textures, Wayland shows them from shared memory.
+                    match Decoder::new_or_software(&render_node, !crate::x11ui::wanted()) {
                         Ok(d) => dec = Some(d),
                         Err(e) => {
                             log::error!("window {wid}: {e:#}");

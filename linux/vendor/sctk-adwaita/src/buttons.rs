@@ -82,8 +82,10 @@ impl Buttons {
         Location::Head
     }
 
-    pub fn update_wm_capabilities(&mut self, wm_capabilites: WindowManagerCapabilities) {
-        let supports_maximize = wm_capabilites.contains(WindowManagerCapabilities::MAXIMIZE);
+    // Sweeflow: `resizable` added: a window of a fixed size has no maximise button.
+    pub fn update_wm_capabilities(&mut self, wm_capabilites: WindowManagerCapabilities, resizable: bool) {
+        let supports_maximize =
+            resizable && wm_capabilites.contains(WindowManagerCapabilities::MAXIMIZE);
         let supports_minimize = wm_capabilites.contains(WindowManagerCapabilities::MINIMIZE);
 
         self.update_buttons(supports_maximize, supports_minimize);

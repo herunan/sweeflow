@@ -3,13 +3,14 @@ import ScreenCaptureKit
 import Network
 import ServiceManagement
 
-/// Puts one of Sweeflow's own windows where a person at the Mac sees it: the built-in screen,
-/// else any screen but Sweeflow's virtual display (nobody sees that, and Sweeflow's own windows
-/// aren't streamed). Lights the built-in screen up while it's open.
+/// Puts one of Sweeflow's own windows where a person at the Mac sees it: the primary display
+/// (the one with the menu bar, where they look: a monitor on a laptop), else any screen but
+/// Sweeflow's virtual display (nobody sees that, and Sweeflow's own windows aren't streamed).
+/// Lights the built-in screen up while it's open, in case that's the one.
 func presentToPerson(_ w: NSWindow) {
     BuiltInScreen.pause()
     let virtual = host.display.displayID
-    let screen = BuiltInScreen.screen ?? NSScreen.screens.first {
+    let screen = NSScreen.screens.first {
         ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) != virtual
     } ?? NSScreen.main
     if let f = screen?.visibleFrame {

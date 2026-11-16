@@ -44,6 +44,8 @@ const DRM_FORMAT_R16: u32 = u32::from_le_bytes(*b"R16 ");
 
 const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+/// RGBA in memory (a CPU picture for the X11 frontend).
+const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
 
 /// Whether pictures go to the compositor as RGB instead of the decoder's own YUV. Hyprland takes
 /// YUV buffers (NV12 and P010 alike) and then draws only their brightness plane, as red: there
@@ -88,8 +90,9 @@ pub struct GpuFrame {
     pub full_range: bool,
     /// Already RGB (see `rgb_output`): no YUV matrix or range to tell the compositor about.
     pub rgb: bool,
-    /// Decoded on the CPU (no VA-API here, X11 only): the picture as RGBA (width × height × 4)
-    /// in memory, and no planes in GPU memory.
+    /// Decoded on the CPU (no HEVC decoding on the GPU): the picture in memory (width × height ×
+    /// 4), RGBA for the X11 frontend's textures and BGRA (wl_shm's XRGB8888) for Wayland's
+    /// shared memory, and no planes in GPU memory.
     pub cpu_rgba: Option<Vec<u8>>,
 }
 
@@ -113,7 +116,9 @@ impl GpuFrame {
             return Some(
                 rgba.chunks_exact(4)
                     .flat_map(|p| {
-                        let v = ((p[0] as u32 * 54 + p[1] as u32 * 183 + p[2] as u32 * 19) >> 8) as u8;
+                        // BGRA (XRGB8888) or RGBA (XBGR8888).
+                        let (r, b) = if self.format == DRM_FORMAT_XRGB8888 { (p[2], p[0]) } else { (p[0], p[2]) };
+                        let v = ((r as u32 * 54 + p[1] as u32 * 183 + b as u32 * 19) >> 8) as u8;
                         [v, v, v, 255]
                     })
                     .collect(),
@@ -276,12 +281,14 @@ pub struct Decoder {
     logged: bool,
     /// Set up with the first picture, where pictures go out as RGB.
     to_rgb: Option<ToRgb>,
-    /// Decoding on the CPU (no VA-API device; X11 only): pictures go out as RGBA in memory,
+    /// Decoding on the CPU (no VA-API device, or one without HEVC): pictures go out in memory,
     /// converted by this.
     sws: Option<*mut SwsContext>,
-    /// CPU pictures may be handed on (the X11 frontend): also when VA-API opened but FFmpeg
-    /// decodes on the CPU after all (a driver without HEVC decoding).
+    /// CPU pictures may be handed on: also when VA-API opened but FFmpeg decodes on the CPU
+    /// after all (a driver without HEVC decoding).
     software_ok: bool,
+    /// CPU pictures go out as BGRA (Wayland) rather than RGBA (X11).
+    cpu_bgra: bool,
 }
 
 unsafe impl Send for Decoder {}
@@ -298,8 +305,7 @@ unsafe extern "C" fn pick_vaapi(_: *mut AVCodecContext, mut fmts: *const AVPixel
             fmts = fmts.add(1);
         }
     }
-    // No VA-API for this video (the driver can't decode HEVC): the CPU, which only the X11
-    // frontend can show (see `software_ok`); elsewhere the frame is refused later.
+    // No VA-API for this video (the driver can't decode HEVC): the CPU (see `software_ok`).
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| log::warn!("the decoder offers no VA-API output for this video: the CPU's"));
     last
@@ -332,26 +338,25 @@ impl Decoder {
             if r < 0 {
                 bail!("avcodec_open2 failed ({r})");
             }
-            Ok(Decoder { ctx, hw_device, pkt: av_packet_alloc(), frame: av_frame_alloc(), logged: false, to_rgb: None, sws: None, software_ok: false })
+            Ok(Decoder { ctx, hw_device, pkt: av_packet_alloc(), frame: av_frame_alloc(), logged: false, to_rgb: None, sws: None, software_ok: false, cpu_bgra: false })
         }
     }
 
-    /// VA-API if the GPU can, otherwise (with `software_ok`) FFmpeg's own decoder on the CPU: a
-    /// GPU without HEVC decoding (a Mesa built without the patented codecs, NVIDIA's driver).
-    /// Only the X11 frontend can show such pictures (as textures).
-    pub fn new_or_software(render_node: &str, software_ok: bool) -> Result<Self> {
-        match Self::new(render_node) {
-            Ok(mut d) => {
-                d.software_ok = software_ok;
-                Ok(d)
-            }
-            Err(e) if software_ok => {
+    /// VA-API if the GPU can, otherwise FFmpeg's own decoder on the CPU: a GPU without HEVC
+    /// decoding (a Mesa built without the patented codecs, NVIDIA's driver, a virtual machine's).
+    /// `cpu_bgra`: CPU pictures as BGRA (Wayland's shared memory) rather than RGBA (X11).
+    pub fn new_or_software(render_node: &str, cpu_bgra: bool) -> Result<Self> {
+        let mut d = match Self::new(render_node) {
+            Ok(d) => d,
+            Err(e) => {
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| log::warn!("{e:#}: decoding on the CPU instead"));
-                Self::software()
+                Self::software()?
             }
-            Err(e) => Err(e),
-        }
+        };
+        d.software_ok = true;
+        d.cpu_bgra = cpu_bgra;
+        Ok(d)
     }
 
     fn software() -> Result<Self> {
@@ -379,6 +384,7 @@ impl Decoder {
                 to_rgb: None,
                 sws: Some(ptr::null_mut()),
                 software_ok: true,
+                cpu_bgra: false,
             })
         }
     }
@@ -391,7 +397,7 @@ impl Decoder {
             let ctx = sws_getCachedContext(
                 self.sws.unwrap_or(ptr::null_mut()),
                 w, h, std::mem::transmute::<i32, AVPixelFormat>(f.format),
-                w, h, AVPixelFormat::AV_PIX_FMT_RGBA,
+                w, h, if self.cpu_bgra { AVPixelFormat::AV_PIX_FMT_BGRA } else { AVPixelFormat::AV_PIX_FMT_RGBA },
                 2 /* SWS_BILINEAR (a constant or an enum, by FFmpeg version) */, ptr::null_mut(), ptr::null_mut(), ptr::null(),
             );
             if ctx.is_null() {
@@ -417,7 +423,7 @@ impl Decoder {
                 height: h as u32,
                 content: (w as u32, h as u32),
                 frame: ptr::null_mut(),
-                format: DRM_FORMAT_XRGB8888,
+                format: if self.cpu_bgra { DRM_FORMAT_XRGB8888 } else { DRM_FORMAT_XBGR8888 },
                 planes: Vec::new(),
                 capture_us,
                 dark_titlebar: true,

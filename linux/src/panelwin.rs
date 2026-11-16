@@ -617,7 +617,7 @@ slint::slint! {
             height: root.height;
             clicked => { root.show-keys = false; }
         }
-        if root.show-keys: Rectangle {
+        if root.show-keys: keys-box := Rectangle {
             x: 12px;
             y: root.height - self.height - 58px;
             width: 270px;
@@ -629,6 +629,14 @@ slint::slint! {
             background: Look.bg.mix(Look.fg, 0.94);
             drop-shadow-blur: 16px;
             drop-shadow-color: #00000055;
+            // One width for every key, the widest one's: the names beside them line up in any
+            // font (in Ubuntu's, ⌘⌥O is wider than ⌘⌥Y).
+            property <length> key-width: max(46px, max(max(m-open.preferred-width, m-pause.preferred-width),
+                max(m-stop.preferred-width, m-menu.preferred-width)) + 12px);
+            m-open := Text { visible: false; font-size: 12px; text: root.key-open == "" ? "none" : root.key-open; }
+            m-pause := Text { visible: false; font-size: 12px; text: root.key-pause == "" ? "none" : root.key-pause; }
+            m-stop := Text { visible: false; font-size: 12px; text: root.key-stop == "" ? "none" : root.key-stop; }
+            m-menu := Text { visible: false; font-size: 12px; text: "⌘⌥U"; }
             key-list := VerticalLayout {
                 padding: 12px;
                 spacing: 7px;
@@ -642,7 +650,7 @@ slint::slint! {
                     spacing: 10px;
                     Rectangle {
                         // Wider for a key written out ("Ctrl+Shift+F5").
-                        width: max(46px, key-text.preferred-width + 12px);
+                        width: keys-box.key-width;
                         height: 20px;
                         border-radius: 5px;
                         background: Look.fg.transparentize(0.9);

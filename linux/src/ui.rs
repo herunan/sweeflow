@@ -1731,24 +1731,43 @@ impl App {
             return;
         }
 
-        let params = match self.dmabuf.create_params(qh) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("dmabuf unavailable: {e}");
-                return;
+        let buffer = if let Some(bgra) = &frame.cpu_rgba {
+            // Decoded on the CPU (a GPU without HEVC decoding): shared memory, which the
+            // compositor copies on commit. No release comes for these; the last few are kept
+            // (the picture shown is laid out again from its buffer) and the rest let go.
+            let Ok(mut pool) = RawPool::new(bgra.len(), &self.shm) else { return };
+            pool.mmap().copy_from_slice(bgra);
+            let buffer = pool.create_buffer(0, frame.width as i32, frame.height as i32, (frame.width * 4) as i32, wl_shm::Format::Xrgb8888, (), qh);
+            w.raw_buffers.push_back((buffer.clone(), pool));
+            while w.raw_buffers.len() > 3 {
+                if let Some((b, _)) = w.raw_buffers.pop_front() {
+                    self.in_use.remove(&b.id());
+                    b.destroy();
+                }
             }
+            buffer
+        } else {
+            let params = match self.dmabuf.create_params(qh) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("dmabuf unavailable: {e}");
+                    return;
+                }
+            };
+            for (i, p) in frame.planes.iter().enumerate() {
+                let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(p.fd) };
+                params.add(fd, i as u32, p.offset, p.stride, p.modifier);
+            }
+            params
+                .create_immed(
+                    frame.width as i32,
+                    frame.height as i32,
+                    frame.format,
+                    wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                )
+                .0
         };
-        for (i, p) in frame.planes.iter().enumerate() {
-            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(p.fd) };
-            params.add(fd, i as u32, p.offset, p.stride, p.modifier);
-        }
-        let (buffer, _) = params.create_immed(
-            frame.width as i32,
-            frame.height as i32,
-            frame.format,
-            wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
-            qh,
-        );
 
         if w.display {
             // Scaled to fit, centred.

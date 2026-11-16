@@ -1,10 +1,13 @@
 # Why this copy is here
 
-This is sctk-adwaita 0.10.1 from crates.io (MIT, see LICENSE) with two changes, both marked
+This is sctk-adwaita 0.10.1 from crates.io (MIT, see LICENSE) with these changes, all marked
 "Sweeflow" in the source:
 
 - `src/lib.rs`: a frame starts as not resizable (upstream: resizable).
 - `src/pointer.rs`: a double click on the title bar only maximises a resizable window.
+- `src/buttons.rs`, `src/lib.rs`, `src/pointer.rs`: a window that isn't resizable has no maximise
+  button, as in GTK. Vanilla GNOME shows only a close button, but Ubuntu's title bars also have
+  minimise and maximise, and maximise filled the screen with the fixed-size content in a corner.
 
 The library draws the title bar of Sweeflow's own windows (Add a Mac, a Mac's prompt) on GNOME,
 which leaves that to each app. Those windows have a fixed size, but a double click on the title
@@ -17,4 +20,4 @@ Every window Sweeflow opens through winit has a fixed size, so starting from "no
 right here. It would be wrong for an app with resizable windows.
 
 `linux/Cargo.toml` points at this folder under `[patch.crates-io]`. To update: copy the new
-version here and reapply the two changes, or drop the patch once winit and sctk-adwaita handle it.
+version here and reapply the changes, or drop the patch once winit and sctk-adwaita handle it.

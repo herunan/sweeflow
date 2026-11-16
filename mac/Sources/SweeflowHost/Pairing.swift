@@ -357,17 +357,18 @@ func serviceTXT(busy: Bool = false) -> NWTXTRecord {
 
 /// The code a computer that's linking has to type, in big digits. A window of its own rather than
 /// a modal alert: nothing else in Sweeflow waits on it (a session may be streaming), and it's
-/// taken down when the other computer stops. Main thread only.
+/// taken down when the other computer stops. One on each screen a person can see (a laptop's own
+/// and its monitor), kept in step: the code is only any use to whoever is at this Mac, and they
+/// may be looking at either. Main thread only.
 final class CodeWindow: NSObject {
     static let shared = CodeWindow()
-    private var window: NSWindow?
+    /// Each screen's copy, with its note and button.
+    private var copies: [(window: NSWindow, note: NSTextField, button: NSButton)] = []
     private var cancelled: (() -> Void)?
-    private let note = NSTextField(wrappingLabelWithString: "")
-    private let button = NSButton(title: "Cancel", target: nil, action: nil)
-    /// Bumped with each window, so a delayed close doesn't take down a newer one.
+    /// Bumped with each code, so a delayed close doesn't take down a newer one.
     private var shown = 0
 
-    var showing: Bool { window != nil }
+    var showing: Bool { !copies.isEmpty }
 
     /// Shows `code` for the computer called `name`. `cancelled` runs if the person here cancels.
     func show(name: String, code: String, cancelled: @escaping () -> Void) {
@@ -375,6 +376,21 @@ final class CodeWindow: NSObject {
         // The explanation has done its job once a computer asks.
         PairingWindow.shared.close()
         shown += 1
+        BuiltInScreen.pause()
+        let virtual = host.display.displayID
+        let screens = NSScreen.screens.filter {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) != virtual
+        }
+        for screen in screens.isEmpty ? [nil] : screens.map(Optional.some) {
+            copies.append(build(name: name, code: code, on: screen))
+        }
+        self.cancelled = cancelled
+        NSApp.activate()
+        // The primary display's copy (listed first) ends up in front, holding the keyboard.
+        for c in copies.reversed() { c.window.makeKeyAndOrderFront(nil) }
+    }
+
+    private func build(name: String, code: String, on screen: NSScreen?) -> (window: NSWindow, note: NSTextField, button: NSButton) {
         let title = NSTextField(wrappingLabelWithString: "Enter this code on \(name)")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
         title.alignment = .center
@@ -384,13 +400,11 @@ final class CodeWindow: NSObject {
         digits.font = .monospacedDigitSystemFont(ofSize: 48, weight: .semibold)
         digits.alignment = .center
         // Said once, in the title; the note is for how it ended (wrong codes, expired, linked).
-        note.stringValue = ""
+        let note = NSTextField(wrappingLabelWithString: "")
         note.alignment = .center
         note.textColor = .secondaryLabelColor
         note.preferredMaxLayoutWidth = 300
-        button.title = "Cancel"
-        button.target = self
-        button.action = #selector(clickedButton)
+        let button = NSButton(title: "Cancel", target: self, action: #selector(clickedButton))
         button.keyEquivalent = "\u{1b}"
         let stack = NSStackView(views: [title, digits, note, button])
         stack.orientation = .vertical
@@ -404,37 +418,42 @@ final class CodeWindow: NSObject {
         w.isReleasedWhenClosed = false
         // Above other windows, as an alert would be.
         w.level = .modalPanel
-        window = w
-        self.cancelled = cancelled
-        presentToPerson(w)
+        if let f = screen?.visibleFrame {
+            w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
+        } else {
+            w.center()
+        }
+        return (w, note, button)
     }
 
     /// A line under the code (a wrong try).
     func note(_ text: String) {
-        guard window != nil else { return }
-        note.stringValue = text
+        for c in copies { c.note.stringValue = text }
     }
 
     /// Says how it ended, then goes by itself (or on OK).
     func finish(_ text: String) {
-        guard window != nil else { return }
+        guard showing else { return }
         cancelled = nil
-        note.stringValue = text
-        note.textColor = .labelColor
-        button.title = "OK"
-        button.keyEquivalent = "\r"
+        for c in copies {
+            c.note.stringValue = text
+            c.note.textColor = .labelColor
+            c.button.title = "OK"
+            c.button.keyEquivalent = "\r"
+        }
         let n = shown
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             if self?.shown == n { self?.close() }
         }
     }
 
-    /// Takes the window down, without telling anyone.
+    /// Takes every copy down, without telling anyone.
     func close() {
         cancelled = nil
-        guard let w = window else { return }
-        window = nil
-        w.close()
+        guard showing else { return }
+        let all = copies
+        copies = []
+        for c in all { c.window.close() }
         BuiltInScreen.resume()
     }
 

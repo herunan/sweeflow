@@ -47,7 +47,8 @@ impl MouseState {
             Location::Right if resizable => FrameAction::Resize(ResizeEdge::Right),
             Location::TopRight if resizable => FrameAction::Resize(ResizeEdge::TopRight),
             Location::Button(ButtonKind::Close) if !pressed => FrameAction::Close,
-            Location::Button(ButtonKind::Maximize) if !pressed && !maximized => {
+            // Sweeflow: `resizable` added (the button is hidden then, see Buttons).
+            Location::Button(ButtonKind::Maximize) if !pressed && resizable && !maximized => {
                 FrameAction::Maximize
             }
             Location::Button(ButtonKind::Maximize) if !pressed && maximized => {

@@ -246,6 +246,8 @@ final class WindowTracker {
         // Frontmost toplevel per pid, to parent popups/menus onto.
         var frontToplevel: [pid_t: TrackedWindow] = [:]
         var popups: [TrackedWindow] = []
+        // Windows at the window level too small to be windows of their own (sorted out below).
+        var small: [TrackedWindow] = []
         var badges: [pid_t: [CGRect]] = [:]
         var blindNow: [UInt32: BlindWindow] = [:]
         var helperPopups: [(wid: UInt32, pid: pid_t, frame: CGRect, layer: Int)] = []
@@ -310,8 +312,10 @@ final class WindowTracker {
             // window titled "Window", of its fixed size (other processes see it unshareable,
             // untitled). Taken for a window too small to stream, it was dropped, and the badge
             // never known: erased blind, and an app's buttons misplaced (see settledButtons).
+            // Decided once the app's windows are all known (below): a field the app floats over
+            // its window (Finder's rename box under an icon, one line high) can be just as small.
             if layer == 0, (60...72).contains(bounds.width), (17...23).contains(bounds.height) {
-                badges[pid, default: []].append(bounds)
+                small.append(w)
                 continue
             }
             var realWindow = true
@@ -326,7 +330,10 @@ final class WindowTracker {
                 w.kind = .popup
                 popups.append(w)
             } else if layer == 0 {
-                guard bounds.width >= 40, bounds.height >= 30 else { continue }
+                guard bounds.width >= 40, bounds.height >= 30 else {
+                    if bounds.width >= 12, bounds.height >= 12 { small.append(w) }
+                    continue
+                }
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
                 order.append(wid)
@@ -336,6 +343,24 @@ final class WindowTracker {
                 // to the app. Above are menus, popovers and tooltips.
                 w.kind = layer < 24 ? .dialog : .popup
                 popups.append(w)
+            }
+        }
+        // Small windows at the window level: the capture badge (its fixed size, at the top-left
+        // of another window of the app), or a field floated over one of the app's windows
+        // (Finder's rename box in icon view, a line high: dropped, the name vanished while it
+        // was typed), shown attached to it like a popover. Others are too small to stream.
+        for s in small {
+            let mine = seen.values.filter { $0.pid == s.pid && $0.wid != s.wid }
+            let badgeSized = (60...72).contains(s.frame.width) && (17...23).contains(s.frame.height)
+            if badgeSized, mine.contains(where: { abs($0.frame.minX - s.frame.minX) < 30 && abs($0.frame.minY - s.frame.minY) < 30 }) {
+                badges[s.pid, default: []].append(s.frame)
+            } else if mine.contains(where: { $0.frame.contains(s.frame) }) {
+                var p = s
+                p.kind = .popup
+                popups.append(p)
+            } else if badgeSized {
+                // Its window not listed (yet): as before, a badge.
+                badges[s.pid, default: []].append(s.frame)
             }
         }
         // Capture badges on floating windows aren't always marked unshareable: recognise them by

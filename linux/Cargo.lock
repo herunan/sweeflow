@@ -4947,6 +4947,7 @@ dependencies = [
  "slint",
  "smithay-client-toolkit 0.21.1",
  "tokio",
+ "ttf-parser",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",

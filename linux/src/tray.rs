@@ -490,11 +490,16 @@ fn with_key(label: &str, key: &Option<crate::keys::Key>, column: f32) -> String 
     }
 }
 
-/// GNOME's menu has a tab stop every 32 px, and a tab needs about 8 px of room before the next
-/// one (measured): the first stop a tab after text this wide reaches.
-const TAB: f32 = 32.0;
+/// GNOME's menu has a tab stop every eight spaces (32 px in Adwaita Sans; 24 px in Ubuntu Sans,
+/// whose space is narrower), and a tab needs about 8 px of room before the next one (measured):
+/// the first stop a tab after text this wide reaches.
+fn tab() -> f32 {
+    // The space rounded to whole pixels, as the menu has it (Adwaita Sans's 4.1 px space gives
+    // 32 px stops, not 33).
+    MENU_FONT.as_ref().and_then(|f| f.width(" ")).map(|w| 8.0 * w.round()).filter(|w| *w > 8.0).unwrap_or(32.0)
+}
 fn tab_stop(width: f32) -> f32 {
-    ((width + 8.0) / TAB).ceil()
+    ((width + 8.0) / tab()).ceil()
 }
 
 /// The tab stop the keys start at, so they end where the rows do: the status line (with its dot
@@ -503,12 +508,16 @@ fn key_column(status: &str) -> f32 {
     const KEY: f32 = 38.0; // "⌘⌥Y"
     const DOT: f32 = 22.0;
     // One stop further than where the status line ends: set apart from the item's text.
-    let end = ((text_width(status) + DOT - KEY) / TAB).floor() + 1.0;
+    let end = ((text_width(status) + DOT - KEY) / tab()).floor() + 1.0;
     end.max(tab_stop(text_width("Open Sweeflow")))
 }
 
-/// About how wide a menu item's text is in GNOME's menu font (Adwaita Sans / Cantarell, 11 pt).
+/// How wide a menu item's text is in the desktop's menu font: measured with that font where
+/// it can be found, else about as wide as in GNOME's (Adwaita Sans / Cantarell, 11 pt).
 fn text_width(text: &str) -> f32 {
+    if let Some(w) = MENU_FONT.as_ref().and_then(|f| f.width(text)) {
+        return w;
+    }
     text.chars()
         .map(|c| match c {
             ' ' => 4.2,
@@ -521,6 +530,46 @@ fn text_width(text: &str) -> f32 {
         .sum::<f32>()
         * 1.08
 }
+
+/// The font the tray's menu is drawn in, and its size in pixels.
+struct MenuFont {
+    data: Vec<u8>,
+    px: f32,
+}
+
+impl MenuFont {
+    /// Ubuntu's shell theme draws its menus in Ubuntu Sans whatever the interface font is;
+    /// elsewhere (GNOME, Cinnamon) the interface font setting, e.g. "Adwaita Sans 11".
+    fn find() -> Option<Self> {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+        let schema = if desktop.contains("cinnamon") { "org.cinnamon.desktop.interface" } else { "org.gnome.desktop.interface" };
+        let get = |key: &str| {
+            let out = std::process::Command::new("gsettings").args(["get", schema, key]).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().trim_matches('\'').to_string())
+        };
+        let setting = get("font-name")?;
+        let (family, pt) = setting.rsplit_once(' ').and_then(|(f, p)| Some((f.trim().to_string(), p.parse::<f32>().ok()?)))?;
+        let family = if desktop.contains("ubuntu") { "Ubuntu Sans".to_string() } else { family };
+        let scale = get("text-scaling-factor").and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+        let out = std::process::Command::new("fc-match").args(["-f", "%{file}", &family]).output().ok()?;
+        let file = String::from_utf8_lossy(&out.stdout).to_string();
+        let data = std::fs::read(&file).ok()?;
+        ttf_parser::Face::parse(&data, 0).ok()?;
+        log::info!("tray menu: keys lined up for {family} {pt} pt ({file})");
+        Some(MenuFont { data, px: pt * 96.0 / 72.0 * scale })
+    }
+
+    fn width(&self, text: &str) -> Option<f32> {
+        let face = ttf_parser::Face::parse(&self.data, 0).ok()?;
+        let units: u32 = text
+            .chars()
+            .map(|c| face.glyph_index(c).and_then(|g| face.glyph_hor_advance(g)).unwrap_or(face.units_per_em() / 2) as u32)
+            .sum();
+        Some(units as f32 * self.px / face.units_per_em() as f32)
+    }
+}
+
+static MENU_FONT: LazyLock<Option<MenuFont>> = LazyLock::new(MenuFont::find);
 
 /// The coloured dots for where the Mac in use stands, as Sweeflow's window and widget draw them
 /// (name, colour, a ring): violet streaming (a ring paused), green available, orange busy or
@@ -780,9 +829,13 @@ fn sort_apps(apps: &mut [serde_json::Value], pinned: &[String]) {
     apps.sort_by_key(|a| (pin_pos(a), a["state"].as_u64().unwrap_or(0) == 0, a["name"].as_str().unwrap_or_default().to_lowercase()));
 }
 
-/// Where a linked Mac is (or was last) reached: "address:port".
+/// Where a linked Mac is (or was last) reached: "address:port". Once it goes offline, still the
+/// address it was reached at (not the name it was linked by, which would read as a change).
 fn reached(m: &crate::config::PairedMac, in_use: &str) -> String {
-    crate::net::connected_to().filter(|_| m.fingerprint == in_use).map_or_else(|| m.host.clone(), |a| a.to_string())
+    crate::net::connected_to()
+        .filter(|_| m.fingerprint == in_use)
+        .or_else(|| crate::net::last_reached(&m.fingerprint))
+        .map_or_else(|| m.host.clone(), |a| a.to_string())
 }
 
 /// "address:port" without its port (and an IPv6 address without its brackets).

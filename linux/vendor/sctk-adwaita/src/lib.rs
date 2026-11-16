@@ -130,7 +130,12 @@ where
             title: None,
             title_text: TitleText::new(theme.active.font_color),
             theme,
-            buttons: Buttons::new(get_button_layout_config()),
+            // Sweeflow: starts without a maximise button, as the frame starts not resizable.
+            buttons: {
+                let mut buttons = Buttons::new(get_button_layout_config());
+                buttons.update_wm_capabilities(WindowManagerCapabilities::all(), false);
+                buttons
+            },
             mouse: Default::default(),
             state: WindowState::empty(),
             wm_capabilities: WindowManagerCapabilities::all(),
@@ -399,7 +404,8 @@ where
     fn update_wm_capabilities(&mut self, wm_capabilities: WindowManagerCapabilities) {
         self.dirty |= self.wm_capabilities != wm_capabilities;
         self.wm_capabilities = wm_capabilities;
-        self.buttons.update_wm_capabilities(wm_capabilities);
+        // Sweeflow: no maximise button on a window of a fixed size (as GTK does).
+        self.buttons.update_wm_capabilities(wm_capabilities, self.resizable);
     }
 
     fn set_hidden(&mut self, hidden: bool) {
@@ -421,6 +427,8 @@ where
     fn set_resizable(&mut self, resizable: bool) {
         self.dirty |= self.resizable != resizable;
         self.resizable = resizable;
+        // Sweeflow: the maximise button follows (see update_wm_capabilities).
+        self.buttons.update_wm_capabilities(self.wm_capabilities, resizable);
     }
 
     fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) {

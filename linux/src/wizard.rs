@@ -585,9 +585,34 @@ fn start_link(ui: &Wizard, mac: FoundMac) {
                 ui.set_code_note(if wrong { format!("That's not the code. {tries} left.").into() } else { SharedString::new() });
             });
         };
-        let result = tokio::runtime::Runtime::new()
-            .map_err(anyhow::Error::from)
-            .and_then(|rt| rt.block_on(pair::link(&mac, &cancelled, &mut codes, on_ask)));
+        // A Mac that's asleep, locked or without Sweeflow open is waited for: asked again until
+        // it answers (or the person cancels), rather than turned away to ask again by hand.
+        let weak_wait = weak.clone();
+        let waiting = move |why: SharedString| {
+            let _ = weak_wait.upgrade_in_event_loop(move |ui| {
+                if ATTEMPT.with_borrow(|a| *a == attempt) && !ui.get_code_ready() {
+                    ui.set_code_wrong(false);
+                    ui.set_code_note(why);
+                }
+            });
+        };
+        let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from).and_then(|rt| {
+            rt.block_on(async {
+                loop {
+                    let outcome = pair::link(&mac, &cancelled, &mut codes, on_ask.clone()).await?;
+                    let why = match outcome {
+                        Outcome::Unreachable => "It isn't answering yet. Waiting for it: wake it, and check Sweeflow is open on it.",
+                        Outcome::Locked => "It's locked. Waiting for it: unlock it to see the code.",
+                        other => return Ok(other),
+                    };
+                    waiting(why.into());
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                        _ = cancelled.notified() => return Ok(Outcome::Cancelled),
+                    }
+                }
+            })
+        });
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if ATTEMPT.with_borrow(|a| *a != attempt) {
                 return; // cancelled meanwhile
@@ -677,12 +702,22 @@ fn after_first_link(fingerprint: &str) -> Result<()> {
     crate::setup::start_client()
 }
 
-/// ufw is running (it blocks incoming connections by default).
+/// ufw is switched on (it then blocks incoming connections by default). Ubuntu and Mint keep
+/// ufw.service "active" even with the firewall off (the unit only runs ufw's boot script), so
+/// the switch itself is read: `ENABLED=yes` in ufw.conf, which anyone can read.
 fn firewall_active() -> bool {
-    Command::new("systemctl")
+    let service = Command::new("systemctl")
         .args(["is-active", "--quiet", "ufw"])
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.success());
+    service && std::fs::read_to_string("/etc/ufw/ufw.conf").is_ok_and(|s| ufw_enabled(&s))
+}
+
+fn ufw_enabled(conf: &str) -> bool {
+    conf.lines()
+        .filter_map(|l| l.trim().strip_prefix("ENABLED="))
+        .last()
+        .is_some_and(|v| v.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case("yes"))
 }
 
 /// Lets the local network reach the installer page for a while: one ufw rule, for this
@@ -724,4 +759,18 @@ fn local_network() -> Option<String> {
         .filter_map(|l| l.split_whitespace().next())
         .find(|n| n.contains('/') && !n.starts_with("169.254."))
         .map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ufw_enabled;
+
+    #[test]
+    fn ufw_switch() {
+        assert!(!ufw_enabled("# comment\nENABLED=no\nLOGLEVEL=low\n"));
+        assert!(ufw_enabled("ENABLED=yes\n"));
+        assert!(ufw_enabled("ENABLED=\"yes\"\n"));
+        assert!(!ufw_enabled("#ENABLED=yes\n"));
+        assert!(!ufw_enabled(""));
+    }
 }
