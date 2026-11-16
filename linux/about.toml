@@ -1,0 +1,24 @@
+# The licences cargo-about accepts for the Rust crates Sweeflow is built from (licenses.sh). A crate
+# under any other licence stops the run, so a new copyleft dependency can't slip in unnoticed:
+# decide on it here, on purpose. Where a crate offers a choice ("MIT OR Apache-2.0") one accepted
+# licence is enough.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    # ffmpeg-next and ffmpeg-sys-next, the Rust wrappers only (FFmpeg itself is a system library).
+    "WTFPL",
+    # Slint offers GPL-3.0-only, this one, or a commercial licence. The Royalty-free one lets a
+    # desktop app be distributed under its own licence (MIT) if it shows the Slint badge on its
+    # download page (site/index.html does) or an AboutSlint widget. cargo-about warns that it has
+    # no licence file for those crates; licenses.sh adds the text.
+    "LicenseRef-Slint-Royalty-free-2.0",
+]
+
+# The Linux builds. (Other targets' crates, such as Windows ones, aren't in the binary.)
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

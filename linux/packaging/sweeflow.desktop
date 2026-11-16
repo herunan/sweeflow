@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sweeflow
+GenericName=Mac apps
+Comment=Mac apps on this desktop
+Exec=sweeflow
+Icon=sweeflow
+Terminal=false
+StartupNotify=false
+Categories=Network;RemoteAccess;
+Keywords=mac;macos;stream;
