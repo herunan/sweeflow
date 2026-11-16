@@ -1593,7 +1593,6 @@ final class Session {
             guard let self else { return }
             self.fixedKnown[w.wid] = nil
             self.fixedSpots[w.wid] = nil
-            if w.kind != .popup { Self.lastFrames[w.bundleId] = w.frame }
             let now = DispatchTime.now()
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
@@ -1819,16 +1818,12 @@ final class Session {
             return
         }
         guard audio == nil else { return }
-        let onPCM: (Data, UInt32) -> Void = { [weak self, weak s] pcm, ageUs in
-            self?.queue.async {
-                // Drop rather than queue: late audio is worse than a tiny gap.
-                guard let s, s.pendingBytes < 64_000 else { return }
-                var m = MsgWriter(.audio)
-                m.bytes(pcm)
-                m.u32(ageUs)   // how long after it played it was captured (older clients stop at the sound)
-                s.send(m)
-            }
-        }
+        // Straight to the connection, on a queue of its own: through the session's queue, sound
+        // waited behind window and input work (up to 62 ms while an app started), the pieces
+        // reached Linux in bursts, and its cushion against that grew to 200-300 ms, which put
+        // the sound behind the pictures.
+        let sender = AudioSender(s)
+        let onPCM: (Data, UInt32) -> Void = { pcm, ageUs in sender.send(pcm, ageUs: ageUs) }
         // A Core Audio tap (~10 ms behind the sound); ScreenCaptureKit's (~55 ms) when there's none.
         let allowed: (String) -> Bool = { settings.config.allows($0) }
         let tap = AudioTap(allowed: allowed)
@@ -1962,15 +1957,6 @@ final class Session {
         return out
     }
 
-    /// Where each app's last window was when it went (see sendAdded), kept across restarts.
-    private static var lastFrames: [String: CGRect] {
-        get {
-            let saved = UserDefaults.standard.dictionary(forKey: "lastWindowFrames") as? [String: String] ?? [:]
-            return saved.mapValues { NSRectToCGRect(NSRectFromString($0)) }
-        }
-        set { UserDefaults.standard.set(newValue.mapValues { NSStringFromRect(NSRectFromCGRect($0)) }, forKey: "lastWindowFrames") }
-    }
-
     /// Whether each window's app lets it be resized (looked at once per window).
     private var fixedKnown: [UInt32: Bool] = [:]
     /// Where each window first appeared on its screen (see spot(of:)).
@@ -2014,12 +2000,17 @@ final class Session {
             }
             return announce(w, fixed: false)
         }
-        // Where the app put it, before it's moved onto the virtual display. Reopened just where
-        // its last window was (Calculator does), that's where Sweeflow had arranged it on the
-        // virtual display, not the app's wish: centred then, as Linux desktops place a dialog.
-        // (Calculator opened at the lower-left edge on Mint, lower-right on Omarchy.)
-        let reopened = Self.lastFrames[w.bundleId].map { abs($0.minX - w.frame.minX) < 3 && abs($0.minY - w.frame.minY) < 3 } ?? false
-        let spot = reopened ? (Float(0.5), Float(0.5)) : Self.spot(of: w.frame)
+        // Where the app put it, before it's moved onto the virtual display. One that appears on
+        // the virtual display itself was placed on a screen nobody sees, which Sweeflow arranges
+        // (Calculator reopens where it was there, near its top-left): that spot means nothing
+        // on Linux, so it's centred there, as Linux desktops place a dialog. (Calculator opened
+        // at the lower-left edge on Mint, lower-right on Omarchy, top-left later.)
+        let center = CGPoint(x: w.frame.midX, y: w.frame.midY)
+        let onVirtual = vdArea?.insetBy(dx: -1, dy: -40).contains(center) ?? false
+        let spot = onVirtual ? (Float(0.5), Float(0.5)) : Self.spot(of: w.frame)
+        if fixedSpots[w.wid] == nil {
+            log("window \(w.wid) (\(w.appName)) appeared at \(Int(w.frame.minX)),\(Int(w.frame.minY))\(onVirtual ? " on the virtual display: centred" : ": spot \(spot.0),\(spot.1)")")
+        }
         fixedSpots[w.wid] = fixedSpots[w.wid] ?? spot
         if let fixed = fixedKnown[w.wid] { return announce(w, fixed: fixed) }
         final class Once { var sent = false }

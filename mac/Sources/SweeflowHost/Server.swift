@@ -63,6 +63,33 @@ final class MsgStream {
     }
 }
 
+/// Sends the Mac's sound on its stream from a queue of its own, not the session's (see
+/// Session.updateAudio). The connection takes sends from any queue; the bytes waiting are
+/// counted here.
+final class AudioSender {
+    private let conn: NWConnection
+    private let queue = DispatchQueue(label: "sweeflow.audio-send", qos: .userInteractive)
+    private var pending = 0
+
+    init(_ stream: MsgStream) { conn = stream.conn }
+
+    func send(_ pcm: Data, ageUs: UInt32) {
+        queue.async { [self] in
+            // Dropped rather than queued: late sound is worse than a tiny gap.
+            guard pending < 64_000 else { return }
+            var m = MsgWriter(.audio)
+            m.bytes(pcm)
+            m.u32(ageUs)   // how long after it played it was captured (older clients stop at the sound)
+            let d = m.framed
+            pending += d.count
+            conn.send(content: d, completion: .contentProcessed { [weak self] _ in
+                guard let self else { return }
+                self.queue.async { self.pending -= d.count }
+            })
+        }
+    }
+}
+
 /// What to do with a hello while another client has the session.
 enum Claim: Equatable {
     /// The one holding it is the same computer (a reconnect) or has gone quiet: replaced silently.
