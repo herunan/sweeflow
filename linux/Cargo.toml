@@ -3,6 +3,7 @@ name = "sweeflow"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Mac apps as windows on a Linux desktop"
 
 [dependencies]
 libc = "0.2"
@@ -40,6 +41,35 @@ zbus = "5"
 # Measures the menu font (tray.rs: lining up the keys at the end of the tray menu rows).
 ttf-parser = "0.25"
 zvariant = "5.15"
+
+# The Debian package (build-deb.sh, cargo-deb). Only what every user shares goes in it: the binary,
+# the licences, a launcher and the icon. The per-user side (systemd user unit, autostart entry, tray
+# icons, Plasma widget, shortcuts) is written by `sweeflow install` itself, which also puts a copy of
+# the binary in ~/.local/bin, and the launcher and icon it writes there take over from these.
+#
+# depends = "$auto": cargo-deb runs dpkg-shlibdeps on the binary, so the FFmpeg package names
+# (libavcodec61 on Debian 13, libavcodec60 on Ubuntu 24.04, ...) are the ones of the system the .deb
+# is built on. FFmpeg's sonames differ between releases, so one .deb is built per target release, on that
+# release (a container is enough), and the release uploads the one for the newest Ubuntu/Debian under
+# sweeflow_amd64.deb. Nothing is listed by hand: a hand-written list would go stale.
+[package.metadata.deb]
+name = "sweeflow"
+maintainer = "Hernán Romero <herunan@users.noreply.github.com>"
+copyright = "2026, Hernán Romero"
+license-file = ["../LICENSE", "0"]
+section = "net"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+Shows the apps of a Mac as windows on this Linux desktop, over the network.
+Run `sweeflow install` once as your user to start it with your desktop; it \
+then offers to link a Mac."""
+assets = [
+    ["target/release/sweeflow", "usr/bin/sweeflow", "755"],
+    ["target/THIRD-PARTY-LICENSES.html", "usr/share/doc/sweeflow/THIRD-PARTY-LICENSES.html", "644"],
+    ["packaging/sweeflow.desktop", "usr/share/applications/sweeflow.desktop", "644"],
+    ["../assets/sweeflow-app.svg", "usr/share/icons/hicolor/scalable/apps/sweeflow.svg", "644"],
+]
 
 # sctk-adwaita with two small changes (see vendor/sctk-adwaita/SWEEFLOW.md): a double click on the title bar
 # doesn't maximise Sweeflow's fixed-size windows on GNOME.

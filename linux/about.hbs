@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sweeflow third-party licences</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { white-space: pre-wrap; background: #f4f4f4; padding: 0.8rem; border-radius: 6px; }
+  .used-by { font-size: 13px; }
+  @media (prefers-color-scheme: dark) { body { background: #16161a; color: #ddd; } pre { background: #232329; } a { color: #9ab; } }
+</style>
+</head>
+<body>
+<h1>Sweeflow third-party licences</h1>
+<p>Sweeflow itself is MIT licensed. It is built from the Rust crates below, each under the licence shown.
+It also loads FFmpeg and other system libraries at run time; those are separate packages with their own licences.</p>
+
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+
+<h2>Licences</h2>
+<ul class="licenses">
+{{#each licenses}}
+  <li class="license" id="{{id}}">
+    <h3>{{name}}</h3>
+    <h4>Used by</h4>
+    <ul class="used-by">
+    {{#each used_by}}
+      <li>{{crate.name}} {{crate.version}}{{#if crate.repository}} (<a href="{{crate.repository}}">{{crate.repository}}</a>){{/if}}</li>
+    {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </li>
+{{/each}}
+</ul>
+<!--SLINT-->
+</body>
+</html>
