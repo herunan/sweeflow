@@ -152,7 +152,7 @@ fn bind_open_key() {
 /// Hyprland runs it through, and the whole command for a Lua string.
 fn own_command(arg: &str) -> Option<String> {
     let home = std::env::var_os("HOME")?;
-    let bin = std::path::Path::new(&home).join(".local/bin/sweeflow").display().to_string();
+    let bin = crate::setup::installed_binary(std::path::Path::new(&home)).display().to_string();
     Some(format!("'{}' {arg}", bin.replace('\'', r"'\''")).replace('\\', r"\\").replace('"', "\\\""))
 }
 

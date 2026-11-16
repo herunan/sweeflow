@@ -44,8 +44,9 @@ zvariant = "5.15"
 
 # The Debian package (build-deb.sh, cargo-deb). Only what every user shares goes in it: the binary,
 # the licences, a launcher and the icon. The per-user side (systemd user unit, autostart entry, tray
-# icons, Plasma widget, shortcuts) is written by `sweeflow install` itself, which also puts a copy of
-# the binary in ~/.local/bin, and the launcher and icon it writes there take over from these.
+# icons, Plasma widget, shortcuts) is written by `sweeflow install` (or the first `sweeflow open`, which
+# this launcher runs), and runs /usr/bin/sweeflow itself, so the package's upgrades reach it (see
+# setup::installed_binary).
 #
 # depends = "$auto": cargo-deb runs dpkg-shlibdeps on the binary, so the FFmpeg package names
 # (libavcodec61 on Debian 13, libavcodec60 on Ubuntu 24.04, ...) are the ones of the system the .deb
@@ -62,8 +63,8 @@ priority = "optional"
 depends = "$auto"
 extended-description = """\
 Shows the apps of a Mac as windows on this Linux desktop, over the network.
-Run `sweeflow install` once as your user to start it with your desktop; it \
-then offers to link a Mac."""
+Open Sweeflow from the app menu (or run `sweeflow install`) once as your user: \
+it starts with your desktop from then on, and offers to link a Mac."""
 assets = [
     ["target/release/sweeflow", "usr/bin/sweeflow", "755"],
     ["target/THIRD-PARTY-LICENSES.html", "usr/share/doc/sweeflow/THIRD-PARTY-LICENSES.html", "644"],

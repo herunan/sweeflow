@@ -134,7 +134,8 @@ pub fn start_client() -> Result<()> {
     }
 }
 
-/// Installs this binary to ~/.local/bin and a systemd user service that runs it with the
+/// Installs this binary to ~/.local/bin (unless a package put it under /usr: see
+/// installed_binary) and a systemd user service that runs it with the
 /// desktop session (restarting it if it ever exits).
 /// `sweeflow install` has put the user service in place.
 pub fn service_installed() -> bool {
@@ -143,15 +144,25 @@ pub fn service_installed() -> bool {
         .is_some_and(|h| h.join(".config/systemd/user/sweeflow.service").exists())
 }
 
+/// The binary the service, launchers and shortcuts run: the system's copy where a package put
+/// it (under /usr: the package's upgrades then reach it), else the user's own in ~/.local/bin,
+/// where `install` copies it.
+pub fn installed_binary(home: &std::path::Path) -> std::path::PathBuf {
+    match std::env::current_exe() {
+        Ok(me) if me.starts_with("/usr/") => me,
+        _ => home.join(".local/bin/sweeflow"),
+    }
+}
+
 pub fn install() -> Result<()> {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
     let bin_dir = home.join(".local/bin");
     let unit_dir = home.join(".config/systemd/user");
-    std::fs::create_dir_all(&bin_dir)?;
     std::fs::create_dir_all(&unit_dir)?;
-    let target = bin_dir.join("sweeflow");
+    let target = installed_binary(&home);
     let me = std::env::current_exe()?;
     if me != target {
+        std::fs::create_dir_all(&bin_dir)?;
         // Copy to a temp name then rename, so a running copy is replaced atomically.
         let tmp = bin_dir.join(".sweeflow.new");
         std::fs::copy(&me, &tmp)?;
@@ -291,7 +302,7 @@ pub fn write_launcher(home: &std::path::Path) -> Result<()> {
     let apps = home.join(".local/share/applications");
     std::fs::create_dir_all(&apps)?;
     let file = apps.join(LAUNCHER);
-    let entry = launcher_entry(&home.join(".local/bin/sweeflow").display().to_string());
+    let entry = launcher_entry(&installed_binary(home).display().to_string());
     if std::fs::read_to_string(&file).ok().as_deref() != Some(entry.as_str()) {
         std::fs::write(file, entry)?;
     }
@@ -899,7 +910,7 @@ fn gnome_custom_key(home: &std::path::Path, our_path: &str, name: &str, arg: &st
     }
     // The shortcut first, then its place in the list, so GNOME never sees half of it.
     let ours = format!("{GNOME_KEYS}.custom-keybinding:{our_path}");
-    let command = format!("{} {arg}", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
+    let command = format!("{} {arg}", command_word(&installed_binary(home).display().to_string()));
     gsettings(&["set", &ours, "name", &gvariant_str(name)])?;
     gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
     gsettings(&["set", &ours, "binding", &gvariant_str(key)])?;
@@ -947,7 +958,7 @@ fn cinnamon_custom_key(home: &std::path::Path, id: &str, name: &str, arg: &str, 
         }
     }
     let ours = cinnamon_schema(id);
-    let command = format!("{} {arg}", command_word(&home.join(".local/bin/sweeflow").display().to_string()));
+    let command = format!("{} {arg}", command_word(&installed_binary(home).display().to_string()));
     gsettings(&["set", &ours, "name", &gvariant_str(name)])?;
     gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
     gsettings(&["set", &ours, "binding", &format!("[{}]", gvariant_str(key))])?;
