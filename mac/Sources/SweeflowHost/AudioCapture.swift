@@ -6,13 +6,16 @@ import AudioToolbox
 /// Captures the audio of the streamed apps (all of them, mixed) and hands out 48 kHz stereo
 /// 16-bit PCM. The app list is refreshed every few seconds so newly launched apps are heard.
 final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
-    var onPCM: ((Data) -> Void)?
+    /// Each piece of sound, and how long after it played it was handed over here (µs).
+    var onPCM: ((Data, UInt32) -> Void)?
     private let allowed: (String) -> Bool
     private let queue = DispatchQueue(label: "sweeflow.audio", qos: .userInteractive)
     private var stream: SCStream?
     private var apps: Set<String> = []
     private var timer: DispatchSourceTimer?
     private var stopped = false
+    /// Failed starts in a row (for the wait before the next try).
+    private var failures = 0
     private var peak: Float = 0
     private var lastLevelLog = Date()
 
@@ -81,12 +84,30 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                     log("audio output: \(error)"); return
                 }
                 self.stream = s
-                s.startCapture { err in
-                    if let err { log("audio capture failed: \(err)") } else { log("audio capture: \(ids.sorted())") }
+                s.startCapture { [weak self] err in
+                    guard let err else {
+                        self?.queue.async { self?.failures = 0 }
+                        return log("audio capture: \(ids.sorted())")
+                    }
+                    // Most often while the virtual display is being set up or changing. The failed
+                    // stream was kept and never started again: no Mac sound for the whole session.
+                    self?.queue.async {
+                        guard let self, self.stream === s else { return }
+                        // 2 s, then less and less often, to once a minute (a Mac with no sound
+                        // device fails every time).
+                        let wait = min(60.0, 2.0 * pow(2.0, Double(self.failures)))
+                        self.failures += 1
+                        log("audio capture failed: \(err.localizedDescription); trying again in \(Int(wait)) s")
+                        self.stream = nil
+                        self.apps = []
+                        self.queue.asyncAfter(deadline: .now() + wait) { self.refresh() }
+                    }
                 }
             }
         }
     }
+
+    private var ageSum = 0.0, ageN = 0, ageMax = 0.0, framesSum = 0
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sb.isValid, let fmt = CMSampleBufferGetFormatDescription(sb),
@@ -134,9 +155,24 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
-        onPCM?(out)
+        // How old the sound is on arrival here (its start, by the host clock): what capturing
+        // it adds to its delay, sent with it so Linux keeps it in step with the pictures
+        // whatever this Mac and its macOS take.
+        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        var ageUs: UInt32 = 0
+        if pts.isValid {
+            let age = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(pts)
+            ageSum += age; ageN += 1; ageMax = max(ageMax, age); framesSum += frames
+            ageUs = UInt32(max(0, min(age, 2)) * 1_000_000)
+        }
+        onPCM?(out, ageUs)
         if Date().timeIntervalSince(lastLevelLog) > 5 {
             log(String(format: "audio: peak level %.3f over the last 5s", peak))
+            if ageN > 0 {
+                log(String(format: "audio: captured %.0f ms after it played on average (worst %.0f), %d frames a buffer",
+                           ageSum / Double(ageN) * 1000, ageMax * 1000, framesSum / ageN))
+            }
+            ageSum = 0; ageN = 0; ageMax = 0; framesSum = 0
             peak = 0
             lastLevelLog = Date()
         }
@@ -144,6 +180,11 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("audio stream stopped: \(error)")
-        queue.async { self.stream = nil }
+        queue.async {
+            guard self.stream === stream else { return }
+            self.stream = nil
+            self.apps = []
+            self.queue.asyncAfter(deadline: .now() + 2) { self.refresh() }
+        }
     }
 }

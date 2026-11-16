@@ -1,0 +1,240 @@
+// How Sweeflow's own windows look: colours, fonts and corners that look.rs reads from the desktop,
+// and the few controls drawn with them. A window built from these sits in GNOME, Omarchy or
+// Plasma like one of that desktop's own dialogs, instead of bringing one look everywhere.
+
+export global Look {
+    in-out property <color> bg: #1e1e22;
+    in-out property <color> fg: #f2f2f4;
+    in-out property <color> accent: #8b5cf6;
+    in-out property <color> on-accent: #ffffff;
+    in-out property <length> radius: 8px;
+    // Font families; empty: the toolkit's own.
+    in-out property <string> font;
+    in-out property <string> mono;
+    // Controls drawn as outlines (Omarchy) instead of filled shapes.
+    in-out property <bool> outlined;
+    out property <color> muted: fg.transparentize(0.38);
+    out property <color> surface: fg.transparentize(0.93);
+    out property <color> line: fg.transparentize(0.7);
+    out property <color> danger: #e5484d;
+}
+
+export component Label inherits Text {
+    color: Look.fg;
+    font-size: 13px;
+    wrap: word-wrap;
+}
+
+// Secondary text: explanations under a heading.
+export component Dim inherits Label {
+    color: Look.muted;
+}
+
+// A player's sign, drawn (a font's ▶ ⏸ ⏹ come out as colour emoji): "start" or "resume" a
+// triangle, "pause" two bars, "stop" a square; anything else nothing.
+export component Sign inherits Rectangle {
+    in property <string> kind;
+    in property <color> ink: Look.fg;
+    width: 11px;
+    height: 11px;
+    if root.kind == "start" || root.kind == "resume": Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 11;
+        viewbox-height: 11;
+        commands: "M 1.5 0.5 L 10.5 5.5 L 1.5 10.5 Z";
+        fill: root.ink;
+    }
+    if root.kind == "pause": Rectangle { x: 1px; width: 3px; height: 11px; background: root.ink; }
+    if root.kind == "pause": Rectangle { x: 7px; width: 3px; height: 11px; background: root.ink; }
+    if root.kind == "stop": Rectangle { x: 1px; y: 1px; width: 9px; height: 9px; background: root.ink; }
+}
+
+export component Btn inherits Rectangle {
+    in property <string> text;
+    // A sign before the text (see Sign); none by default.
+    in property <string> sign;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 34px;
+    min-width: max(84px, label.preferred-width + 32px + (root.sign != "" ? 18px : 0px));
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    opacity: root.enabled ? 1 : 0.45;
+    border-radius: Look.radius;
+    border-width: scope.has-focus ? 2px : Look.outlined ? 1px : 0px;
+    border-color: scope.has-focus ? Look.fg : root.primary ? Look.accent : Look.line;
+    background: root.primary
+        ? (touch.has-hover && root.enabled ? Look.accent.brighter(0.12) : Look.accent)
+        : Look.fg.transparentize(touch.pressed ? 0.8 : touch.has-hover && root.enabled ? 0.86 : Look.outlined ? 0.96 : 0.9);
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+    scope := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 7px;
+        if root.sign != "": VerticalLayout {
+            alignment: center;
+            Sign { kind: root.sign; ink: root.primary ? Look.on-accent : Look.fg; }
+        }
+        label := Text {
+            text: root.text;
+            color: root.primary ? Look.on-accent : Look.fg;
+            font-size: 13px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// One line of typed text.
+export component Field inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> input.text;
+    callback accepted(string);
+    height: 34px;
+    horizontal-stretch: 1;
+    clip: true;
+    border-radius: Look.radius;
+    border-width: 1px;
+    border-color: input.has-focus ? Look.accent : Look.line;
+    background: Look.surface;
+    forward-focus: input;
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        visible: input.text == "";
+        text: root.placeholder;
+        color: Look.muted;
+        font-size: 13px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        single-line: true;
+        vertical-alignment: center;
+        color: Look.fg;
+        font-size: 13px;
+        selection-background-color: Look.accent;
+        selection-foreground-color: Look.on-accent;
+        accepted => {
+            root.accepted(self.text);
+        }
+    }
+}
+
+// Something is going on: three quarters of a ring, turning.
+export component Spin inherits Rectangle {
+    in property <length> size: 20px;
+    property <angle> at: 360deg * mod(animation-tick() / 900ms, 1);
+    width: root.size;
+    height: root.size;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 100;
+        viewbox-height: 100;
+        fill: transparent;
+        stroke: Look.accent;
+        stroke-width: root.size / 8;
+        MoveTo {
+            x: 50 + 40 * cos(root.at);
+            y: 50 + 40 * sin(root.at);
+        }
+        ArcTo {
+            x: 50 + 40 * cos(root.at + 270deg);
+            y: 50 + 40 * sin(root.at + 270deg);
+            radius-x: 40;
+            radius-y: 40;
+            sweep: true;
+            large-arc: true;
+        }
+    }
+}
+
+// Hover hints. A control that has a hint tells `Tip` where it is while the pointer is over it
+// (Tip.enter / Tip.leave); one TipBubble at the end of the window draws it after a short wait,
+// above everything and kept inside the window. Slint has no tooltips of its own.
+export global Tip {
+    in-out property <string> want;
+    in-out property <length> ax;
+    in-out property <length> ay;
+    in-out property <length> ah;
+
+    public function enter(text: string, x: length, y: length, w: length, h: length) {
+        root.want = text;
+        root.ax = x + w / 2;
+        root.ay = y;
+        root.ah = h;
+    }
+    public function leave() {
+        root.want = "";
+    }
+
+    // What the stream signs (start, pause, resume, stop) do.
+    pure public function stream(id: string) -> string {
+        return id == "start" ? "Start streaming (Super+Alt+Z)" : id == "pause" ? "Pause streaming (Super+Alt+Y)" : id == "resume" ? "Resume streaming (Super+Alt+Y)" : id == "stop" ? "Stop streaming (Super+Alt+Z)" : "";
+    }
+}
+
+export component TipBubble inherits Rectangle {
+    // The window's size, to keep the bubble inside it.
+    in property <length> bounds-w;
+    in property <length> bounds-h;
+    property <string> w: Tip.want;
+    property <string> ready;
+    property <bool> shown: Tip.want != "" && root.ready == Tip.want;
+    property <length> bw: label.preferred-width + 16px;
+    property <length> bh: 24px;
+    changed w => { if (self.w == "") { self.ready = ""; } }
+
+    Timer {
+        interval: 450ms;
+        running: Tip.want != "" && root.ready != Tip.want;
+        triggered => { root.ready = Tip.want; }
+    }
+
+    visible: root.shown;
+    width: root.bw;
+    height: root.bh;
+    x: max(4px, min(Tip.ax - root.bw / 2, root.bounds-w - root.bw - 4px));
+    y: Tip.ay + Tip.ah + 4px + root.bh > root.bounds-h ? Tip.ay - root.bh - 4px : Tip.ay + Tip.ah + 4px;
+    border-radius: min(Look.radius, 6px);
+    border-width: 1px;
+    border-color: Look.line;
+    background: Look.bg.mix(Look.fg, 0.9);
+    label := Text {
+        x: 8px;
+        text: Tip.want;
+        color: Look.fg;
+        font-size: 12px;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+}

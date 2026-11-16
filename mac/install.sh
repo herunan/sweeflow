@@ -80,12 +80,20 @@ STAGE=$(mktemp -d)
 ./bundle.sh "$BIN" "$STAGE/Sweeflow.app" "$VERSION" "$BUILD"
 codesign --force --timestamp=none --options runtime --keychain "$KEYCHAIN" -s "$SIGN_NAME" \
     -i "$BUNDLE_ID" "$STAGE/Sweeflow.app"
+# With the lid closed and no monitor, Sweeflow's display is the Mac's only one: a stand-in holds
+# one up until the new copy's is there, or the Mac sleeps and locks in between. (It quits by
+# itself when that isn't so.)
+OLD=$(pgrep -x SweeflowHost || true)
+if [ -n "$OLD" ] && [ -x "$APP/Contents/MacOS/SweeflowHost" ]; then
+    nohup "$APP/Contents/MacOS/SweeflowHost" --hold-display >>"$LOG" 2>&1 &
+    sleep 1
+fi
 launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
 # The app's own login item (SMAppService) goes stale whenever the app is replaced in place
 # (launchd then refuses to start it), so a plain LaunchAgent runs it here; the app sees that and
 # leaves its own login item alone.
 launchctl bootout "gui/$(id -u)/dev.sweeflow.agent" 2>/dev/null || true
-pkill -x SweeflowHost 2>/dev/null || true
+kill $OLD 2>/dev/null || true
 rm -rf "$APP"
 mv "$STAGE/Sweeflow.app" "$APP"
 rmdir "$STAGE"

@@ -100,11 +100,19 @@ setvbuf(stderr, nil, _IOLBF, 0)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
-// `SweeflowHost --pair`: ask the running Sweeflow to open pairing, then quit.
+// `SweeflowHost --pair`: ask the running Sweeflow to show how to link a Linux machine, then quit.
 if CommandLine.arguments.contains("--pair") {
     DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.pair"), object: nil,
                                                                  userInfo: nil, deliverImmediately: true)
     exit(0)
+}
+
+// `SweeflowHost --hold-display`: keeps a stand-in display up while Sweeflow restarts (an update),
+// then quits once the new Sweeflow's own display is up (a minute at most). With the lid closed
+// and no monitor, the virtual display is the Mac's only one: it went with the old process, and
+// the Mac fell asleep and locked before the new one was up.
+if CommandLine.arguments.contains("--hold-display") {
+    VirtualDisplay.holdDuringRestart()
 }
 
 // Opened by hand (Finder, Launchpad): the copy macOS keeps running is the one that serves Linux.
@@ -162,11 +170,15 @@ final class HostState {
     var client: String? {
         didSet { if client != oldValue { NotificationCenter.default.post(name: .sweeflowConnectionChanged, object: nil) } }
     }
+    /// What that computer calls itself (said in its hello; empty from older ones). Main thread.
+    var clientSaysName = ""
     private var teardown: DispatchWorkItem?
 
     private var mutedByUs = false
 
     init() {
+        // Hidden by a run that ended without putting it back (a crash, a forced quit).
+        DockHider.restore()
         NotificationCenter.default.addObserver(forName: .sweeflowSettingsChanged, object: nil, queue: .main) { [weak self] _ in
             self?.apply()
         }
@@ -187,6 +199,7 @@ final class HostState {
         teardown?.cancel()
         BuiltInScreen.setConnected(true)
         undimForGood()
+        DockHider.hide()
         apply()
     }
 
@@ -207,6 +220,7 @@ final class HostState {
             guard let self, self.sessions == 0 else { return }
             log("no client: removing virtual display, allowing sleep")
             self.display.remove()
+            DockHider.restore()
             self.wake.release()
             self.wake.releaseReachable()
             self.setMuted(false)
@@ -216,6 +230,14 @@ final class HostState {
             if dimmed { dimmed = false; BuiltInScreen.stopDimming() }
             log("client left: tidying up now")
             work.perform()
+            // Not asleep straight away, though: a computer restarting Sweeflow (an update, a
+            // restart, Stop then Start) says goodbye too, and a Mac idle for a while slept the
+            // moment it was let go, before that computer was back.
+            wake.holdReachable()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard let self, self.sessions == 0 else { return }
+                self.wake.releaseReachable()
+            }
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
         }
@@ -268,12 +290,15 @@ final class HostState {
 
 let host = HostState()
 Wakefulness.resetLidSleep()   // in case a previous run died while streaming
+ScrollAcceleration.reload()
 BuiltInScreen.restore()
 // Started afresh (after a crash, an update): never dimmed from the start.
 if settings.config.dimMacScreenWhileStreaming { settings.update { $0.dimMacScreenWhileStreaming = false } }
 
 let server = Server(identity: identity) { group, queue in Session(group: group, queue: queue) }
 do { try server.start(port: settings.config.port) } catch { log("listen failed: \(error)"); exit(1) }
+// Link requests are taken for as long as Sweeflow runs (nothing has to be opened here first).
+Pairing.shared.start()
 
 let debugPort = DebugPort()
 if settings.config.debugPort != 0 { debugPort.start(port: settings.config.debugPort) }
@@ -287,7 +312,7 @@ if Identity.pairedClients().isEmpty {
 } else if !Onboarding.complete {
     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { if !Onboarding.complete { Onboarding.shared.show() } }
 }
-// Opens pairing from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
+// Shows how to link from elsewhere on this Mac (`SweeflowHost --pair`, or a script).
 DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.pair"), object: nil, queue: .main) { _ in
     PairingWindow.shared.show()
 }

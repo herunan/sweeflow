@@ -95,6 +95,54 @@ final class VirtualDisplay {
     }
 
     /// Creates or resizes the display to `points` (logical size of the Linux monitor).
+    /// Whether the Mac's own screen is shut (lid closed) and no other display than Sweeflow's is
+    /// on: then Sweeflow's virtual display is all that keeps the Mac awake and unlocked.
+    static var onlyDisplayLeft: Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &n)
+        return !ids.prefix(Int(n)).contains { CGDisplayVendorNumber($0) != 0x4D46 }
+    }
+
+    /// See `--hold-display` in main.swift. Never returns.
+    static func holdDuringRestart() -> Never {
+        // SWEEFLOW_HOLD_ANYWAY: held with other displays up too (to try it with the lid open).
+        guard onlyDisplayLeft || ProcessInfo.processInfo.environment["SWEEFLOW_HOLD_ANYWAY"] != nil else { exit(0) }
+        let desc = CGVirtualDisplayDescriptor()
+        desc.queue = DispatchQueue.main
+        desc.name = "Sweeflow (restarting)"
+        desc.maxPixelsWide = 1280; desc.maxPixelsHigh = 800
+        desc.sizeInMillimeters = CGSize(width: 300, height: 190)
+        desc.vendorID = 0x4D46
+        desc.productID = 0x0002
+        desc.serialNum = 2
+        guard let vd = CGVirtualDisplay(descriptor: desc) else { log("hold display: creation failed"); exit(1) }
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 0
+        settings.modes = [CGVirtualDisplayMode(width: 1280, height: 800, refreshRate: 60)]
+        guard vd.apply(settings) else { log("hold display: applySettings failed"); exit(1) }
+        log("hold display: up while Sweeflow restarts")
+        let mine = vd.displayID
+        let start = Date()
+        // The old Sweeflow's display is still up as this starts (it goes when that copy is
+        // stopped): taken for the new one's, this let go before the new copy was there. So the
+        // old one must go first, then the new one be up for 3 s (looked at four times a second: the gap between them can be short). (The new one may
+        // get the old one's display number: same maker, model and serial.)
+        var oldGone = false, upFor = 0
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+            var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+            CGGetOnlineDisplayList(16, &ids, &n)
+            let sweeflow = ids.prefix(Int(n)).contains { $0 != mine && CGDisplayVendorNumber($0) == 0x4D46 }
+            if !sweeflow, !oldGone { oldGone = true; log("hold display: the old copy's display is gone") }
+            upFor = oldGone && sweeflow ? upFor + 1 : 0
+            if upFor >= 12 || Date().timeIntervalSince(start) > 60 {
+                log("hold display: \(upFor >= 12 ? "Sweeflow's display is back" : "timed out"), letting go")
+                withExtendedLifetime(vd) { exit(0) }
+            }
+        }
+        RunLoop.main.run()
+        exit(0)
+    }
+
     func ensure(points: CGSize) {
         let w = UInt32(points.width.rounded()), h = UInt32(points.height.rounded())
         guard w >= 640, h >= 480 else { return }
@@ -161,16 +209,18 @@ final class Wakefulness {
             }
         }
         // Closing the lid sleeps a MacBook regardless of assertions; `pmset disablesleep` is the
-        // only switch. `sweeflow setup` installs a sudoers rule allowing exactly these two calls.
-        lidSleepDisabled = setLidSleep(disabled: true)
+        // only switch, run through sudo: it needs a sudoers rule allowing exactly these two calls
+        // (none is installed yet; without it, closing the lid on battery sleeps the Mac).
+        lidSleepDisabled = true
+        Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
     }
 
     func release() {
         assertions.forEach { IOPMAssertionRelease($0) }
         assertions.removeAll()
         if lidSleepDisabled {
-            _ = setLidSleep(disabled: false)
             lidSleepDisabled = false
+            Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: false) }
         }
     }
 
@@ -192,6 +242,10 @@ final class Wakefulness {
         if let id = reachable { IOPMAssertionRelease(id) }
         reachable = nil
     }
+
+    /// `sudo pmset` is another process: waited for here, not on the main thread (hold and release
+    /// are called there). One at a time, in order, so a release never lands before its hold.
+    private static let pmsetQueue = DispatchQueue(label: "sweeflow.pmset")
 
     /// Restores normal lid-close sleep (e.g. after a crash left it disabled).
     static func resetLidSleep() { _ = Wakefulness().setLidSleep(disabled: false) }

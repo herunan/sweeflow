@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="4.5 2.6 119 119">
+  <!-- The tray logo outside Plasma: the same diagonal sweet as Plasma's widget (plasmoid
+       icons/sweeflow-tray.svg), solid, in near-white. setup.rs adds the status dot in the empty
+       bottom-right corner, one icon per state (sweeflow-tray-<state>). The view is cut to the
+       logo's own width (its widest way), so a tray draws it as big as its slot allows. -->
+  <g transform="translate(64 64) rotate(-20) scale(1.2)" fill="#fcfcfc">
+    <path d="M-23 -3 C-29 -4.5 -36 -18 -43 -17 C-50 -16.00 -50 -6.67 -43 -5.67 C-50 -4.67 -50 4.67 -43 5.67 C-50 6.67 -50 16.00 -43 17.00 C-36 18 -29 4.5 -23 3 Z"/>
+    <path d="M23 -3 C29 -4.5 36 -18 43 -17 C50 -16.00 50 -6.67 43 -5.67 C50 -4.67 50 4.67 43 5.67 C50 6.67 50 16.00 43 17.00 C36 18 29 4.5 23 3 Z"/>
+    <path d="M0 -12 C6 -18 22 -19.5 24 -4 C25.5 8 17.5 22 9 22 C5.5 22 3 20.5 0 20.5 C-3 20.5 -5.5 22 -9 22 C-17.5 22 -25.5 8 -24 -4 C-22 -19.5 -6 -18 0 -12 Z"/>
+    <path d="M-1.7 -12 L-1.7 -17 C-1.7 -20 -.5 -22.5 1.5 -24.5 L3.7 -22.6 C2.3 -21 1.7 -19.5 1.7 -17 L1.7 -12 Z"/>
+    <path d="M5 -19 C8 -27 14 -30 21 -28.5 C18 -21 12 -18 5 -19 Z"/>
+  </g>
+</svg>

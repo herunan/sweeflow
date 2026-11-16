@@ -1,12 +1,13 @@
 //! The tray icon: streaming on and off, which Mac apps, and the features, with the same switches
 //! as the Mac's menu-bar item. The Mac keeps the settings; changing them on either side changes
-//! them on both.
+//! them on both. Stop (the choice kept across restarts) lets go of the Mac altogether, Start takes
+//! it back; Pause keeps the connection and only stops the windows coming here, until Resume.
 
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use ksni::{
     blocking::{Handle, TrayMethods},
-    menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu},
+    menu::StandardItem,
     MenuItem, ToolTip,
 };
 use serde::{Deserialize, Serialize};
@@ -72,12 +73,15 @@ struct State {
     pending: serde_json::Map<String, serde_json::Value>,
     /// Pinned Mac apps (bundle ids, in order): first in the tray's Apps page, kept in the Dock.
     pinned: Vec<String>,
-    /// Where Mac apps show up (task manager, Mac Dock, Global Menu), as last looked at.
+    /// Where Mac apps show up (task manager, Global Menu), as last looked at.
     placement: crate::placement::Placement,
     /// When Sweeflow was last opened from the app menu (ms since the epoch): the widget pops up.
     show_at: u64,
-    /// The Mac disconnected this computer from its own menu (it refuses until connected there).
+    /// The Mac stopped this computer from its own menu (it refuses until allowed there again).
     mac_refused: bool,
+    /// The Mac is streaming to another computer (its name): this one waits, looking again now
+    /// and then, and streams once it's free. Start can't be chosen meanwhile.
+    elsewhere: Option<String>,
 }
 
 static STATE: LazyLock<Mutex<State>> =
@@ -94,10 +98,32 @@ static STATE: LazyLock<Mutex<State>> =
 static REFRESH: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
 static NET: OnceLock<UnboundedSender<NetCmd>> = OnceLock::new();
 
-pub fn start(net: UnboundedSender<NetCmd>) {
+/// The connection to the Mac is being made (a Mac is linked): the tray's actions can reach it.
+pub fn set_net(net: UnboundedSender<NetCmd>) {
     let _ = NET.set(net);
+    refresh();
+}
+
+/// No Mac linked yet: the tray offers only "Link a Mac…".
+fn unpaired() -> bool {
+    NET.get().is_none() && crate::config::Config::load_or_default().is_ok_and(|c| c.host.is_empty())
+}
+
+/// Shows the tray icon (or serves the KDE widget). Before a Mac is linked too.
+pub fn start() {
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = REFRESH.set(tx);
+    // The keys the menu and panels show, as the user changes them.
+    crate::keys::watch();
+    // No tray to show the icon in (plain Hyprland, a bar without one): say once that Sweeflow
+    // runs and how to open it, or nothing tells anyone.
+    std::thread::spawn(|| {
+        // A bar may come up a little after Sweeflow at login.
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        if !widget_installed() && !tray_host_present() {
+            tell_no_tray();
+        }
+    });
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
@@ -107,7 +133,10 @@ pub fn start(net: UnboundedSender<NetCmd>) {
             let handle: Option<Handle<Tray>> = if widget_installed() {
                 None
             } else {
-                match Tray.spawn() {
+                // The bar that shows tray icons (Omarchy's, waybar, GNOME's extension) may come up a
+                // moment after Sweeflow at login, or restart: the icon waits for it and shows then
+                // (a refused registration was final: no icon until Sweeflow restarted).
+                match Tray.assume_sni_available(true).spawn() {
                     Ok(h) => Some(h),
                     Err(e) => {
                         log::warn!("tray icon: {e}");
@@ -115,21 +144,76 @@ pub fn start(net: UnboundedSender<NetCmd>) {
                     }
                 }
             };
-            while rx.recv().is_ok() {
-                // Several changes at once: one redraw.
-                while rx.try_recv().is_ok() {}
-                if let Some(h) = &handle {
-                    h.update(|_| {});
-                }
-                if let Some(p) = &panel {
-                    p.changed();
+            // Whether the icon is to be shown again once things are quiet (see TWIN).
+            let mut again = false;
+            loop {
+                let got = if again { rx.recv_timeout(std::time::Duration::from_secs(2)) } else { rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected) };
+                match got {
+                    Ok(()) => {
+                        // Several changes at once: one redraw.
+                        while rx.try_recv().is_ok() {}
+                        if let Some(h) = &handle {
+                            h.update(|_| {});
+                        }
+                        if let Some(p) = &panel {
+                            p.changed();
+                        }
+                        again = handle.is_some();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        again = false;
+                        ICON_TWIN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(h) = &handle {
+                            h.update(|_| {});
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         })
         .unwrap();
 }
 
-fn refresh() {
+/// Whether anything shows tray icons here (a StatusNotifier watcher on the session bus).
+fn tray_host_present() -> bool {
+    let Ok(bus) = zbus::blocking::Connection::session() else { return true };
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&bus) else { return true };
+    dbus.name_has_owner("org.kde.StatusNotifierWatcher".try_into().unwrap()).unwrap_or(true)
+}
+
+/// A desktop notification that Sweeflow is running and which key opens it (when there's no tray).
+fn tell_no_tray() {
+    let key = crate::keys::current().open.map(|k| k.shown(crate::setup::mac_keys_remapped(), "Super"));
+    let body = match key {
+        Some(k) if k.starts_with('⌘') => format!("{} (Super+Alt+{}) opens it; it's in your app launcher too.", k, k.chars().last().unwrap_or('O')),
+        Some(k) => format!("{k} opens it; it's in your app launcher too."),
+        None => "Open it from your app launcher (or run `sweeflow open`).".to_string(),
+    };
+    let Ok(bus) = zbus::blocking::Connection::session() else { return };
+    let hints: std::collections::HashMap<&str, zbus::zvariant::Value> = std::collections::HashMap::new();
+    let r = bus.call_method(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        Some("org.freedesktop.Notifications"),
+        "Notify",
+        &("Sweeflow", 0u32, "sweeflow", "Sweeflow is running", body.as_str(), Vec::<&str>::new(), hints, 10_000i32),
+    );
+    match r {
+        Ok(_) => log::info!("no tray here: told how to open Sweeflow ({body})"),
+        Err(e) => log::info!("no tray here, and no notifications either: {e}"),
+    }
+}
+
+/// Tells the tray (and widget) to redraw: something they show changed.
+/// The Mac's whole screen is up in a window here (Settings' Troubleshoot row: Show / Hide).
+static DISPLAY_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_display_shown(shown: bool) {
+    DISPLAY_SHOWN.store(shown, std::sync::atomic::Ordering::Relaxed);
+    refresh();
+}
+
+pub fn refresh() {
     if let Some(tx) = REFRESH.get() {
         let _ = tx.send(());
     }
@@ -167,14 +251,6 @@ pub fn set_settings(json: &[u8]) {
                 }
                 save_pending(&Default::default());
             }
-            // Not tied to streaming being on: pausing would take the desktop away (and back
-            // under a new id), and windows opening meanwhile landed on the shared desktop.
-            let wanted = new.desktop;
-            // Acted on when it changes, and once per run (in case it changed while away).
-            static APPLIED: Mutex<Option<bool>> = Mutex::new(None);
-            if APPLIED.lock().unwrap().replace(wanted) != Some(wanted) {
-                crate::desktop::apply(wanted);
-            }
             {
                 let mut s = STATE.lock().unwrap();
                 save_last(&new);
@@ -206,12 +282,14 @@ fn get<T>(f: impl FnOnce(&Settings) -> T, unknown: T) -> T {
     STATE.lock().unwrap().settings.as_ref().map_or(unknown, f)
 }
 
-pub fn allows_clipboard() -> bool {
-    get(|s| s.enabled && s.clipboard, true)
+/// A Mac app's name, from its bundle id (the id itself if it isn't known).
+pub fn app_name(bid: &str) -> String {
+    let s = STATE.lock().unwrap();
+    s.apps.iter().find(|(b, _)| b == bid).map(|(_, n)| n.clone()).unwrap_or_else(|| bid.to_string())
 }
 
-pub fn wants_own_desktop() -> bool {
-    get(|s| s.desktop, false)
+pub fn allows_clipboard() -> bool {
+    get(|s| s.enabled && s.clipboard, true)
 }
 
 pub fn streaming() -> bool {
@@ -252,171 +330,124 @@ fn change(f: impl FnOnce(&mut Settings)) {
     refresh();
 }
 
+/// The plain tray icon, for desktops without the Plasma widget (GNOME, Hyprland). Their menus
+/// close after every click and can't show running apps or rename a Mac, so a click opens
+/// Sweeflow's own window (panelwin.rs) and the menu is only a short fallback.
 struct Tray;
 
 impl ksni::Tray for Tray {
-    const MENU_ON_ACTIVATE: bool = true;
+    fn activate(&mut self, _x: i32, _y: i32) {
+        open_panel();
+    }
 
     fn id(&self) -> String {
         "sweeflow".into()
     }
 
     fn title(&self) -> String {
-        "sweeflow".into()
+        "Sweeflow".into()
     }
 
+    /// The logo with the dot for where the Mac stands, as Plasma's widget draws it (installed by
+    /// `sweeflow install`, one icon per state). Not an overlay icon: bars that get one draw the
+    /// pair themselves, and not every theme has the emblems.
     fn icon_name(&self) -> String {
-        "computer-laptop-symbolic".into()
+        let state = STATE.lock().unwrap();
+        let name = tray_icon_of(state_dot(status_short(standing(&state)).as_str()));
+        if ICON_TWIN.load(std::sync::atomic::Ordering::Relaxed) { name + TWIN } else { name }
     }
 
-    fn overlay_icon_name(&self) -> String {
-        let s = STATE.lock().unwrap();
-        match &s.settings {
-            None => "network-disconnect".into(),
-            Some(st) if !st.enabled => "media-playback-paused".into(),
-            _ => String::new(),
-        }
+    /// Where that icon is, for bars that haven't noticed them in the icon theme (one that
+    /// started before the folder existed, as on a first install).
+    fn icon_theme_path(&self) -> String {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".local/share/icons/hicolor/symbolic/apps").to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let s = STATE.lock().unwrap();
-        let description = match (&s.mac, &s.settings) {
-            (Some(mac), Some(st)) if st.enabled => format!("Streaming apps from {mac}"),
-            (Some(mac), _) => format!("Connected to {mac}, streaming off"),
-            (None, _) if crate::net::offline() => "Disconnected".into(),
-            (None, _) => "Mac not connected".into(),
-        };
-        ToolTip { title: "sweeflow".into(), description, ..Default::default() }
+        let description = if unpaired() { "No Mac linked yet".into() } else { status() };
+        ToolTip { title: "Sweeflow".into(), description, ..Default::default() }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let state = STATE.lock().unwrap();
-        let known = state.settings.is_some();
-        let s = Some(state.settings.clone().unwrap_or_else(|| away_view(&state)));
-        let on = s.as_ref().is_some_and(|s| s.enabled);
-        let mut items: Vec<MenuItem<Self>> = vec![
-            StandardItem {
-                label: match &state.mac {
-                    Some(m) => format!("Connected to {m}"),
-                    None if crate::net::offline() => "Disconnected".into(),
-                    None => "Mac not connected".into(),
-                },
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            // With the Mac away, applied once it's back.
-            CheckmarkItem {
-                label: "Stream Mac apps".into(),
-                checked: on,
-                activate: Box::new(|_| change(|s| s.enabled = !s.enabled)),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Wake Mac".into(),
-                icon_name: "system-reboot".into(),
-                visible: !known && !crate::net::offline(),
-                activate: Box::new(|_| {
-                    std::thread::spawn(crate::wake::wake);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: if crate::net::offline() { "Connect" } else { "Disconnect" }.into(),
-                icon_name: if crate::net::offline() { "network-connect" } else { "network-disconnect" }.into(),
-                activate: Box::new(|_| set_connected(crate::net::offline())),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-        ];
-
-        items.push(macs_menu());
-        items.push(MenuItem::Separator);
-
-        let exclude = s.as_ref().map(|s| s.exclude.clone()).unwrap_or_default();
-        let apps: Vec<MenuItem<Self>> = state
-            .apps
-            .iter()
-            .map(|(bid, name)| {
-                let bid = bid.clone();
-                CheckmarkItem {
-                    // Underscores would be taken as keyboard accelerators.
-                    label: name.replace('_', "__"),
-                    checked: !exclude.contains(&bid),
-                    activate: Box::new(move |_| {
-                        let bid = bid.clone();
-                        change(move |s| {
-                            if let Some(i) = s.exclude.iter().position(|b| *b == bid) {
-                                s.exclude.remove(i);
-                            } else {
-                                s.exclude.push(bid);
-                            }
-                        })
+        if unpaired() {
+            return vec![
+                StandardItem { label: "No Mac linked yet".into(), enabled: false, ..Default::default() }.into(),
+                StandardItem {
+                    label: "Link a Mac…".into(),
+                    icon_name: menu_icon("list-add-symbolic"),
+                    activate: Box::new(|_| open_wizard()),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                StandardItem {
+                    label: "Quit Sweeflow".into(),
+                        activate: Box::new(|_| {
+                        quit();
                     }),
                     ..Default::default()
                 }
-                .into()
-            })
-            .collect();
-        items.push(SubMenu { label: "Apps".into(), enabled: !apps.is_empty(), submenu: apps, ..Default::default() }.into());
-        items.push(MenuItem::Separator);
-
-        type Toggle = (&'static str, fn(&Settings) -> bool, fn(&mut Settings));
-        let toggles: [Toggle; 5] = [
-            ("Mac sound on Linux", |s| s.sound, |s| s.sound = !s.sound),
-            ("Shared clipboard", |s| s.clipboard, |s| s.clipboard = !s.clipboard),
-            ("Drag and drop", |s| s.drag_drop, |s| s.drag_drop = !s.drag_drop),
-            ("Mac Apps in app menu", |s| s.launcher, |s| s.launcher = !s.launcher),
-            ("Mac apps on their own desktop", |s| s.desktop, |s| s.desktop = !s.desktop),
-        ];
-        for (label, get, flip) in toggles {
+                .into(),
+            ];
+        }
+        let state = STATE.lock().unwrap();
+        let status = status_of(&state).replace('_', "__");
+        // The keys' column on GNOME (see with_key): as far right as the status line reaches.
+        let column = key_column(&status);
+        let dot = state_dot(status_short(standing(&state)).as_str());
+        let actions = stream_actions(standing(&state));
+        let elsewhere = state.elsewhere.clone();
+        drop(state);
+        // Each item shows the key the desktop has for it now (the user may have changed it).
+        let keys = crate::keys::current();
+        // Where streaming stands, and what can be done about it.
+        // The status line leads with the same coloured dot the window gives the Mac in use.
+        let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, icon_name: dot.into(), ..Default::default() }.into()];
+        // How the Mac in use is reached ("Local: 192.168.1.20"), under it.
+        let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+        if let Some(m) = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint) {
+            let at = reached(m, &cfg.host_fingerprint);
+            let words = crate::net::route_words(crate::net::route_kind(&at), &address_only(&at));
+            if !words.is_empty() {
+                items.push(StandardItem { label: words.replace('_', "__"), enabled: false, ..Default::default() }.into());
+            }
+        }
+        for &action in actions {
+            if let (Some(other), "start") = (&elsewhere, action) {
+                items.push(StandardItem { label: start_hint(other).replace('_', "__"), enabled: false, ..Default::default() }.into());
+                continue;
+            }
+            let key = match action {
+                "pause" | "resume" => &keys.pause,
+                _ => &keys.stop,
+            };
             items.push(
-                CheckmarkItem {
-                    label: label.into(),
-                    checked: s.as_ref().is_some_and(get),
-                    activate: Box::new(move |_| change(flip)),
+                StandardItem {
+                    label: with_key(action_label(action), key, column),
+                    shortcut: key.as_ref().map(|k| k.menu()).unwrap_or_default(),
+                    activate: Box::new(move |_| panel_do(action, "")),
                     ..Default::default()
                 }
                 .into(),
             );
         }
-        items.push(
-            SubMenu {
-                label: "Quality".into(),
-                submenu: vec![
-                    RadioGroup {
-                        selected: usize::from(s.as_ref().is_some_and(|s| s.quality == "light")),
-                        select: Box::new(|_, i| change(|s| s.quality = if i == 1 { "light" } else { "sharp" }.into())),
-                        options: vec![
-                            RadioItem { label: "Sharpest".into(), ..Default::default() },
-                            RadioItem { label: "Lighter (for slower networks)".into(), ..Default::default() },
-                        ],
-                    }
-                    .into(),
-                ],
-                ..Default::default()
-            }
-            .into(),
-        );
-        // Dims the Mac's own screen now; using the Mac itself brings it back.
-        let dimmed = s.as_ref().is_some_and(|s| s.dim);
-        items.push(
-            StandardItem {
-                label: if dimmed { "Mac screen dimmed" } else { "Dim Mac screen" }.into(),
-                enabled: known && on && !dimmed,
-                activate: Box::new(|_| change(|s| s.dim = true)),
-                ..Default::default()
-            }
-            .into(),
-        );
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
-                label: "Quit sweeflow".into(),
-                icon_name: "application-exit".into(),
+                label: with_key("Open Sweeflow", &keys.open, column),
+                shortcut: keys.open.as_ref().map(|k| k.menu()).unwrap_or_default(),
+                activate: Box::new(|_| open_panel()),
+                ..Default::default()
+            }
+            .into(),
+        );
+        // (The Global menu opens with Cmd+Opt+U in a Mac window, on every desktop: no item here.)
+        items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "Quit Sweeflow".into(),
                 activate: Box::new(|_| {
                     quit();
                 }),
@@ -428,51 +459,167 @@ impl ksni::Tray for Tray {
     }
 }
 
-/// "Mac ▸": which paired Mac to stream from, adding one, forgetting one.
-fn macs_menu() -> MenuItem<Tray> {
-    let cfg = crate::config::Config::load_or_default().unwrap_or_default();
-    let mut sub: Vec<MenuItem<Tray>> = Vec::new();
-    if !cfg.macs.is_empty() {
-        let fps: Vec<String> = cfg.macs.iter().map(|m| m.fingerprint.clone()).collect();
-        sub.push(
-            RadioGroup {
-                selected: fps.iter().position(|f| *f == cfg.host_fingerprint).unwrap_or(0),
-                select: Box::new(move |_, i| {
-                    let Some(fp) = fps.get(i).cloned() else { return };
-                    switch_to(&fp);
-                }),
-                options: cfg.macs.iter().map(|m| RadioItem { label: m.name.replace('_', "__"), ..Default::default() }).collect(),
-            }
-            .into(),
-        );
-        sub.push(MenuItem::Separator);
+/// Where the desktop lets keyboard shortcuts be changed (Sweeflow's among them): Plasma's
+/// System Settings at Shortcuts, GNOME's Settings at Keyboard. Hyprland has no such place (its
+/// config file; Sweeflow adds its keys while it runs), so nothing opens there.
+pub fn shortcut_settings_place() -> Option<&'static [&'static str]> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if desktop.contains("KDE") {
+        Some(&["systemsettings", "kcm_keys"])
+    } else if desktop.contains("GNOME") {
+        Some(&["gnome-control-center", "keyboard"])
+    } else if desktop.contains("Cinnamon") {
+        Some(&["cinnamon-settings", "keyboard"])
+    } else {
+        None
     }
-    sub.push(
-        StandardItem {
-            label: "Add a Mac…".into(),
-            icon_name: "list-add".into(),
-            activate: Box::new(|_| open_wizard()),
-            ..Default::default()
+}
+
+fn open_shortcut_settings() {
+    if let Some(cmd) = shortcut_settings_place() {
+        if let Err(e) = std::process::Command::new(cmd[0]).args(&cmd[1..]).spawn() {
+            log::warn!("opening the shortcut settings ({}): {e}", cmd[0]);
         }
-        .into(),
-    );
-    if !cfg.macs.is_empty() {
-        let forget: Vec<MenuItem<Tray>> = cfg
-            .macs
-            .iter()
-            .map(|m| {
-                let fp = m.fingerprint.clone();
-                StandardItem {
-                    label: m.name.replace('_', "__"),
-                    activate: Box::new(move |_| forget(&fp)),
-                    ..Default::default()
-                }
-                .into()
-            })
-            .collect();
-        sub.push(SubMenu { label: "Forget".into(), submenu: forget, ..Default::default() }.into());
     }
-    SubMenu { label: "Mac".into(), icon_name: "computer-laptop".into(), submenu: sub, ..Default::default() }.into()
+}
+
+/// An icon for a menu entry (symbolic: each desktop draws it in its menu's text colour).
+fn menu_icon(name: &str) -> String {
+    name.into()
+}
+
+/// A menu item's text, with its key after it where the tray doesn't show a menu item's shortcut
+/// (everywhere but Plasma, which shows it at the right).
+fn with_key(label: &str, key: &Option<crate::keys::Key>, column: f32) -> String {
+    match key {
+        // Only Plasma's tray draws a menu item's shortcut; GNOME's, Cinnamon's and Omarchy's
+        // bar don't, so there the key goes in the text.
+        Some(k) if !std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE") => {
+            // Lined up in a column at the end of the rows, by tabs (key_column).
+            // Omarchy's bar draws its menus at a fixed width: tabs pushed the key out of sight.
+            if crate::hyprland::running() {
+                return format!("{label}  {}", k.shown(crate::setup::mac_keys_remapped(), "Super"));
+            }
+            let tabs = (column - tab_stop(text_width(label))) as usize + 1;
+            format!("{label}{}{}", "\t".repeat(tabs), k.shown(crate::setup::mac_keys_remapped(), "Super"))
+        }
+        _ => label.to_string(),
+    }
+}
+
+/// GNOME's menu has a tab stop every eight spaces (32 px in Adwaita Sans; 24 px in Ubuntu Sans,
+/// whose space is narrower), and a tab needs about 8 px of room before the next one (measured):
+/// the first stop a tab after text this wide reaches.
+fn tab() -> f32 {
+    // The space rounded to whole pixels, as the menu has it (Adwaita Sans's 4.1 px space gives
+    // 32 px stops, not 33).
+    MENU_FONT.as_ref().and_then(|f| f.width(" ")).map(|w| 8.0 * w.round()).filter(|w| *w > 8.0).unwrap_or(32.0)
+}
+fn tab_stop(width: f32) -> f32 {
+    ((width + 8.0) / tab()).ceil()
+}
+
+/// The tab stop the keys start at, so they end where the rows do: the status line (with its dot
+/// after it) is the widest; never before the first stop after "Open Sweeflow".
+fn key_column(status: &str) -> f32 {
+    const KEY: f32 = 38.0; // "⌘⌥Y"
+    const DOT: f32 = 22.0;
+    // One stop further than where the status line ends: set apart from the item's text.
+    let end = ((text_width(status) + DOT - KEY) / tab()).floor() + 1.0;
+    end.max(tab_stop(text_width("Open Sweeflow")))
+}
+
+/// How wide a menu item's text is in the desktop's menu font: measured with that font where
+/// it can be found, else about as wide as in GNOME's (Adwaita Sans / Cantarell, 11 pt).
+fn text_width(text: &str) -> f32 {
+    if let Some(w) = MENU_FONT.as_ref().and_then(|f| f.width(text)) {
+        return w;
+    }
+    text.chars()
+        .map(|c| match c {
+            ' ' => 4.2,
+            'i' | 'l' | 'j' | 't' | 'f' | 'r' | 'I' => 4.5,
+            'm' | 'w' => 11.0,
+            'M' | 'W' => 13.0,
+            c if c.is_uppercase() => 9.5,
+            _ => 7.6,
+        })
+        .sum::<f32>()
+        * 1.08
+}
+
+/// The font the tray's menu is drawn in, and its size in pixels.
+struct MenuFont {
+    data: Vec<u8>,
+    px: f32,
+}
+
+impl MenuFont {
+    /// Ubuntu's shell theme draws its menus in Ubuntu Sans whatever the interface font is;
+    /// elsewhere (GNOME, Cinnamon) the interface font setting, e.g. "Adwaita Sans 11".
+    fn find() -> Option<Self> {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+        let schema = if desktop.contains("cinnamon") { "org.cinnamon.desktop.interface" } else { "org.gnome.desktop.interface" };
+        let get = |key: &str| {
+            let out = std::process::Command::new("gsettings").args(["get", schema, key]).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().trim_matches('\'').to_string())
+        };
+        let setting = get("font-name")?;
+        let (family, pt) = setting.rsplit_once(' ').and_then(|(f, p)| Some((f.trim().to_string(), p.parse::<f32>().ok()?)))?;
+        let family = if desktop.contains("ubuntu") { "Ubuntu Sans".to_string() } else { family };
+        let scale = get("text-scaling-factor").and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+        let out = std::process::Command::new("fc-match").args(["-f", "%{file}", &family]).output().ok()?;
+        let file = String::from_utf8_lossy(&out.stdout).to_string();
+        let data = std::fs::read(&file).ok()?;
+        ttf_parser::Face::parse(&data, 0).ok()?;
+        log::info!("tray menu: keys lined up for {family} {pt} pt ({file})");
+        Some(MenuFont { data, px: pt * 96.0 / 72.0 * scale })
+    }
+
+    fn width(&self, text: &str) -> Option<f32> {
+        let face = ttf_parser::Face::parse(&self.data, 0).ok()?;
+        let units: u32 = text
+            .chars()
+            .map(|c| face.glyph_index(c).and_then(|g| face.glyph_hor_advance(g)).unwrap_or(face.units_per_em() / 2) as u32)
+            .sum();
+        Some(units as f32 * self.px / face.units_per_em() as f32)
+    }
+}
+
+static MENU_FONT: LazyLock<Option<MenuFont>> = LazyLock::new(MenuFont::find);
+
+/// The coloured dots for where the Mac in use stands, as Sweeflow's window and widget draw them
+/// (name, colour, a ring): violet streaming (a ring paused), green available, orange busy or
+/// locked, a grey ring not online or not known. Installed as named icons (setup::write_icons).
+pub const STATE_DOTS: [(&str, &str, bool); 5] = [
+    ("sweeflow-dot-streaming", "#8b5cf6", false),
+    ("sweeflow-dot-paused", "#8b5cf6", true),
+    ("sweeflow-dot-available", "#30a46c", false),
+    ("sweeflow-dot-busy", "#e8890c", false),
+    ("sweeflow-dot-offline", "#9a96a3", true),
+];
+
+/// The suffix of each tray icon's twin, the same picture under a second name. Ubuntu's tray
+/// extension can miss a change of icon (offline and back within seconds: it went on showing
+/// offline while streaming), and an icon sent again under the same name changes nothing. So a
+/// moment after each change the icon is sent again as its twin, and the tray loads it afresh.
+pub const TWIN: &str = "-again";
+static ICON_TWIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The tray icon with that dot (setup.rs writes them): "sweeflow-tray-streaming"…
+pub fn tray_icon_of(dot: &str) -> String {
+    dot.replacen("sweeflow-dot-", "sweeflow-tray-", 1)
+}
+
+/// The dot's icon name for the status line.
+fn state_dot(status: &str) -> &'static str {
+    match status {
+        "Streaming" => STATE_DOTS[0].0,
+        "Paused" => STATE_DOTS[1].0,
+        "Available" => STATE_DOTS[2].0,
+        "Streaming elsewhere" | "Locked" => STATE_DOTS[3].0,
+        _ => STATE_DOTS[4].0,
+    }
 }
 
 fn quit() {
@@ -556,6 +703,172 @@ fn save_last(s: &Settings) {
     }
 }
 
+/// Where streaming stands: what the status line says.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Standing<'a> {
+    /// Stop was chosen (no connection is held).
+    pub stopped: bool,
+    /// The Mac is streaming to that other computer (and turns this one away until it stops).
+    pub elsewhere: Option<&'a str>,
+    /// Connected, and the Mac's settings known.
+    pub connected: bool,
+    /// Not paused (Pause / Resume).
+    pub enabled: bool,
+    /// The Mac's screen is locked.
+    pub locked: bool,
+    /// The Mac stopped this computer from its own menu (it refuses until allowed there again).
+    pub refused: bool,
+    /// The Mac can be reached; None while not known yet.
+    pub online: Option<bool>,
+}
+
+/// The same status where the Mac's name stands right above it (the widget and Sweeflow's own
+/// window): without the name, which only repeated it.
+pub fn status_short(s: Standing) -> String {
+    if let Standing { stopped: false, elsewhere: Some(_), .. } = s {
+        return "Streaming elsewhere".into();
+    }
+    // The same words as the Mac's line in the list of Macs.
+    match s {
+        Standing { stopped: true, online: Some(true), elsewhere: Some(_), .. } => "Streaming elsewhere",
+        Standing { stopped: true, online: Some(true), locked: true, .. } => "Locked",
+        Standing { stopped: true, online: Some(true), .. } => "Available",
+        Standing { stopped: true, online: Some(false), .. } => "Not online",
+        Standing { stopped: true, .. } => "Stopped",
+        Standing { connected: true, locked: true, .. } => "Locked",
+        Standing { connected: true, enabled: false, .. } => "Paused",
+        Standing { connected: true, .. } => "Streaming",
+        Standing { refused: true, .. } => "Stopped on the Mac",
+        Standing { online: Some(false), .. } => "Not online",
+        _ => "Connecting",
+    }
+    .into()
+}
+
+/// The status line where nothing else names the Mac (the tray's menu and tooltip).
+pub fn status_line(mac: &str, s: Standing) -> String {
+    match s {
+        Standing { stopped: true, online: Some(true), .. } => format!("Stopped · {mac} is online"),
+        Standing { stopped: true, online: Some(false), .. } => format!("Stopped · {mac} is not online"),
+        // The first look on the network takes a moment.
+        Standing { stopped: true, .. } => format!("Stopped · {mac}"),
+        Standing { elsewhere: Some(_), .. } => format!("{mac} is streaming elsewhere"),
+        Standing { connected: true, enabled: false, .. } => format!("Paused · {mac}"),
+        // The state first, as "Paused · …": narrow menus (Omarchy's) cut the end off.
+        Standing { connected: true, locked: true, .. } => format!("Locked · {mac}"),
+        Standing { connected: true, .. } => format!("Streaming from {mac}"),
+        // Online, but it turns this computer away until allowed again from its own menu.
+        Standing { refused: true, .. } => format!("Waiting for {mac} · stopped on the Mac"),
+        // Started: it streams as soon as the Mac is back.
+        Standing { online: Some(false), .. } => format!("Waiting for {mac} · not online"),
+        _ => format!("Waiting for {mac}"),
+    }
+}
+
+/// What can be done about the Mac in use, in order (Do actions; see `action_label`): Streaming:
+/// Pause and Stop; Paused: Resume and Stop; Stopped: Start; started but waiting for the Mac: Stop.
+pub fn stream_actions(s: Standing) -> &'static [&'static str] {
+    match s {
+        Standing { stopped: true, .. } => &["start"],
+        // Start shown, but not to be chosen (see can_start); Stop ends the waiting.
+        Standing { elsewhere: Some(_), .. } => &["start", "stop"],
+        Standing { connected: false, .. } => &["stop"],
+        Standing { enabled: true, .. } => &["pause", "stop"],
+        _ => &["resume", "stop"],
+    }
+}
+
+/// Start can be chosen: not while the Mac streams to another computer (it has to be stopped
+/// there first).
+pub fn can_start(s: Standing) -> bool {
+    s.elsewhere.is_none()
+}
+
+/// What a shortcut's toggle (Do "pause-toggle" / "stream-toggle", see `panel_do`) does now: one
+/// of the actions, or None when there's nothing it can do. Pause or resume: Pause while
+/// streaming, Resume while paused, nothing otherwise (stopped, waiting for the Mac). Stop or
+/// start: Start when stopped (if it can be chosen), Stop otherwise (also ends the waiting).
+pub fn toggle_action(toggle: &str, s: Standing) -> Option<&'static str> {
+    match toggle {
+        "pause-toggle" => stream_actions(s).iter().copied().find(|a| matches!(*a, "pause" | "resume")),
+        "stream-toggle" if s.stopped => can_start(s).then_some("start"),
+        "stream-toggle" => Some("stop"),
+        _ => None,
+    }
+}
+
+/// What a Start that can't be chosen says instead.
+pub fn start_hint(_other: &str) -> String {
+    "Stop streaming elsewhere first".into()
+}
+
+pub fn action_label(action: &str) -> &'static str {
+    match action {
+        "start" => "Start",
+        "pause" => "Pause",
+        "resume" => "Resume",
+        _ => "Stop",
+    }
+}
+
+fn standing(state: &State) -> Standing<'_> {
+    let stopped = crate::net::offline();
+    // Stopped here, the Mac in use still says on the network whether it's busy or locked.
+    let (busy, locked) = if stopped { crate::net::in_use_says() } else { (false, false) };
+    Standing {
+        stopped,
+        elsewhere: state.elsewhere.as_deref().or(busy.then_some("")),
+        connected: state.settings.is_some(),
+        enabled: state.settings.as_ref().is_none_or(|s| s.enabled),
+        locked: crate::net::mac_locked() || locked,
+        refused: state.mac_refused,
+        online: crate::net::mac_online(),
+    }
+}
+
+/// The Mac in use, by the name given here (renamable) over the one it reports.
+fn mac_name(state: &State, cfg: &crate::config::Config) -> String {
+    cfg.macs
+        .iter()
+        .find(|m| m.fingerprint == cfg.host_fingerprint)
+        .map(|m| m.name.clone())
+        .or_else(|| state.mac.clone())
+        .unwrap_or_default()
+}
+
+fn status_of(state: &State) -> String {
+    let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+    let name = mac_name(state, &cfg);
+    status_line(if name.is_empty() { "Mac" } else { &name }, standing(state))
+}
+
+fn status() -> String {
+    status_of(&STATE.lock().unwrap())
+}
+
+/// The Mac's apps as the widget and Sweeflow's window list them: pinned first (in their order),
+/// then running, then the rest; by name within each.
+fn sort_apps(apps: &mut [serde_json::Value], pinned: &[String]) {
+    let pin_pos = |a: &serde_json::Value| pinned.iter().position(|p| a["id"] == **p).unwrap_or(usize::MAX);
+    apps.sort_by_key(|a| (pin_pos(a), a["state"].as_u64().unwrap_or(0) == 0, a["name"].as_str().unwrap_or_default().to_lowercase()));
+}
+
+/// Where a linked Mac is (or was last) reached: "address:port". Once it goes offline, still the
+/// address it was reached at (not the name it was linked by, which would read as a change).
+fn reached(m: &crate::config::PairedMac, in_use: &str) -> String {
+    crate::net::connected_to()
+        .filter(|_| m.fingerprint == in_use)
+        .or_else(|| crate::net::last_reached(&m.fingerprint))
+        .map_or_else(|| m.host.clone(), |a| a.to_string())
+}
+
+/// "address:port" without its port (and an IPv6 address without its brackets).
+fn address_only(host: &str) -> String {
+    host.parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| host.rsplit_once(':').map_or(host, |(n, _)| n).to_string())
+}
+
 /// Everything the tray widget shows.
 pub fn panel_state() -> serde_json::Value {
     let state = STATE.lock().unwrap();
@@ -566,17 +879,19 @@ pub fn panel_state() -> serde_json::Value {
         .iter()
         .map(|m| {
             serde_json::json!({ "name": m.name, "fingerprint": m.fingerprint, "active": m.fingerprint == cfg.host_fingerprint,
-                                "kind": kinds.get(&m.fingerprint).map(String::as_str).unwrap_or("") })
+                                "kind": kinds.get(&m.fingerprint).map(String::as_str).unwrap_or(""),
+                                // Reachable on the network: null until known.
+                                "online": crate::net::online(&m.fingerprint),
+                                // Streaming to another computer (as its network announcement says).
+                                "busy": crate::net::busy(&m.fingerprint),
+                                "locked": crate::net::locked(&m.fingerprint),
+                                // How it's reached (net::route_kind) and at what address: where it
+                                // is connected now for the Mac in use, else where it was last.
+                                "via": crate::net::route_kind(&reached(m, &cfg.host_fingerprint)),
+                                "address": address_only(&reached(m, &cfg.host_fingerprint)) })
         })
         .collect();
-    // The name given here (renamable) over the one the Mac reports.
-    let mac_name = cfg
-        .macs
-        .iter()
-        .find(|m| m.fingerprint == cfg.host_fingerprint)
-        .map(|m| m.name.clone())
-        .or_else(|| state.mac.clone())
-        .unwrap_or_default();
+    let mac_name = mac_name(&state, &cfg);
     let mut apps: Vec<_> = state
         .apps
         .iter()
@@ -587,11 +902,11 @@ pub fn panel_state() -> serde_json::Value {
             a
         })
         .collect();
-    // Pinned (in their order), then running, then the rest; by name within each.
-    let pin_pos = |a: &serde_json::Value| state.pinned.iter().position(|p| a["id"] == **p).unwrap_or(usize::MAX);
-    apps.sort_by_key(|a| (pin_pos(a), a["state"].as_u64() == Some(0), a["name"].as_str().unwrap_or_default().to_lowercase()));
+    sort_apps(&mut apps, &state.pinned);
+    let standing = standing(&state);
     serde_json::json!({
         "connected": state.settings.is_some(),
+        "locked": crate::net::mac_locked(),
         "paired": !cfg.host.is_empty(),
         "mac": mac_name,
         "settings": state.settings.clone().unwrap_or_else(|| away_view(&state)),
@@ -599,11 +914,27 @@ pub fn panel_state() -> serde_json::Value {
         "apps": apps,
         "macs": macs,
         "openAtLogin": open_at_login(),
+        "square": crate::config::square_corners(),
+        "displayShown": DISPLAY_SHOWN.load(std::sync::atomic::Ordering::Relaxed),
         "placement": state.placement,
         "pinned": state.pinned,
+        // Stop was chosen (the name is from when it was called Disconnect).
         "offline": crate::net::offline(),
+        // The Mac can be reached, streaming or not: null until known.
+        "online": crate::net::mac_online(),
+        // The status (the reader shows the Mac's name above it), and what can be done (Do
+        // actions, in order).
+        "status": status_short(standing),
+        "actions": stream_actions(standing),
         "macRefused": state.mac_refused,
+        // The Mac is streaming to this other computer (its name), or null; Start can't be chosen
+        // meanwhile ("Stop streaming on <name> first").
+        "elsewhere": state.elsewhere,
+        "canStart": can_start(standing),
         "showAt": state.show_at,
+        // The keys the desktop has now for open / pause / stop (and the Global menu's): as
+        // shown, "" for one with none.
+        "keys": crate::keys::current().json(),
     })
 }
 
@@ -630,13 +961,29 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
-        "disconnect" | "connect" => set_connected(action == "connect"),
+        "start" if elsewhere().is_some() => log::info!("Start: the Mac is streaming to another computer"),
+        "start" | "stop" => set_started(action == "start"),
+        // What a widget from before Start / Stop still sends, until Plasma reloads it.
+        "connect" | "disconnect" => set_started(action == "connect"),
+        // With the Mac away, applied once it's back.
+        "pause" | "resume" => change(|s| s.enabled = action == "resume"),
+        // The shortcuts (Cmd+Opt+Y, Cmd+Opt+Z): whichever of the above fits now.
+        "pause-toggle" | "stream-toggle" => {
+            let state = STATE.lock().unwrap();
+            let chosen = toggle_action(action, standing(&state));
+            drop(state);
+            match chosen {
+                Some(a) => panel_do(a, ""),
+                None => log::info!("{action}: nothing to do now"),
+            }
+        }
         "show" => {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             STATE.lock().unwrap().show_at = now.as_millis() as u64;
             refresh();
         }
         "switch" => switch_to(arg),
+        "use" => use_mac(arg),
         "forget" => forget(arg),
         "launch" => {
             if let Err(e) = crate::launchers::launch(arg) {
@@ -648,7 +995,10 @@ pub fn panel_do(action: &str, arg: &str) {
             let _ = std::process::Command::new("systemctl").args(["--user", verb, "sweeflow"]).status();
             refresh();
         }
-        "gather" => crate::desktop::gather(),
+        "square" => {
+            crate::config::set_square_corners(arg == "on");
+            refresh();
+        }
         "pin" | "unpin" => {
             let mut s = STATE.lock().unwrap();
             s.pinned.retain(|b| b != arg);
@@ -660,16 +1010,10 @@ pub fn panel_do(action: &str, arg: &str) {
             refresh();
         }
         "placement" => refresh_placement(),
-        "taskbar" | "dock" | "global-menu" => {
+        "global-menu" => {
             let (action, arg) = (action.to_string(), arg.to_string());
             std::thread::spawn(move || {
-                let r = match (action.as_str(), arg.as_str()) {
-                    ("taskbar", a) => crate::placement::set_taskbar(a == "on"),
-                    ("dock", "off") => crate::placement::remove_dock(),
-                    ("dock", _) => crate::placement::add_dock(),
-                    (_, a) => crate::placement::set_global_menu(a == "on"),
-                };
-                if let Err(e) = r {
+                if let Err(e) = crate::placement::set_global_menu(arg == "on") {
                     log::warn!("{action} {arg}: {e:#}");
                 }
                 refresh_placement();
@@ -680,9 +1024,11 @@ pub fn panel_do(action: &str, arg: &str) {
                 let _ = net.send(NetCmd::Control(W::new(t::QUIT_APP).str(arg).finish()));
             }
         }
+        "shortcut-settings" => open_shortcut_settings(),
         "display" => {
             if let Some(net) = NET.get() {
-                let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(1).finish()));
+                let show = !DISPLAY_SHOWN.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = net.send(NetCmd::Control(W::new(t::SHOW_DISPLAY).u8(show as u8).finish()));
             }
         }
         "quit" => quit(),
@@ -690,13 +1036,14 @@ pub fn panel_do(action: &str, arg: &str) {
     }
 }
 
-/// Connects (which always means streaming: never back into a pause from before) or disconnects.
-fn set_connected(connect: bool) {
-    if connect {
+/// Starts (which always means unpaused: never back into a pause from before), or stops: the
+/// Mac's windows go and its one session is left free for another computer.
+fn set_started(start: bool) {
+    if start {
         // With the Mac still away, kept and applied once it's back.
         change(|s| s.enabled = true);
     }
-    crate::net::set_offline(!connect);
+    crate::net::set_offline(!start);
     refresh();
 }
 
@@ -723,6 +1070,33 @@ fn open_at_login() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// The Mac stopped this computer from its menu, and hasn't allowed it again.
+pub fn mac_refused() -> bool {
+    STATE.lock().unwrap().mac_refused
+}
+
+/// The Mac is streaming to another computer (Some: its name); None once it streams here, or
+/// Stop is chosen.
+pub fn set_elsewhere(other: Option<String>) {
+    let mut s = STATE.lock().unwrap();
+    if s.elsewhere != other {
+        s.elsewhere = other;
+        drop(s);
+        refresh();
+    }
+}
+
+pub fn elsewhere() -> Option<String> {
+    STATE.lock().unwrap().elsewhere.clone()
+}
+
+/// The Mac in use, as this computer shows it.
+pub fn mac_display_name() -> String {
+    let cfg = crate::config::Config::load_or_default().unwrap_or_default();
+    let name = mac_name(&STATE.lock().unwrap(), &cfg);
+    if name.is_empty() { "Your Mac".into() } else { name }
+}
+
 pub fn set_mac_refused(on: bool) {
     let mut s = STATE.lock().unwrap();
     if s.mac_refused != on {
@@ -735,12 +1109,18 @@ pub fn set_mac_refused(on: bool) {
 /// The Mac in use forgot this computer (from its menu): forget it here too.
 pub fn mac_forgot_us() {
     let Ok(cfg) = crate::config::Config::load_or_default() else { return };
-    let name = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint).map(|m| m.name.clone()).unwrap_or_else(|| "The Mac".into());
+    mac_unlinked_us(&cfg.host_fingerprint);
+}
+
+/// A linked Mac unlinked this computer (from its menu): unlinked here too, and said so.
+pub fn mac_unlinked_us(fingerprint: &str) {
+    let Ok(cfg) = crate::config::Config::load_or_default() else { return };
+    let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == fingerprint) else { return };
     let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=Sweeflow", "--icon=sweeflow", &format!("{name} unlinked this computer"),
-               "It was forgotten on the Mac, so Sweeflow forgot it here too. Link it again from Linked Macs."])
+        .args(["--app-name=Sweeflow", "--icon=sweeflow", &format!("{} unlinked this computer", mac.name),
+               "It was unlinked on the Mac, so it's unlinked here too. Link it again with Link a Mac…"])
         .spawn();
-    forget(&cfg.host_fingerprint);
+    forget_here(fingerprint);
 }
 
 /// What sort of Mac each linked one is ("laptop", "imac", "desktop"), by fingerprint: its icon.
@@ -781,13 +1161,28 @@ pub fn rename(fingerprint: &str, name: &str) {
 }
 
 pub fn open_wizard() {
+    run_window("pair", "the pairing window");
+}
+
+/// Sweeflow's own window (`sweeflow panel`), where the Plasma widget isn't. One at a time: a
+/// second one exits at once.
+fn open_panel() {
+    run_window("panel", "Sweeflow's window");
+}
+
+/// Opens one of Sweeflow's own windows: this binary again, with `arg`.
+fn run_window(arg: &str, what: &str) {
     match std::env::current_exe() {
-        Ok(me) => {
-            if let Err(e) = std::process::Command::new(me).arg("pair").spawn() {
-                log::warn!("couldn't open the pairing window: {e}");
+        Ok(me) => match std::process::Command::new(me).arg(arg).spawn() {
+            // Waited for, so it doesn't stay behind as a dead process once its window closes.
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
             }
-        }
-        Err(e) => log::warn!("couldn't open the pairing window: {e}"),
+            Err(e) => log::warn!("couldn't open {what}: {e}"),
+        },
+        Err(e) => log::warn!("couldn't open {what}: {e}"),
     }
 }
 
@@ -809,7 +1204,37 @@ fn switch_to(fingerprint: &str) {
     restart();
 }
 
+/// A Mac just linked (the Link a Mac window says): streams from it now, switching from the one in
+/// use if there is one, and starting if stopped.
+fn use_mac(fingerprint: &str) {
+    let mut cfg = match crate::config::Config::load_or_default() {
+        Ok(c) => c,
+        Err(e) => return log::warn!("config: {e:#}"),
+    };
+    if !cfg.activate(fingerprint) {
+        return log::warn!("no linked Mac {fingerprint}");
+    }
+    if let Err(e) = cfg.save() {
+        return log::warn!("saving config: {e:#}");
+    }
+    log::info!("streaming from the Mac just linked, {}", cfg.host);
+    crate::net::set_offline(false);
+    // A Mac already streaming to another computer answers Busy: "In use by …" until it's free.
+    restart();
+}
+
+/// Unlink, chosen here: the Mac is told too (now, or once it's seen again), and forgets this
+/// computer.
 fn forget(fingerprint: &str) {
+    let Ok(cfg) = crate::config::Config::load_or_default() else { return };
+    if let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == fingerprint) {
+        crate::pair::tell_unlinked(mac.clone());
+    }
+    forget_here(fingerprint);
+}
+
+/// Forgets a Mac on this side only.
+fn forget_here(fingerprint: &str) {
     let Ok(mut cfg) = crate::config::Config::load_or_default() else { return };
     let was_active = cfg.host_fingerprint == fingerprint;
     cfg.forget(fingerprint);
@@ -818,6 +1243,10 @@ fn forget(fingerprint: &str) {
     }
     refresh();
     if was_active {
+        // Unlinking the Mac in use disconnects; it doesn't go on to another linked Mac (one
+        // locked or far away showed its windows as paused stills). Another one, now listed
+        // first, is there to Start.
+        crate::net::set_offline(true);
         restart();
     }
 }
@@ -850,5 +1279,87 @@ mod tests {
         let json = br#"{"enabled":true,"exclude":[],"sound":true,"dim":true,"clipboard":true,"dragDrop":true,"launcher":true,"quality":"sharp"}"#;
         let s: Settings = serde_json::from_slice(json).unwrap();
         assert!(s.desktop);
+    }
+
+    #[test]
+    fn the_status_line_for_each_state() {
+        let streaming = Standing { connected: true, enabled: true, online: Some(true), ..Default::default() };
+        assert_eq!(status_line("Studio", streaming), "Streaming from Studio");
+        assert_eq!(status_short(streaming), "Streaming");
+        assert_eq!(status_short(Standing { enabled: false, ..streaming }), "Paused");
+        assert_eq!(status_line("Studio", Standing { locked: true, ..streaming }), "Locked · Studio");
+        assert_eq!(status_line("Studio", Standing { enabled: false, ..streaming }), "Paused · Studio");
+        // Locked while paused: the pause is what matters here.
+        assert_eq!(status_line("Studio", Standing { enabled: false, locked: true, ..streaming }), "Paused · Studio");
+
+        let stopped = Standing { stopped: true, ..Default::default() };
+        assert_eq!(status_line("Studio", Standing { online: Some(true), ..stopped }), "Stopped · Studio is online");
+        assert_eq!(status_line("Studio", Standing { online: Some(false), ..stopped }), "Stopped · Studio is not online");
+        assert_eq!(status_line("Studio", stopped), "Stopped · Studio");
+        let elsewhere = Standing { elsewhere: Some("workstation"), online: Some(true), ..Default::default() };
+        assert_eq!(status_line("Studio", elsewhere), "Studio is streaming elsewhere");
+        assert_eq!(status_short(elsewhere), "Streaming elsewhere");
+
+        let waiting = Standing { enabled: true, online: Some(false), ..Default::default() };
+        assert_eq!(status_line("Studio", waiting), "Waiting for Studio · not online");
+        assert_eq!(status_line("Studio", Standing { online: None, ..waiting }), "Waiting for Studio");
+        assert_eq!(status_line("Studio", Standing { refused: true, online: Some(true), ..waiting }), "Waiting for Studio · stopped on the Mac");
+    }
+
+    #[test]
+    fn each_state_has_its_actions_and_no_others() {
+        let streaming = Standing { connected: true, enabled: true, online: Some(true), ..Default::default() };
+        assert_eq!(stream_actions(streaming), ["pause", "stop"]);
+        assert_eq!(stream_actions(Standing { locked: true, ..streaming }), ["pause", "stop"]);
+        assert_eq!(stream_actions(Standing { enabled: false, ..streaming }), ["resume", "stop"]);
+        assert_eq!(stream_actions(Standing { stopped: true, online: Some(false), ..Default::default() }), ["start"]);
+        // In use by another computer: Start shown but not to be chosen; Stop ends the waiting.
+        let elsewhere = Standing { elsewhere: Some("box"), online: Some(true), ..Default::default() };
+        assert_eq!(stream_actions(elsewhere), ["start", "stop"]);
+        assert!(!can_start(elsewhere));
+        assert!(can_start(Standing { stopped: true, ..Default::default() }));
+        assert_eq!(start_hint("box"), "Stop streaming elsewhere first");
+        assert_eq!(stream_actions(Standing { online: Some(false), ..Default::default() }), ["stop"]);
+        let labels: Vec<&str> = ["start", "pause", "resume", "stop"].into_iter().map(action_label).collect();
+        assert_eq!(labels, ["Start", "Pause", "Resume", "Stop"]);
+    }
+
+    #[test]
+    fn the_shortcuts_toggle_what_fits_now() {
+        let streaming = Standing { connected: true, enabled: true, online: Some(true), ..Default::default() };
+        let paused = Standing { enabled: false, ..streaming };
+        let stopped = Standing { stopped: true, online: Some(true), ..Default::default() };
+        let waiting = Standing { online: Some(false), ..Default::default() };
+        let busy = Standing { stopped: true, elsewhere: Some("box"), ..Default::default() };
+        let started_elsewhere = Standing { elsewhere: Some("box"), online: Some(true), ..Default::default() };
+        assert_eq!(toggle_action("pause-toggle", streaming), Some("pause"));
+        assert_eq!(toggle_action("pause-toggle", Standing { locked: true, ..streaming }), Some("pause"));
+        assert_eq!(toggle_action("pause-toggle", paused), Some("resume"));
+        assert_eq!(toggle_action("pause-toggle", stopped), None);
+        assert_eq!(toggle_action("pause-toggle", waiting), None);
+        assert_eq!(toggle_action("stream-toggle", streaming), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", paused), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", waiting), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", started_elsewhere), Some("stop"));
+        assert_eq!(toggle_action("stream-toggle", stopped), Some("start"));
+        // The Mac streams to another computer: it has to be stopped there first.
+        assert_eq!(toggle_action("stream-toggle", busy), None);
+        assert_eq!(toggle_action("show", streaming), None);
+    }
+
+    #[test]
+    fn apps_list_pinned_then_running_then_the_rest() {
+        let app = |id: &str, name: &str, state: u8| serde_json::json!({ "id": id, "name": name, "state": state });
+        let mut apps = vec![
+            app("z", "zed", 0),
+            app("s", "Safari", 3),
+            app("n", "Notes", 0),
+            app("m", "Mail", 1),
+            app("f", "Finder", 0),
+            app("t", "Terminal", 2),
+        ];
+        sort_apps(&mut apps, &["t".into(), "f".into()]);
+        let names: Vec<&str> = apps.iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Terminal", "Finder", "Mail", "Safari", "Notes", "zed"]);
     }
 }

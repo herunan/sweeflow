@@ -18,40 +18,50 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// The logo (a template: macOS draws it in the menu bar's colour). Paused or not connected:
-    /// faded, with a small badge saying which, the same as the Linux tray icon's.
+    /// Where this Mac stands, as a dot in the logo's empty bottom-right corner (the sweet runs
+    /// from bottom left to top right), in the colours Linux gives it (its trays and Sweeflow's
+    /// window): violet streaming, a violet ring paused, green waiting for a Linux computer.
+    private let dot = CALayer()
+
+    /// The logo (a template: macOS draws it in the menu bar's colour), always solid, with the dot.
     private func updateIcon() {
         let connected = host.connected
         let on = settings.config.enabled && connected
         let base = NSImage(named: "MenuIcon")
             ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Sweeflow")
-        guard let base else { return }
+        guard let base, let button = item.button else { return }
         // The logo is wider than tall (a wrapped sweet): the menu bar's usual height, its own width.
         if base.size.height > 0 {
             base.size = NSSize(width: (16 * base.size.width / base.size.height).rounded(), height: 16)
         }
-        let badge = !connected ? "BadgeDisconnected" : !settings.config.enabled ? "BadgePaused" : nil
-        let image = badge.map { Self.badged(base, $0) } ?? base
-        image.isTemplate = true
-        item.button?.image = image
-        item.button?.appearsDisabled = !on
-        item.button?.toolTip = !connected ? "Sweeflow: not connected" : on ? "Sweeflow: streaming to Linux" : "Sweeflow: paused"
+        base.isTemplate = true
+        button.image = base
+        button.toolTip = !connected ? "Sweeflow: not streaming" : on ? "Sweeflow: streaming" : "Sweeflow: paused"
+        let violet = NSColor(srgbRed: 0x8b / 255.0, green: 0x5c / 255.0, blue: 0xf6 / 255.0, alpha: 1).cgColor
+        let green = NSColor(srgbRed: 0x30 / 255.0, green: 0xa4 / 255.0, blue: 0x6c / 255.0, alpha: 1).cgColor
+        let ring = connected && !on
+        dot.backgroundColor = ring ? nil : (connected ? violet : green)
+        dot.borderColor = violet
+        dot.borderWidth = ring ? 1.4 : 0
+        button.wantsLayer = true
+        if dot.superlayer == nil { button.layer?.addSublayer(dot) }
+        DispatchQueue.main.async { [weak self] in self?.placeDot() }
     }
 
-    /// The logo with a badge in its bottom-right corner, half its height (as on Linux), cut out
-    /// around it so it reads.
-    private static func badged(_ base: NSImage, _ name: String) -> NSImage {
-        guard let sign = NSImage(named: name) else { return base }
-        return NSImage(size: base.size, flipped: false) { rect in
-            base.draw(in: rect)
-            let side = rect.height / 2 + 1
-            let b = NSRect(x: rect.maxX - side, y: rect.minY, width: side, height: side)
-            NSGraphicsContext.current?.compositingOperation = .destinationOut
-            NSBezierPath(roundedRect: b.insetBy(dx: -1, dy: -1), xRadius: 2, yRadius: 2).fill()
-            NSGraphicsContext.current?.compositingOperation = .sourceOver
-            sign.draw(in: b)
-            return true
-        }
+    /// At the image's bottom-right corner, wherever the button has put it.
+    private func placeDot() {
+        guard let button = item.button, let image = button.image else { return }
+        button.layoutSubtreeIfNeeded()
+        let b = button.bounds, side: CGFloat = 5.5
+        let img = CGRect(x: (b.width - image.size.width) / 2, y: (b.height - image.size.height) / 2,
+                         width: image.size.width, height: image.size.height)
+        // The image's bottom edge, in the button's (and so its layer's) coordinates.
+        let y = button.isFlipped ? img.maxY - side : img.minY
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dot.frame = CGRect(x: img.maxX - side, y: y, width: side, height: side)
+        dot.cornerRadius = side / 2
+        CATransaction.commit()
     }
 
     /// Built when opened, so it always shows the current state. Only what concerns this Mac:
@@ -65,31 +75,46 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let refused = Identity.disconnectedClients().intersection(Identity.pairedClients().map(\.fingerprint))
         let statusText: String
         if let fp = client {
-            let who = fp.isEmpty ? "Linux machine" : Identity.clientName(fp)
+            // The name it has here (renamed here, or from linking), else what it calls itself,
+            // never a code made from its certificate.
+            let known = fp.isEmpty ? "" : (Identity.pairedClients().first { $0.fingerprint == fp }?.name ?? "")
+            let who = !known.isEmpty ? known : !host.clientSaysName.isEmpty ? host.clientSaysName : "a Linux computer"
             statusText = c.enabled ? "Streaming to \(who)" : "Paused · \(who)"
         } else {
-            statusText = refused.isEmpty ? "Not connected" : "Disconnected"
+            statusText = refused.isEmpty ? "Not streaming" : "Stopped"
         }
         let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
         if let fp = client {
             menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
-            menu.addItem(ClosureMenuItem(title: "Disconnect") { Self.disconnect(fp) })
+            menu.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(fp) })
         } else if let fp = refused.first {
-            menu.addItem(ClosureMenuItem(title: "Connect") { Self.connect(fp) })
+            menu.addItem(ClosureMenuItem(title: "Start") { Self.connect(fp) })
         }
         menu.addItem(.separator())
 
-        let apps = NSMenuItem(title: "Apps", action: nil, keyEquivalent: "")
+        let found = AppList.found()
+        // How many of them stream, out of all: "Allowed apps (85/87)", kept up as they're ticked.
+        let count = { () -> String in
+            let off = Set(settings.config.excludeApps)
+            return "Allowed apps (\(found.filter { !off.contains($0.bundleId) }.count)/\(found.count))"
+        }
+        let apps = NSMenuItem(title: count(), action: nil, keyEquivalent: "")
         let sub = NSMenu()
-        for a in AppList.found() {
-            let i = toggle(a.name, !c.excludeApps.contains(a.bundleId)) { c in
-                if let n = c.excludeApps.firstIndex(of: a.bundleId) { c.excludeApps.remove(at: n) } else { c.excludeApps.append(a.bundleId) }
-            }
-            let icon = NSWorkspace.shared.icon(forFile: a.path)
+        for a in found {
+            // Ticked: its windows stream. A click ticks or unticks it and leaves the menu open, so
+            // several can be changed in one go.
+            let icon = NSWorkspace.shared.icon(forFile: URL(fileURLWithPath: a.path).resolvingSymlinksInPath().path)
             icon.size = NSSize(width: 16, height: 16)
-            i.image = icon
+            let i = NSMenuItem()
+            i.view = StayOpenToggle(title: a.name, icon: icon, on: !settings.config.excludeApps.contains(a.bundleId)) { on in
+                settings.update { c in
+                    c.excludeApps.removeAll { $0 == a.bundleId }
+                    if !on { c.excludeApps.append(a.bundleId) }
+                }
+                apps.title = count()
+            }
             sub.addItem(i)
         }
         apps.submenu = sub
@@ -122,16 +147,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             let options = NSMenu()
             if p.fingerprint == client {
                 computer.state = .on
-                options.addItem(ClosureMenuItem(title: "Disconnect") { Self.disconnect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(p.fingerprint) })
             } else if refused.contains(p.fingerprint) {
-                options.addItem(ClosureMenuItem(title: "Connect") { Self.connect(p.fingerprint) })
+                options.addItem(ClosureMenuItem(title: "Start") { Self.connect(p.fingerprint) })
             } else {
-                let idle = NSMenuItem(title: "Not connected", action: nil, keyEquivalent: "")
+                let idle = NSMenuItem(title: "Not streaming", action: nil, keyEquivalent: "")
                 idle.isEnabled = false
                 options.addItem(idle)
             }
             options.addItem(ClosureMenuItem(title: "Rename…") { Self.rename(p.fingerprint) })
-            options.addItem(ClosureMenuItem(title: "Forget…") { Self.confirmForget(name, p.fingerprint) })
+            options.addItem(ClosureMenuItem(title: "Unlink…") { Self.confirmForget(name, p.fingerprint) })
             computer.submenu = options
             list.addItem(computer)
         }
@@ -163,15 +188,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
-    /// Ends that computer's connection and refuses it until Connect (it shows "Disconnected on
+    /// Ends that computer's connection and refuses it until Start (it shows "Disconnected on
     /// the Mac" meanwhile).
-    private static func disconnect(_ fingerprint: String) {
+    static func disconnect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, true)
         server.drop(fingerprint, telling: .macDisconnected)
     }
 
     /// Lets it in again: it connects by itself within a few seconds.
-    private static func connect(_ fingerprint: String) {
+    static func connect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, false)
     }
 
@@ -193,16 +218,22 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    /// Asks once: linking it again needs a new code. The Linux machine forgets this Mac too
-    /// (now, or the next time it connects).
-    private static func confirmForget(_ label: String, _ fingerprint: String) {
+    /// Asks once: to use it again, it has to be linked again. The Linux machine unlinks this Mac
+    /// too (now if it's connected, otherwise once it next connects or sees this Mac online).
+    static func confirmForget(_ label: String, _ fingerprint: String) {
         let alert = NSAlert()
-        alert.messageText = "Forget \(label)?"
-        alert.informativeText = "It forgets this Mac too. Linking them again needs a new code."
-        alert.addButton(withTitle: "Forget")
+        alert.messageText = "Unlink \(label)?"
+        alert.informativeText = "It's unlinked on \(label) too. To use it again, link it again from there."
+        alert.addButton(withTitle: "Unlink")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        forget(fingerprint)
+    }
+
+    /// What Unlink does once confirmed: the computer forgotten here, and told (now if it's the one
+    /// connected, else when it next connects or sees this Mac online).
+    static func forget(_ fingerprint: String) {
         Identity.removeClient(fingerprint)
         Identity.setDisconnected(fingerprint, false)
         if host.client == fingerprint {
@@ -231,4 +262,70 @@ private final class ClosureMenuItem: NSMenuItem {
     required init(coder: NSCoder) { fatalError() }
 
     @objc private func fire() { run() }
+}
+
+
+/// A menu row with a tick that changes in place: clicking it doesn't close the menu (a plain
+/// menu item always does), so several can be ticked or unticked in one go.
+private final class StayOpenToggle: NSView {
+    private let title: String
+    private let icon: NSImage
+    private var on: Bool
+    private let changed: (Bool) -> Void
+    private var hovered = false {
+        didSet { needsDisplay = true }
+    }
+
+    init(title: String, icon: NSImage, on: Bool, changed: @escaping (Bool) -> Void) {
+        self.title = title
+        self.icon = icon
+        self.on = on
+        self.changed = changed
+        let width = max(200, (title as NSString).size(withAttributes: [.font: NSFont.menuFont(ofSize: 0)]).width + 64)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
+        autoresizingMask = .width
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(title)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func viewDidMoveToWindow() { hovered = false }
+
+    override func mouseUp(with event: NSEvent) {
+        on.toggle()
+        needsDisplay = true
+        changed(on)
+    }
+
+    override func accessibilityValue() -> Any? { on }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let inner = bounds.insetBy(dx: 5, dy: 1)
+        if hovered {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: inner, xRadius: 4, yRadius: 4).fill()
+        }
+        let ink: NSColor = hovered ? .selectedMenuItemTextColor : .labelColor
+        let font = NSFont.menuFont(ofSize: 0)
+        if on {
+            let tick = "✓" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: font.pointSize, weight: .semibold), .foregroundColor: ink]
+            let sz = tick.size(withAttributes: attrs)
+            tick.draw(at: NSPoint(x: 12, y: (bounds.height - sz.height) / 2), withAttributes: attrs)
+        }
+        icon.draw(in: NSRect(x: 28, y: (bounds.height - 16) / 2, width: 16, height: 16))
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: ink]
+        let text = title as NSString
+        let sz = text.size(withAttributes: attrs)
+        text.draw(at: NSPoint(x: 50, y: (bounds.height - sz.height) / 2), withAttributes: attrs)
+    }
 }

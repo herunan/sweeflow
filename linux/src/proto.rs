@@ -2,7 +2,8 @@
 
 use anyhow::{bail, Result};
 
-pub const VERSION: u16 = 1;
+/// 2: understands WINDOW_REPLACED (the Mac sends it only to clients that say 2 or more).
+pub const VERSION: u16 = 2;
 
 pub mod t {
     pub const HELLO: u8 = 0x01;
@@ -11,8 +12,10 @@ pub mod t {
     pub const MAC_DISCONNECTED: u8 = 0x03;
     /// The Mac forgot this computer: forget it too.
     pub const FORGOTTEN: u8 = 0x04;
-    /// Leaving on purpose (switching Macs, disconnecting, quitting): the Mac tidies up at once.
+    /// Leaving on purpose (switching Macs, stopping streaming, quitting): the Mac tidies up at once.
     pub const GOODBYE: u8 = 0x05;
+    /// str computer: the Mac is streaming to that computer; turned away until it stops there.
+    pub const BUSY: u8 = 0x06;
     pub const WINDOW_ADDED: u8 = 0x10;
     pub const WINDOW_CHANGED: u8 = 0x11;
     pub const WINDOW_REMOVED: u8 = 0x12;
@@ -25,6 +28,13 @@ pub mod t {
     /// The press just made is on a spot that drags the window (title bar, toolbar): start the
     /// move on the first bit of motion instead of waiting for the app to begin dragging.
     pub const MOVE_READY: u8 = 0x2E;
+    /// u32 wid, f32 x, f32 y (window points), u8 drags: what the Mac found under the pointer as
+    /// it hovered the title-bar strip, ahead of any press (see DRAG_SPOT in ui.rs).
+    pub const DRAG_SPOT: u8 = 0x37;
+    /// u32 old wid, then a WINDOW_ADDED body for the new window: the Mac swapped one window for
+    /// another at the same frame in one step (switching a tabbed window's tab). The window here
+    /// stays on screen and becomes the new one's; the old wid is never mentioned again.
+    pub const WINDOW_REPLACED: u8 = 0x38;
     pub const MINIMIZE: u8 = 0x1A;
     pub const MENU_TREE: u8 = 0x1B;
     pub const APP_LIST: u8 = 0x1C;
@@ -57,6 +67,13 @@ pub mod t {
     pub const SCROLL: u8 = 0x32;
     pub const KEY: u8 = 0x33;
     pub const RELEASE_ALL: u8 = 0x34;
+    /// From the Mac: u32 wid, f32 fx, f32 fy — the app won't let this window be resized (a
+    /// reminder, a dialog): it keeps exactly its own size here, at the same spot of the screen
+    /// (fractions of the room: 0 left/top, 1 right/bottom; older Macs send only the wid).
+    pub const WINDOW_FIXED: u8 = 0x35;
+    /// From the Mac: u16 n, n str — its addresses (each interface's, Tailscale's) and its .local
+    /// name: kept with it, and tried when its last address stops answering (config.rs).
+    pub const ADDRESSES: u8 = 0x36;
     pub const CLIPBOARD: u8 = 0x40;
     #[allow(dead_code)] // part of the protocol; this client measures RTT from QUIC instead
     pub const PING: u8 = 0x41;
@@ -67,6 +84,10 @@ pub mod t {
     pub const DRAG_FETCH: u8 = 0x49;
     pub const DRAG_DATA: u8 = 0x4A;
     pub const DRAG_DROP_LOCAL: u8 = 0x4B;
+    /// C→S u32 n: the files of the Mac's clipboard copy n are being pasted here.
+    pub const CLIP_FETCH: u8 = 0x4C;
+    /// S→C u32 n, then a clipboard item list: them (empty: gone or unreadable).
+    pub const CLIP_FILES: u8 = 0x4D;
     pub const PONG: u8 = 0x42;
     pub const SUBSCRIBE: u8 = 0x50;
     pub const FRAME: u8 = 0x51;
@@ -76,9 +97,14 @@ pub mod t {
     pub const CORNERS: u8 = 0x55;
     pub const AUDIO_SUBSCRIBE: u8 = 0x60;
     pub const AUDIO: u8 = 0x61;
-    // Pairing listener only.
+    // Linking listener only (see pair.rs and PROTOCOL.md).
     pub const PAIR_REQUEST: u8 = 0x70;
     pub const PAIR_RESULT: u8 = 0x71;
+    // (0x72–0x74 were link version 2's nonce exchange.)
+    pub const PAIR_SHARE: u8 = 0x75;
+    pub const PAIR_GUESS: u8 = 0x76;
+    pub const PAIR_UNLINK: u8 = 0x77;
+    pub const PAIR_CHECK: u8 = 0x78;
 }
 
 /// Builds one framed message.

@@ -1,3 +1,4 @@
+import SystemConfiguration
 import AppKit
 import CPrivate
 import IOKit
@@ -10,13 +11,11 @@ final class Session {
     let queue: DispatchQueue
     private var control: MsgStream?
     private var clientScale: CGFloat = 1
-    /// Pixels per point to capture at; 0 = the window's native (Retina) backing scale.
-    private var captureScale: CGFloat = 0
     private let tracker: WindowTracker
     private let control_ = WindowControl()
     private let input = InputInjector()
     private var streamers: [ObjectIdentifier: WindowStreamer] = [:]
-    private var audio: (AudioCapture, ObjectIdentifier)?
+    private var audio: (SoundSource, ObjectIdentifier)?
     private var clipboard: (ClipboardSync, MsgStream)?
     /// Main-thread only.
     private let drag = DragBridge()
@@ -45,6 +44,8 @@ final class Session {
     private let menuQueue = DispatchQueue(label: "sweeflow.menus", qos: .userInitiated)
     /// The window with keyboard focus on the Linux side (0 = none of ours).
     private var clientFocus: UInt32 = 0
+    /// The protocol version the client said in its hello (2: knows windowReplaced).
+    private var clientVersion: UInt16 = 1
 
     /// The Linux screen's size (points), for (re)creating the virtual display.
     private var clientScreen: CGSize?
@@ -58,11 +59,32 @@ final class Session {
     /// It said goodbye: leaving on purpose, so no grace period for it to come back.
     private var leaving = false
 
+    /// What the client calls itself (its Hello; empty from older clients).
+    private(set) var clientName = ""
+    /// Asked on hello, before anything is served: may this client have the session? False: it
+    /// has been answered already (Busy).
+    var onHello: ((Session) -> Bool)?
+    /// Hello was answered with the session (and it hasn't been ended since).
+    var serving: Bool { started && !ended }
+    /// Ended (turned away, refused): anything more from the client is ignored while the last
+    /// message gets there.
+    private var ended = false
+    /// When the client last said anything (it pings every 2 s): a connection that went quiet
+    /// is taken to be gone.
+    private var lastHeard = DispatchTime.now()
+    var silentFor: TimeInterval { Double(DispatchTime.now().uptimeNanoseconds - lastHeard.uptimeNanoseconds) / 1e9 }
+
     /// Says something and ends the connection (a moment later, so it gets there).
     func sendAndClose(_ msg: Msg) {
-        control?.send(MsgWriter(msg))
+        sendAndClose(MsgWriter(msg))
+    }
+
+    func sendAndClose(_ w: MsgWriter) {
+        ended = true
+        control?.send(w)
         queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.shutdown() }
     }
+
 
     init(group: NWConnectionGroup, queue: DispatchQueue) {
         self.group = group
@@ -123,6 +145,8 @@ final class Session {
     // MARK: messages
 
     private func handle(_ m: inout MsgReader, on s: MsgStream) throws {
+        lastHeard = .now()
+        guard !ended else { return }
         // Input that comes while a press waits for its window to come to the front (see
         // holdInput) waits too, so it all lands in order.
         if heldInput != nil, [.pointerMove, .pointerButton, .scroll, .key, .releaseAll].contains(m.type) {
@@ -139,9 +163,17 @@ final class Session {
             leaving = true
         case .hello:
             let v = try m.u16()
+            clientVersion = v
             clientScale = try m.f32()
-            captureScale = (try? m.f32()) ?? 0
-            log("client hello v\(v) scale \(clientScale) capture scale \(captureScale)")
+            log("client hello v\(v) scale \(clientScale)")
+            if let fp = Server.peerFingerprint(s.conn), fp != clientFingerprint {
+                log("client is \(fp.prefix(8)), not \(clientFingerprint?.prefix(8) ?? "unknown") (the latest handshake was another computer's)")
+                clientFingerprint = fp
+            }
+            // A stuck capture service, once restarted, takes every window's capture afresh.
+            CaptureHealth.restartAll = { [weak self] in
+                self?.queue.async { self?.streamers.values.forEach { $0.restartAfterServiceReset() } }
+            }
             control = s
             // Forgotten here: told once, so it forgets this Mac too. Disconnected here: refused.
             if let fp = clientFingerprint, Identity.forgottenClients().contains(fp) {
@@ -153,19 +185,34 @@ final class Session {
                 log("client \(fp.prefix(8)) was disconnected here: refused")
                 return sendAndClose(.macDisconnected)
             }
+            // Newer clients say their name. One linked without a name (the development setup)
+            // takes it, so the menu lists it by name rather than a code from its certificate.
+            clientName = (try? m.str()) ?? ""
+            if let fp = clientFingerprint, !clientName.isEmpty,
+               Identity.pairedClients().first(where: { $0.fingerprint == fp })?.name.isEmpty == true {
+                Identity.renameClient(fp, to: clientName)
+            }
+            if let claim = onHello, !claim(self) { return }
+            ScrollAcceleration.reload()   // the scroll settings may have changed meanwhile
             DebugPort.session = self
             if !started {
                 started = true
-                let fp = clientFingerprint
-                DispatchQueue.main.async { host.client = fp; host.sessionStarted() }
+                let fp = clientFingerprint, name = clientName
+                DispatchQueue.main.async { host.clientSaysName = name; host.client = fp; host.sessionStarted() }
             }
             let key = ObjectIdentifier(s)
             if let st = streamers.removeValue(forKey: key) { st.stop() }
             var w = MsgWriter(.welcome)
             w.u16(protocolVersion)
-            w.str(Host.current().localizedName ?? "Mac")
+            // The Mac's name as set in its settings, from configd (Host.current() can wait on name lookups).
+            w.str(SCDynamicStoreCopyComputerName(nil, nil) as String? ?? macName)
             w.str(Self.macKind)
             s.send(w)
+            var a = MsgWriter(.addresses)
+            let all = Self.ownAddresses()
+            a.u16(UInt16(all.count))
+            all.forEach { a.str($0) }
+            s.send(a)
             // Accessibility calls wait at most a second for an app (not the default 6 s): a
             // hung app must not hold its queue, and everything behind it, for long.
             AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
@@ -215,16 +262,16 @@ final class Session {
             // A new window is about to move onto the virtual display (see placeOnVirtualDisplay):
             // capture at its scale from the start, not at wherever it opened and then again.
             let vdScale = vdArea.flatMap { win.kind == .popup ? nil : displayScale(at: CGPoint(x: $0.midX, y: $0.midY)) }
-            let scale = settings.config.quality == "light" ? 1 : captureScale > 0 ? captureScale : vdScale ?? backingScale(of: win.frame)
+            let scale = captureScale(vdScale ?? backingScale(of: win.frame))
             let st = WindowStreamer(wid: wid, pointSize: win.frame.size, scale: scale, lossless: win.kind == .popup,
                                     out: s, queue: queue)
             st.buttons = sentButtons[wid] ?? []
             st.badgeRect = { [weak tracker] in tracker?.badgeRect(wid) }
-            st.visibleSize = requestedSizes[wid]
-            st.displayScale = { [weak tracker] in
-                if settings.config.quality == "light" { return 1 }
-                guard let f = tracker?.windows[wid]?.frame else { return nil }
-                return displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40)))
+            st.badgeAbsent = { [weak tracker] in tracker?.badgeAbsent(wid) ?? false }
+            st.displayScale = { [weak self, weak tracker] in
+                guard let self, let f = tracker?.windows[wid]?.frame,
+                      let d = displayScale(at: CGPoint(x: f.midX, y: f.minY + min(f.height / 2, 40))) else { return nil }
+                return self.captureScale(d)
             }
             if let app = NSRunningApplication(processIdentifier: win.pid) {
                 var r = CGRect(x: 0, y: 0, width: 256, height: 256)
@@ -233,10 +280,7 @@ final class Session {
             st.onDetectedButtons = { [weak self] rects in
                 guard let self else { return }
                 self.sentButtons[wid] = rects
-                var m = MsgWriter(.windowButtons)
-                m.u32(wid)
-                for r in rects { m.f32(r.minX); m.f32(r.minY); m.f32(r.width); m.f32(r.height) }
-                self.control?.send(m)
+                self.sendWindowButtons(wid, rects)
             }
             st.active = wid == clientFocus
             if let flow = datagrams {
@@ -266,11 +310,22 @@ final class Session {
                     }
                     self.queue.async {
                         var out = MsgWriter(.dragData)
-                        out.u16(UInt16(items.count))
-                        for it in items { out.str(it.kind.rawValue); out.str(it.name); out.bytes(it.data) }
+                        out.items(items)
                         s.send(out)
                         log("drag to Linux: \(items.map(\.name))")
                     }
+                }
+            }
+        case .clipFetch:
+            let number = try m.u32()
+            guard let sync = clipboard?.0 else { return }
+            sync.files(number) { [weak self] items in
+                self?.queue.async {
+                    var out = MsgWriter(.clipFiles)
+                    out.u32(number)
+                    out.items(items ?? [])
+                    s.send(out)
+                    log("clipboard: pasted on Linux: \(items.map { $0.map(\.name) } ?? ["(gone)"])")
                 }
             }
         case .dragDropLocal:
@@ -407,13 +462,18 @@ final class Session {
             // Only onto another window: looking at the window list costs a few ms, and motion
             // comes hundreds of times a second (a press still checks every time). And not here:
             // with many windows open the window server answers late, and every move waited.
-            if let p, !DragBridge.replaying { if wid != raisedWid { ensureFrontSoon(wid, at: p) }; input.move(to: p) }
+            if let p, !DragBridge.replaying {
+                if wid != raisedWid { ensureFrontSoon(wid, at: p) }
+                input.move(to: p)
+                probeSpot(wid, at: p)
+            }
             userDidSomething(click: false)
         case .pointerButton:
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
             let pressId = (try? m.u32()) ?? 0   // newer clients number their presses
             log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")")
+            if pressed { spotProbe.last = nil }   // the hover after this looks afresh (see probeSpot)
             if let p {
                 let post = { [self] in
                     input.button(b, pressed: pressed, at: p)
@@ -424,7 +484,11 @@ final class Session {
                         if pressed, pressId != 0 { classifyPress(wid, at: p, id: pressId) }
                     }
                 }
-                if pressed { press(wid, at: p, then: post) } else { post() }
+                if pressed { press(wid, at: p, then: post) } else {
+                    post()
+                    // A capture gone quiet shows up as a click with no new picture.
+                    for st in streamers.values where st.wid == wid { st.expectFrameAfterInput() }
+                }
             }
         case .scroll:
             let (_, p) = try pointerTarget(&m)
@@ -437,11 +501,16 @@ final class Session {
             // Keys that open, close or switch things (menus, dialogs, fields, shortcuts) look
             // closely; plain typing only as closely as pointer motion.
             if v == 1 { userDidSomething(click: Self.actionKeys.contains(code) || input.commandOrControlHeld) }
+            // Keys go to the focused window: its capture should show what they did.
+            if v == 1 { for st in streamers.values where st.active { st.expectFrameAfterInput() } }
         case .releaseAll:
             input.releaseAll()
             setClientFocus(0)
         case .moveTaken:
-            moveTaken(try m.u32())
+            // Linux may start its move from a spot it knew from the hover (dragSpot), right after
+            // the press: in line behind that press if it's being held for a raise (holdInput).
+            let wid = try m.u32()
+            afterHeld { [weak self] in self?.moveTaken(wid) }
 
         default:
             log("unhandled message \(m.type)")
@@ -735,14 +804,42 @@ final class Session {
     /// itself or its toolbar within the title-bar strip (above the controls), or a spot that
     /// dragged this app's window before, tells Linux to move the window on the first motion.
     private func classifyPress(_ wid: UInt32, at p: CGPoint, id: UInt32) {
-        guard let win = tracker.windows[wid], win.kind == .toplevel,
-              let button = sentButtons[wid]?.first(where: { $0 != .zero }) else { return }
-        // The traffic lights sit centred in the title bar (or the toolbar merged with it).
-        let strip = button.minY + button.maxY + 2
+        guard inTitleStrip(wid, at: p) else { return }
+        hitSpot(wid, at: p) { [weak self] spot, bare in
+            guard let self, let spot, let g = self.gesture, g.wid == wid, g.buttonDown else { return }
+            self.pressSpot = (wid, id, spot)
+            guard bare || self.dragSpots.contains(spot) else { return }
+            var m = MsgWriter(.moveReady); m.u32(wid); m.u32(id); self.control?.send(m)
+        }
+    }
+
+    /// Whether `p` is in the window's title-bar strip: the band the traffic lights sit centred
+    /// in (the title bar, or the toolbar merged with it). A floating panel without them (a
+    /// reminder, Quick Look) is moved by any bare part of it. Not a menu (see movable).
+    private func inTitleStrip(_ wid: UInt32, at p: CGPoint) -> Bool {
+        guard let win = tracker.windows[wid], Self.movable(win) else { return false }
+        let strip: CGFloat
+        if let button = sentButtons[wid]?.first(where: { $0 != .zero }) {
+            strip = button.minY + button.maxY + 2
+        } else if win.kind == .dialog || win.kind == .popup {
+            strip = win.frame.height
+        } else {
+            return false
+        }
         let y = p.y - win.frame.minY
-        guard y >= 0, y <= strip else { return }
+        return y >= 0 && y <= strip
+    }
+
+    /// What's under `p` in window `wid`, by an Accessibility hit test off this queue (the app
+    /// answers in a few ms, a busy one later: capped at 250 ms): `then`, on this queue, gets the
+    /// spot ("bundle id|role|subrole|identifier") and whether it's bare window or toolbar, or
+    /// nil when it isn't this window's (one in front of it, or no answer).
+    private func hitSpot(_ wid: UInt32, at p: CGPoint, then: @escaping (_ spot: String?, _ bare: Bool) -> Void) {
+        guard let win = tracker.windows[wid] else { return then(nil, false) }
         let bundle = win.bundleId
         hitQueue.async { [weak self] in
+            var found: (String, Bool)?
+            defer { self?.queue.async { then(found?.0, found?.1 ?? false) } }
             let system = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(system, 0.25)
             // The system-wide timeout holds for the whole process: back to the usual second after.
@@ -756,21 +853,75 @@ final class Session {
             }
             // It must be this window's (not one in front of it).
             var owner: AXUIElement? = el
-            if attr(el, kAXRoleAttribute) != kAXWindowRole {
+            let role = attr(el, kAXRoleAttribute)
+            if role != kAXWindowRole {
                 var w: CFTypeRef?
                 owner = AXUIElementCopyAttributeValue(el, kAXWindowAttribute as CFString, &w) == .success ? (w as! AXUIElement) : nil
             }
             var ownerId: CGWindowID = 0
             guard let owner, _AXUIElementGetWindow(owner, &ownerId) == .success, ownerId == wid else { return }
-            let role = attr(el, kAXRoleAttribute)
             let spot = [bundle, role, attr(el, kAXSubroleAttribute), attr(el, kAXIdentifierAttribute)].joined(separator: "|")
-            self?.queue.async {
-                guard let self, let g = self.gesture, g.wid == wid, g.buttonDown else { return }
-                self.pressSpot = (wid, id, spot)
-                let bare = role == kAXWindowRole || role == kAXToolbarRole
-                guard bare || self.dragSpots.contains(spot) else { return }
-                var m = MsgWriter(.moveReady); m.u32(wid); m.u32(id); self.control?.send(m)
+            found = (spot, role == kAXWindowRole || role == kAXToolbarRole)
+        }
+    }
+
+    /// The hover's hit tests (probeSpot): one at a time, the newest point wanted meanwhile
+    /// (so the last place the pointer stops is always looked at), and the last point looked at.
+    private var spotProbe: (busy: Bool, want: (wid: UInt32, p: CGPoint)?, last: (wid: UInt32, p: CGPoint, at: DispatchTime)?, retries: Int) = (false, nil, nil, 0)
+    /// The last answer sent (window, drags): a change is logged.
+    private var spotAnswer: (wid: UInt32, drags: Bool)?
+
+    /// Looks under the pointer while it hovers a window's title-bar strip, before any press, and
+    /// tells Linux what's there (dragSpot): with that, a press there starts the window's move
+    /// on its first motion with no wait for an answer, so the window is taken hold of exactly
+    /// where it was pressed (classifyPress's answer comes a round trip and a hit test later,
+    /// by when a quick drag has moved the pointer tens of points: the hand slid over the window
+    /// before it caught). A new look every 3 points of travel; an answer "no" matters too (a
+    /// tab or toolbar button next to a bare spot gets its own press).
+    private func probeSpot(_ wid: UInt32, at p: CGPoint) {
+        guard inTitleStrip(wid, at: p) else { spotProbe.last = nil; return }
+        // The same spot again (within 3 points, in the last 2 s) needs no new look. Not across a
+        // press (pointerButton forgets the last look): the window may have moved under the
+        // pointer, on Linux, with it still at the same point of the Mac's screen.
+        if let last = spotProbe.last, last.wid == wid, abs(last.p.x - p.x) < 3, abs(last.p.y - p.y) < 3,
+           DispatchTime.now().uptimeNanoseconds - last.at.uptimeNanoseconds < 2_000_000_000 { return }
+        spotProbe.want = (wid, p)
+        spotProbe.retries = 0
+        runSpotProbe()
+    }
+
+    private func runSpotProbe() {
+        guard !spotProbe.busy, let want = spotProbe.want else { return }
+        let (wid, p) = (want.wid, want.p)
+        spotProbe.want = nil
+        guard let win = tracker.windows[wid] else { return }
+        spotProbe.busy = true
+        spotProbe.last = (wid, p, .now())
+        let origin = win.frame.origin
+        hitSpot(wid, at: p) { [weak self] spot, bare in
+            guard let self else { return }
+            self.spotProbe.busy = false
+            let drags = bare || spot.map { self.dragSpots.contains($0) } == true
+            var m = MsgWriter(.dragSpot)
+            m.u32(wid); m.f32(Float(p.x - origin.x)); m.f32(Float(p.y - origin.y)); m.u8(drags ? 1 : 0)
+            self.control?.send(m)
+            if self.spotAnswer.map({ $0.wid != wid || $0.drags != drags }) ?? true {
+                self.spotAnswer = (wid, drags)
+                let what = spot.map { String($0.split(separator: "|", omittingEmptySubsequences: false).dropFirst().joined(separator: "|")) } ?? "not this window's"
+                log("window \(wid): under the pointer at \(Int(p.x - origin.x)),\(Int(p.y - origin.y)): \(what) → \(drags ? "a press there moves the window" : "no move from there")")
             }
+            // Not this window's: the one over it on the Mac is being moved out of the way
+            // (ensureFrontSoon, asked as the pointer came). Looked at again shortly, while the
+            // pointer stays, a few times.
+            if spot == nil, self.spotProbe.want == nil, self.spotProbe.retries < 4 {
+                self.spotProbe.retries += 1
+                self.queue.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak self] in
+                    guard let self, self.spotProbe.want == nil, let last = self.spotProbe.last, last.wid == wid, last.p == p else { return }
+                    self.spotProbe.want = (wid, p)
+                    self.runSpotProbe()
+                }
+            }
+            self.runSpotProbe()
         }
     }
 
@@ -800,8 +951,14 @@ final class Session {
         log("window \(wid): moved by Linux from the press")
     }
 
+    /// Whether a press can move the window: not a menu, but a floating panel shown attached on
+    /// Linux (Quick Look), which Linux moves itself there (a popup to its desktop).
+    static func movable(_ win: TrackedWindow) -> Bool {
+        win.kind != .popup || (1..<24).contains(win.layer)
+    }
+
     private func watchGesture(_ wid: UInt32, buttonDown: Bool) {
-        guard let win = tracker.windows[wid], win.kind == .toplevel else { return }
+        guard let win = tracker.windows[wid], Self.movable(win) else { return }
         if buttonDown || gesture?.wid != wid {
             // Where the window is as the press lands: the tracker's frame when its last look is
             // recent, else the first look from here (see checkGesture) says. Not asked on this
@@ -941,6 +1098,13 @@ final class Session {
             let t0 = Date()
             if let o = t.origin { control.setPosition(wid, pid: t.pid, o) }
             control.setSize(wid, pid: t.pid, t.size)
+            // Moved first so it could grow: an app may size it against where it was, its move not
+            // landed yet (TextEdit stopped at the screen's edge from there). Once it's there, again.
+            if let o = t.origin, let f = self?.tracker.liveFrame(wid),
+               f.width < t.size.width - 2 || f.height < t.size.height - 2 {
+                for _ in 0..<10 where self?.tracker.liveFrame(wid)?.origin != o { usleep(20_000) }
+                control.setSize(wid, pid: t.pid, t.size)
+            }
             let ms = Date().timeIntervalSince(t0) * 1000
             if ms > 100 { log(String(format: "resize of %u took %.0f ms", wid, ms)) }
             // What the app made of it: some keep a size of their own (a minimum, a step).
@@ -1145,6 +1309,18 @@ final class Session {
         }
     }
 
+    func debugDump(wid: UInt32, n: Int) -> String {
+        queue.async { self.streamers.values.first(where: { $0.wid == wid })?.dumpChanges(n) }
+        return "ok"
+    }
+
+    func debugChanges(wid: UInt32, reply: @escaping (String) -> Void) {
+        queue.async {
+            guard let st = self.streamers.values.first(where: { $0.wid == wid }) else { return reply("no stream for \(wid)") }
+            st.recentChanges(reply)
+        }
+    }
+
     func debugPause(_ on: Bool, placeholder: Bool = false) {
         queue.async { self.streamers.values.forEach { $0.setScreenLocked(on, placeholder: placeholder) } }
     }
@@ -1205,13 +1381,15 @@ final class Session {
     private func clientResized(_ wid: UInt32, to size: CGSize) -> Bool {
         guard let win = tracker.windows[wid] else { return false }
         requestedSizes[wid] = size
-        for st in streamers.values where st.wid == wid { st.visibleSize = size }
         resize(win, to: size)
         return true
     }
 
     private func sendButtons(_ w: TrackedWindow) {
-        guard w.kind == .toplevel else { return }
+        // Panels too (Activity Monitor's CPU History, a Fonts panel): they have their own small
+        // close button, under the capture badge like any window's, and without it drawn on
+        // Linux there was no way to close one from there.
+        guard w.kind == .toplevel || w.kind == .dialog else { return }
         // Looked up on the app's own queue: an app busy resizing answers late, and on the
         // session's queue every window's frames waited for it (a tiling relayout resizes them
         // all at once). One look per window at a time; changes meanwhile look once more after.
@@ -1238,24 +1416,106 @@ final class Session {
     private var buttonLookups: Set<UInt32> = []
     private var buttonsAgain: Set<UInt32> = []
 
+    /// Apps that place their buttons themselves (Tauri- and Electron-style title bars) get them
+    /// put back at the standard place by AppKit whenever it lays the title bar out again, and
+    /// move them down again with their next drawing. Asked in between, such a window gives the
+    /// standard place, higher up, and can stay there while nothing redraws it: Linux then drew
+    /// the buttons too high. So a window whose buttons went to a place and straight back (same
+    /// sizes and spacing, within a few seconds) keeps them at the lower of the two from then
+    /// on, which is where the app puts them; and the app is remembered for it (across
+    /// restarts), so its windows get the lower place straight away next time.
+    private var buttonHistory: [UInt32: [(at: DispatchTime, rects: [CGRect])]] = [:]
+    private var buttonsKept: [UInt32: [CGRect]] = [:]
+    /// "bundle id|the standard place as reported" → how far down and right the app really has
+    /// its buttons ("dx,dy").
+    private var buttonShifts = UserDefaults.standard.dictionary(forKey: "buttonShifts") as? [String: String] ?? [:]
+
+    private func settledButtons(_ w: TrackedWindow, _ rects: [CGRect]) -> [CGRect] {
+        let wid = w.wid
+        guard rects.count == 3, rects.allSatisfy({ $0.width > 0 }) else { return rects }
+        func sameShape(_ a: [CGRect], _ b: [CGRect]) -> Bool {
+            a.count == 3 && b.count == 3 && zip(a, b).allSatisfy { $0.size == $1.size }
+                && abs((a[1].minX - a[0].minX) - (b[1].minX - b[0].minX)) < 0.5
+        }
+        func key(_ r: [CGRect]) -> String {
+            w.bundleId + "|" + r.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" }.joined(separator: " ")
+        }
+        // macOS's capture badge sits over the real buttons: when it covers them where they're
+        // reported and not where a shift would put them, they are where reported. (TextEdit has
+        // two real places, by its toolbar's height: going from one to the other and back had it
+        // taken for an app that moves its own buttons, and Linux drew them 26 points too low,
+        // over its formatting bar.)
+        func badgeSaysAsReported(_ shifted: [CGRect]) -> Bool {
+            guard let badge = tracker.badgeRect(wid)?.insetBy(dx: -2, dy: -2) else { return false }
+            let mid = { (r: [CGRect]) in CGPoint(x: r[1].midX, y: r[1].midY) }
+            return badge.contains(mid(rects)) && !badge.contains(mid(shifted))
+        }
+        // Known from before: this app's buttons, reported at the standard place.
+        if let shift = buttonShifts[key(rects)]?.split(separator: ",").compactMap({ Double($0) }), shift.count == 2 {
+            let shifted = rects.map { $0.offsetBy(dx: shift[0], dy: shift[1]) }
+            if !badgeSaysAsReported(shifted) { return shifted }
+            buttonShifts[key(rects)] = nil
+            UserDefaults.standard.set(buttonShifts, forKey: "buttonShifts")
+            log("window \(wid) (\(w.appName)): the badge is over its buttons where reported: no longer shifted for the app")
+            return rects
+        }
+        if let kept = buttonsKept[wid] {
+            if sameShape(kept, rects) {
+                if rects[0].minY > kept[0].minY { buttonsKept[wid] = rects; return rects }
+                if badgeSaysAsReported(kept) { buttonsKept[wid] = nil; buttonHistory[wid] = nil; return rects }
+                return kept
+            }
+            // Other buttons altogether (another title bar style): start over.
+            buttonsKept[wid] = nil
+            buttonHistory[wid] = nil
+        }
+        var history = buttonHistory[wid] ?? []
+        if history.last?.rects != rects { history.append((.now(), rects)) }
+        history = Array(history.suffix(3))
+        buttonHistory[wid] = history
+        if history.count == 3, history[0].rects == history[2].rects, sameShape(history[0].rects, history[1].rects),
+           history[2].at.uptimeNanoseconds - history[0].at.uptimeNanoseconds < 5_000_000_000 {
+            let (a, b) = (history[0].rects, history[1].rects)
+            let (lower, higher) = a[0].minY >= b[0].minY ? (a, b) : (b, a)
+            // Both places real (the badge is over the buttons where they are now, the higher
+            // one): nothing to keep or remember.
+            if rects == higher, badgeSaysAsReported(lower) { return rects }
+            buttonsKept[wid] = lower
+            buttonShifts[key(higher)] = "\(lower[0].minX - higher[0].minX),\(lower[0].minY - higher[0].minY)"
+            UserDefaults.standard.set(buttonShifts, forKey: "buttonShifts")
+            log("window \(wid) (\(w.appName)): its buttons went to a place and straight back: kept at the lower one, and remembered for the app")
+            return lower
+        }
+        return rects
+    }
+
     private func applyButtons(_ w: TrackedWindow, _ rects: [CGRect]) {
         guard tracker.windows[w.wid] != nil else { return }
         // A transient failure (window mid-move) must not wipe known-good positions.
         if rects.allSatisfy({ $0 == .zero }), sentButtons[w.wid]?.contains(where: { $0 != .zero }) == true {
             return
         }
+        let rects = settledButtons(w, rects)
         guard sentButtons[w.wid] != rects else { return }
         sentButtons[w.wid] = rects
         for st in streamers.values where st.wid == w.wid { st.buttons = rects }
         log("window \(w.wid) (\(w.appName)) buttons \(rects.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" })")
+        sendWindowButtons(w.wid, rects)
+    }
+
+    /// Where a window's close, minimise and zoom buttons are (window points).
+    private func sendWindowButtons(_ wid: UInt32, _ rects: [CGRect]) {
         var m = MsgWriter(.windowButtons)
-        m.u32(w.wid)
+        m.u32(wid)
         for r in rects { m.f32(r.minX); m.f32(r.minY); m.f32(r.width); m.f32(r.height) }
         control?.send(m)
     }
 
     /// Brings a window to the front, then (on the main thread) does what needs it there.
     private func raiseThen(_ win: TrackedWindow, _ then: @escaping () -> Void) {
+        if tracker.isKnownSheet(win.wid), let parent = tracker.windows[win.parent], parent.kind == .toplevel {
+            return raiseThen(parent, then)
+        }
         guard win.kind == .toplevel else { return DispatchQueue.main.async(execute: then) }
         let control = control_
         raisedWid = win.wid
@@ -1272,6 +1532,12 @@ final class Session {
     private let raiseLock = NSLock()
 
     private func raise(_ win: TrackedWindow) {
+        // A sheet comes forward with its window, and is raised by raising that: put in front on
+        // its own (its window number to the window server), the app took no more clicks on it
+        // until its window was clicked.
+        if tracker.isKnownSheet(win.wid), let parent = tracker.windows[win.parent], parent.kind == .toplevel {
+            return raise(parent)
+        }
         log("raising \(win.wid) (\(win.appName))")
         let gen = raiseLock.withLock { raiseGeneration += 1; return raiseGeneration }
         // To the front in the window server at once, in the order asked: the rest (below) goes
@@ -1308,12 +1574,20 @@ final class Session {
             self?.sendAdded(w)
         }
         tracker.onChanged = { [weak self] w in self?.sendChanged(w) }
+        tracker.onReplaced = { [weak self] old, w in self?.windowReplaced(old, by: w) }
         tracker.onRemoved = { [weak self] w in
             guard let self else { return }
+            self.fixedKnown[w.wid] = nil
+            self.fixedSpots[w.wid] = nil
             let now = DispatchTime.now()
             self.recentlyGone = self.recentlyGone.filter { now.uptimeNanoseconds - $0.value.at.uptimeNanoseconds < 2_000_000_000 }
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
             let wid = w.wid
+            self.announced.remove(wid)
+            // Its popups waiting for it: told now, with whatever window they have by then.
+            for c in self.awaitingParent.removeValue(forKey: wid) ?? [] {
+                if let now = self.tracker.windows[c] { self.sendAdded(now) }
+            }
             self.lastFrames[wid] = nil
             self.refusedSizes[wid] = nil
             if self.minimized[wid] != nil { return }
@@ -1350,6 +1624,10 @@ final class Session {
             }
         }
         tracker.isAppWindow = { [weak self] wid, pid in self?.control_.element(wid, pid: pid) != nil }
+        tracker.isSheet = { [weak self] wid, pid in
+            // A child of the window it hangs from, or listed as a window with the role of one.
+            self?.control_.isSheet(wid, pid: pid) ?? false
+        }
         tracker.hasNoButtons = { [weak self] wid, pid in
             guard let self, self.control_.element(wid, pid: pid) != nil else { return false }
             return self.control_.buttonRects(wid, pid: pid).allSatisfy { $0.width == 0 }
@@ -1357,6 +1635,13 @@ final class Session {
         // Which window has focus changes with what the user does or with app switches, which
         // both start a burst of window checks.
         tracker.onBurstPoll = { [weak self] in self?.checkFocus() }
+        tracker.onBadgeAppeared = { [weak self] wid in
+            guard let self, let w = self.tracker.windows[wid] else { return }
+            self.sendButtons(w)
+        }
+        tracker.onBadgeFound = { [weak self] wid in
+            self?.streamers.values.filter { $0.wid == wid }.forEach { $0.requestRepaint() }
+        }
         tracker.onBlindAdded = { [weak self] b in self?.blindAdded(b) }
         tracker.onScreenSelect = { [weak self] on in
             log("screenshot selection \(on ? "started" : "ended")")
@@ -1371,6 +1656,9 @@ final class Session {
             self.control?.send(m)
         }
         tracker.start()
+        // Which window is in front here, told as the client starts showing them: it focuses
+        // that one, not whichever its desktop focuses last as they arrive (linux arrival.rs).
+        tracker.burst(everyMs: 50, for: 3)
         // Displays come and go (the virtual one, the lid, a real monitor plugged in): macOS can
         // rearrange them and move the virtual display, so look up where it is now, bring the
         // windows back onto it, and capture at its scale.
@@ -1500,6 +1788,14 @@ final class Session {
         streamers.values.forEach { $0.checkScale() }
     }
 
+    /// What to capture a window at, drawn at `display` pixels per point on the Mac. High
+    /// quality: as the Mac draws it (2× on its Retina virtual display), even for a 1× Linux
+    /// screen: shrunk there by the compositor it reads sharper than captured at 1×, which the
+    /// Mac's window server shrinks softly. Low: 1×.
+    private func captureScale(_ display: CGFloat) -> CGFloat {
+        settings.config.quality == "light" ? 1 : display
+    }
+
     private func updateAudio() {
         let c = settings.config
         guard let s = audioStream, c.enabled, c.soundOnLinux else {
@@ -1508,18 +1804,31 @@ final class Session {
             return
         }
         guard audio == nil else { return }
-        let cap = AudioCapture(allowed: { settings.config.allows($0) })
-        cap.onPCM = { [weak self, weak s] pcm in
+        let onPCM: (Data, UInt32) -> Void = { [weak self, weak s] pcm, ageUs in
             self?.queue.async {
                 // Drop rather than queue: late audio is worse than a tiny gap.
                 guard let s, s.pendingBytes < 64_000 else { return }
                 var m = MsgWriter(.audio)
                 m.bytes(pcm)
+                m.u32(ageUs)   // how long after it played it was captured (older clients stop at the sound)
                 s.send(m)
             }
         }
-        cap.start()
-        audio = (cap, ObjectIdentifier(s))
+        // A Core Audio tap (~10 ms behind the sound); ScreenCaptureKit's (~55 ms) when there's none.
+        let allowed: (String) -> Bool = { settings.config.allows($0) }
+        let tap = AudioTap(allowed: allowed)
+        tap.onPCM = onPCM
+        audio = (tap, ObjectIdentifier(s))
+        tap.start { [weak self] ok in
+            guard !ok else { return }
+            self?.queue.async {
+                guard let self, let a = self.audio, a.0 === tap else { return }
+                let cap = AudioCapture(allowed: allowed)
+                cap.onPCM = onPCM
+                cap.start()
+                self.audio = (cap, a.1)
+            }
+        }
     }
 
     private func updateClipboard() {
@@ -1535,10 +1844,9 @@ final class Session {
             self?.queue.async {
                 guard let s else { return }
                 var m = MsgWriter(.clipboard)
-                m.u16(UInt16(items.count))
-                for it in items { m.str(it.kind.rawValue); m.str(it.name); m.bytes(it.data) }
+                m.items(items)
                 s.send(m)
-                log("clipboard to Linux: \(items.map { $0.kind == .file ? $0.name : $0.kind.rawValue })")
+                log("clipboard to Linux: \(items.map { $0.kind == .fileRef ? $0.name : $0.kind.rawValue })")
             }
         }
         sync.start()
@@ -1578,6 +1886,8 @@ final class Session {
         guard goneWindows.insert(wid).inserted else { return }
         control_.forget(wid)
         sentButtons[wid] = nil
+        buttonHistory[wid] = nil
+        buttonsKept[wid] = nil
         var m = MsgWriter(.windowRemoved); m.u32(wid); control?.send(m)
     }
 
@@ -1595,10 +1905,17 @@ final class Session {
         focusChecking = true
         let control = control_
         focusQueue.async { [weak self] in
-            let wid = control.focusedWindowID()
+            let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            let focused = pid.flatMap { control.focusedWindowID(of: $0) }
             self?.queue.async {
                 guard let self else { return }
                 self.focusChecking = false
+                // Not said (Finder with Quick Look up has no focused window for Accessibility):
+                // the app's frontmost window, from the window server's order.
+                var wid = focused ?? self.tracker.zOrder.first { self.tracker.windows[$0].map { $0.pid == pid && $0.kind == .toplevel } ?? false }
+                // A panel shown as a popup on Linux (Quick Look, when Accessibility names it)
+                // can't have the focus there: the window it's shown on.
+                if let w = wid.flatMap({ self.tracker.windows[$0] }), w.kind == .popup, w.parent != 0 { wid = w.parent }
                 guard let wid, wid != self.lastFocused, self.tracker.windows[wid] != nil else { return }
                 self.lastFocused = wid
                 var m = MsgWriter(.focused); m.u32(wid); self.control?.send(m)
@@ -1606,17 +1923,181 @@ final class Session {
         }
     }
 
+    /// This Mac's IPv4 addresses on interfaces that are up (not loopback), and its .local name.
+    static func ownAddresses() -> [String] {
+        var out: [String] = []
+        var list: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&list) == 0, let first = list {
+            var p: UnsafeMutablePointer<ifaddrs>? = first
+            while let i = p {
+                let flags = Int32(i.pointee.ifa_flags)
+                if let a = i.pointee.ifa_addr, a.pointee.sa_family == UInt8(AF_INET),
+                   flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 {
+                    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    if getnameinfo(a, socklen_t(a.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        let s = String(cString: host)
+                        if !s.hasPrefix("169.254."), !out.contains(s) { out.append(s) }
+                    }
+                }
+                p = i.pointee.ifa_next
+            }
+            freeifaddrs(first)
+        }
+        if let local = SCDynamicStoreCopyLocalHostName(nil) as String? { out.append(local + ".local") }
+        return out
+    }
+
+    /// Whether each window's app lets it be resized (looked at once per window).
+    private var fixedKnown: [UInt32: Bool] = [:]
+    /// Where each window first appeared on its screen (see spot(of:)).
+    private var fixedSpots: [UInt32: (Float, Float)] = [:]
+
+    /// The window is fixed-size, and the spot its app put it at: Linux shows it there too.
+    private func sendFixed(_ wid: UInt32, fixed: Bool = true) {
+        let (fx, fy) = fixedSpots[wid] ?? (0.5, 0.5)
+        var f = MsgWriter(.windowFixed); f.u32(wid); f.f32(fx); f.f32(fy); f.u8(fixed ? 1 : 0); control?.send(f)
+    }
+
+    /// Where a window is on its screen, as fractions of the room it has there: 0 flush with the
+    /// left (top) edge, 1 flush with the right (bottom), 0.5 centred. A reminder an app puts in
+    /// the top-right corner is (1, 0) on any screen size.
+    static func spot(of frame: CGRect) -> (Float, Float) {
+        var id: CGDirectDisplayID = 0, n: UInt32 = 0
+        guard CGGetDisplaysWithPoint(CGPoint(x: frame.midX, y: frame.midY), 1, &id, &n) == .success, n > 0 else { return (0.5, 0.5) }
+        let b = CGDisplayBounds(id)
+        let f = { (at: CGFloat, start: CGFloat, room: CGFloat) -> Float in room <= 1 ? 0.5 : Float(max(0, min(1, (at - start) / room))) }
+        return (f(frame.minX, b.minX, b.width - frame.width), f(frame.minY, b.minY, b.height - frame.height))
+    }
+
+    /// Windows told to the client, and popups waiting for theirs to be told first, by window.
+    /// A window is told once its app has said whether it can be resized (a moment), a popup at
+    /// once: after a reconnect, Quick Look (open over its Finder window) got to the client
+    /// before that window, and was shown as a window of its own there.
+    private var announced: Set<UInt32> = []
+    private var awaitingParent: [UInt32: [UInt32]] = [:]
+
+    /// Tells Linux about a new window. Whether its app lets it be resized is looked at first
+    /// (Accessibility, off this queue), so a fixed one (a reminder, a dialog) is said to be
+    /// fixed before it's added: Linux then shows it as a dialog of its own size from the start,
+    /// which desktops and tilers (Karousel) float instead of tiling, and they decide that only
+    /// when a window appears. An app slow to answer doesn't hold the window up: after 60 ms it's
+    /// added anyway, and said to be fixed when the answer comes.
     private func sendAdded(_ w: TrackedWindow) {
+        if w.kind == .popup {
+            if w.parent != 0, !announced.contains(w.parent), tracker.windows[w.parent] != nil {
+                awaitingParent[w.parent, default: []].append(w.wid)
+                return
+            }
+            return announce(w, fixed: false)
+        }
+        // Where the app put it, before it's moved onto the virtual display.
+        let spot = Self.spot(of: w.frame)
+        fixedSpots[w.wid] = fixedSpots[w.wid] ?? spot
+        if let fixed = fixedKnown[w.wid] { return announce(w, fixed: fixed) }
+        final class Once { var sent = false }
+        // A sheet keeps the size its app gives it (its window is resized, not it).
+        let once = Once(), control = control_, wid = w.wid, pid = w.pid, sheet = tracker.isKnownSheet(w.wid)
+        appQueue(pid).async { [weak self] in
+            let fixed = sheet || control.fixedSize(wid, pid: pid) == true
+            self?.queue.async {
+                guard let self, let now = self.tracker.windows[wid] else { return }
+                self.fixedKnown[wid] = fixed
+                if !once.sent {
+                    once.sent = true
+                    self.announce(now, fixed: fixed)
+                } else if fixed {
+                    self.sendFixed(wid)
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self, !once.sent, let now = self.tracker.windows[wid] else { return }
+            once.sent = true
+            self.announce(now, fixed: false)
+        }
+    }
+
+    private func announce(_ w: TrackedWindow, fixed: Bool) {
         sendIcon(w)
+        // A floating panel (picture in picture, a palette) floats on Linux too, resizable.
+        if fixed || w.kind == .dialog { sendFixed(w.wid, fixed: fixed) }
         var m = MsgWriter(.windowAdded)
+        Self.describe(w, into: &m)
+        control?.send(m)
+        lastFrames[w.wid] = w.frame
+        sendButtonsNowAndSettled(w)
+        announced.insert(w.wid)
+        for c in awaitingParent.removeValue(forKey: w.wid) ?? [] {
+            if let now = tracker.windows[c] { sendAdded(now) }
+        }
+    }
+
+    /// A window as windowAdded and windowReplaced carry it.
+    private static func describe(_ w: TrackedWindow, into m: inout MsgWriter) {
         m.u32(w.wid); m.i32(w.pid)
         m.str(w.bundleId); m.str(w.appName); m.str(w.title)
         m.f32(w.frame.width); m.f32(w.frame.height)
         m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
         m.u8(w.kind.rawValue)
+    }
+
+    /// A tab switched (see WindowTracker.onReplaced): `w` is where `old` was. Linux is told in
+    /// one message and keeps its window, which becomes `w`. As an addition and a removal, the
+    /// new window came up beside the old one, which went most of a second later (that long is
+    /// waited to see whether a window that left the screen was only minimised).
+    private func windowReplaced(_ old: TrackedWindow, by w: TrackedWindow) {
+        guard clientVersion >= 2, announced.contains(old.wid), minimized[old.wid] == nil else {
+            // A client that doesn't know the message, or a window Linux doesn't have: the two.
+            tracker.onRemoved?(old)
+            tracker.onAdded?(w)
+            return
+        }
+        log("window \(old.wid) (\(old.appName)) replaced by \(w.wid) at the same place (a tab switched)")
+        WindowStreamer.prefetch(w.wid)
+        goneWindows.remove(w.wid)
+        minimized[w.wid] = nil
+        // What's known about the window Linux shows goes with it; the rest of the old one's is
+        // forgotten as when a window goes.
+        fixedKnown[w.wid] = fixedKnown.removeValue(forKey: old.wid)
+        fixedSpots[w.wid] = fixedSpots.removeValue(forKey: old.wid)
+        requestedSizes[w.wid] = requestedSizes.removeValue(forKey: old.wid)
+        if clientFocus == old.wid { clientFocus = w.wid }
+        if lastFocused == old.wid { lastFocused = w.wid }
+        if raisedWid == old.wid { raisedWid = w.wid }
+        announced.remove(old.wid)
+        lastFrames[old.wid] = nil
+        refusedSizes[old.wid] = nil
+        goneWindows.insert(old.wid)
+        control_.forget(old.wid)
+        sentButtons[old.wid] = nil
+        buttonHistory[old.wid] = nil
+        buttonsKept[old.wid] = nil
+        var m = MsgWriter(.windowReplaced)
+        m.u32(old.wid)
+        Self.describe(w, into: &m)
         control?.send(m)
         lastFrames[w.wid] = w.frame
+        sendButtonsNowAndSettled(w)
+        announced.insert(w.wid)
+        // Popups that were waiting for the old one: told now, with whatever window they have.
+        for c in awaitingParent.removeValue(forKey: old.wid) ?? [] {
+            if let now = tracker.windows[c] { sendAdded(now) }
+        }
+    }
+
+    /// The window's buttons now, and again shortly. An app that places them itself (an
+    /// Electron-style title bar) puts them back a moment after its window opens or changes
+    /// size; asked right then, it still gives the standard place, higher up, and that was
+    /// where Linux drew them from then on. (A look that finds nothing new sends nothing.)
+    private func sendButtonsNowAndSettled(_ w: TrackedWindow) {
         sendButtons(w)
+        // (3 s: macOS's capture badge, which says where the buttons really are, is up by then.)
+        for delay in [0.4, 1.5, 3] {
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, let now = self.tracker.windows[w.wid] else { return }
+                self.sendButtons(now)
+            }
+        }
     }
 
     /// Each window's frame as last sent (sendAdded, sendChanged).
@@ -1638,6 +2119,9 @@ final class Session {
         m.f32(w.rel.x); m.f32(w.rel.y)
         control?.send(m)
         // The buttons sit where they did unless the size changed (each look asks the app).
+        // (Once, not the three looks a new window gets: every look asks the app, on the queue its
+        // resizes wait on, and a relayout changes every window's size at once. Where the app
+        // really keeps its buttons is remembered per app by now, see settledButtons.)
         if last?.size != w.frame.size { sendButtons(w) }
     }
 

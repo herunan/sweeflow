@@ -140,6 +140,15 @@ final class DebugPort {
         case "scroll" where p.count == 3:
             guard let s = session, let x = Double(p[1]), let y = Double(p[2]) else { return reply("usage: scroll x y") }
             s.debugScroll(x: x, y: y, reply: reply)
+        case "changes" where p.count == 2:
+            // Why a window's captures lately counted as changed (or didn't): changes <wid>.
+            guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
+            s.debugChanges(wid: wid) { r in DispatchQueue.main.async { reply(r) } }
+        case "dump" where p.count == 3:
+            // The next n captures of a window that differ from the one before, raw, into
+            // /tmp/sweeflow-dump (see WindowStreamer.dumpChanges): dump <wid> <n>.
+            guard let s = session, let wid = UInt32(p[1]), let n = Int(p[2]) else { return reply("no session") }
+            reply(s.debugDump(wid: wid, n: n))
         case "pause" where p.count == 2:
             // Preview the locked look: pause on|off.
             session?.debugPause(p[1] != "off", placeholder: p[1] == "placeholder")
@@ -155,6 +164,27 @@ final class DebugPort {
                 let r = s.debugDrop(wid, x: x, y: y, file: URL(fileURLWithPath: p[4]))
                 DispatchQueue.main.async { reply(r) }
             }
+        case "client":
+            // Who's connected, as the menu and Unlink see it, and as the served session has it.
+            let main = host.client.map { "\($0.prefix(12)) \(Identity.clientName($0))" } ?? "none"
+            reply("menu: \(main); session: \(DebugPort.session?.clientFingerprint?.prefix(12) ?? "none")")
+        case "disconnect" where p.count == 2, "connect" where p.count == 2:
+            // The menu's Disconnect / Connect for a linked computer (by name or fingerprint start).
+            let key = p[1].lowercased()
+            guard let c = Identity.pairedClients().first(where: {
+                Identity.clientName($0.fingerprint).lowercased() == key || $0.fingerprint.hasPrefix(key)
+            }) else { return reply("no such computer") }
+            if cmd == "disconnect" { StatusMenu.disconnect(c.fingerprint) } else { StatusMenu.connect(c.fingerprint) }
+            reply("\(cmd)ed \(Identity.clientName(c.fingerprint))")
+        case "unlink" where p.count == 2:
+            // The menu's Unlink… for a linked computer (by name or the start of its fingerprint), as
+            // confirmed: no dialog (a modal one would hold up this port too).
+            let key = p[1].lowercased()
+            guard let c = Identity.pairedClients().first(where: {
+                Identity.clientName($0.fingerprint).lowercased() == key || $0.fingerprint.hasPrefix(key)
+            }) else { return reply("no such computer") }
+            StatusMenu.forget(c.fingerprint)
+            reply("unlinked \(Identity.clientName(c.fingerprint))")
         case "close" where p.count == 2:
             guard let s = session, let wid = UInt32(p[1]) else { return reply("no session") }
             s.queue.async {

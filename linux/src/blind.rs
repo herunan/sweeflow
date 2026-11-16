@@ -1,7 +1,7 @@
 //! Stand-ins for Mac windows that refuse to be captured (security prompts, sign-in verifiers): their
-//! text and buttons, read on the Mac through Accessibility, shown as a plain dialog (prompt.qml:
-//! text and buttons, no icons, as macOS shows them; kdialog where Qt's `qml` runner isn't
-//! installed). The button clicked here is pressed there. Ones without buttons (Touch ID /
+//! text and buttons, read on the Mac through Accessibility, shown as a plain dialog (prompt.rs:
+//! text and buttons, no icons, as macOS shows them; kdialog if that can't come up). The button
+//! clicked here is pressed there. Ones without buttons (Touch ID /
 //! password prompts, which must be answered on the Mac itself) become a notification.
 
 use std::{collections::HashMap, process::Command, sync::Mutex};
@@ -20,15 +20,34 @@ unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
+/// The notification shown for each window without buttons, closed when the Mac window goes.
+static NOTES: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
+
+/// macOS's own prompt helpers go by their process names ("UserNotificationCenter needs you"):
+/// "macOS" reads better.
+fn shown_name(app: &str) -> &str {
+    match app {
+        "CoreServicesUIAgent" | "SecurityAgent" | "UserNotificationCenter" | "universalAccessAuthWarn" | "coreautha"
+        | "LocalAuthenticationRemoteService" => "macOS",
+        _ => app,
+    }
+}
+
 pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String], net: UnboundedSender<NetCmd>) {
+    let app = shown_name(app);
     let heading = if title.is_empty() || title == app { app.to_string() } else { format!("{app} — {title}") };
     // "Help" only opens Apple's help viewer; the rest keep their Mac order (default last).
     let shown: Vec<(usize, &String)> = buttons.iter().enumerate().filter(|(_, b)| b.as_str() != "Help").collect();
     if shown.is_empty() {
-        let _ = Command::new("notify-send")
-            .args(["--app-name=sweeflow", "--icon=dialog-password", "--urgency=critical",
-                   &format!("{heading} needs you on your Mac"), &texts.join("\n\n")])
-            .spawn();
+        let (heading, text) = (format!("{heading} needs you on your Mac"), texts.join("\n\n"));
+        std::thread::spawn(move || {
+            let out = Command::new("notify-send")
+                .args(["--app-name=sweeflow", "--icon=dialog-password", "--urgency=critical", "--print-id", &heading, &text])
+                .output();
+            if let Some(n) = out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok()) {
+                NOTES.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, n);
+            }
+        });
         return;
     }
     // The Mac's cancel button (closing the dialog answers like it, as with any dialog).
@@ -49,7 +68,7 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
             let index = match status.code() {
                 Some(code) if code >= 10 => Some((code - 10) as usize),
                 Some(0) => cancel,
-                // It didn't come up (no such style, a Qt without Quick Controls): kdialog instead.
+                // It didn't come up (no display for it, a failed start): kdialog instead.
                 Some(code) => {
                     log::warn!("stand-in dialog: the plain prompt failed ({code}), using kdialog");
                     return show_kdialog(id, &app, &title, &texts, &buttons, net);
@@ -67,28 +86,18 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
     show_kdialog(id, app, title, texts, buttons, net);
 }
 
-/// The plain prompt (prompt.qml), run by Qt's `qml` tool, whatever this system calls it.
-/// None when it isn't installed.
+/// The plain prompt: this program again, as `sweeflow prompt` (prompt.rs). None when it can't
+/// be started.
 fn spawn_prompt(heading: &str, text: &str, shown: &[(usize, &String)], cancel: Option<usize>) -> Option<std::process::Child> {
-    static QML: &str = include_str!("prompt.qml");
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let file = dir.join("sweeflow-prompt.qml");
-    std::fs::write(&file, QML).ok()?;
     // The Mac's default button is its last.
     let default = shown.last().map(|(i, _)| *i as i64).unwrap_or(-1);
-    for tool in ["qml6", "qml-qt6", "/usr/lib/qt6/bin/qml", "/usr/lib64/qt6/bin/qml"] {
-        let mut cmd = Command::new(tool);
-        // A widgets application, so the desktop's own style (Breeze) draws the buttons.
-        cmd.args(["--apptype", "widget"]).arg(&file).arg("--");
-        cmd.args([default.to_string(), cancel.map_or(-1, |c| c as i64).to_string(), heading.to_string(), text.to_string()]);
-        for (i, label) in shown {
-            cmd.args([i.to_string(), label.to_string()]);
-        }
-        if let Ok(child) = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
-            return Some(child);
-        }
+    let mut cmd = Command::new(std::env::current_exe().ok()?);
+    cmd.arg("prompt");
+    cmd.args([default.to_string(), cancel.map_or(-1, |c| c as i64).to_string(), heading.to_string(), text.to_string()]);
+    for (i, label) in shown {
+        cmd.args([i.to_string(), label.to_string()]);
     }
-    None
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()
 }
 
 /// The same with kdialog, whose dialogs always carry an icon and icons on their buttons.
@@ -199,6 +208,15 @@ pub fn show_menu(id: u32, app: &str, items: &[String], net: UnboundedSender<NetC
 
 /// The Mac window went away: close its dialog.
 pub fn gone(id: u32) {
+    // A notification (critical ones stay until dismissed): closed with it.
+    if let Some(n) = NOTES.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) {
+        let _ = Command::new("busctl")
+            .args(["--user", "call", "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                   "org.freedesktop.Notifications", "CloseNotification", "u", &n.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
     if let Some(pid) = DIALOGS.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) {
         // SAFETY: signals a process we started (removed from the map, so the waiting thread
         // won't press anything).

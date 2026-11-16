@@ -1,7 +1,6 @@
 import Foundation
 import Network
 import Security
-import CryptoKit
 
 /// One QUIC stream with message framing and send-side byte accounting (for backpressure).
 final class MsgStream {
@@ -64,15 +63,71 @@ final class MsgStream {
     }
 }
 
-/// QUIC listener. Accepts one client session at a time (a new one replaces the old).
+/// What to do with a hello while another client has the session.
+enum Claim: Equatable {
+    /// The one holding it is the same computer (a reconnect) or has gone quiet: replaced silently.
+    case replace
+    /// Another computer: told who has it, and turned away (it checks again now and then). The
+    /// session is only ever let go of from the computer that has it (Stop there), so two
+    /// computers never take the Mac back and forth.
+    case busy
+
+    /// A held session that hasn't been heard from for this long (the client pings every 2 s)
+    /// counts as gone.
+    static let quietFor: TimeInterval = 8
+
+    static func decide(sameComputer: Bool, heldSilentFor: TimeInterval) -> Claim {
+        sameComputer || heldSilentFor >= quietFor ? .replace : .busy
+    }
+}
+
+/// QUIC listener. One client has the session at a time: another one gets it once that one has
+/// stopped (see Claim).
 final class Server {
     let queue = DispatchQueue(label: "sweeflow.net", qos: .userInteractive)
     private let identity: Identity
     private var listener: NWListener?
-    private var session: Session?
+    /// The session being served.
+    private var session: Session? {
+        didSet {
+            if (session != nil) != (oldValue != nil) {
+                Server.lock.withLock { Server.servingNow = session != nil }
+                advertise()
+            }
+        }
+    }
+
+    /// A computer is being served now (read from the linking listener's queue).
+    static var serving: Bool { lock.withLock { servingNow } }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var servingNow = false
+
+    /// The streaming service on the network, saying whether a computer is being served (busy).
+    /// Watches the screen lock once, so the announcement says when it's locked.
+    private lazy var watchLock: Void = ScreenLock.onChange { [weak self] in self?.queue.async { self?.advertise() } }
+
+    private func advertise() {
+        _ = watchLock
+        guard let l = listener else { return }
+        l.service = NWListener.Service(name: macName, type: streamServiceType, domain: nil, txtRecord: serviceTXT(busy: session != nil))
+    }
+    /// Every connection's session, served or not yet (kept alive here).
+    private var sessions: [ObjectIdentifier: Session] = [:]
     private var groups: [ObjectIdentifier: NWConnectionGroup] = [:]
     /// The client certificate of the latest handshake (one client connects at a time).
     private var lastVerified: String?
+
+    /// The certificate fingerprint of the computer at the other end of a stream, from that
+    /// connection's own handshake (lastVerified is only the latest handshake of any computer,
+    /// and with several connecting or looking at once it can be another one's).
+    static func peerFingerprint(_ conn: NWConnection) -> String? {
+        guard let m = conn.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata else { return nil }
+        var fp: String?
+        _ = sec_protocol_metadata_access_peer_certificate_chain(m.securityProtocolMetadata) { cert in
+            if fp == nil { fp = Pairing.fingerprint(sec_certificate_copy_ref(cert).takeRetainedValue()) }
+        }
+        return fp
+    }
 
     /// Ends the connection of that client, if it's the one connected.
     func drop(_ fingerprint: String, telling msg: Msg) {
@@ -109,7 +164,7 @@ final class Server {
             guard let chain = SecTrustCopyCertificateChain(t) as? [SecCertificate], let leaf = chain.first else {
                 return complete(false)
             }
-            let fp = SHA256.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
+            let fp = Pairing.fingerprint(leaf)
             let ok = authorized().contains(fp)
             if !ok { log("rejected client certificate \(fp)") } else { self?.lastVerified = fp }
             complete(ok)
@@ -124,6 +179,7 @@ final class Server {
         l.newConnectionGroupHandler = { [weak self] group in self?.accept(group) }
         l.start(queue: queue)
         listener = l
+        _ = watchLock
     }
 
     private func accept(_ group: NWConnectionGroup) {
@@ -132,20 +188,55 @@ final class Server {
         groups[key] = group
         let s = makeSession(group, queue)
         s.clientFingerprint = lastVerified
+        sessions[key] = s
+        s.onHello = { [weak self] s in self?.claim(s) ?? true }
         group.stateUpdateHandler = { [weak self, weak s] state in
             log("connection: \(state)")
             switch state {
             case .failed, .cancelled:
                 s?.shutdown()
                 self?.groups[key] = nil
+                self?.sessions[key] = nil
                 if self?.session === s { self?.session = nil }
             default: break
             }
         }
         group.newConnectionHandler = { [weak s] conn in s?.addStream(conn) }
-        session?.shutdown()
-        session = s
         group.start(queue: queue)
+    }
+
+    /// A client said hello: it gets the session, or is told who has it (see Claim).
+    private func claim(_ s: Session) -> Bool {
+        guard let held = session, held !== s, held.serving else {
+            session = s
+            return true
+        }
+        // The certificate alone doesn't tell computers apart (one can be copied to another).
+        // A computer reconnecting (after a restart here, or a Wi-Fi blip) says the same name; the
+        // certificate a session is recorded with can be another connection's, when two arrive
+        // close together, so it settles nothing alone.
+        let same = held.clientName.isEmpty || s.clientName.isEmpty
+            ? held.clientFingerprint == s.clientFingerprint && held.clientName == s.clientName
+            : held.clientName == s.clientName
+        switch Claim.decide(sameComputer: same, heldSilentFor: held.silentFor) {
+        case .replace:
+            log("client replaces its earlier connection")
+            held.shutdown()
+        case .busy:
+            log("\(Self.name(of: s)) connected while \(Self.name(of: held)) has the session: busy")
+            var w = MsgWriter(.busy)
+            w.str(Self.name(of: held))
+            s.sendAndClose(w)
+            return false
+        }
+        session = s
+        return true
+    }
+
+    /// A client as the other one is told about it: what it calls itself, else its name here.
+    private static func name(of s: Session) -> String {
+        if !s.clientName.isEmpty { return s.clientName }
+        return s.clientFingerprint.map(Identity.clientName) ?? "another computer"
     }
 }
 
@@ -198,7 +289,7 @@ struct Identity {
         let secIdent = ident as! SecIdentity
         var leaf: SecCertificate?
         SecIdentityCopyCertificate(secIdent, &leaf)
-        let fp = SHA256.hash(data: SecCertificateCopyData(leaf!) as Data).map { String(format: "%02x", $0) }.joined()
+        let fp = Pairing.fingerprint(leaf!)
         try fp.write(to: dir.appendingPathComponent("fingerprint"), atomically: true, encoding: .utf8)
 
         return Identity(secIdentity: sec_identity_create(secIdent)!, fingerprint: fp, authorizedClients: {
@@ -247,7 +338,7 @@ struct Identity {
     /// What a paired client is called here.
     static func clientName(_ fingerprint: String) -> String {
         let n = pairedClients().first { $0.fingerprint == fingerprint }?.name ?? ""
-        return n.isEmpty ? "Linux \(PairingCode.of(fingerprint: fingerprint))" : n
+        return n.isEmpty ? "Linux computer" : n
     }
 
     // Lists of fingerprints, one per line, beside the clients file.

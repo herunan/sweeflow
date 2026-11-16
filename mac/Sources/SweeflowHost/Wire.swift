@@ -9,19 +9,42 @@ enum Msg: UInt8 {
     case forgotten = 0x04
     /// From a client leaving on purpose (switching Macs, disconnecting, quitting): tidy up now.
     case goodbye = 0x05
+    /// To a client saying hello while another computer has the session: turned away until
+    /// that one stops.
+    case busy = 0x06
     case windowAdded = 0x10, windowChanged = 0x11, windowRemoved = 0x12, appIcon = 0x13, cursor = 0x14, focused = 0x15
+    /// To Linux (from version 2): u32 old wid, then a window as in windowAdded. That window has
+    /// taken the old one's place (a tab switched): Linux keeps the window it shows and makes it
+    /// this one. The old one isn't mentioned again.
+    case windowReplaced = 0x38
     case windowButtons = 0x16, moveStarted = 0x17, toggleMaximize = 0x18, minimize = 0x1A, menuTree = 0x1B, appList = 0x1C, screenLocked = 0x1D, settings = 0x1E, blindShow = 0x1F, blindGone = 0x19
     case resize = 0x20, focus = 0x21, close = 0x22, screenSize = 0x23, menuActivate = 0x24, menuRefresh = 0x25, restore = 0x26, launchApp = 0x27, setSettings = 0x28, blindPress = 0x29, showDisplay = 0x2A, quitApp = 0x2B, runningApps = 0x2C, screenSelect = 0x2D
     /// To Linux: the press just made drags the window; it starts its move on the first motion.
     /// From Linux: it did, let go of the press.
     case moveReady = 0x2E, moveTaken = 0x2F
+    /// To Linux: u32 wid, f32 x, f32 y (window points), u8 drags — what's under the pointer as it
+    /// hovers the title-bar strip, ahead of any press: a press about there moves the window at once.
+    case dragSpot = 0x37
     case pointerMove = 0x30, pointerButton = 0x31, scroll = 0x32, key = 0x33, releaseAll = 0x34
+    /// To Linux: u32 wid, f32 fx, f32 fy — the app won't let this window be resized: it keeps its
+    /// own size there, at the same spot of the screen as on the Mac (fractions; see Session.spot).
+    /// A trailing u8: 1 fixed; 0 a floating panel that can be resized (it floats all the same).
+    case windowFixed = 0x35
+    /// To Linux: u16 n, then n str — this Mac's addresses (every interface's, Tailscale's too)
+    /// and its .local name, for finding it again where the network carries no Bonjour.
+    case addresses = 0x36
     case clipboard = 0x40, ping = 0x41, pong = 0x42, clipboardSubscribe = 0x43
     case dropFiles = 0x46, dragBegan = 0x47, dragTaken = 0x48, dragFetch = 0x49, dragData = 0x4A, dragDropLocal = 0x4B
+    /// From Linux: u32 n — the files of clipboard copy n (told as `file-ref` items) are being
+    /// pasted. To Linux: u32 n, u16 count, count × (str kind, str name, bytes data) — them (none:
+    /// the clipboard has changed since, or they couldn't be read).
+    case clipFetch = 0x4C, clipFiles = 0x4D
     case subscribe = 0x50, frame = 0x51, requestKeyframe = 0x52, pause = 0x53, frameAck = 0x54, corners = 0x55
     case audioSubscribe = 0x60, audio = 0x61
-    // Pairing listener only (see Pairing.swift).
-    case pairRequest = 0x70, pairResult = 0x71
+    // Linking listener only (see Pairing.swift): a request, this Mac's share (its code is up), the
+    // other computer's share and tag, the answer; and a linked computer's unlink and check.
+    // (0x72–0x74 were link version 2's nonce exchange.)
+    case pairRequest = 0x70, pairResult = 0x71, pairShare = 0x75, pairGuess = 0x76, pairUnlink = 0x77, pairCheck = 0x78
 }
 
 let protocolVersion: UInt16 = 1

@@ -1,6 +1,8 @@
 //! The Mac apps' menu bars as native KDE menus: each app's menu is served over D-Bus with the
 //! `com.canonical.dbusmenu` interface (what Plasma's Global Menu reads), and each of its windows
-//! points KWin at it through the `org_kde_kwin_appmenu` protocol.
+//! points KWin at it through the `org_kde_kwin_appmenu` protocol. The trees are kept on every
+//! desktop, also where nothing shows them that way (Hyprland): the Global menu window (`sweeflow
+//! menu`, palette.rs) shows the last focused app's, and runs its items the way the Global Menu does.
 
 use std::{
     collections::HashMap,
@@ -157,6 +159,96 @@ fn find(n: &Node, id: i32) -> Option<&Node> {
 
 type Models = Arc<Mutex<HashMap<i32, Model>>>;
 
+/// Presses a menu item on the Mac: what choosing it in the Global Menu does, and the palette too.
+fn activate(models: &Models, net: &UnboundedSender<NetCmd>, pid: i32, id: i32) {
+    let path = models.lock().unwrap().get(&pid).and_then(|m| m.by_id.get(&id).cloned());
+    if let Some(path) = path {
+        press(net, pid, path);
+    }
+}
+
+/// Asks the Mac to press the item at that path in the app's menu bar.
+fn press(net: &UnboundedSender<NetCmd>, pid: i32, path: Vec<u16>) {
+    let mut w = W::new(t::MENU_ACTIVATE).i32(pid).u16(path.len() as u16);
+    for p in path {
+        w = w.u16(p);
+    }
+    let _ = net.send(NetCmd::Control(w.finish()));
+}
+
+/// The menus as the palette (`sweeflow menu`, a process of its own) reaches them: through the
+/// tray's D-Bus service (panel.rs), on its thread rather than the window side's.
+struct Shared {
+    models: Models,
+    net: UnboundedSender<NetCmd>,
+}
+
+static SHARED: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+
+/// The Mac app whose window last had keyboard focus here, and its name. The palette takes the
+/// focus the moment it opens, so it's this app's menu it shows, not whatever has focus then.
+static LAST_FOCUSED: Mutex<Option<(i32, String)>> = Mutex::new(None);
+
+/// A Mac app's window got keyboard focus.
+pub fn focused(pid: i32, app: &str) {
+    *LAST_FOCUSED.lock().unwrap() = Some((pid, app.to_string()));
+}
+
+/// An app's last window here closed: its menu is nothing to offer any more.
+pub fn app_gone(pid: i32) {
+    let mut last = LAST_FOCUSED.lock().unwrap();
+    if last.as_ref().is_some_and(|(p, _)| *p == pid) {
+        *last = None;
+    }
+}
+
+/// One item for the palette, with its children: the same ids as the Global Menu's.
+fn palette_item(n: &Node) -> serde_json::Value {
+    serde_json::json!({
+        "id": n.id,
+        "label": n.item.t,
+        "enabled": n.item.e,
+        "separator": n.item.sep == Some(true),
+        // Ticked, as the Mac draws it.
+        "checked": n.item.c == Some(true),
+        // A submenu even when it's empty right now (Open Recent with nothing in it): not an item to run.
+        "submenu": n.item.sub.is_some(),
+        "shortcut": shortcut(&n.item).and_then(|c| c.into_iter().next()).map(|c| c.join("+")).unwrap_or_default(),
+        "children": n.children.iter().map(palette_item).collect::<Vec<_>>(),
+    })
+}
+
+/// The last focused Mac app's menu, as JSON: {app, pid, revision, items}. With `refresh`, the
+/// Mac is asked for its current state too (which items are enabled now; it last sent them when
+/// the window got focus), which comes back as a new revision.
+pub fn palette_menu(refresh: bool) -> String {
+    let last = LAST_FOCUSED.lock().unwrap().clone();
+    let (Some((pid, app)), Some(shared)) = (last, SHARED.get()) else {
+        return serde_json::json!({ "app": "", "pid": 0, "revision": 0, "items": [] }).to_string();
+    };
+    let mut models = shared.models.lock().unwrap();
+    let mut m = models.get_mut(&pid);
+    if refresh && m.as_ref().is_none_or(|m| m.last_refresh.elapsed() > Duration::from_millis(800)) {
+        if let Some(m) = m.as_deref_mut() {
+            m.last_refresh = Instant::now();
+        }
+        let _ = shared.net.send(NetCmd::Control(W::new(t::MENU_REFRESH).i32(pid).finish()));
+    }
+    let (revision, items) = m.map_or((0, Vec::new()), |m| (m.revision, m.root.children.iter().map(palette_item).collect()));
+    serde_json::json!({ "app": app, "pid": pid, "revision": revision, "items": items }).to_string()
+}
+
+/// Runs an item the palette was shown. False when the app's menu has changed since (ids are
+/// handed out afresh with each tree, so this one may now be another item): look again.
+pub fn palette_activate(pid: i32, revision: u32, id: i32) -> bool {
+    let Some(shared) = SHARED.get() else { return false };
+    // Looked up under the same lock as the revision, so a tree arriving meanwhile can't swap it.
+    let path = shared.models.lock().unwrap().get(&pid).filter(|m| m.revision == revision).and_then(|m| m.by_id.get(&id).cloned());
+    let Some(path) = path else { return false };
+    press(&shared.net, pid, path);
+    true
+}
+
 /// `com.canonical.dbusmenu` for one Mac app.
 struct MenuIface {
     pid: i32,
@@ -196,14 +288,7 @@ impl MenuIface {
         if event_id != "clicked" {
             return;
         }
-        let path = self.models.lock().unwrap().get(&self.pid).and_then(|m| m.by_id.get(&id).cloned());
-        if let Some(path) = path {
-            let mut w = W::new(t::MENU_ACTIVATE).i32(self.pid).u16(path.len() as u16);
-            for p in path {
-                w = w.u16(p);
-            }
-            let _ = self.net.send(NetCmd::Control(w.finish()));
-        }
+        activate(&self.models, &self.net, self.pid, id);
     }
 
     #[zbus(name = "EventGroup")]
@@ -269,7 +354,9 @@ pub struct Menus {
 
 impl Menus {
     pub fn new(net: UnboundedSender<NetCmd>) -> zbus::Result<Self> {
-        Ok(Menus { conn: blocking::Connection::session()?, models: Default::default(), net, registered: Default::default() })
+        let menus = Menus { conn: blocking::Connection::session()?, models: Default::default(), net, registered: Default::default() };
+        let _ = SHARED.set(Shared { models: menus.models.clone(), net: menus.net.clone() });
+        Ok(menus)
     }
 
     /// Our unique bus name, which KWin is given along with the object path.

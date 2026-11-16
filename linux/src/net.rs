@@ -1,7 +1,7 @@
 //! QUIC connection to the Mac host. Runs on its own tokio runtime; talks to the Wayland thread
 //! through channels.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -35,6 +35,21 @@ pub struct WinInfo {
     pub kind: u8,
 }
 
+impl WinInfo {
+    /// Where a popup goes on its parent (window points): where the Mac has it, unless that's
+    /// nowhere on the parent. The Mac keeps its windows side by side on its virtual display, so
+    /// a panel it centres on that display (Quick Look's) can sit far off its window: placed by
+    /// that offset here it opened off the side of the screen. Centred on the parent instead.
+    pub fn spot_on(&self, parent_w: f32, parent_h: f32) -> (f32, f32) {
+        let apart = self.rel_x >= parent_w || self.rel_x + self.w <= 0.0 || self.rel_y >= parent_h || self.rel_y + self.h <= 0.0;
+        if apart {
+            (((parent_w - self.w) / 2.0).round(), ((parent_h - self.h) / 2.0).max(0.0).round())
+        } else {
+            (self.rel_x, self.rel_y)
+        }
+    }
+}
+
 pub enum UiEvent {
     Connected(String),
     Disconnected(String),
@@ -43,16 +58,36 @@ pub enum UiEvent {
     WindowAdded(WinInfo),
     WindowChanged { wid: u32, title: String, w: f32, h: f32, rel_x: f32, rel_y: f32 },
     WindowRemoved(u32),
+    /// (old wid, new window): the Mac swapped that window for this one at the same frame (a
+    /// tabbed window's tab switched). The window here stays and becomes the new one's.
+    WindowReplaced(u32, WinInfo),
+    /// The app won't let this window be resized; where its app put it on the Mac's screen
+    /// (fractions of the room there: 0 left/top, 1 right/bottom), if said.
+    /// The bool: fixed (false: a floating panel that can be resized, floated all the same).
+    WindowFixed(u32, Option<(f32, f32)>, bool),
     AppIcon { bundle_id: String, png: Vec<u8> },
     Cursor { hot_x: f32, hot_y: f32, scale: f32, png: Vec<u8> },
-    Focused,
+    /// The Mac's key window changed (sent too as a session starts).
+    Focused(u32),
+    /// Square or rounded corners was switched (the tray): open windows follow now.
+    CornersSetting,
+    /// Keeping Mac windows at least as big as their app allows was switched (config.rs).
+    /// Hyprland's view of this client's windows: (class, title, floating) each. It doesn't tell
+    /// a window that it's tiled, as other desktops do (see hyprland::watch_tiling).
+    Tiling(Vec<(String, String, bool)>),
     /// Close / minimise / zoom button rects (x, y, w, h) in window points.
     WindowButtons(u32, [[f32; 4]; 3]),
     MoveStarted(u32),
     /// (window, press id): that press can start a window move right away.
     MoveReady(u32, u32),
+    /// (window, x, y, drags): hovering that point (window points) of the title-bar strip, the
+    /// Mac found a spot that drags the window (or not), ahead of any press.
+    DragSpot(u32, f32, f32, bool),
     ToggleMaximize(u32),
     Minimize(u32),
+    /// An app launched here that already has windows: bring its newest back (unminimised, in
+    /// front), with the launcher's activation token if it gave one.
+    Raise { bundle_id: String, token: Option<String> },
     /// macOS's screenshot selection started (true) or ended: drawn here, as the Mac's can't be captured.
     ScreenSelect(bool),
     /// An app's menu bar (JSON from the Mac).
@@ -82,14 +117,20 @@ impl UiEvent {
             UiEvent::WindowAdded(_) => "window added",
             UiEvent::WindowChanged { .. } => "window changed",
             UiEvent::WindowRemoved(_) => "window removed",
+            UiEvent::WindowReplaced(..) => "window replaced",
+            UiEvent::WindowFixed(..) => "window fixed",
             UiEvent::AppIcon { .. } => "app icon",
             UiEvent::Cursor { .. } => "cursor",
-            UiEvent::Focused => "focused",
+            UiEvent::Focused(_) => "focused",
+            UiEvent::CornersSetting => "corners setting",
+            UiEvent::Tiling(_) => "tiling",
             UiEvent::WindowButtons(..) => "window buttons",
             UiEvent::MoveStarted(_) => "move started",
             UiEvent::MoveReady(..) => "move ready",
+            UiEvent::DragSpot(..) => "drag spot",
             UiEvent::ToggleMaximize(_) => "toggle maximize",
             UiEvent::Minimize(_) => "minimize",
+            UiEvent::Raise { .. } => "raise",
             UiEvent::ScreenSelect(_) => "screen select",
             UiEvent::MenuTree { .. } => "menu tree",
             UiEvent::Frame(..) => "video frame",
@@ -114,19 +155,38 @@ pub enum NetCmd {
     Clipboard(Vec<crate::clipboard::ClipItem>),
     /// A framed message for the clipboard stream (drag and drop data).
     ClipStream(Vec<u8>),
-    /// "Disconnect" or "Connect" was chosen (see `set_offline`): look again.
+    /// Stop or Start was chosen (see `set_offline`): look again.
     Recheck,
     /// Leaving on purpose (switching Macs, quitting): say so to the Mac, then close (the sender
     /// is told when that's done).
     Goodbye(std::sync::mpsc::Sender<()>),
 }
 
+impl NetCmd {
+    /// The Mac window `wid` resized to `size` (points), as it's shown here.
+    pub fn resize(wid: u32, size: (u32, u32)) -> Self {
+        NetCmd::Control(W::new(t::RESIZE).u32(wid).f32(size.0 as f32).f32(size.1 as f32).finish())
+    }
+}
+
 pub type UiTx = smithay_client_toolkit::reexports::calloop::channel::Sender<UiEvent>;
 
+/// The way to the window side, for the few things that start elsewhere (a setting in the tray).
+static UI: std::sync::Mutex<Option<UiTx>> = std::sync::Mutex::new(None);
+
+pub fn tell_ui(event: UiEvent) {
+    if let Some(ui) = UI.lock().unwrap().as_ref() {
+        let _ = ui.send(event);
+    }
+}
+
 pub fn spawn(cfg: Config, ui: UiTx) -> mpsc::UnboundedSender<NetCmd> {
+    *UI.lock().unwrap() = Some(ui.clone());
     let (tx, rx) = mpsc::unbounded_channel();
     let _ = NET_TX.set(tx.clone());
     listen_local(tx.clone());
+    let fingerprint = cfg.host_fingerprint.clone();
+    std::thread::Builder::new().name("presence".into()).spawn(move || watch_presence(&fingerprint)).unwrap();
     // A ping on the control stream every 2 s: the round trip through QUIC and the Mac's
     // session queue, logged now and then (latency figures).
     let ping_tx = tx.clone();
@@ -151,6 +211,51 @@ static EPOCH: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new
 static PINGS: std::sync::Mutex<(u32, u64, u64, i64, i64)> = std::sync::Mutex::new((0, 0, 0, 0, 0));
 /// Quickest ping round trip seen (µs) and the Mac's clock minus ours then.
 static BEST_PING: std::sync::Mutex<Option<(i64, i64)>> = std::sync::Mutex::new(None);
+/// How long a picture takes from its capture on the Mac to being shown here (µs, smoothed).
+static VIDEO_LAG_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// A picture captured at `capture_us` (the Mac's clock) was just shown: how long that took,
+/// for keeping the sound in step with the pictures (audio_task). Smoothed, so one slow frame
+/// doesn't move the sound.
+pub fn video_shown(capture_us: u64) {
+    let Some((_, offset)) = *BEST_PING.lock().unwrap() else { return };
+    let now = EPOCH.elapsed().as_micros() as i64;
+    let lag = now - (capture_us as i64 - offset);
+    if !(0..1_000_000).contains(&lag) {
+        return; // the clocks aren't matched up yet
+    }
+    let old = VIDEO_LAG_US.load(std::sync::atomic::Ordering::Relaxed);
+    let new = if old == 0 { lag } else { old + (lag - old) / 32 };
+    VIDEO_LAG_US.store(new, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long after it played the Mac hands its sound over (µs), as it measures and sends with
+/// each piece (ScreenCaptureKit: ~55 ms on macOS 26). Smoothed; 0 from a Mac that doesn't say.
+static MAC_AUDIO_AGE_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// How much sound the player is kept ahead by (µs): what the network has lately made pieces
+/// wait, so a late one doesn't run it dry (see audio_task). 0 until the first pieces have come.
+static AUDIO_CUSHION_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The buffer we ask the player for (pw-cat's --latency, pacat's --latency-msec).
+const PLAYER_LATENCY_MS: u64 = 20;
+/// The sound's format (48 kHz, s16, stereo, as the player is told): bytes a millisecond.
+const AUDIO_BYTES_PER_MS: usize = 48 * 2 * 2;
+
+/// How much later than it arrives the sound should play, so it's heard with the pictures it
+/// goes with, all from what's measured on this connection: the pictures' lag from capture to
+/// screen, less what sound spends on its way (the network to here, the sound already waiting
+/// for the player, `queued_us`, and the player's own buffer) and the time this Mac took to
+/// hand it over at all. Never more than the pictures' lag.
+fn audio_delay(queued_us: u64) -> std::time::Duration {
+    use std::sync::atomic::Ordering::Relaxed;
+    let video = VIDEO_LAG_US.load(Relaxed);
+    let p = *PINGS.lock().unwrap();
+    // The way back from the Mac, as the last pings measured it (their average).
+    let transit = if p.0 > 0 { (p.4 / p.0 as i64).max(0) } else { 0 };
+    let sound = transit + MAC_AUDIO_AGE_US.load(Relaxed) + queued_us as i64 + PLAYER_LATENCY_MS as i64 * 1000;
+    std::time::Duration::from_micros((video - sound).clamp(0, video.max(0)) as u64)
+}
 
 /// Each window's decoder input, for frames arriving as datagrams.
 static FRAME_SINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, std::sync::mpsc::Sender<Encoded>>>> =
@@ -164,19 +269,300 @@ fn request_keyframe(wid: u32) {
     }
 }
 
-/// Local socket for `sweeflow launch <bundle id>` (used by the Mac app launchers).
+/// Local socket for `sweeflow launch <bundle id>` and `sweeflow quit <bundle id>` (used by the
+/// Mac app launchers).
 /// Launch requests made while the Mac is offline, delivered on (re)connect.
 static PENDING_LAUNCHES: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
 /// The Mac's lock state as last reported (kept across reconnects).
 static MAC_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Disconnected on purpose (the tray's Disconnect): no connection until Connect. Kept across
-/// restarts, in a file beside the config.
+/// The address the Mac in use was reached at, while connected.
+static CONNECTED_TO: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+/// The address each Mac (by fingerprint) was last reached at: still shown once it goes offline,
+/// rather than the name it was linked by.
+static LAST_REACHED: std::sync::Mutex<Vec<(String, SocketAddr)>> = std::sync::Mutex::new(Vec::new());
+/// Stopped on purpose (Stop): no connection until Start, so the Mac is free for another
+/// computer. Kept across restarts, in a file beside the config.
 static OFFLINE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
     std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(offline_file().exists()));
+/// Whether the Mac in use can be reached: 0 not known yet, 1 no, 2 yes. Apart from streaming:
+/// it is shown while stopped too (see `watch_presence`).
+static REACHABLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The Mac in use (its fingerprint): the others are only ever looked for on the network.
+static IN_USE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The other linked Macs found online (true) or not (false), by fingerprint; missing: not known yet.
+static OTHERS_ONLINE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+/// Linked Macs this computer isn't streaming from that say they're streaming to a computer
+/// (their network announcement), by fingerprint.
+static BUSY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+/// The same, with their screen locked.
+static LOCKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// A linked Mac this computer isn't connected to has its screen locked.
+pub fn locked(fingerprint: &str) -> bool {
+    LOCKED.lock().unwrap().contains(fingerprint)
+}
+
+/// What the Mac in use says of itself while stopped here: (busy streaming elsewhere, locked).
+pub fn in_use_says() -> (bool, bool) {
+    // From the config: the Mac in use can change while Sweeflow runs (linking, switching).
+    let f = crate::config::Config::load_or_default().map(|c| c.host_fingerprint).unwrap_or_default();
+    (busy(&f), locked(&f))
+}
+
+/// A linked Mac this computer isn't connected to is streaming to another computer.
+pub fn busy(fingerprint: &str) -> bool {
+    BUSY.lock().unwrap().contains(fingerprint)
+}
 
 fn offline_file() -> std::path::PathBuf {
+    // The file's name is from when Stop was called Disconnect: kept, so the choice made then
+    // still holds.
     crate::config::dir().join("disconnected")
+}
+
+/// The Mac in use is online (reachable on the network): None until known.
+pub fn mac_online() -> Option<bool> {
+    match REACHABLE.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        n => Some(n == 2),
+    }
+}
+
+/// The address the Mac in use is connected at, while it is.
+pub fn connected_to() -> Option<SocketAddr> {
+    *CONNECTED_TO.lock().unwrap()
+}
+
+/// The address the Mac with `fingerprint` was last reached at by this run, connected or not.
+pub fn last_reached(fingerprint: &str) -> Option<SocketAddr> {
+    LAST_REACHED.lock().unwrap().iter().find(|(f, _)| f == fingerprint).map(|(_, a)| *a)
+}
+
+/// How this computer reaches a Mac at `host` ("address:port", or a name with its port), for
+/// the word beside it: "tailscale"; "vm" (a Mac in a virtual machine on this computer: this
+/// computer's own address with the VM's ports forwarded, or a VM network's bridge); "lan";
+/// "internet"; or "" (a name that doesn't say).
+pub fn route_kind(host: &str) -> &'static str {
+    use std::net::IpAddr;
+    let ip = host.parse::<SocketAddr>().map(|a| a.ip()).ok().or_else(|| host.parse::<IpAddr>().ok());
+    let Some(ip) = ip else {
+        let name = host.rsplit_once(':').map_or(host, |(n, _)| n).trim_end_matches('.').to_ascii_lowercase();
+        return if name.ends_with(".ts.net") {
+            "tailscale"
+        } else if name.ends_with(".local") {
+            "lan"
+        } else if name == "localhost" {
+            "vm"
+        } else {
+            ""
+        };
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if v4.is_loopback() {
+                "vm"
+            } else if o[0] == 100 && (o[1] & 0xc0) == 64 {
+                "tailscale"
+            } else if vm_bridge(v4) {
+                "vm"
+            } else if v4.is_private() || v4.is_link_local() {
+                "lan"
+            } else {
+                "internet"
+            }
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if v6.is_loopback() {
+                "vm"
+            } else if s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0 {
+                "tailscale"
+            } else if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                "lan"
+            } else {
+                "internet"
+            }
+        }
+    }
+}
+
+/// How a Mac is reached, in a few words (`kind` from `route_kind`): "Local: 192.168.1.20",
+/// "Remote: 100.64.0.3" (Tailscale or the internet), "VM: 127.0.0.1"; empty if not known.
+pub fn route_words(kind: &str, address: &str) -> String {
+    let word = match kind {
+        "lan" => "Local",
+        "tailscale" | "internet" => "Remote",
+        "vm" => "VM",
+        _ => return String::new(),
+    };
+    let address = address.trim();
+    if address.is_empty() { word.to_string() } else { format!("{word}: {address}") }
+}
+
+/// The address is on a virtual machines' network: the interface the kernel routes it through
+/// is a VM bridge here (libvirt's virbr, VirtualBox's vboxnet, VMware's vmnet, a tap), or this
+/// computer is itself a virtual machine and the address is its way out (its host, the Mac).
+fn vm_bridge(ip: std::net::Ipv4Addr) -> bool {
+    let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let bridge = route_iface(&routes, ip).is_some_and(|i| ["virbr", "vboxnet", "vmnet", "vnet", "tap", "incusbr", "lxdbr"].iter().any(|p| i.starts_with(p)));
+    bridge || (default_gateway(&routes) == Some(ip) && in_a_vm())
+}
+
+/// The default route's gateway in /proc/net/route's table.
+fn default_gateway(routes: &str) -> Option<std::net::Ipv4Addr> {
+    routes.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.get(1) == Some(&"00000000") && f.get(7) == Some(&"00000000")).then(|| u32::from_str_radix(f.get(2)?, 16).ok().map(|v| std::net::Ipv4Addr::from(v.to_le_bytes())))?
+    })
+}
+
+/// This computer is a virtual machine (as its firmware says: QEMU, UTM, Parallels, VMware,
+/// VirtualBox, Apple's Virtualization).
+fn in_a_vm() -> bool {
+    static VM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        ["sys_vendor", "product_name"].iter().any(|f| {
+            let v = std::fs::read_to_string(format!("/sys/class/dmi/id/{f}")).unwrap_or_default().to_lowercase();
+            ["qemu", "parallels", "vmware", "virtualbox", "innotek", "apple virtualization", "kvm", "utm"].iter().any(|n| v.contains(n))
+        })
+    });
+    *VM
+}
+
+/// The interface /proc/net/route's table sends `ip` through (the longest matching prefix, the
+/// default route left out: that's the way to everything else).
+fn route_iface(routes: &str, ip: std::net::Ipv4Addr) -> Option<&str> {
+    let ip = u32::from_be_bytes(ip.octets());
+    // Addresses in the table are the network's bytes printed as a little-endian number.
+    let field = |h: &str| u32::from_str_radix(h, 16).ok().map(|v| u32::from_be_bytes(v.to_le_bytes()));
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (dest, mask) = (field(f.get(1)?)?, field(f.get(7)?)?);
+            (mask != 0 && ip & mask == dest).then_some((mask.count_ones(), f[0]))
+        })
+        .max_by_key(|r| r.0)
+        .map(|r| r.1)
+}
+
+/// Whether a linked Mac is online: None until known.
+pub fn online(fingerprint: &str) -> Option<bool> {
+    if IN_USE.get().is_some_and(|f| f == fingerprint) {
+        return mac_online();
+    }
+    OTHERS_ONLINE.lock().unwrap().get(fingerprint).copied()
+}
+
+fn set_reachable(online: bool) {
+    let n = if online { 2 } else { 1 };
+    if REACHABLE.swap(n, std::sync::atomic::Ordering::SeqCst) != n {
+        log::info!("the Mac is {}", if online { "online" } else { "not online" });
+        crate::tray::refresh();
+    }
+}
+
+/// Looks of one Mac on the network, in a row: it counts as online once seen, and as not online
+/// only after two looks in a row miss it (Wi-Fi drops multicast now and then).
+#[derive(Default)]
+struct Looks {
+    misses: u32,
+}
+
+impl Looks {
+    /// What one more look says: online, not online, or nothing new yet.
+    fn after(&mut self, found: bool) -> Option<bool> {
+        self.misses = if found { 0 } else { self.misses + 1 };
+        if found {
+            Some(true)
+        } else if self.misses >= 2 {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether each linked Mac is online, for the list of Macs and for the Mac in use while stopped.
+/// While stopped, Sweeflow holds no connection to the Mac: it serves one computer at a time, and
+/// even a connection closed straight after its handshake would end another computer's session
+/// there (and the other linked Macs may well be serving another computer). A running Mac host
+/// always advertises its streaming service on the local network (Bonjour, with the start of its
+/// certificate's fingerprint), so every few seconds Sweeflow looks for that instead, which asks
+/// nothing of any Mac's session. While started, the connection says for the Mac in use.
+fn watch_presence(in_use: &str) {
+    let _ = IN_USE.set(in_use.to_string());
+    let mut looks: HashMap<String, Looks> = HashMap::new();
+    // Macs asked directly (not seen on the network), and when: every 10 s at most each.
+    let mut probed: HashMap<String, (Instant, Option<crate::pair::Presence>)> = HashMap::new();
+    loop {
+        // Read each time: Macs are linked and unlinked while Sweeflow runs.
+        let linked: Vec<String> =
+            crate::config::Config::load_or_default().map(|c| c.macs.into_iter().map(|m| m.fingerprint).collect()).unwrap_or_default();
+        let wanted: Vec<&String> = linked.iter().filter(|f| *f != in_use || offline()).collect();
+        if wanted.is_empty() {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        let seen = crate::pair::seen_on_network(Duration::from_secs(2));
+        let mut changed = false;
+        for fp in wanted {
+            let id = fp.get(..16).unwrap_or_default();
+            let mut found = seen.contains_key(id);
+            // Busy: only while this computer isn't the one it streams to (stopped, or another Mac).
+            let mut said = seen.get(id).copied().unwrap_or_default();
+            // Whether this round learnt anything: an announcement seen, or the Mac asked now. A
+            // failed ask is kept for 10 s; counted again each round, one dropped answer made
+            // the Mac "not online" (Looks wants two misses in a row).
+            let mut fresh = found;
+            if !found {
+                // Not seen announcing itself: asked at its last address instead (a virtual
+                // machine's network carries no announcements, some Wi-Fi drops them).
+                // The Mac in use more often: a Start pressed just after it was stopped elsewhere
+                // was refused as "busy" for up to 10 s.
+                let every = if *fp == in_use { Duration::from_secs(4) } else { Duration::from_secs(10) };
+                let stale = probed.get(fp.as_str()).is_none_or(|(at, _)| at.elapsed() >= every);
+                if stale {
+                    let mac = crate::config::Config::load_or_default().ok().and_then(|c| c.macs.into_iter().find(|m| &m.fingerprint == fp));
+                    let answer = mac.as_ref().and_then(crate::pair::probe);
+                    probed.insert(fp.clone(), (Instant::now(), answer));
+                    fresh = true;
+                }
+                if let Some((_, Some(p))) = probed.get(fp.as_str()) {
+                    found = true;
+                    said = *p;
+                }
+            }
+            for (set, on) in [(&BUSY, said.busy), (&LOCKED, said.locked)] {
+                let mut set = set.lock().unwrap();
+                changed |= if on { set.insert(fp.clone()) } else { set.remove(fp) };
+            }
+            if !fresh && !found {
+                continue;
+            }
+            let Some(now) = looks.entry(fp.clone()).or_default().after(found) else { continue };
+            if fp == in_use {
+                // Started meanwhile: then the connection says, not this.
+                if offline() {
+                    set_reachable(now);
+                }
+            } else if OTHERS_ONLINE.lock().unwrap().insert(fp.clone(), now) != Some(now) {
+                changed = true;
+            }
+        }
+        looks.retain(|f, _| linked.contains(f));
+        probed.retain(|f, _| linked.contains(f));
+        OTHERS_ONLINE.lock().unwrap().retain(|f, _| linked.contains(f));
+        // The Mac in use while started: the connection says (Busy), not this.
+        BUSY.lock().unwrap().retain(|f| linked.contains(f) && (f != in_use || offline()));
+        LOCKED.lock().unwrap().retain(|f| linked.contains(f) && (f != in_use || offline()));
+        if changed {
+            crate::tray::refresh();
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
 }
 
 /// Tells the Mac this computer is leaving on purpose (so it tidies up at once, without waiting
@@ -196,16 +582,71 @@ pub fn offline() -> bool {
     OFFLINE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Disconnects from the Mac (its windows go) and stays so, or connects again.
+/// Connected, and the Mac's screen is locked (its windows are paused until it's unlocked). The
+/// Mac says on every connect and on every change, so this is current while connected.
+pub fn mac_locked() -> bool {
+    CONNECTED.load(std::sync::atomic::Ordering::SeqCst) && MAC_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Stops (the Mac's windows go, the connection closes and the Mac is free for another computer)
+/// and stays so, or starts again.
 pub fn set_offline(on: bool) {
+    // Stop ends waiting for a Mac in use elsewhere; Start looks afresh.
+    crate::tray::set_elsewhere(None);
     if OFFLINE.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
         return;
     }
-    log::info!("{}", if on { "disconnecting, as asked" } else { "connecting again, as asked" });
+    log::info!("{}", if on { "stopping, as asked" } else { "starting again, as asked" });
     let _ = if on { std::fs::write(offline_file(), "") } else { std::fs::remove_file(offline_file()) };
     if let Some(tx) = NET_TX.get() {
         let _ = tx.send(NetCmd::Recheck);
     }
+}
+
+/// This computer's name, as the Mac tells another computer it's streaming here.
+fn this_computer() -> String {
+    let h = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    let h = h.trim();
+    if h.is_empty() { "a Linux computer".into() } else { h.into() }
+}
+
+/// How long to wait before looking again whether the Mac is still streaming to another
+/// computer. (A look is a hello the Mac turns away:
+/// the other computer doesn't notice.)
+fn busy_wait(_checks: u32) -> Duration {
+    // Every 5 s: streaming here starts within moments of it stopping there (backing off to
+    // 30 s left Sweeflow showing "Busy" for half a minute after the Mac was free).
+    Duration::from_secs(5)
+}
+
+/// How long to wait before asking again a Mac that disconnected this computer: 5 s at first
+/// (Connect on the Mac is answered quickly), then 10, then every 20 s.
+fn refused_wait(checks: u32) -> Duration {
+    Duration::from_secs((5u64 << checks.min(2)).min(20))
+}
+
+/// Busy's payload: the computer the Mac is streaming to.
+fn parse_busy(body: &[u8]) -> Result<String> {
+    R::new(body).str()
+}
+
+/// The notifications: on first finding the Mac in use, and when it's free again.
+fn busy_message(mac: &str, _other: &str) -> (String, String) {
+    (format!("{mac} is busy"), format!("It's streaming elsewhere. Stop it there first; Sweeflow streams here once {mac} is free."))
+}
+
+fn free_message(mac: &str, other: &str) -> (String, String) {
+    (format!("{mac} is free: streaming here now"), format!("{other} stopped streaming."))
+}
+
+/// The Mac turned this computer away: another one has it. Said once (not at every look).
+fn mac_busy(other: String) {
+    if crate::tray::elsewhere().is_none() {
+        log::info!("the Mac is streaming to {other}: waiting until it's free");
+        let (summary, body) = busy_message(&crate::tray::mac_display_name(), &other);
+        std::thread::spawn(move || notify(&summary, &body));
+    }
+    crate::tray::set_elsewhere(Some(other));
 }
 
 /// Mac apps only appear in the app menu while the Mac is connected (after a grace period, so a
@@ -281,11 +722,25 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
         .spawn(move || {
             for conn in listener.incoming().flatten() {
                 for line in std::io::BufReader::new(conn).lines().map_while(Result::ok) {
-                    if let Some(bid) = line.strip_prefix("launch ") {
-                        let bid = bid.trim().to_string();
+                    if let Some(rest) = line.strip_prefix("launch ") {
+                        // "launch <bundle id> [activation token]" (GNOME's tokens hold the
+                        // entry's name, spaces and all: the rest of the line).
+                        let mut parts = rest.trim().splitn(2, ' ');
+                        let bid = parts.next().unwrap_or_default().to_string();
+                        let token = parts.next().map(str::to_string).filter(|t| !t.is_empty());
                         if CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
                             log::info!("launching {bid} on the Mac");
+                            tell_ui(UiEvent::Raise { bundle_id: bid.clone(), token });
                             let _ = tx.send(NetCmd::Control(W::new(t::LAUNCH_APP).str(&bid).finish()));
+                            if mac_locked() {
+                                let name = crate::tray::app_name(&bid);
+                                std::thread::spawn(move || {
+                                    notify(
+                                        "Your Mac is locked",
+                                        &format!("{name} opens here once you unlock it (Touch ID or password on the Mac)."),
+                                    )
+                                });
+                            }
                         } else {
                             // Hold it until we reconnect; tell the user if that takes too long.
                             log::info!("Mac offline; holding launch of {bid}");
@@ -299,6 +754,16 @@ fn listen_local(tx: mpsc::UnboundedSender<NetCmd>) {
                                     notify("Mac not connected", &format!("Couldn't open {bid}: sweeflow can't reach your Mac."));
                                 }
                             });
+                        }
+                    } else if let Some(bid) = line.strip_prefix("quit ") {
+                        // A launcher's Quit action. Not held for later like launches: quitting
+                        // an app some time after asking would only surprise.
+                        let bid = bid.trim();
+                        if CONNECTED.load(std::sync::atomic::Ordering::SeqCst) {
+                            log::info!("quitting {bid} on the Mac");
+                            let _ = tx.send(NetCmd::Control(W::new(t::QUIT_APP).str(bid).finish()));
+                        } else {
+                            log::info!("Mac offline; not quitting {bid}");
                         }
                     }
                 }
@@ -317,10 +782,13 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         }
     };
     let mut backoff = Duration::from_millis(250);
+    // Looks at a Mac in use by another computer, in a row.
+    let mut busy_checks = 0;
+    let mut refused_checks = 0;
     loop {
         if offline() {
-            let _ = ui.send(UiEvent::Disconnected("disconnected, as asked".into()));
-            // Any command wakes this to look again; only Connect (a Recheck) changes anything.
+            let _ = ui.send(UiEvent::Disconnected("stopped, as asked".into()));
+            // Any command wakes this to look again; only Start (a Recheck) changes anything.
             while offline() {
                 if cmds.recv().await.is_none() {
                     return;
@@ -331,8 +799,14 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         match session(&cfg, &endpoint, &ui, &mut cmds).await {
             Ok(()) => return, // UI went away
             Err(e) => {
-                log::warn!("connection lost: {e:#}");
                 let _ = ui.send(UiEvent::Disconnected(format!("{e:#}")));
+                // Stopped on purpose, or turned away (the Mac was there a moment ago): still online.
+                if offline() || crate::tray::elsewhere().is_some() {
+                    log::info!("connection closed: {e:#}");
+                } else {
+                    log::warn!("connection lost: {e:#}");
+                    set_reachable(false);
+                }
             }
         }
         // Drop commands meant for the dead connection.
@@ -340,6 +814,40 @@ async fn run(cfg: Config, ui: UiTx, mut cmds: mpsc::UnboundedReceiver<NetCmd>) {
         if offline() {
             continue;
         }
+        if crate::tray::elsewhere().is_some() {
+            // In use by another computer: look again in a while (Stop here ends the waiting).
+            let until = tokio::time::Instant::now() + busy_wait(busy_checks);
+            busy_checks += 1;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(until) => break,
+                    cmd = cmds.recv() => {
+                        if cmd.is_none() { return; }
+                        if offline() { break; }
+                    }
+                }
+            }
+            continue;
+        }
+        busy_checks = 0;
+        if crate::tray::mac_refused() {
+            // Disconnected on the Mac: it lets this computer in again only after Connect there,
+            // so asking every few seconds for good only fills its log. Less often the longer it
+            // lasts (Stop or Start here asks again at once).
+            let until = tokio::time::Instant::now() + refused_wait(refused_checks);
+            refused_checks += 1;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(until) => break,
+                    cmd = cmds.recv() => {
+                        if cmd.is_none() { return; }
+                        if offline() { break; }
+                    }
+                }
+            }
+            continue;
+        }
+        refused_checks = 0;
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(3));
     }
@@ -356,37 +864,69 @@ async fn session(
     let saved = async {
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.host).await?.collect();
         let addr = *addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).context("host did not resolve")?;
-        anyhow::Ok((addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?))
+        // Not for ever: a handshake the Mac never answers would hold Start up indefinitely.
+        let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(addr, "sweeflow")?).await.context("no answer")?;
+        anyhow::Ok((addr, conn.context("connect")?))
     };
     let (addr, conn) = match saved.await {
         Ok(c) => c,
         Err(e) => {
-            // The Mac may have a new address: look for it on the network by its certificate.
+            // The Mac may have a new address: look for it on the network by its certificate,
+            // then at the other addresses it said it has (a network with no Bonjour: a VM's).
             let fp = cfg.host_fingerprint.clone();
-            let Some(addr) = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?
-            else {
-                return Err(e);
-            };
-            log::info!("{} not reachable ({e:#}); found the Mac at {addr}", cfg.host);
-            (addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?)
+            let found = tokio::task::spawn_blocking(move || crate::pair::locate(&fp, Duration::from_secs(2))).await?;
+            let mut reached = None;
+            if let Some(addr) = found {
+                log::info!("{} not reachable ({e:#}); found the Mac at {addr}", cfg.host);
+                reached = Some((addr, endpoint.connect(addr, "sweeflow")?.await.context("connect")?));
+            } else if let Some(mac) = cfg.macs.iter().find(|m| m.fingerprint == cfg.host_fingerprint) {
+                for place in crate::config::places(mac).into_iter().skip(1) {
+                    let Ok(Ok(mut addrs)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(place.clone())).await else { continue };
+                    let Some(addr) = addrs.find(|a| a.is_ipv4()) else { continue };
+                    let Ok(connecting) = endpoint.connect(addr, "sweeflow") else { continue };
+                    if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(3), connecting).await {
+                        log::info!("{} not reachable ({e:#}); reached the Mac at {place}", cfg.host);
+                        reached = Some((addr, conn));
+                        break;
+                    }
+                }
+            }
+            let Some(r) = reached else { return Err(e) };
+            // Its address from now on.
+            crate::config::remember_addresses(&cfg.host_fingerprint, Vec::new(), Some(r.0.to_string()));
+            r
         }
     };
     log::info!("connected to {addr}, rtt {:?}", conn.rtt());
     let ip = addr.ip();
     std::thread::spawn(move || crate::wake::remember(ip));
+    *CONNECTED_TO.lock().unwrap() = Some(addr);
+    {
+        let mut last = LAST_REACHED.lock().unwrap();
+        last.retain(|(f, _)| *f != cfg.host_fingerprint);
+        last.push((cfg.host_fingerprint.clone(), addr));
+    }
     struct Online;
     impl Drop for Online {
         fn drop(&mut self) {
+            *CONNECTED_TO.lock().unwrap() = None;
             set_online(false);
             crate::tray::connected(None);
         }
     }
-    set_online(true);
+    // A look at a Mac in use by another computer: online only once it lets this one in (the
+    // app menu's Mac apps don't come and go at every look), and launches wait.
+    let busy = crate::tray::elsewhere().is_some();
+    if !busy {
+        set_online(true);
+    }
+    set_reachable(true);
     let _online = Online;
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
-    ctl_tx.write_all(&W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(cfg.capture_scale as f32).finish()).await?;
-    let held: Vec<String> = PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect();
+    let hello = W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(0.0);   // (was the capture scale: the screen's own scale now goes with SCREEN_SIZE)
+    ctl_tx.write_all(&hello.str(&this_computer()).finish()).await?;
+    let held: Vec<String> = if busy { Vec::new() } else { PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect() };
     for bid in held {
         log::info!("launching {bid} (requested while offline)");
         ctl_tx.write_all(&W::new(t::LAUNCH_APP).str(&bid).finish()).await?;
@@ -444,6 +984,11 @@ async fn session(
         let ui3 = ui.clone();
         let task = tokio::spawn(async move {
             while let Ok(Some((ty, body))) = proto::read_msg(&mut crx).await {
+                if ty == t::CLIP_FILES {
+                    // The Mac's clipboard files, being pasted here (see clipboard::wait_for_files).
+                    let _ = tokio::task::spawn_blocking(move || crate::clipboard::files_arrived(&body)).await;
+                    continue;
+                }
                 if ty == t::DRAG_DATA {
                     // The dragged Mac files: save them, hand the UI a URI list.
                     let parsed = crate::clipboard::decode(&body);
@@ -469,7 +1014,19 @@ async fn session(
                 }
             }
         });
-        (Arc::new(tokio::sync::Mutex::new(ctx)), task)
+        let ctx = Arc::new(tokio::sync::Mutex::new(ctx));
+        // Messages from the clipboard code (a paste fetching the Mac's files).
+        let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        crate::clipboard::set_clip_stream(Some(ftx));
+        let out = ctx.clone();
+        tokio::spawn(async move {
+            while let Some(m) = frx.recv().await {
+                if out.lock().await.write_all(&m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (ctx, task)
     };
 
     let mut video: HashMap<u32, (quinn::SendStream, tokio::task::JoinHandle<()>)> = HashMap::new();
@@ -484,7 +1041,7 @@ async fn session(
                         let _ = ctl_tx.write_all(&W::new(t::GOODBYE).finish()).await;
                         let _ = ctl_tx.finish();
                         tokio::time::sleep(Duration::from_millis(150)).await;
-                        break Err(anyhow::anyhow!("disconnected, as asked"));
+                        break Err(anyhow::anyhow!("stopped, as asked"));
                     }
                     NetCmd::Recheck => {}
                     NetCmd::Goodbye(done) => {
@@ -558,9 +1115,39 @@ async fn session(
     result
 }
 
+/// A WINDOW_ADDED body (also the tail of WINDOW_REPLACED's).
+fn read_win_info(r: &mut R) -> Result<WinInfo> {
+    Ok(WinInfo {
+        wid: r.u32()?,
+        pid: r.i32()?,
+        bundle_id: r.str()?,
+        app_name: r.str()?,
+        title: r.str()?,
+        w: r.f32()?,
+        h: r.f32()?,
+        parent: r.u32()?,
+        rel_x: r.f32()?,
+        rel_y: r.f32()?,
+        kind: r.u8()?,
+    })
+}
+
 fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     let mut r = R::new(body);
     let ev = match ty {
+        t::ADDRESSES => {
+            let n = r.u16()?;
+            let mut all = Vec::new();
+            for _ in 0..n {
+                all.push(r.str()?);
+            }
+            std::thread::spawn(move || {
+                if let Ok(c) = crate::config::Config::load_or_default() {
+                    crate::config::remember_addresses(&c.host_fingerprint, all, None);
+                }
+            });
+            return Ok(());
+        }
         t::WELCOME => {
             let _v = r.u16()?;
             let name = r.str()?;
@@ -568,25 +1155,20 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             if let Ok(kind) = r.str() {
                 crate::tray::set_mac_kind(&kind);
             }
+            if let Some(other) = crate::tray::elsewhere() {
+                log::info!("the Mac is free again: streaming here");
+                crate::tray::set_elsewhere(None);
+                set_online(true);
+                let (summary, body) = free_message(&crate::tray::mac_display_name(), &other);
+                std::thread::spawn(move || notify(&summary, &body));
+            }
             crate::tray::connected(Some(name.clone()));
             UiEvent::Connected(name)
         }
-        t::WINDOW_ADDED => {
-            let wid = r.u32()?;
-            let pid = r.i32()?;
-            UiEvent::WindowAdded(WinInfo {
-                wid,
-                pid,
-                bundle_id: r.str()?,
-                app_name: r.str()?,
-                title: r.str()?,
-                w: r.f32()?,
-                h: r.f32()?,
-                parent: r.u32()?,
-                rel_x: r.f32()?,
-                rel_y: r.f32()?,
-                kind: r.u8()?,
-            })
+        t::WINDOW_ADDED => UiEvent::WindowAdded(read_win_info(&mut r)?),
+        t::WINDOW_REPLACED => {
+            let old = r.u32()?;
+            UiEvent::WindowReplaced(old, read_win_info(&mut r)?)
         }
         t::WINDOW_CHANGED => UiEvent::WindowChanged {
             wid: r.u32()?,
@@ -597,12 +1179,15 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             rel_y: r.f32()?,
         },
         t::WINDOW_REMOVED => UiEvent::WindowRemoved(r.u32()?),
+        t::WINDOW_FIXED => {
+            let wid = r.u32()?;
+            let spot = r.f32().and_then(|x| Ok((x, r.f32()?))).ok();
+            let fixed = r.u8().map_or(true, |f| f != 0);
+            UiEvent::WindowFixed(wid, spot, fixed)
+        }
         t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
-        t::FOCUSED => {
-            r.u32()?;
-            UiEvent::Focused
-        }
+        t::FOCUSED => UiEvent::Focused(r.u32()?),
         t::WINDOW_BUTTONS => {
             let wid = r.u32()?;
             let mut rects = [[0f32; 4]; 3];
@@ -615,6 +1200,7 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
         }
         t::MOVE_STARTED => UiEvent::MoveStarted(r.u32()?),
         t::MOVE_READY => UiEvent::MoveReady(r.u32()?, r.u32()?),
+        t::DRAG_SPOT => UiEvent::DragSpot(r.u32()?, r.f32()?, r.f32()?, r.u8()? != 0),
         t::TOGGLE_MAXIMIZE => UiEvent::ToggleMaximize(r.u32()?),
         t::MINIMIZE => UiEvent::Minimize(r.u32()?),
         t::SCREEN_SELECT => UiEvent::ScreenSelect(r.u8()? != 0),
@@ -639,6 +1225,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             });
             return Ok(());
         }
+        t::BUSY => {
+            mac_busy(parse_busy(body)?);
+            return Ok(());
+        }
         t::MAC_DISCONNECTED => {
             log::info!("the Mac disconnected this computer: refused until it connects again");
             crate::tray::set_mac_refused(true);
@@ -655,6 +1245,9 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             // Once per lock, not on every reconnect while it stays locked (a sleeping Mac wakes
             // briefly now and then), and not at all while streaming is switched off.
             let was = MAC_LOCKED.swap(locked, std::sync::atomic::Ordering::SeqCst);
+            if locked != was {
+                crate::tray::refresh();
+            }
             if locked && !was && crate::tray::streaming() {
                 std::thread::spawn(|| {
                     notify("Your Mac is locked", "Mac windows are paused until you unlock it (Touch ID or password on the Mac).")
@@ -801,7 +1394,9 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
                 }
                 waiting_for_key = false;
                 if dec.is_none() {
-                    match Decoder::new(&render_node) {
+                    // Pictures decoded on the CPU, for a GPU that can't: X11 draws them as
+                    // textures, Wayland shows them from shared memory.
+                    match Decoder::new_or_software(&render_node, !crate::x11ui::wanted()) {
                         Ok(d) => dec = Some(d),
                         Err(e) => {
                             log::error!("window {wid}: {e:#}");
@@ -897,6 +1492,26 @@ async fn video_task(wid: u32, mut rx: quinn::RecvStream, ui: UiTx, render_node: 
     }
 }
 
+/// The command that plays raw 48 kHz stereo 16-bit audio from a file: PipeWire's `pw-cat` where
+/// it takes raw audio (PipeWire 1.2 and later), else PulseAudio's `pacat` (PipeWire answers as
+/// PulseAudio; Ubuntu 24.04 / Mint 22 ship PipeWire 1.0), else ALSA's `aplay`. As its own
+/// "sweeflow" stream in the mixer where the player can name it.
+fn audio_player() -> Vec<String> {
+    let has = |cmd: &str| std::process::Command::new(cmd).arg("--help").output().ok();
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if has("pw-cat").is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("--raw")) {
+        return v(&["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", "48000", "--channels", "2", "--latency", &*format!("{PLAYER_LATENCY_MS}ms"),
+                   "-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }"]);
+    }
+    if has("pacat").is_some() {
+        log::info!("audio: through pacat (this PipeWire's pw-cat takes no raw audio)");
+        return v(&["pacat", "--playback", "--raw", "--format=s16le", "--rate=48000", "--channels=2", &*format!("--latency-msec={PLAYER_LATENCY_MS}"),
+                   "--client-name=sweeflow", "--stream-name=Mac audio"]);
+    }
+    log::info!("audio: through aplay");
+    v(&["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2"])
+}
+
 /// Plays the Mac's audio through PipeWire (`pw-cat`), as its own "sweeflow" stream in the mixer.
 ///
 /// The player runs as a transient systemd user unit reading a FIFO, not as our child: KDE's
@@ -913,9 +1528,8 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     const UNIT: &str = "sweeflow-audio";
     let _ = std::process::Command::new("systemctl").args(["--user", "stop", UNIT]).status();
     let started = std::process::Command::new("systemd-run")
-        .args(["--user", "--quiet", "--collect", "--unit", UNIT, "pw-cat", "--playback", "--raw"])
-        .args(["--format", "s16", "--rate", "48000", "--channels", "2", "--latency", "20ms"])
-        .args(["-P", "{ application.name = \"sweeflow\" media.name = \"Mac audio\" node.name = \"sweeflow\" }"])
+        .args(["--user", "--quiet", "--collect", "--unit", UNIT])
+        .args(audio_player())
         .arg(&fifo)
         .status();
     if !started.is_ok_and(|s| s.success()) {
@@ -932,24 +1546,142 @@ async fn audio_task(_keep_open: quinn::SendStream, mut rx: quinn::RecvStream) {
     let _player = Player;
 
     // Blocking FIFO writes happen on their own thread so the network reader never stalls.
-    let (tx, prx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+    // Each piece is held back until it's due (audio_delay: in step with the pictures); one
+    // that is late by more than a little is dropped, so a shorter delay takes effect at once
+    // instead of the player's buffer growing.
+    let (tx, prx) = std::sync::mpsc::sync_channel::<(std::time::Instant, Vec<u8>)>(256);
     let writer = std::thread::spawn(move || {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::time::{Duration, Instant};
         // Opening blocks until pw-cat opens its end.
         let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo) else { return };
-        while let Ok(pcm) = prx.recv() {
-            if pipe.write_all(&pcm).is_err() {
-                break;
+        // What waits in the pipe for the player, in bytes (FIONREAD works on either end).
+        let queued = |p: &std::fs::File| -> usize {
+            use std::os::fd::AsRawFd;
+            let mut n: libc::c_int = 0;
+            if unsafe { libc::ioctl(p.as_raw_fd(), libc::FIONREAD, &mut n) } == 0 { n.max(0) as usize } else { 0 }
+        };
+        let us_of = |bytes: usize| (bytes as u64 * 1000) / AUDIO_BYTES_PER_MS as u64;
+        let bytes_of = |us: u64| (us * AUDIO_BYTES_PER_MS as u64 / 1000) as usize;
+        // The cushion in bytes: what the network has made pieces wait lately (AUDIO_CUSHION_US),
+        // and never less than two pieces.
+        let cushion = |piece: usize| bytes_of(AUDIO_CUSHION_US.load(Relaxed)).max(2 * piece);
+        let mut dropped = 0u32;
+        // Run dry (or just started): written again only once the cushion's worth is ready.
+        let mut priming = true;
+        let mut piece = 0usize;
+        let mut held: std::collections::VecDeque<(Instant, Vec<u8>)> = Default::default();
+        // The delay in use: it follows the target only once that has been off it by more than
+        // a piece for a while, as each change is heard (a gap when it grows, a skip when it
+        // shrinks).
+        let mut delay = Duration::ZERO;
+        let mut off_since: Option<Instant> = None;
+        loop {
+            match prx.recv_timeout(Duration::from_millis(2)) {
+                Ok(p) => {
+                    piece = p.1.len();
+                    held.push_back(p)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+            if piece == 0 {
+                continue;
+            }
+            let now = Instant::now();
+            let in_pipe = queued(&pipe);
+            let target = audio_delay(us_of(in_pipe));
+            if target.abs_diff(delay) > Duration::from_micros(us_of(piece)) {
+                let since = *off_since.get_or_insert(now);
+                if now - since > Duration::from_secs(2) {
+                    delay = target;
+                    off_since = None;
+                    log::info!("audio: held {} ms after arriving, to go with the pictures", delay.as_millis());
+                }
+            } else {
+                off_since = None;
+            }
+            if !priming && in_pipe == 0 {
+                priming = true;
+            }
+            if priming {
+                let ready: usize = held.iter().filter(|(arrived, _)| *arrived + delay <= now).map(|(_, p)| p.len()).sum();
+                if ready < cushion(piece) {
+                    continue;
+                }
+                priming = false;
+            }
+            while let Some((arrived, _)) = held.front() {
+                let due = *arrived + delay;
+                if due > now {
+                    break;
+                }
+                let (_, pcm) = held.pop_front().unwrap();
+                // Later than the cushion covers: dropped, so a shorter delay takes effect now.
+                if now - due > Duration::from_micros(us_of(cushion(piece))) {
+                    continue;
+                }
+                // The pipe is the player's cushion against pieces coming unevenly: kept to the
+                // cushion and a piece more (and refilled to the cushion when it runs dry,
+                // above). Unbounded (64 KB, a third of a second), whatever piled up in it once
+                // (a burst at the start, network jitter) stayed as delay for good, the player
+                // draining it only as fast as it plays: the sound came 150-300 ms after its
+                // picture. Made small instead (4 KB), the player ran dry 75 times a second.
+                if queued(&pipe) + pcm.len() > cushion(piece) + piece {
+                    dropped += 1;
+                    if dropped.is_power_of_two() {
+                        log::info!("audio: {dropped} pieces dropped to keep the player's queue short");
+                    }
+                    continue;
+                }
+                if pipe.write_all(&pcm).is_err() {
+                    return;
+                }
             }
         }
     });
     log::info!("audio: playing Mac app sound");
+    let (mut last_piece, mut pieces, mut gap_max, mut gap_logged) =
+        (None::<std::time::Instant>, 0u32, std::time::Duration::ZERO, std::time::Instant::now());
     while let Ok(Some((ty, body))) = proto::read_msg(&mut rx).await {
         if ty != t::AUDIO {
             continue;
         }
-        let Ok(pcm) = R::new(&body).bytes().map(<[u8]>::to_vec) else { continue };
+        let mut r = R::new(&body);
+        let Ok(pcm) = r.bytes().map(<[u8]>::to_vec) else { continue };
+        use std::sync::atomic::Ordering::Relaxed;
+        // How long after it played the Mac got it (newer Macs say): smoothed.
+        if let Ok(age) = r.u32() {
+            let old = MAC_AUDIO_AGE_US.load(Relaxed);
+            MAC_AUDIO_AGE_US.store(if old == 0 { age as i64 } else { old + (age as i64 - old) / 16 }, Relaxed);
+        }
+        // The cushion follows how long pieces wait between them: up at once to the longest
+        // wait (over a bumpy Wi-Fi pieces of 20 ms came up to 250 ms apart, then all at once),
+        // back down every 10 s halfway towards the longest of those 10 s, to no less than two
+        // pieces. A fixed cushion either ran dry on such waits (gaps) or kept the sound late.
+        let now = std::time::Instant::now();
+        let piece_us = (pcm.len() as u64 * 1000) / AUDIO_BYTES_PER_MS as u64;
+        // (A wait of over a second is the sound stopping and starting again, not the network.)
+        if let Some(prev) = last_piece.filter(|p| now - *p < std::time::Duration::from_secs(1)) {
+            let gap = now - prev;
+            gap_max = gap_max.max(gap);
+            pieces += 1;
+            let want = gap.as_micros() as u64 + piece_us;
+            if want > AUDIO_CUSHION_US.load(Relaxed) {
+                AUDIO_CUSHION_US.store(want, Relaxed);
+            }
+        }
+        last_piece = Some(now);
+        if gap_logged.elapsed() > std::time::Duration::from_secs(10) && pieces > 0 {
+            let old = AUDIO_CUSHION_US.load(Relaxed);
+            let new = ((old + gap_max.as_micros() as u64 + piece_us) / 2).max(2 * piece_us).min(old);
+            AUDIO_CUSHION_US.store(new, Relaxed);
+            log::info!("audio: longest wait between pieces {} ms: cushion {} → {} ms; the Mac hands sound over {} ms after it plays",
+                       gap_max.as_millis(), old / 1000, new / 1000, MAC_AUDIO_AGE_US.load(Relaxed) / 1000);
+            (pieces, gap_max, gap_logged) = (0, std::time::Duration::ZERO, std::time::Instant::now());
+        }
         // If the player falls behind, drop audio rather than letting latency build up.
-        let _ = tx.try_send(pcm);
+        let _ = tx.try_send((now, pcm));
     }
     drop(tx);
     let _ = writer.join();
@@ -1020,6 +1752,11 @@ fn make_endpoint(cfg: &Config) -> Result<quinn::Endpoint> {
 
 /// A QUIC client endpoint with our client certificate, accepting the Mac `check` approves.
 pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint> {
+    client_endpoint_offering(check, &[alpn])
+}
+
+/// The same, offering several ALPNs (the server picks one).
+pub fn client_endpoint_offering(check: HostCheck, alpns: &[&[u8]]) -> Result<quinn::Endpoint> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let (cert, key) = crate::config::client_identity()?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -1027,7 +1764,7 @@ pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint>
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedHost { check, provider }))
         .with_client_auth_cert(vec![cert], PrivateKeyDer::Pkcs8(key.into()))?;
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.alpn_protocols = alpns.iter().map(|a| a.to_vec()).collect();
 
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
@@ -1041,4 +1778,128 @@ pub fn client_endpoint(check: HostCheck, alpn: &[u8]) -> Result<quinn::Endpoint>
     let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
     ep.set_default_client_config(client);
     Ok(ep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_words_say_where() {
+        assert_eq!(route_words("lan", "192.168.1.20"), "Local: 192.168.1.20");
+        assert_eq!(route_words("tailscale", "100.64.0.3"), "Remote: 100.64.0.3");
+        assert_eq!(route_words("internet", "8.8.8.8"), "Remote: 8.8.8.8");
+        assert_eq!(route_words("vm", "127.0.0.1"), "VM: 127.0.0.1");
+        assert_eq!(route_words("vm", ""), "VM");
+        assert_eq!(route_words("", "mac.example.com"), "");
+    }
+
+    /// What handle_control makes of one message from the Mac.
+    fn control_event(msg: Vec<u8>) -> UiEvent {
+        use smithay_client_toolkit::reexports::calloop::{channel, EventLoop};
+        let (tx, rx) = channel::channel();
+        handle_control(msg[4], &msg[5..], &tx).unwrap();
+        let mut got = Vec::new();
+        let mut el: EventLoop<Vec<UiEvent>> = EventLoop::try_new().unwrap();
+        el.handle().insert_source(rx, |e, _, got: &mut Vec<UiEvent>| {
+            if let channel::Event::Msg(e) = e {
+                got.push(e);
+            }
+        }).unwrap();
+        el.dispatch(Some(Duration::ZERO), &mut got).unwrap();
+        assert_eq!(got.len(), 1);
+        got.pop().unwrap()
+    }
+
+    #[test]
+    fn window_replaced_carries_the_old_id_and_the_new_window() {
+        let added = |m: W| m.u32(42).i32(7).str("com.apple.finder").str("Finder").str("Downloads").f32(800.0).f32(500.0).u32(0).f32(1.0).f32(2.0).u8(0);
+        let check = |i: &WinInfo| {
+            assert_eq!((i.wid, i.pid, i.bundle_id.as_str(), i.app_name.as_str(), i.title.as_str()), (42, 7, "com.apple.finder", "Finder", "Downloads"));
+            assert_eq!((i.w, i.h, i.parent, i.rel_x, i.rel_y, i.kind), (800.0, 500.0, 0, 1.0, 2.0, 0));
+        };
+        match control_event(added(W::new(t::WINDOW_REPLACED).u32(41)).finish()) {
+            UiEvent::WindowReplaced(41, info) => check(&info),
+            e => panic!("got {}", e.kind()),
+        }
+        match control_event(added(W::new(t::WINDOW_ADDED)).finish()) {
+            UiEvent::WindowAdded(info) => check(&info),
+            e => panic!("got {}", e.kind()),
+        }
+    }
+
+    #[test]
+    fn route_kinds() {
+        assert_eq!(route_kind("100.64.0.3:44120"), "tailscale");
+        assert_eq!(route_kind("[fd7a:115c:a1e0::1]:44120"), "tailscale");
+        assert_eq!(route_kind("mac.tail1234.ts.net:44120"), "tailscale");
+        assert_eq!(route_kind("192.168.1.20:44120"), "lan");
+        assert_eq!(route_kind("10.0.0.5:44120"), "lan");
+        assert_eq!(route_kind("Air.local:44120"), "lan");
+        assert_eq!(route_kind("127.0.0.1:44120"), "vm");
+        assert_eq!(route_kind("localhost:44120"), "vm");
+        assert_eq!(route_kind("8.8.8.8:44120"), "internet");
+        assert_eq!(route_kind("100.128.0.1:44120"), "internet");
+        assert_eq!(route_kind("mac.example.com:44120"), "");
+    }
+
+    #[test]
+    fn routes_through_the_longest_prefix() {
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                     wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                     wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n\
+                     virbr0\t007AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(route_iface(table, "192.168.122.40".parse().unwrap()), Some("virbr0"));
+        assert_eq!(route_iface(table, "192.168.1.9".parse().unwrap()), Some("wlan0"));
+        assert_eq!(route_iface(table, "8.8.8.8".parse().unwrap()), None);
+        assert_eq!(default_gateway(table), Some("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn busy_decodes() {
+        let m = W::new(t::BUSY).str("Größe-VM").finish();
+        assert_eq!(m[4], 0x06);
+        assert_eq!(parse_busy(&m[5..]).unwrap(), "Größe-VM");
+        assert!(parse_busy(&[]).is_err(), "Busy names the other computer");
+    }
+
+    #[test]
+    fn hello_ends_with_the_computer_name() {
+        // What the Mac reads after the older fields.
+        let m = W::new(t::HELLO).u16(1).f32(1.0).f32(0.0).str("box").finish();
+        let mut r = R::new(&m[5..]);
+        (r.u16().unwrap(), r.f32().unwrap(), r.f32().unwrap());
+        assert_eq!(r.str().unwrap(), "box");
+    }
+
+    #[test]
+    fn a_busy_mac_is_looked_at_every_few_seconds() {
+        let waits: Vec<u64> = (0..6).map(|n| busy_wait(n).as_secs()).collect();
+        assert_eq!(waits, [5, 5, 5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn a_mac_that_disconnected_this_computer_is_asked_less_and_less_often() {
+        let waits: Vec<u64> = (0..7).map(|n| refused_wait(n).as_secs()).collect();
+        assert_eq!(waits, [5, 10, 20, 20, 20, 20, 20]);
+    }
+
+    #[test]
+    fn the_notifications_say_the_mac_is_busy() {
+        assert_eq!(busy_message("Studio", "workstation").0, "Studio is busy");
+        assert!(busy_message("Studio", "workstation").1.starts_with("It's streaming elsewhere"));
+        assert_eq!(free_message("Studio", "workstation").0, "Studio is free: streaming here now");
+    }
+
+    #[test]
+    fn a_mac_is_not_online_only_after_two_missed_looks() {
+        let mut looks = Looks::default();
+        assert_eq!(looks.after(false), None);
+        assert_eq!(looks.after(false), Some(false));
+        assert_eq!(looks.after(false), Some(false));
+        assert_eq!(looks.after(true), Some(true));
+        // One look missed after being seen: still online, as far as anyone can tell.
+        assert_eq!(looks.after(false), None);
+        assert_eq!(looks.after(true), Some(true));
+    }
 }

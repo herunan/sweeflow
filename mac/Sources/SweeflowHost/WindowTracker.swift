@@ -24,6 +24,11 @@ final class WindowTracker {
     var onAdded: ((TrackedWindow) -> Void)?
     var onChanged: ((TrackedWindow) -> Void)?
     var onRemoved: ((TrackedWindow) -> Void)?
+    /// A window went and another of the same app came at the very same frame, in one look at
+    /// the window list: (old, new). A tab switched: each tab is a window of its own, and macOS
+    /// swaps one for the other in a single step. Without this they are a removal and an
+    /// addition.
+    var onReplaced: ((TrackedWindow, TrackedWindow) -> Void)?
 
     private(set) var windows: [UInt32: TrackedWindow] = [:]
     /// Window ids in front-to-back order from the last poll.
@@ -59,6 +64,12 @@ final class WindowTracker {
     /// Whether a window lacks working window buttons (all zero-size): set by the session.
     var hasNoButtons: ((UInt32, pid_t) -> Bool)?
     private var noButtonsSeen: [UInt32: Bool] = [:]
+    /// Whether a window is a sheet ("Save changes?"), hanging from one of its app's windows: set
+    /// by the session, asked with hasNoButtons.
+    var isSheet: ((UInt32, pid_t) -> Bool)?
+    private var sheetSeen: [UInt32: Bool] = [:]
+    /// Whether the window is a sheet (one attached to its parent window, as a save sheet is).
+    func isKnownSheet(_ wid: UInt32) -> Bool { sheetSeen[wid] == true }
     /// Untitled windows' answers, looked at for their first second (the list can lag a new
     /// window), then kept.
     private var appWindowSeen: [UInt32: (isApp: Bool?, first: DispatchTime)] = [:]
@@ -83,9 +94,15 @@ final class WindowTracker {
                 self?.queue.async {
                     guard let self else { return }
                     self.askingApp.remove(wid)
-                    guard let c = self.appWindowSeen[wid] else { return }   // gone meanwhile
-                    self.appWindowSeen[wid] = (isApp, c.first)
-                    if c.isApp != isApp { self.poll() }
+                    // Kept even when the entry is gone: the look that asked drops it again at its
+                    // end (a window still waiting for its answer isn't among the live ones), and
+                    // with the answer thrown away for that, no untitled window ever got one: a
+                    // sheet on an app's window (a prompt in the TV app) was never shown, the app
+                    // left dimmed behind it and deaf to clicks. The next look uses the answer;
+                    // if the window has gone meanwhile, that look drops it.
+                    let was = self.appWindowSeen[wid]
+                    self.appWindowSeen[wid] = (isApp, was?.first ?? .now())
+                    if was?.isApp != isApp { self.poll() }
                 }
             }
         }
@@ -94,13 +111,15 @@ final class WindowTracker {
 
     private func askNoButtons(_ wid: UInt32, pid: pid_t) {
         guard askingButtons.insert(wid).inserted else { return }
-        let ask = hasNoButtons
+        let ask = hasNoButtons, sheet = isSheet
         askQueue.async { [weak self] in
-            let none = ask?(wid, pid) ?? false
+            let isSheet = sheet?(wid, pid) ?? false
+            let none = isSheet || (ask?(wid, pid) ?? false)
             self?.queue.async {
                 guard let self else { return }
                 self.askingButtons.remove(wid)
                 self.noButtonsSeen[wid] = none
+                self.sheetSeen[wid] = isSheet
                 self.poll()
             }
         }
@@ -165,10 +184,6 @@ final class WindowTracker {
 
     func stop() { timer?.cancel(); timer = nil }
 
-    /// A window over more than one display (a drag's image layer, which covers the whole
-    /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
-    /// Linux desktop and take the pointer. It covers whole displays; a real window that merely
-    /// straddles two (a video-call app's meeting window, left across a display edge) is no drag layer.
     /// Whether a window covers at least one whole display.
     static func coversDisplay(_ r: CGRect) -> Bool {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
@@ -177,6 +192,10 @@ final class WindowTracker {
         return ids.prefix(Int(n)).contains { r.insetBy(dx: -4, dy: -4).contains(CGDisplayBounds($0)) }
     }
 
+    /// A window over more than one display (a drag's image layer, which covers the whole
+    /// desktop while dragging in Finder) is no menu or panel: streamed, it would sit over the
+    /// Linux desktop and take the pointer. It covers whole displays; a real window that merely
+    /// straddles two (a video-call app's meeting window, left across a display edge) is no drag layer.
     static func spansDisplays(_ r: CGRect) -> Bool {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
         var n: UInt32 = 0
@@ -227,6 +246,8 @@ final class WindowTracker {
         // Frontmost toplevel per pid, to parent popups/menus onto.
         var frontToplevel: [pid_t: TrackedWindow] = [:]
         var popups: [TrackedWindow] = []
+        // Windows at the window level too small to be windows of their own (sorted out below).
+        var small: [TrackedWindow] = []
         var badges: [pid_t: [CGRect]] = [:]
         var blindNow: [UInt32: BlindWindow] = [:]
         var helperPopups: [(wid: UInt32, pid: pid_t, frame: CGRect, layer: Int)] = []
@@ -287,6 +308,16 @@ final class WindowTracker {
                                   frame: bounds, layer: layer, parent: 0, kind: .toplevel)
             // Whether an untitled window is one of the app's own isn't known until the app has
             // answered: a new one waits for that (a moment), one already shown stays as it is.
+            // The badge as macOS lists it to the capturing app itself: an ordinary, shareable
+            // window titled "Window", of its fixed size (other processes see it unshareable,
+            // untitled). Taken for a window too small to stream, it was dropped, and the badge
+            // never known: erased blind, and an app's buttons misplaced (see settledButtons).
+            // Decided once the app's windows are all known (below): a field the app floats over
+            // its window (Finder's rename box under an icon, one line high) can be just as small.
+            if layer == 0, (60...72).contains(bounds.width), (17...23).contains(bounds.height) {
+                small.append(w)
+                continue
+            }
             var realWindow = true
             if layer == 0, title.isEmpty {
                 if let isApp = looksLikeAppWindow(wid, pid: pid) { realWindow = isApp }
@@ -299,7 +330,10 @@ final class WindowTracker {
                 w.kind = .popup
                 popups.append(w)
             } else if layer == 0 {
-                guard bounds.width >= 40, bounds.height >= 30 else { continue }
+                guard bounds.width >= 40, bounds.height >= 30 else {
+                    if bounds.width >= 12, bounds.height >= 12 { small.append(w) }
+                    continue
+                }
                 if frontToplevel[pid] == nil { frontToplevel[pid] = w }
                 seen[wid] = w
                 order.append(wid)
@@ -309,6 +343,24 @@ final class WindowTracker {
                 // to the app. Above are menus, popovers and tooltips.
                 w.kind = layer < 24 ? .dialog : .popup
                 popups.append(w)
+            }
+        }
+        // Small windows at the window level: the capture badge (its fixed size, at the top-left
+        // of another window of the app), or a field floated over one of the app's windows
+        // (Finder's rename box in icon view, a line high: dropped, the name vanished while it
+        // was typed), shown attached to it like a popover. Others are too small to stream.
+        for s in small {
+            let mine = seen.values.filter { $0.pid == s.pid && $0.wid != s.wid }
+            let badgeSized = (60...72).contains(s.frame.width) && (17...23).contains(s.frame.height)
+            if badgeSized, mine.contains(where: { abs($0.frame.minX - s.frame.minX) < 30 && abs($0.frame.minY - s.frame.minY) < 30 }) {
+                badges[s.pid, default: []].append(s.frame)
+            } else if mine.contains(where: { $0.frame.contains(s.frame) }) {
+                var p = s
+                p.kind = .popup
+                popups.append(p)
+            } else if badgeSized {
+                // Its window not listed (yet): as before, a badge.
+                badges[s.pid, default: []].append(s.frame)
             }
         }
         // Capture badges on floating windows aren't always marked unshareable: recognise them by
@@ -330,9 +382,13 @@ final class WindowTracker {
         // suggestions, which can hang off the bottom): listed as a window, but with no window
         // buttons, starting within a bigger window of the app. Shown attached to it, like a popover.
         for (wid, w) in seen where w.kind == .toplevel {
+            // Its top-left corner on it, or the middle of its top edge: a sheet hangs from the
+            // middle of its window's top, and sticks out both sides of a window narrower than it
+            // (a tile on Linux), taken for a window of its own then.
             let corner = CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)
+            let top = CGPoint(x: w.frame.midX, y: w.frame.minY + 1)
             let host = seen.values.contains {
-                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && $0.frame.contains(corner)
+                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && ($0.frame.contains(corner) || $0.frame.contains(top))
                     && $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
             }
             guard host else { continue }
@@ -351,6 +407,9 @@ final class WindowTracker {
             }
             guard none else { continue }
             var p = w
+            // A sheet (a save sheet) too: attached to its window on Linux, as on the Mac, it
+            // moves with it (a tiler scrolling, the window dragged) and keeps its size. Shown
+            // as a dialog of its own instead, it stayed behind on Plasma and could be resized.
             p.kind = .popup
             popups.append(p)
             seen[wid] = nil
@@ -360,7 +419,7 @@ final class WindowTracker {
             }
         }
         let appWindows = Array(seen.values)
-        for i in popups.indices where popups[i].kind == .dialog && popups[i].title.isEmpty {
+        for i in popups.indices where popups[i].kind == .dialog && popups[i].title.isEmpty && sheetSeen[popups[i].wid] != true {
             let p = popups[i]
             if appWindows.contains(where: { $0.pid == p.pid && $0.frame.intersects(p.frame) }) {
                 popups[i].kind = .popup
@@ -390,7 +449,10 @@ final class WindowTracker {
             // (a list that gets shorter shrinks in height only).
             if closing.contains(p.wid) { continue }
             let big = popupMax[p.wid] ?? p.frame.size
-            if p.frame.width < big.width * 0.9 && p.frame.height < big.height * 0.9 {
+            // Not a floating panel (layers 1–23): Quick Look's opens over its window and then
+            // settles to its picture's size, smaller in both directions (on macOS 26 in a VM,
+            // 810×543 to 370×399), and was taken down as closing while it stayed up.
+            if !(1..<24).contains(p.layer), p.frame.width < big.width * 0.9 && p.frame.height < big.height * 0.9 {
                 log("popup \(p.wid) (\(p.appName)) shrank from \(big) to \(p.frame.size): taken as closing")
                 closing.insert(p.wid)
                 continue
@@ -398,9 +460,18 @@ final class WindowTracker {
             popupMax[p.wid] = CGSize(width: max(big.width, p.frame.width), height: max(big.height, p.frame.height))
             let near = owners.filter { $0.pid == p.pid && $0.frame.insetBy(dx: -40, dy: -40).intersects(p.frame) }
             // Prefer a panel (drawn above its app's windows), then the frontmost window.
-            guard let parent = near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
+            // A floating panel (Quick Look's) belongs to the app's frontmost window, the one it
+            // was opened from: by overlap on this display it went to whichever window it happened
+            // to lie over there, a column away on Linux. Not lying wholly on that window (macOS
+            // centres the panel on the display), it's shown centred on it.
+            let panel = (1..<24).contains(p.layer)
+            guard let parent = (panel ? frontToplevel[p.pid] : nil) ?? near.first(where: { $0.kind == .dialog }) ?? near.first ?? frontToplevel[p.pid] else { continue }
             p.parent = parent.wid
             p.rel = CGPoint(x: p.frame.minX - parent.frame.minX, y: p.frame.minY - parent.frame.minY)
+            if panel, !parent.frame.contains(p.frame) {
+                p.rel = CGPoint(x: ((parent.frame.width - p.frame.width) / 2).rounded(),
+                                y: max(0, ((parent.frame.height - p.frame.height) / 3).rounded()))
+            }
             seen[p.wid] = p
             order.append(p.wid)
         }
@@ -410,10 +481,21 @@ final class WindowTracker {
         closing = closing.filter { id in popups.contains { $0.wid == id } }
         appWindowSeen = appWindowSeen.filter { live.contains($0.key) }
         noButtonsSeen = noButtonsSeen.filter { live.contains($0.key) }
+        sheetSeen = sheetSeen.filter { live.contains($0.key) }
+        // New windows that took a gone one's place (see onReplaced): new wid → the old window.
+        var replaced: [UInt32: TrackedWindow] = [:]
+        if onReplaced != nil {
+            var gone = windows.values.filter { seen[$0.wid] == nil && $0.kind == .toplevel }
+            for wid in order {
+                guard windows[wid] == nil, let w = seen[wid], w.kind == .toplevel,
+                      let i = gone.firstIndex(where: { $0.pid == w.pid && $0.frame == w.frame }) else { continue }
+                replaced[wid] = gone.remove(at: i)
+            }
+        }
+        let replacedOld = Set(replaced.values.map(\.wid))
         for (wid, old) in windows where seen[wid] == nil {
-
             windows[wid] = nil
-            onRemoved?(old)
+            if !replacedOld.contains(wid) { onRemoved?(old) }
         }
         // Parents before children so the client can attach popups.
         for wid in order {
@@ -422,11 +504,18 @@ final class WindowTracker {
                 if old != w { windows[wid] = w; onChanged?(w) }
             } else {
                 windows[wid] = w
-                onAdded?(w)
+                if let old = replaced[wid] { onReplaced?(old, w) } else { onAdded?(w) }
             }
         }
         zOrder = order
         self.badges = badges
+        // macOS puts the capture badge up some seconds after a capture starts: once it's there,
+        // it says where a window's buttons really are (see Session.settledButtons).
+        for (wid, w) in windows where !badged.contains(wid) && Self.badge(among: badges[w.pid] ?? [], over: w.frame) != nil {
+            badged.insert(wid)
+            onBadgeAppeared?(wid)
+        }
+        badged = badged.filter { windows[$0] != nil }
         for (wid, b) in blind where blindNow[wid] == nil { onBlindRemoved?(b) }
         for (wid, b) in blindNow where blind[wid] == nil { onBlindAdded?(b) }
         blind = blindNow
@@ -436,14 +525,72 @@ final class WindowTracker {
         }
     }
 
+    /// Called once per window when its capture badge is first seen.
+    var onBadgeAppeared: ((UInt32) -> Void)?
+    private var badged: Set<UInt32> = []
+
     /// Where macOS's capture badge overlaps `wid`, relative to the window (points).
     func badgeRect(_ wid: UInt32) -> CGRect? {
         guard let w = windows[wid] else { return nil }
-        for b in badges[w.pid] ?? [] {
-            let i = b.intersection(w.frame)
+        if let r = Self.badge(among: badges[w.pid] ?? [], over: w.frame) { return r }
+        // Not there at the last look at the window list. macOS puts the badge up a moment after
+        // a capture starts, and that changes the picture: the capture with the badge in it gets
+        // here before the next look, and for a window that then stays as it is, that picture
+        // (badge and all) was the one Linux kept showing. So the window server is asked again,
+        // every two seconds at most per window: off this queue (input goes through it, and the
+        // answer took tens of ms with many windows), and a badge found is said (onBadgeFound),
+        // so the window's last picture is painted again without it.
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let asked = badgeAsked[wid], now - asked < 2_000_000_000 { return nil }
+        badgeAsked[wid] = now
+        let pid = w.pid, frame = w.frame
+        listQueue.async { [weak self] in
+            guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                    as? [[String: Any]] else { return }
+            var frame = frame
+            var found: [CGRect] = []
+            for info in list {
+                guard (info[kCGWindowOwnerPID as String] as? pid_t) == pid, (info[kCGWindowLayer as String] as? Int) == 0,
+                      let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd) else { continue }
+                if (info[kCGWindowNumber as String] as? UInt32) == wid {
+                    frame = b
+                } else if (60...72).contains(b.width), (17...23).contains(b.height) {
+                    found.append(b)   // the badge's fixed size (see update)
+                }
+            }
+            self?.queue.async {
+                guard let self, self.windows[wid] != nil else { return }
+                guard Self.badge(among: found, over: frame) != nil else {
+                    self.badgeAbsentAt[wid] = DispatchTime.now().uptimeNanoseconds   // asked just now, and it isn't there
+                    return
+                }
+                self.badges[pid, default: []].append(contentsOf: found)   // until the next look, which lists them itself
+                self.onBadgeFound?(wid)
+            }
+        }
+        return nil
+    }
+
+    /// A badge found on a window by asking the window server (badgeRect), on the tracker's queue.
+    var onBadgeFound: ((UInt32) -> Void)?
+
+    /// Whether the window server said, within the last moment, that `wid` has no badge on it
+    /// (as right after its capture starts): what is captured then is the window as it is.
+    func badgeAbsent(_ wid: UInt32) -> Bool {
+        guard let at = badgeAbsentAt[wid] else { return false }
+        return DispatchTime.now().uptimeNanoseconds - at < 150_000_000
+    }
+    private var badgeAbsentAt: [UInt32: UInt64] = [:]
+
+    /// When the window server was last asked for a window's badge (badgeRect).
+    private var badgeAsked: [UInt32: UInt64] = [:]
+
+    private static func badge(among badges: [CGRect], over frame: CGRect) -> CGRect? {
+        for b in badges {
+            let i = b.intersection(frame)
             // The badge sits at the window's top-left corner.
-            guard !i.isNull, i.width > 0, i.height > 0, b.minX - w.frame.minX < 40, b.minY - w.frame.minY < 40 else { continue }
-            return i.offsetBy(dx: -w.frame.minX, dy: -w.frame.minY)
+            guard !i.isNull, i.width > 0, i.height > 0, b.minX - frame.minX < 40, b.minY - frame.minY < 40 else { continue }
+            return i.offsetBy(dx: -frame.minX, dy: -frame.minY)
         }
         return nil
     }

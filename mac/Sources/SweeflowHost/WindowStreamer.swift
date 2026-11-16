@@ -5,6 +5,7 @@ import VideoToolbox
 import CoreMedia
 import Compression
 import Accelerate
+import os
 
 /// Captures one window with ScreenCaptureKit, encodes it with the hardware HEVC encoder and
 /// writes frames to a video stream. Flow control is end-to-end: at most `maxInFlight` frames may
@@ -51,10 +52,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Pixel work on a frame (overlays, corners, the 10-bit conversion: 5–15 ms on a Retina
     /// window) runs here, off the session queue, so input never waits behind video.
     private let work = DispatchQueue(label: "sweeflow.frame", qos: .userInteractive)
+    /// The last corner tiles worked out (used on `work` only).
+    private let cornerCache = CornerTileCache()
     /// The focus changed while a frame was being prepared: repaint the lights once it's done.
     private var repaintAfter = false
     private var lastBuffer: CVPixelBuffer?      // last encoded capture, reused for refinement
-    private var lastEncodeAt = DispatchTime.now()
     private var refinementsLeft = 0
     private var refineTimer: DispatchSourceTimer?
     private var forceKeyframe = true
@@ -65,10 +67,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     var buttons: [CGRect] = []
     /// Where macOS's capture badge overlaps this window (window points), looked up per frame.
     var badgeRect: () -> CGRect? = { nil }
-    /// The size Linux shows this window at (points). When the Mac window can't shrink that far
-    /// (app minimum size), Linux crops it, so the bottom/right corners must be cut at the
-    /// visible edge rather than the window's real edge.
-    var visibleSize: CGSize?
+    /// The buffer waiting to be encoded is the still taken as a capture starts (see prepare).
+    private var pendingStill = false
+    /// The window's top-left corner as it looks without the badge (see CleanCorner).
+    private lazy var cleanCorner = CleanCorner.of(wid)
+    /// Whether the window server has just said the window has no badge (WindowTracker.badgeAbsent).
+    var badgeAbsent: () -> Bool = { false }
+    /// Where the window's content ends in the last capture (px): all of it, unless the capture
+    /// is of a stale size and macOS padded it (ScreenCaptureKit's content rect). The corner
+    /// tiles are cut there, the window's real corners; Linux puts them on the edges it shows
+    /// whole, and cuts the rest off straight.
+    private var captureContent: CGSize?
     /// The app's icon, shown on the placeholder when the Mac is locked before the first frame.
     var appIcon: CGImage?
     /// Pixels per point of the display the window is on (looked up from its position).
@@ -92,8 +101,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         active ? (unchanging ? Self.activeIdleFps : Self.activeFps) : (unchanging ? Self.backgroundIdleFps : Self.backgroundFps)
     }
 
+    /// When any window's capture was last reconfigured (uptime, ns). Reconfiguring one makes
+    /// macOS tell the apps their windows' sharing started again: they rebuild the purple
+    /// "being shared" badge (a small window of its own over each), and every captured window's
+    /// title bar is drawn again a level or two different (see compareWithLast).
+    private static let reconfiguredAt = OSAllocatedUnfairLock(initialState: UInt64(0))
+
     private func applyFrameRate() {
         config.minimumFrameInterval = CMTime(value: 1, timescale: frameRate)
+        let rate = frameRate
+        captureQueue.async { [weak self] in self?.note("capture rate \(rate) a second") }
+        Self.reconfiguredAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
         stream?.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
     }
 
@@ -106,23 +124,46 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// that kept the encoder, this app and the window server busy all the time, and everything
     /// that waits on them (clicks, raises, resizes) slow.
     /// So each capture is compared with the one before, by a hash of every row, and dropped if
-    /// it's the same. When one differs the rows aren't all hashed (it stops at the first that
-    /// differs), so what the last one looked like isn't known again until the hashes are
-    /// rebuilt, at most every 250 ms: a window that keeps changing pays for one rebuild and
-    /// one comparison in that time, one that doesn't for a comparison per capture, and those
-    /// come less often after a second without a change. (All on captureQueue.)
+    /// it's the same; after a second without a change the captures come less often. (All on
+    /// captureQueue.)
     private var rowHashes: [UInt64] = []
     private var rowHashWidth = 0
     private var rowHashesValid = false
+    /// This frame's hashes while they're compared, and sampled rows of the last frame sent
+    /// (see compareWithLast).
+    private var scratchHashes: [UInt64] = []
+    private var samples: [UInt8] = []
+    /// The capture just compared was dropped as a redraw (not as identical).
+    private var droppedAsRedraw = false
     private var rowHashesRebuiltAt: UInt64 = 0
     private var lastChangeAt: UInt64 = 0
     private var slowedForNoChange = false
 
+    /// The last few things that counted as a change in this window's captures and the capture
+    /// rate's changes, for the debug port's `changes <wid>` (on captureQueue).
+    private var changeNotes: [String] = []
+    private func note(_ s: String) {
+        if changeNotes.count >= 30 { changeNotes.removeFirst() }
+        changeNotes.append(String(format: "%.2f ", Double(DispatchTime.now().uptimeNanoseconds) / 1e9) + s)
+    }
+    private var dumpLeft = 0, dumpIndex = 0
+    func dumpChanges(_ n: Int) {
+        captureQueue.async { self.dumpLeft = n; self.dumpIndex = 0 }
+    }
+    func recentChanges(_ reply: @escaping (String) -> Void) {
+        captureQueue.async { reply(self.changeNotes.joined(separator: "\n")) }
+    }
+
     private func differsFromLast(_ pb: CVPixelBuffer) -> Bool {
         let differs = compareWithLast(pb)
         let now = DispatchTime.now().uptimeNanoseconds
+        // Back to the fast rate only for a window that keeps changing: two changed captures
+        // within half a second. One by itself (a clock's digit, a list refreshing once a
+        // second) is sent at the idle rate, and changing the rate for it cost more than it
+        // saved: every change of rate redraws every window's title bar (see reconfiguredAt).
+        let keepsChanging = differs && now - lastChangeAt < 500_000_000
         if differs { lastChangeAt = now }
-        let slow = !differs && now - lastChangeAt > 1_000_000_000
+        let slow = slowedForNoChange ? !keepsChanging : !differs && now - lastChangeAt > 1_000_000_000
         if slow != slowedForNoChange {
             slowedForNoChange = slow
             queue.async { [weak self] in
@@ -140,42 +181,161 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(pb) else { return true }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-        let rowBytes = w * 4
+        // Not the outer 6 pixels. The outermost 2 fillEdges paints over with their neighbours;
+        // captured at less than the Mac draws, the last row takes in a little of what's below
+        // the window (a playing video: every window over one sent every frame); and the rim
+        // inside them flickers by a level in its alpha (a pixel or two, 3 to 4 in from the
+        // edge, in a window otherwise still).
+        let edge = h > 64 && w > 64 ? 6 : 0
+        let rowBytes = (w - 2 * edge) * 4
         guard rowHashesValid, rowHashes.count == h, rowHashWidth == w else {
             let now = DispatchTime.now().uptimeNanoseconds
             guard now - rowHashesRebuiltAt > 250_000_000 else { return true }
             rowHashesRebuiltAt = now
             if rowHashes.count != h { rowHashes = [UInt64](repeating: 0, count: h) }
             rowHashes.withUnsafeMutableBufferPointer { out in
-                for y in 0..<h { out[y] = Self.hashRow(base + y * stride, rowBytes) }
+                for y in edge..<(h - edge) { out[y] = Self.hashRow(base + y * stride + edge * 4, rowBytes) }
             }
             rowHashWidth = w
             rowHashesValid = true
+            takeSamples(base, stride: stride, w: w, h: h)
             return true
         }
-        let same = rowHashes.withUnsafeBufferPointer { last -> Bool in
-            for y in 0..<h where Self.hashRow(base + y * stride, rowBytes) != last[y] { return false }
-            return true
+        // Every row's hash, kept: the next frame is compared with this one. (It was the first
+        // changed row, then the hashes thrown away and every frame taken as changed until
+        // rebuilt 250 ms later: one small change four times a second made a window send every
+        // frame.)
+        if scratchHashes.count != h { scratchHashes = [UInt64](repeating: 0, count: h) }
+        var changedRows = 0, firstRow = -1, lastRow = -1, bodyRows = 0
+        let band = Self.titleBand
+        scratchHashes.withUnsafeMutableBufferPointer { cur in
+            rowHashes.withUnsafeBufferPointer { last in
+                for y in edge..<(h - edge) {
+                    let v = Self.hashRow(base + y * stride + edge * 4, rowBytes)
+                    cur[y] = v
+                    if v != last[y] {
+                        changedRows += 1; if firstRow < 0 { firstRow = y }; lastRow = y
+                        if y >= band && y < h - 60 { bodyRows += 1 }
+                    }
+                }
+            }
         }
-        if !same { rowHashesValid = false }
-        return !same
+        droppedAsRedraw = false
+        guard changedRows > 0 else { return false }
+        // A redraw, not a change? Each time a capture is reconfigured (its rate changed), macOS
+        // tells every app its windows' sharing started again, and they redraw: title bars a
+        // level or two different in a colour (Terminal's rows 0 to 63 across its whole width,
+        // TextEdit's badge faded in again), Finder's toolbar and sidebar too (500 to 1000 rows,
+        // five levels at most seen). Taken for changes, each was prepared and encoded whole (a
+        // Retina window, 60 ms of the one encoder) and put that window's capture back to its
+        // fast rate, which is another reconfigure: with nine windows open they never stopped,
+        // the window server sat at 100% of a core, this app at 60%, Finder's main thread was
+        // busy rebuilding badges, and clicks and raises came seconds late. With the rate left
+        // alone, no idle window changed at all in a minute.
+        // So a frame isn't a change when its sampled rows are within a few levels of the last
+        // frame *sent* (not the last seen: a slow fade still adds up) and either many rows
+        // differ (the toolbar-and-sidebar kind), or only rows of the title bar and the bottom
+        // rim do, shortly after a reconfigure.
+        let sinceReconfigure = DispatchTime.now().uptimeNanoseconds &- Self.reconfiguredAt.withLock { $0 }
+        let titleOnly = bodyRows == 0 && sinceReconfigure < 2_500_000_000
+        let maxDiff = changedRows * 20 >= h || titleOnly ? sampleDifference(base, stride: stride, w: w, h: h) : Int.max
+        let rerendered = maxDiff <= Self.unseenDifference
+        note("\(w)x\(h): \(changedRows) rows differ (\(firstRow)...\(lastRow), \(bodyRows) below the title bar), samples by \(maxDiff == Int.max ? "?" : String(maxDiff)): \(rerendered ? "a redraw, not sent" : "a change")")
+        if dumpLeft > 0 {
+            // Debug port `dump <wid> <n>`: the next n frames that differ from the one before,
+            // raw, with what was in front and where the pointer was.
+            let n = dumpIndex; dumpIndex += 1; dumpLeft -= 1
+            try? FileManager.default.createDirectory(atPath: "/tmp/sweeflow-dump", withIntermediateDirectories: true)
+            try? Data(bytes: base, count: stride * h).write(to: URL(fileURLWithPath: "/tmp/sweeflow-dump/\(wid)-\(n).bgra"))
+            let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+            let order = list.filter { ($0[kCGWindowLayer as String] as? Int) == 0 }.prefix(12).map { "\($0[kCGWindowNumber as String] ?? 0)" }.joined(separator: ",")
+            let mouse = CGEvent(source: nil)?.location ?? .zero
+            log(String(format: "DUMP %u frame %d at %.2f: %dx%d stride %d, %d rows differ, samples by %d, front %@, order %@, pointer %.0f,%.0f", wid, n,
+                       Double(DispatchTime.now().uptimeNanoseconds) / 1e9, w, h, stride, changedRows, maxDiff == Int.max ? -1 : maxDiff,
+                       NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?", order, mouse.x, mouse.y))
+        }
+        swap(&rowHashes, &scratchHashes)
+        droppedAsRedraw = rerendered
+        if rerendered { return false }
+        takeSamples(base, stride: stride, w: w, h: h)
+        return true
     }
 
-    /// A fast hash of one row of pixels (two independent multiply chains, 16 bytes a step).
-    @inline(__always)
-    private static func hashRow(_ p: UnsafeRawPointer, _ n: Int) -> UInt64 {
-        var a: UInt64 = 0x9E37_79B9_7F4A_7C15, b: UInt64 = 0xC2B2_AE3D_27D4_EB4F
-        var i = 0
-        while i + 16 <= n {
-            a = (a ^ p.loadUnaligned(fromByteOffset: i, as: UInt64.self)) &* 0x0000_0100_0000_01B3
-            b = (b ^ p.loadUnaligned(fromByteOffset: i + 8, as: UInt64.self)) &* 0x9E37_79B9_7F4A_7C15
-            i += 16
+    /// Colour levels (of 255) a sampled pixel may differ by in a frame that isn't a change.
+    private static let unseenDifference = 6
+
+    /// Rows from the top that count as the title bar (and toolbar) for a redraw after a
+    /// reconfigure, in capture pixels.
+    private static let titleBand = 140
+
+    /// The rows sampled to tell a redraw from a change: several through the title bar and
+    /// toolbar (a window going inactive, a title changing or a toolbar button pressed show
+    /// there), the rest spread down the window.
+    private static func sampleRows(_ h: Int) -> [Int] {
+        guard h >= 400 else { return [] }
+        let body = stride(from: 160, to: h - 64, by: max(1, (h - 224) / 24))
+        return [40, 48, 56, 64, 72, 80, 100, 120] + Array(body)
+    }
+
+    /// The part of a sampled row that is kept: not the 8 pixels at each end (the rim), and in
+    /// the title bar not the left end either, where the badge fades in again and the traffic
+    /// lights are (those are painted by us, not taken from the capture).
+    private static func sampleSpan(row y: Int, w: Int) -> Range<Int> {
+        (y < titleBand && w > 700 ? 260 : 8)..<(w - 8)
+    }
+
+    /// Keeps the sampled rows' pixels of a frame that is sent.
+    private func takeSamples(_ base: UnsafeRawPointer, stride: Int, w: Int, h: Int) {
+        let rows = Self.sampleRows(h), n = w * 4
+        guard w > 16, !rows.isEmpty else { samples.removeAll(keepingCapacity: true); return }
+        if samples.count != rows.count * n { samples = [UInt8](repeating: 0, count: rows.count * n) }
+        samples.withUnsafeMutableBytes { out in
+            for (i, y) in rows.enumerated() { memcpy(out.baseAddress! + i * n, base + y * stride, n) }
         }
+    }
+
+    /// The most any byte of the sampled rows differs from the kept ones (Int.max: none kept).
+    private func sampleDifference(_ base: UnsafeRawPointer, stride: Int, w: Int, h: Int) -> Int {
+        let rows = Self.sampleRows(h), n = w * 4
+        guard w > 16, !rows.isEmpty, samples.count == rows.count * n else { return Int.max }
+        var worst = 0
+        samples.withUnsafeBytes { kept in
+            let k = kept.bindMemory(to: UInt8.self).baseAddress!
+            for (i, y) in rows.enumerated() {
+                let span = Self.sampleSpan(row: y, w: w)
+                let p = (base + y * stride).assumingMemoryBound(to: UInt8.self), q = k + i * n
+                var m: UInt8 = 0
+                for j in (span.lowerBound * 4)..<(span.upperBound * 4) { let a = p[j], b = q[j]; m = max(m, a > b ? a - b : b - a) }
+                worst = max(worst, Int(m))
+                if worst > Self.unseenDifference { return }
+            }
+        }
+        return worst
+    }
+
+    /// A fast hash of one row of pixels: sixteen 32-bit lanes, 64 bytes a step (NEON multiplies
+    /// four lanes at once; 3.5 times the speed of two 64-bit chains, 0.6 ms for a Retina frame on
+    /// an M1). Each step is a bijection of its lane, so a change to any one word always changes
+    /// the result.
+    @inline(__always)
+    fileprivate static func hashRow(_ p: UnsafeRawPointer, _ n: Int) -> UInt64 {
+        let k = SIMD8<UInt32>(repeating: 0x0100_0193)
+        var a = SIMD8<UInt32>(0x9E37_79B9, 0x7F4A_7C15, 0xC2B2_AE3D, 0x27D4_EB4F, 0x1656_67B1, 0x85EB_CA77, 0x27D4_EB2F, 0x1656_67C5)
+        var b = a &+ 1
+        var i = 0
+        while i + 64 <= n {
+            a = (a ^ p.loadUnaligned(fromByteOffset: i, as: SIMD8<UInt32>.self)) &* k
+            b = (b ^ p.loadUnaligned(fromByteOffset: i + 32, as: SIMD8<UInt32>.self)) &* k
+            i += 64
+        }
+        var h: UInt64 = 0xC2B2_AE3D_27D4_EB4F
         while i + 4 <= n {
-            a = (a ^ UInt64(p.loadUnaligned(fromByteOffset: i, as: UInt32.self))) &* 0x0000_0100_0000_01B3
+            h = (h ^ UInt64(p.loadUnaligned(fromByteOffset: i, as: UInt32.self))) &* 0x0000_0100_0000_01B3
             i += 4
         }
-        return a ^ (b << 31 | b >> 33)
+        let c = a ^ (b &* 0x85EB_CA77)
+        for j in 0..<8 { h = (h ^ UInt64(c[j])) &* 0x9E37_79B9_7F4A_7C15 }
+        return h
     }
     private var darkTitleBar = true
     /// Last corner tiles sent (hash), and the ones to send with the next encoded frame.
@@ -230,15 +390,35 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Looks up a window that's about to be subscribed to (it just appeared).
     static func prefetch(_ wid: UInt32) {
         let t0 = Date()
+        prefetchLock.withLock { if prefetching[wid] == nil { prefetching[wid] = [] } }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
-            guard let w = content?.windows.first(where: { $0.windowID == wid }) else { return }
-            prefetchLock.withLock { prefetched[wid] = (w, Date()) }
-            log(String(format: "window %u: looked up for capture in %.0f ms", wid, Date().timeIntervalSince(t0) * 1000))
+            let w = content?.windows.first(where: { $0.windowID == wid })
+            let waiting = prefetchLock.withLock { () -> [(SCWindow?) -> Void] in
+                if let w { prefetched[wid] = (w, Date()) }
+                return prefetching.removeValue(forKey: wid) ?? []
+            }
+            if w != nil { log(String(format: "window %u: looked up for capture in %.0f ms", wid, Date().timeIntervalSince(t0) * 1000)) }
+            waiting.forEach { $0(w) }
         }
     }
+    /// Subscriptions that came while their window's lookup was still under way: they take its
+    /// answer (a fresh full lookup of every window took half a second more; Quick Look's panel,
+    /// subscribed right after it appears, waited for one each time).
+    private static var prefetching: [UInt32: [(SCWindow?) -> Void]] = [:]
 
     func start() {
         if displayID != nil { return startDisplay() }
+        let joined = Self.prefetchLock.withLock { () -> Bool in
+            guard Self.prefetched[wid] == nil, Self.prefetching[wid] != nil else { return false }
+            Self.prefetching[wid]?.append { [weak self] w in
+                guard let self else { return }
+                _ = Self.prefetchLock.withLock { Self.prefetched.removeValue(forKey: self.wid) }
+                guard let w else { return self.lookUpAndStart() }
+                self.queue.async { if !self.stopped { self.startCapture(w) } }
+            }
+            return true
+        }
+        if joined { return }
         let cached = Self.prefetchLock.withLock { Self.prefetched.removeValue(forKey: wid) }
         if let cached, Date().timeIntervalSince(cached.at) < 5 {
             queue.async { [weak self] in
@@ -247,6 +427,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             return
         }
+        lookUpAndStart()
+    }
+
+    private func lookUpAndStart() {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, err in
             guard let self else { return }
             self.queue.async {
@@ -282,12 +466,17 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Starts again from the same window or display (after a stop, or a capture that never
     /// delivered a frame).
-    private func restartCapture() {
-        if let d = scDisplay { startCapture(nil, display: d) } else if let w = scWindow { startCapture(w) }
+    /// `still`: show a still of it while the capture starts (see startCapture).
+    private func restartCapture(still: Bool = false) {
+        if let d = scDisplay { startCapture(nil, display: d, still: still) } else if let w = scWindow { startCapture(w, still: still) }
     }
 
-    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil) {
+    /// `still`: send a still of the window while the capture starts (always, the first time).
+    private func startCapture(_ win: SCWindow?, display: SCDisplay? = nil, still: Bool = false) {
         scWindow = win
+        // Paused (not shown on Linux): no capture at all; resuming starts one with what's
+        // remembered here. Every path that (re)starts a capture comes through here.
+        guard !paused else { return }
         let filter: SCContentFilter
         if let display {
             filter = SCContentFilter(display: display, excludingWindows: [])
@@ -299,6 +488,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         unchanging = false
         captureQueue.async { [weak self] in
             self?.rowHashesValid = false
+            self?.heldBack = nil
             self?.rowHashesRebuiltAt = 0
             self?.slowedForNoChange = false
             self?.lastChangeAt = DispatchTime.now().uptimeNanoseconds
@@ -325,11 +515,13 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             out.close(); return
         }
         stream = s
+        // Counts this capture's frames (the still below only shows while there are none yet).
+        framesSinceStart = 0
         // Starting a capture takes ScreenCaptureKit ~0.4 s; a still of the window takes a fraction
         // of that, so a new window shows straight away and goes live when the capture starts.
         // Not for popups: macOS fades them in, so a still catches one half-drawn and holds it
         // until the capture starts (it pops). Popups' captures start fast enough.
-        if !sentStill && !lossless {
+        if (still || !sentStill) && !lossless {
             sentStill = true
             let t0 = Date()
             SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { [weak self] sb, _ in
@@ -339,6 +531,19 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     guard !self.stopped, !self.showingPause, self.stream === s, self.framesSinceStart == 0, !ScreenLock.isLocked else { return }
                     self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
                 }
+            }
+        }
+        if lossless {
+            // Some popups get no frame at all from the live capture (one sitting still, a
+            // "Save changes?" sheet; Safari's address-bar suggestions, even while they change):
+            // after a moment with none, stills of it instead, taken ten times a second and sent
+            // when they differ, for as long as the capture stays silent. The moment is short: a
+            // capture can take two seconds to start (Quick Look's panel, which zooms in), and
+            // a still caught mid-fade is replaced by the next one 100 ms later.
+            // Straight away where the window server gives stills quickly (see quickStill): the
+            // first is the panel as it starts to open, the next ones follow it.
+            queue.asyncAfter(deadline: .now() + (Self.windowImage != nil ? 0 : 0.15)) { [weak self] in
+                self?.pollStills(s, filter: filter)
             }
         }
         s.startCapture { [weak self] err in
@@ -380,26 +585,158 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     func windowResized(to size: CGSize) {
         guard size != pointSize, let stream else { pointSize = size; return }
         pointSize = size
-        if lossless, let win = scWindow {
+        if lossless, scWindow != nil {
             // Menus are static: after a reconfigure ScreenCaptureKit would not deliver a frame
             // until the content changes, leaving the old-size image. A fresh capture always
-            // starts with a frame.
-            stream.stopCapture { _ in }
-            self.stream = nil
-            startCapture(win)
+            // starts with a frame. Once the size has settled, though: a panel that zooms open
+            // (Quick Look's) changes size every few milliseconds, and a capture started for
+            // each (forty in a third of a second) put off its first picture until it stopped.
+            // Meanwhile stills of it go out (pollStills, at the size it has then).
+            resizeRestarts += 1
+            let gen = resizeRestarts
+            queue.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                guard let self, !self.stopped, gen == self.resizeRestarts, let st = self.stream, let win = self.scWindow else { return }
+                st.stopCapture { _ in }
+                self.stream = nil
+                self.startCapture(win)
+            }
             return
         }
         applySize(to: config)
         stream.updateConfiguration(config) { err in if let err { log("updateConfiguration: \(err)") } }
+        expectFrameAfterResize()
     }
 
+    /// A reconfigured capture sends nothing until the window changes. A window that had already
+    /// redrawn at its new size by then (an idle one, resized by a tiling layout swapping tiles)
+    /// stayed at its old picture on Linux, at the old size. So if no frame has come shortly
+    /// after the last resize, the capture is started afresh, which always begins with one.
+    private var resizeChecks = 0
+    /// Popups' resizes, for restarting their capture once the size settles (windowResized).
+    private var resizeRestarts = 0
+    /// A shrunk capture was seen (and dropped) since the last proper frame.
+    private var shrunkSeen = false
+
+    private func expectFrameAfterResize() {
+        resizeChecks += 1
+        let check = resizeChecks, frames = framesSinceStart
+        queue.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.showingPause, check == self.resizeChecks,
+                  let s = self.stream, self.framesSinceStart == frames else { return }
+            log("stream \(self.wid): no frame since its resize, starting the capture again")
+            s.stopCapture { _ in }
+            self.stream = nil
+            self.forceKeyframe = true
+            self.restartCapture(still: true)
+        }
+    }
+
+    /// Captures ScreenCaptureKit delivered since the capture started, unchanged ones included.
+    private var delivered = 0
+    private var inputChecks = 0
+    private var lastInputRestart: UInt64 = 0
+
+    /// A capture can go quiet for good: after the virtual display was replaced (a computer
+    /// switching in), several windows' captures delivered nothing again, ever, while clicks and
+    /// keys still reached the apps, so the window looked frozen on Linux (Calculator read
+    /// "7+278" on the Mac and "7+2" on Linux). Input almost always changes something on
+    /// screen, so a click or key that is followed by no capture at all for 0.8 s means the
+    /// capture is dead: it's started afresh (which always begins with a frame), at most once
+    /// every 3 s per window. A live one delivers a frame for any change, so nothing restarts.
+    func expectFrameAfterInput() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.showingPause, self.stream != nil else { return }
+            self.inputChecks += 1
+            let check = self.inputChecks, before = self.delivered
+            self.queue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, !self.stopped, !self.paused, !self.showingPause, check == self.inputChecks,
+                      let s = self.stream, self.delivered == before, !ScreenLock.isLocked else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now - self.lastInputRestart > 3_000_000_000 else { return }
+                self.lastInputRestart = now
+                log("stream \(self.wid): nothing captured after input, starting the capture again")
+                s.stopCapture { _ in }
+                self.stream = nil
+                self.forceKeyframe = true
+                self.startRetries = 0
+                self.restartCapture(still: true)
+            }
+        }
+    }
+
+    /// The capture service was restarted (CaptureHealth): this capture belonged to the old one.
+    func restartAfterServiceReset() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.showingPause, let s = self.stream else { return }
+            s.stopCapture { _ in }
+            self.stream = nil
+            self.forceKeyframe = true
+            self.startRetries = 0
+            self.restartCapture(still: true)
+        }
+    }
+
+    /// When the last resume was asked for (host µs), until its first frame goes out (0: none due).
+    private var resumedUs: UInt64 = 0
+
+    /// Linux isn't showing the window (minimised, on another desktop): stop capturing it
+    /// altogether. Only stopping encoding left ScreenCaptureKit delivering every change, each
+    /// hashed and prepared for nothing: with many windows open, most of them hidden, that kept
+    /// the host near full CPU. A stop rather than a slower capture: a capture started afresh
+    /// always begins with a frame of the window as it is now, at its size and scale now, where
+    /// a reconfigured one sends nothing until the window changes. Starting takes ~0.4 s, so a
+    /// still (a fraction of that) is sent first. Not the Mac being locked: that's `showingPause`.
     func setPaused(_ p: Bool) {
+        guard p != paused, !stopped else { return }
         paused = p
-        if !p {
-            forceKeyframe = true
+        if p {
+            let unshown = resumedUs > 0 ? String(format: " (resumed %.0f ms ago, no frame sent yet)", Double(hostMicros() - resumedUs) / 1000) : ""
+            resumedUs = 0
+            refineTimer?.cancel()
+            // A capture still starting stops itself when it finds it's been replaced.
+            stream?.stopCapture { _ in }
+            stream = nil
+            // Out of date by the time it's shown again. The locked picture stays (it's current).
+            if !showingPause { pendingBuffer = nil }
+            log("stream \(wid): paused, capture stopped\(unshown)")
+            // Still paused in 10 s (not just passed over while switching windows): its encoder
+            // goes too, 200 MB for a big window. The next frame after a resume makes a new one,
+            // while the capture is starting again anyway.
+            queue.asyncAfter(deadline: .now() + 10) { [weak self] in
+                guard let self, self.paused, !self.stopped, !self.showingPause, !self.encoding, !self.makingEncoder, self.inEncoder == 0,
+                      self.pendingBuffer == nil, let e = self.encoder else { return }
+                self.encoder = nil
+                self.work.async { VTCompressionSessionInvalidate(e) }
+                log("stream \(self.wid): paused for 10 s, encoder given back")
+            }
+            return
+        }
+        // Logged with its first frame (sendFrame, sendLossless).
+        forceKeyframe = true
+        resumedUs = hostMicros()
+        if showingPause {
+            // Locked: captures show nothing, so the locked picture goes back up and the capture
+            // starts at unlock (see setScreenLocked). The colour picture from before the lock
+            // may be out of date by then: forget it, so unlocking starts a fresh capture.
+            colourBeforeLock = nil
             if pendingBuffer == nil, let b = lastBuffer { pendingBuffer = b; pendingPrepared = true }
             pump()
+            return
         }
+        // Whatever was waiting is older than the still.
+        pendingBuffer = nil
+        resumeCapture()
+    }
+
+    /// Starts capturing again after a pause, with a still first, at the scale of the display
+    /// the window is on now (it may have moved meanwhile; checkScale leaves a paused one be).
+    /// Its size is already current: windowResized keeps `pointSize` while there's no capture.
+    private func resumeCapture() {
+        if let want = displayScale?(), want > 0, abs(want - scale) > 0.01 {
+            log("stream \(wid): display scale \(scale) → \(want) (while paused)")
+            scale = want
+        }
+        restartCapture(still: true)
     }
 
     /// Re-encode the last capture with fresh overlays (e.g. focus changed the traffic lights).
@@ -407,7 +744,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     func requestRepaint() {
         if encoding { repaintAfter = true; return }   // that buffer is being worked on
         guard pendingBuffer == nil, let b = lastBuffer else { return }
-        eraseCaptureBadge(b, buttons: buttons, badge: badgeRect(), scale: scale)
+        eraseCaptureBadge(b, buttons: buttons, badge: badgeRect(), scale: scale, clean: cleanCorner)
         pendingBuffer = b
         pendingPrepared = true
         refinementsLeft = 2
@@ -417,14 +754,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Corner tiles cut from `pb` (sent ahead of its frame), so they match what it shows.
     private func updateCorners(from pb: CVPixelBuffer) {
         let radius = Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded())
-        if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale, visible: visiblePx()), hash != cornersHash {
+        if let (t, tiles, hash) = cornerTiles(pb, radius: radius, scale: scale), hash != cornersHash {
             cornersHash = hash
             pendingCorners = (t, tiles)
         }
-    }
-
-    private func visiblePx() -> CGSize? {
-        visibleSize.map { CGSize(width: $0.width * scale, height: $0.height * scale) }
     }
 
     /// The colour frame shown before the Mac locked, put back when it unlocks (a static window
@@ -530,7 +863,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 guard !self.showingPause else { return }
                 self.showingPause = true
                 if !placeholder, let b = self.lastBuffer {
-                    guard let grey = pausedCopy(of: b, scale: self.scale, visible: self.visiblePx()) else { return }
+                    guard let grey = pausedCopy(of: b, scale: self.scale, visible: self.captureContent) else { return }
                     self.colourBeforeLock = b
                     self.updateCorners(from: grey)
                     self.pendingBuffer = grey
@@ -538,8 +871,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                     // Locked before the first frame: a dark placeholder with the pause symbol.
                     let (w, h) = self.pixelSize()
                     guard let blank = solidBuffer(width: w, height: h, gray: 0x3A) else { return }
-                    if let icon = self.appIcon { drawCentred(icon, in: blank, size: 72 * self.scale, visible: self.visiblePx()) }
-                    guard let grey = pausedCopy(of: blank, scale: self.scale, visible: self.visiblePx()) else { return }
+                    if let icon = self.appIcon { drawCentred(icon, in: blank, size: 72 * self.scale, visible: self.captureContent) }
+                    guard let grey = pausedCopy(of: blank, scale: self.scale, visible: self.captureContent) else { return }
                     self.updateCorners(from: grey)
                     self.pendingBuffer = grey
                 }
@@ -553,6 +886,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                         stream.stopCapture { _ in }
                         self.stream = nil
                         self.restartCapture()
+                    } else if !self.paused {
+                        // Resumed while locked (see setPaused): no capture was started then.
+                        self.resumeCapture()
                     }
                     return
                 }
@@ -589,6 +925,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !stopped else { return }
         stopped = true
         refineTimer?.cancel()
+        captureQueue.async { [weak self] in
+            self?.heldBackTimer?.cancel()
+            self?.heldBack = nil
+        }
         stream?.stopCapture { _ in }
         stream = nil
         // Dropped on the stream's own queue: it waits for a frame still inside the encoder.
@@ -605,12 +945,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
               let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         // A locked Mac captures as blank: keep showing the last real frame instead.
         guard !ScreenLock.isLocked else { return }
-        guard differsFromLast(pb) else { return }
-        // Where the window's content actually is in the buffer: when it doesn't fill it (the
-        // configured size is stale), ScreenCaptureKit pads with black.
+        // Counted before the unchanged ones are dropped: the capture is alive (see
+        // expectFrameAfterInput).
+        queue.async { [weak self] in if let self, stream === self.stream { self.delivered &+= 1 } }
         let info = attachments.first ?? [:]
-        let contentRect = (info[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
-        let contentScale = info[.contentScale] as? CGFloat ?? 1
+        guard differsFromLast(pb) else {
+            if droppedAsRedraw { holdBack(pb, info: info, from: stream) }
+            return
+        }
+        heldBack = nil
         // How long ScreenCaptureKit took to hand us the frame (its timestamp is host time).
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         let lagUs: UInt64 = {
@@ -619,10 +962,66 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let d = CMTimeGetSeconds(CMTimeSubtract(now, pts))
             return d > 0 && d < 1 ? UInt64(d * 1e6) : 0
         }()
+        send(pb, info: info, lagUs: lagUs, from: stream)
+    }
+
+    /// The latest capture dropped as a redraw since a frame was last sent (on captureQueue).
+    /// Dropping it is a guess (see compareWithLast): should it have been a real change, faint
+    /// and spread wide, Linux would show the picture before it until the window next changed.
+    /// So 10 s after the first is dropped the latest is sent after all: one frame, and only
+    /// for a window that had any.
+    private var heldBack: (pb: CVPixelBuffer, info: [SCStreamFrameInfo: Any], stream: SCStream)?
+    private var heldBackTimer: DispatchSourceTimer?
+
+    private func holdBack(_ pb: CVPixelBuffer, info: [SCStreamFrameInfo: Any], from stream: SCStream) {
+        heldBack = (pb, info, stream)
+        guard heldBackTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: captureQueue)
+        t.schedule(deadline: .now() + 10)
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.heldBackTimer = nil
+            guard let held = self.heldBack else { return }
+            self.heldBack = nil
+            // It's the last frame sent now: what the next captures' samples are compared with.
+            if CVPixelBufferLockBaseAddress(held.pb, .readOnly) == kCVReturnSuccess {
+                if let base = CVPixelBufferGetBaseAddress(held.pb) {
+                    self.takeSamples(base, stride: CVPixelBufferGetBytesPerRow(held.pb), w: CVPixelBufferGetWidth(held.pb),
+                                     h: CVPixelBufferGetHeight(held.pb))
+                }
+                CVPixelBufferUnlockBaseAddress(held.pb, .readOnly)
+            }
+            self.note("the picture held back as a redraw, sent after 10 s")
+            self.send(held.pb, info: held.info, lagUs: 0, from: held.stream)
+        }
+        t.resume()
+        heldBackTimer = t
+    }
+
+    /// Hands a capture that is to be sent over to `queue`.
+    private func send(_ pb: CVPixelBuffer, info: [SCStreamFrameInfo: Any], lagUs: UInt64, from stream: SCStream) {
+        // Where the window's content actually is in the buffer: when it doesn't fill it (the
+        // configured size is stale), ScreenCaptureKit pads with black.
+        let contentRect = (info[.contentRect] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        let contentScale = info[.contentScale] as? CGFloat ?? 1
         let scaleFactor = info[.scaleFactor] as? CGFloat ?? 1
         queue.async { [weak self] in
             // Only the current capture's frames (a replaced one can still deliver a few).
             guard let self, !self.stopped, !self.showingPause, stream === self.stream else { return }
+            // The window outgrew the capture's size and macOS shrank it into it, with black
+            // around (a TV window showed a black band at its bottom on Linux). Not sent: the
+            // capture is started afresh at the window's size if no proper frame follows soon.
+            // (Relative to the scale asked for: a 1× capture of a window on a 2× display is
+            // always at 50%.)
+            if self.scDisplay == nil && contentScale * scaleFactor < 0.98 * self.scale {
+                if !self.shrunkSeen {
+                    self.shrunkSeen = true
+                    log(String(format: "stream %u: capture shrunk to %.0f%% (window outgrew it): dropped", self.wid, contentScale * 100))
+                    self.expectFrameAfterResize()
+                }
+                return
+            }
+            self.shrunkSeen = false
             self.process(pb, contentRect: contentRect, contentScale: contentScale, scaleFactor: scaleFactor, lagUs: lagUs)
         }
     }
@@ -641,6 +1040,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] ?? [:]
             log("stream \(wid): buffer colour tags \(a.filter { $0.key.contains("Color") || $0.key.contains("Transfer") || $0.key.contains("Matrix") || $0.key.contains("Primaries") })")
         }
+        captureContent = contentRect.map { CGSize(width: $0.width * scaleFactor, height: $0.height * scaleFactor) }
         if let r = contentRect {
             let bw = CGFloat(CVPixelBufferGetWidth(pb)), bh = CGFloat(CVPixelBufferGetHeight(pb))
             let cw = r.width * scaleFactor, ch = r.height * scaleFactor
@@ -654,6 +1054,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // Prepared only if it's encoded: a newer capture may replace it while the encoder is busy.
         pendingBuffer = pb
+        pendingStill = still
         pendingPrepared = false
         refinementsLeft = 2
         pump()
@@ -661,8 +1062,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// What preparing a frame needs from the streamer's state, taken on `queue`.
     private struct Prep {
-        let buttons: [CGRect], badge: CGRect?, scale: CGFloat, visiblePx: CGSize?, radiusPx: Int
+        let buttons: [CGRect], badge: CGRect?, scale: CGFloat, content: CGSize?, radiusPx: Int
         let detect: Bool, measure: Bool
+        let clean: CleanCorner
+        let cornerCache: CornerTileCache
+        let noBadge: Bool
+        let still: Bool
     }
 
     /// And what it found, applied back on `queue`.
@@ -685,17 +1090,16 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             r.detected = found
             buttons = found
         }
-        r.dark = eraseCaptureBadge(pb, buttons: buttons, badge: p.badge, scale: p.scale)
+        r.dark = eraseCaptureBadge(pb, buttons: buttons, badge: p.badge, scale: p.scale, clean: p.clean, fresh: true,
+                                   noBadge: p.noBadge, still: p.still)
         // A few radius measurements per window (not every frame) feed the shared vote.
         if p.measure { r.radiusPx = measureCornerRadius(pb, scale: p.scale) }
-        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, visible: p.visiblePx)
+        r.corners = cornerTiles(pb, radius: p.radiusPx, scale: p.scale, content: p.content, cache: p.cornerCache)
         fillCorners(pb, radiusPx: Int(28 * p.scale))
         fillEdges(pb, ring: max(2, Int(p.scale)))
-        // Translucent areas (vibrancy sidebars etc.) arrive premultiplied; the encoder
-        // drops alpha, which would leave them darkened. Restore their real colour.
-        // Most windows are fully opaque: a sparse look (1 pixel in 64) decides whether
-        // the full pass is needed.
-        if hasTranslucency(pb, skip: Int(28 * p.scale)) { unpremultiply(pb) }
+        // Translucent areas (sidebars, a see-through Terminal) are left premultiplied as the
+        // encoder drops alpha. Restoring their colour cost 7-15 ms a frame for a see-through
+        // Terminal and changed nothing visible (Finder's sidebar the same in light and dark).
         return r
     }
 
@@ -761,6 +1165,110 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: encode
 
+    /// The last still sent by pollStills (a sample of its pixels), to send only changes.
+    private var lastStillHash: UInt64 = 0
+    private var pollingStills = false
+    private var stillsSince: UInt64 = 0
+
+    /// How soon the next still is taken: every 30 ms while a panel may be opening (Quick Look
+    /// zooming in), less often once it has stayed up: a popup the capture never feeds was taken
+    /// at full resolution 33 times a second for as long as it was open (a fifth of a core, idle).
+    private var stillPace: Double {
+        let up = Double(DispatchTime.now().uptimeNanoseconds - stillsSince) / 1e9
+        return up < 2 ? 0.03 : up < 10 ? 0.25 : 1
+    }
+
+    /// Stills of a popup whose live capture delivers nothing (see startCapture), every 100 ms
+    /// while that lasts; each one sent only when it differs from the last.
+    private func pollStills(_ s: SCStream, filter: SCContentFilter) {
+        guard !stopped, stream === s, framesSinceStart == 0 else { pollingStills = false; return }
+        if !pollingStills {
+            pollingStills = true
+            stillsSince = DispatchTime.now().uptimeNanoseconds
+            lastStillHash = 0
+            log("stream \(wid): no frame from the capture: stills of it instead")
+        }
+        // At the size it has now (it may be growing: a panel zooming open).
+        applySize(to: config)
+        let pace = stillPace
+        let take = { [weak self] (pb: CVPixelBuffer?, again: Double) in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.stopped, self.stream === s, self.framesSinceStart == 0 else { self.pollingStills = false; return }
+                if let pb, !self.showingPause, !ScreenLock.isLocked {
+                    let h = Self.sampleHash(pb)
+                    if h != self.lastStillHash {
+                        self.lastStillHash = h
+                        self.process(pb, contentRect: nil, contentScale: 1, scaleFactor: self.scale, lagUs: 0, still: true)
+                    }
+                }
+                self.queue.asyncAfter(deadline: .now() + again) { [weak self] in
+                    self?.pollStills(s, filter: filter)
+                }
+            }
+        }
+        // The window server's own picture of the window, where it still gives one: in a few
+        // ms, against ScreenCaptureKit's 70–400, so a panel zooming open (Quick Look) shows as
+        // it opens and whole at once, instead of most of a second later.
+        let wid = self.wid
+        if Self.windowImage != nil, quickMisses < 8 {
+            stillQueue.async { [weak self] in
+                if let pb = Self.quickStill(wid) { return take(pb, pace) }
+                // None (the window not drawn yet): again shortly; after a few misses in all,
+                // ScreenCaptureKit's stills instead.
+                self?.queue.async { self?.quickMisses += 1 }
+                take(nil, pace)
+            }
+            return
+        }
+        SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sb, _ in
+            take(sb.flatMap { CMSampleBufferGetImageBuffer($0) }, max(0.1, pace))
+        }
+    }
+
+    private let stillQueue = DispatchQueue(label: "sweeflow.still", qos: .userInteractive)
+    /// quickStill gave nothing this many times (on `queue`).
+    private var quickMisses = 0
+
+    /// CGWindowListCreateImage, looked up at run time (gone from the SDK's headers since macOS
+    /// 15, still there to call).
+    private typealias WindowImageFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+    private static let windowImage: WindowImageFn? = {
+        guard let f = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return nil }
+        return unsafeBitCast(f, to: WindowImageFn.self)
+    }()
+
+    /// The window's picture from the window server (its frame only, at full resolution), as a
+    /// BGRA buffer; nil when it gives none.
+    private static func quickStill(_ wid: UInt32) -> CVPixelBuffer? {
+        // kCGWindowListOptionIncludingWindow; kCGWindowImageBoundsIgnoreFraming | BestResolution.
+        guard let f = windowImage, let img = f(.null, 1 << 3, wid, (1 << 0) | (1 << 3))?.takeRetainedValue(),
+              img.width > 1, img.height > 1 else { return nil }
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        guard CVPixelBufferCreate(nil, img.width, img.height, kCVPixelFormatType_32BGRA, attrs, &pb) == kCVReturnSuccess, let pb else { return nil }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: img.width, height: img.height, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.clear(CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        return pb
+    }
+
+    /// A quick fingerprint of a picture: every 7th byte of it (enough to tell a change).
+    private static func sampleHash(_ pb: CVPixelBuffer) -> UInt64 {
+        guard CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return 0 }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+        let n = CVPixelBufferGetBytesPerRow(pb) * CVPixelBufferGetHeight(pb)
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        var i = 0
+        while i < n { h = (h ^ UInt64(base[i])) &* 0x100_0000_01b3; i += 7 }
+        return h ^ UInt64(n)
+    }
+
     /// Encodes the pending capture if flow control allows.
     private func pump() {
         // A frame lost on the way (datagrams) is never acknowledged: don't wait for it forever.
@@ -814,11 +1322,12 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             measureCountdown -= 1
             let measure = radiusSamples < 5 && measureCountdown <= 0
             if measure { measureCountdown = 15 }
-            prep = Prep(buttons: buttons, badge: badgeRect(), scale: scale, visiblePx: visiblePx(),
-                        radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure)
+            let badge = badgeRect()
+            prep = Prep(buttons: buttons, badge: badge, scale: scale, content: captureContent,
+                        radiusPx: Int((CGFloat(WindowStreamer.consensusRadiusPt) * scale).rounded()), detect: detect, measure: measure,
+                        clean: cleanCorner, cornerCache: cornerCache, noBadge: badge == nil && badgeAbsent(), still: pendingStill)
         }
         lastBuffer = pb
-        lastEncodeAt = .now()
         encoding = true
         encodingSince = .now()
         let startUs = hostMicros()
@@ -856,7 +1365,14 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self?.startRetries = 0
                 return
             }
-            guard self.startRetries < 3 else { log("stream \(self.wid): still no frame after 3 restarts"); return }
+            // A popup the capture won't feed is shown by stills (pollStills): restarting the
+            // capture would only make it flicker.
+            if self.lossless { return }
+            guard self.startRetries < 3 else {
+                log("stream \(self.wid): still no frame after 3 restarts")
+                CaptureHealth.captureGaveNothing()
+                return
+            }
             self.startRetries += 1
             log("stream \(self.wid): no first frame, starting the capture again")
             s.stopCapture { _ in }
@@ -880,6 +1396,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// losing detail.
     func checkScale() {
         queue.async { [weak self] in
+            // Paused, there's no capture: resumeCapture looks the scale up when it starts one
+            // (until then the last picture, at the old scale, may still be sent again).
             guard let self, let want = self.displayScale?(), want > 0, abs(want - self.scale) > 0.01,
                   let stream = self.stream, !self.stopped else { return }
             log("stream \(self.wid): display scale \(self.scale) → \(want)")
@@ -1039,7 +1557,6 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard n > 0 else { log("lz4 failed for \(wid)"); return }
         let captureUs = hostMicros()
         inFlight.append(captureUs)
-        lastEncodeAt = .now()
         scheduleRefine()
         logStatsIfDue()
         var m = MsgWriter(.frame)
@@ -1048,12 +1565,20 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         m.u8(0b11 | (UInt8(min(15, max(1, scale.rounded()))) << 4))   // keyframe | lossless | px/pt
         m.bytes(Data(out[0..<n]))
         out_send(m, bytes: n)
+        logResumedIfDue(captureUs: captureUs)
     }
 
     private func out_send(_ m: MsgWriter, bytes: Int) {
         out.send(m)
         statFrames += 1
         statBytes += bytes
+    }
+
+    /// The first frame since a resume went out (one prepared before the pause doesn't count).
+    private func logResumedIfDue(captureUs: UInt64) {
+        guard resumedUs > 0, captureUs >= resumedUs else { return }
+        log(String(format: "stream %u: resumed, first frame sent %.0f ms after the resume", wid, Double(hostMicros() - resumedUs) / 1000))
+        resumedUs = 0
     }
 
     private func sendFrame(captureUs: UInt64, w: Int32, h: Int32, key: Bool, fullRange: Bool, data: Data) {
@@ -1073,6 +1598,7 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         statFrames += 1
         statBytes += data.count
+        logResumedIfDue(captureUs: captureUs)
     }
 
     private static func makeEncoder(width: Int32, height: Int32, tenBit encoderTenBit: Bool) -> VTCompressionSession? {
@@ -1099,6 +1625,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
+            // One reference frame (the one before): half the encoder's memory. Four encoders of
+            // 3840x2688 in 10-bit held 1.64 GB in the system's encoder service with the default
+            // and 0.8 GB with this (410 → 200 MB each), and were no slower.
+            kVTCompressionPropertyKey_ReferenceBufferCount: 1,
             // 10-bit: subtle UI gradients (sidebars, glass) get four times the steps.
             kVTCompressionPropertyKey_ProfileLevel: encoderTenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: 100_000,
@@ -1157,19 +1687,39 @@ func measureCornerRadius(_ pb: CVPixelBuffer, scale: CGFloat) -> Int? {
 /// The window's four corners (TL, TR, BL, BR) as square premultiplied BGRA tiles with an exact
 /// anti-aliased rounded mask of radius `r` px. Colours come from the nearest pixel inside the
 /// window, so whatever the capture has in the corner (transparency, an erased badge, an app's own
-/// square edge) can't leak through. Returns (tile px, tiles, hash).
-func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, visible: CGSize? = nil) -> (Int, Data, UInt64)? {
+/// square edge) can't leak through. `content`: where the window ends in the buffer (px), when
+/// macOS padded a capture of a stale size. Returns (tile px, tiles, hash).
+/// The corner tiles last worked out for a window, and what they were worked out from.
+final class CornerTileCache {
+    fileprivate var key: [UInt64] = []
+    fileprivate var tiles: (Int, Data, UInt64)?
+}
+
+/// `cache`: tiles depend only on the pixels in the four corner squares (and the sizes), which
+/// rarely change: when a hash of those is what it was, the last tiles are given again (working
+/// them out, 4x4 supersampled with a walk inward per see-through pixel, was the host's biggest
+/// cost per frame after the capture itself).
+func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, content: CGSize? = nil, cache: CornerTileCache? = nil) -> (Int, Data, UInt64)? {
     guard r > 0, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let bufW = CVPixelBufferGetWidth(pb), bufH = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-    // The corners go where Linux's view of the window ends (it crops windows it can't shrink).
-    let w = min(bufW, visible.map { Int($0.width.rounded()) } ?? bufW)
-    let h = min(bufH, visible.map { Int($0.height.rounded()) } ?? bufH)
+    // The window's real corners, wherever its content ends in the buffer.
+    let w = max(1, min(bufW, content.map { Int($0.width.rounded()) } ?? bufW))
+    let h = max(1, min(bufH, content.map { Int($0.height.rounded()) } ?? bufH))
     let s = max(1, Int(scale.rounded()))
     let t = ((r + s - 1) / s) * s          // whole points, so the client can place it exactly
     guard t <= w / 3, t <= h / 3 else { return nil }
+    var key: [UInt64] = [UInt64(w), UInt64(h), UInt64(t), UInt64(r)]
+    if let cache {
+        var hash: UInt64 = 0
+        for (ox, oy) in [(0, 0), (w - t, 0), (0, h - t), (w - t, h - t)] {
+            for y in oy..<(oy + t) { hash = (hash ^ WindowStreamer.hashRow(UnsafeRawPointer(base + y * stride + ox * 4), t * 4)) &* 0x100000001b3 }
+        }
+        key.append(hash)
+        if key == cache.key, let last = cache.tiles { return last }
+    }
     let rf = Double(r)
     var tiles = Data(count: t * t * 4 * 4)
     tiles.withUnsafeMutableBytes { raw in
@@ -1228,8 +1778,8 @@ func cornerTiles(_ pb: CVPixelBuffer, radius r: Int, scale: CGFloat, visible: CG
             }
         }
     }
-    var hash: UInt64 = 0xcbf29ce484222325
-    for b in tiles { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
+    let hash = tiles.withUnsafeBytes { WindowStreamer.hashRow($0.baseAddress!, $0.count) }
+    if let cache { cache.key = key; cache.tiles = (t, tiles, hash) }
     return (t, tiles, hash)
 }
 
@@ -1323,19 +1873,6 @@ func fillEdges(_ pb: CVPixelBuffer, ring: Int) {
     }
 }
 
-/// Premultiplied → straight BGRA in place (SIMD), so dropping alpha doesn't darken translucent
-/// pixels.
-func unpremultiply(_ pb: CVPixelBuffer) {
-    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
-          CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return }
-    defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-    guard let base = CVPixelBufferGetBaseAddress(pb) else { return }
-    var buf = vImage_Buffer(data: base, height: vImagePixelCount(CVPixelBufferGetHeight(pb)),
-                            width: vImagePixelCount(CVPixelBufferGetWidth(pb)), rowBytes: CVPixelBufferGetBytesPerRow(pb))
-    // Alpha is last in BGRA as in RGBA; the colour order does not matter here.
-    vImageUnpremultiplyData_RGBA8888(&buf, &buf, vImage_Flags(kvImageNoFlags))
-}
-
 /// macOS windows have rounded, transparent corners. The Linux window is a plain rectangle, so
 /// composite the transparent corner pixels over the window's own edge colour; the corners then
 /// read as part of the window rather than as black specks.
@@ -1373,49 +1910,241 @@ func fillCorners(_ pb: CVPixelBuffer, radiusPx: Int) {
     }
 }
 
+/// What a window's top-left corner looks like without macOS's capture badge on it, learnt pixel
+/// by pixel from the captures. In apps that move their own buttons the badge sits now in one
+/// place, now in another, and at the lower one it lies over whatever comes right after the
+/// buttons (an app's logo, a toolbar button): covered with plain background, that lost a bite
+/// each time. The corner shows whole in the first captures after a capture starts (macOS puts
+/// the badge up a moment later), and what one place hides shows while the badge sits at the
+/// other: those pixels are kept here and put back under the badge instead. Kept per window
+/// for as long as the host runs: across resizes (the corner doesn't move) and reconnects.
+final class CleanCorner {
+    private static var all: [UInt32: CleanCorner] = [:]
+    private static let allLock = NSLock()
+    static func of(_ wid: UInt32) -> CleanCorner {
+        allLock.lock(); defer { allLock.unlock() }
+        if let c = all[wid] { return c }
+        let c = CleanCorner(); all[wid] = c; return c
+    }
+
+    fileprivate let lock = NSLock()
+    fileprivate var shape = (0, 0)   // the corner's width and height in pixels
+    fileprivate var px: [UInt8] = []
+    fileprivate var known: [Bool] = []
+    private var badge: CGRect?
+    private var since: UInt64 = 0
+    /// Said in the log once each: the corner learnt, and pixels under the badge not known
+    /// (covered with plain background: what a logo right after the buttons loses).
+    fileprivate var saidLearnt = false, saidUnknown = false
+
+    /// Whether the badge has been at `rect` for a second: only then is the rest of the corner
+    /// taken as clear of it (while it moves, the capture and its position can disagree).
+    fileprivate func settled(at rect: CGRect) -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if badge != rect { badge = rect; since = now; return false }
+        return now - since > 1_000_000_000
+    }
+}
+
 /// While a window is captured, macOS draws a purple "being shared" badge where its traffic lights
 /// are. Erase it to the title-bar colour; the client composites the real buttons over the spot.
 /// Returns whether the title bar is dark (nil when there are no buttons), for the client's
 /// inactive traffic-light colour.
+/// `clean`: the window's remembered corner (see CleanCorner); `fresh`: this is a new capture,
+/// nothing painted on it yet, so the corner can be learnt from it; `noBadge`: the window
+/// server has just said there is no badge on the window.
 @discardableResult
-func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, scale: CGFloat) -> Bool? {
+func eraseCaptureBadge(_ pb: CVPixelBuffer, buttons: [CGRect], badge: CGRect?, scale: CGFloat,
+                       clean: CleanCorner? = nil, fresh: Bool = false, noBadge: Bool = false, still: Bool = false) -> Bool? {
     let rects = buttons.filter { $0.width > 0 }
-    // Erase where the badge is, plus a margin around the buttons it may cover.
-    var region: CGRect?
-    if rects.count == 3 { region = rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5) }
-    if let badge { region = region.map { $0.union(badge.insetBy(dx: -1, dy: -1)) } ?? badge.insetBy(dx: -1, dy: -1) }
-    guard let union = region, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
+    // Two places, each covered with the background around it: where the badge is, and the
+    // buttons it may cover (with a margin). Not one box around both: an app that keeps its
+    // buttons away from the badge's place (its own title bar: a browser, an Electron-style
+    // app) has other things between the two, and the colour around such a box isn't the
+    // colour around the badge, so pieces of the badge stayed.
+    var regions: [CGRect] = []
+    // First the corner above and to the left of the buttons, whether or not the badge was
+    // found there: that is where macOS puts it on a window with buttons (at 16,17 on a tall
+    // toolbar, 12,4 or even partly above the window on others), and where pieces of a badge
+    // missed for any reason showed. No further right or down than the buttons' own cover
+    // below: an app's logo or toolbar can start right after them.
+    if rects.count == 3, let right = rects.map(\.maxX).max(), let bottom = rects.map(\.maxY).max() {
+        regions.append(CGRect(x: 0, y: 0, width: right + 6, height: bottom + 5))
+    }
+    // (Only when the whole badge is on the window: cut off by its edge, the piece that shows
+    // isn't that shape, and is covered as a box.)
+    let badgeRegion = badge.flatMap { $0.width >= 60 && $0.height >= 17 ? $0.insetBy(dx: -1, dy: -1) : nil }
+    if let badge { regions.append(badgeRegion ?? badge.insetBy(dx: -1, dy: -1)) }
+    if rects.count == 3 { regions.append(rects.reduce(rects[0]) { $0.union($1) }.insetBy(dx: -6, dy: -5)) }
+    guard !regions.isEmpty, CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
           CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return nil }
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
     guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return nil }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
 
-    // The badge is a pill around all three buttons; clear it to the surrounding title bar.
-    let x0 = max(0, Int(union.minX * scale)), x1 = min(w, Int(union.maxX * scale))
-    let y0 = max(0, Int(union.minY * scale)), y1 = min(h, Int(union.maxY * scale))
-    guard x1 > x0, y1 > y0 else { return nil }
-    // Fill colour: median of the pixels just outside the region (robust to a logo or text next
-    // to the buttons, which a single sample would pick up).
-    var samples: [(UInt8, UInt8, UInt8)] = []
-    let pad = max(2, Int(scale * 1.5))
-    func sample(_ x: Int, _ y: Int) {
-        guard x >= 0, x < w, y >= 0, y < h else { return }
-        let p = base + y * stride + x * 4
-        if p[3] > 250 { samples.append((p[0], p[1], p[2])) }
+    /// The bar with round ends that fills a region (the badge's shape), in pixels: worked out
+    /// once per region, not at every pixel it's asked about.
+    struct Pill {
+        let radius2: Double, leftX: Double, rightX: Double, midY: Double
+        init(_ region: CGRect, _ scale: CGFloat) {
+            let radius = Double(region.height * scale) / 2
+            radius2 = radius * radius
+            leftX = Double(region.minX * scale) + radius; rightX = Double(region.maxX * scale) - radius
+            midY = Double(region.midY * scale)
+        }
+        @inline(__always) func contains(_ x: Int, _ y: Int) -> Bool {
+            let px = Double(x) + 0.5, dy = Double(y) + 0.5 - midY
+            let dx = px < leftX ? leftX - px : px > rightX ? px - rightX : 0
+            return dx * dx + dy * dy <= radius2
+        }
     }
-    for x in Swift.stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
-    for y in Swift.stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
-    guard !samples.isEmpty else { return nil }
-    let mid = samples.count / 2
-    let bb = samples.map { $0.0 }.sorted()[mid]
-    let bgc = samples.map { $0.1 }.sorted()[mid]
-    let br = samples.map { $0.2 }.sorted()[mid]
-    for y in y0..<y1 {
-        let row = base + y * stride
-        for x in x0..<x1 { let p = row + x * 4; p[0] = bb; p[1] = bgc; p[2] = br; p[3] = 255 }
+
+    // The remembered corner: learnt from a fresh capture wherever the badge (with a margin)
+    // isn't, once the badge has stayed put; and held for the covering below. Its pixels are
+    // taken out of `clean` while they're worked on (and put back at the end): read and written
+    // in place there, each access paid for a check of the class's storage.
+    let cornerW = min(w, Int(112 * scale)), cornerH = min(h, Int(50 * scale))
+    clean?.lock.lock()
+    defer { clean?.lock.unlock() }
+    var cpx: [UInt8] = [], known: [Bool] = []
+    if let clean {
+        if clean.shape != (cornerW, cornerH) {
+            clean.shape = (cornerW, cornerH)
+            clean.px = [UInt8](repeating: 0, count: cornerW * cornerH * 4)
+            clean.known = [Bool](repeating: false, count: cornerW * cornerH)
+        }
+        swap(&cpx, &clean.px); swap(&known, &clean.known)
     }
-    let luminance = (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10
-    return luminance < 128
+    defer { if let clean { swap(&cpx, &clean.px); swap(&known, &clean.known) } }
+    if let clean {
+        // What is remembered must still be what the app shows there (its toolbar may have
+        // changed): where the corner is in plain view now, away from the badge and the
+        // buttons, it has to match, or the lot is forgotten and learnt again.
+        // (In pixels: x, maxX, y, maxY.)
+        let hidden = ((badge.map { [$0.insetBy(dx: -3, dy: -3)] } ?? []) + rects.map { $0.insetBy(dx: -8, dy: -8) })
+            .map { (Double($0.minX * scale), Double($0.maxX * scale), Double($0.minY * scale), Double($0.maxY * scale)) }
+        if fresh {
+            var seen = 0, differ = 0
+            for y in Swift.stride(from: 0, to: cornerH, by: 2) {
+                let row = base + y * stride, fy = Double(y)
+                for x in Swift.stride(from: 0, to: cornerW, by: 2) where known[y * cornerW + x] {
+                    let fx = Double(x)
+                    if hidden.contains(where: { fx >= $0.0 && fx < $0.1 && fy >= $0.2 && fy < $0.3 }) { continue }
+                    seen += 1
+                    let i = (y * cornerW + x) * 4
+                    if abs(Int(row[x * 4]) - Int(cpx[i])) > 40 || abs(Int(row[x * 4 + 1]) - Int(cpx[i + 1])) > 40
+                        || abs(Int(row[x * 4 + 2]) - Int(cpx[i + 2])) > 40 { differ += 1 }
+                }
+            }
+            if seen > 50, differ * 5 > seen {
+                known = [Bool](repeating: false, count: cornerW * cornerH)
+            }
+        }
+        // The still taken as a capture starts often has no badge on it yet, though the window
+        // server still lists one (a capture of the window just ended, as when this host
+        // restarts): the one look under the badge where it never moves away (Herdr's sits on
+        // its logo). Taken as clear when none of the corner has the badge's violet.
+        var stillClear = false
+        if still, fresh {
+            var violet = 0
+            for y in Swift.stride(from: 0, to: cornerH, by: 2) {
+                let row = base + y * stride
+                for x in Swift.stride(from: 0, to: cornerW, by: 2) {
+                    let (b, g, r) = (Int(row[x * 4]), Int(row[x * 4 + 1]), Int(row[x * 4 + 2]))
+                    if b > 200, (80...175).contains(r), (80...175).contains(g), b - r > 60, b - g > 60 { violet += 1 }
+                }
+            }
+            stillClear = violet < 40
+        }
+        // Learnt from a fresh capture: all of the corner while there is no badge, and
+        // otherwise wherever the badge (with a margin) isn't, once it has stayed put.
+        let around = stillClear ? nil : badge?.insetBy(dx: -3, dy: -3)
+        if fresh, (badge == nil && noBadge) || stillClear || (badge.map { clean.settled(at: $0) } ?? false) {
+            let pill = around.map { Pill($0, scale) }
+            cpx.withUnsafeMutableBufferPointer { cp in
+                known.withUnsafeMutableBufferPointer { kn in
+                    for y in 0..<cornerH {
+                        let row = base + y * stride
+                        for x in 0..<cornerW where !(pill?.contains(x, y) ?? false) {
+                            let i = y * cornerW + x
+                            for c in 0..<4 { cp[i * 4 + c] = row[x * 4 + c] }
+                            kn[i] = true
+                        }
+                    }
+                }
+            }
+            if !clean.saidLearnt || stillClear {
+                clean.saidLearnt = true
+                log("capture badge: corner learnt \(around == nil ? "whole (no badge on it)" : "around the badge at \(badge!)")")
+            }
+        }
+    }
+
+    /// Fills one region with the colour around it; whether that colour is dark, nil when
+    /// there was nothing around it to go by. `pill`: only the badge's own shape within the
+    /// region (a bar with round ends), so what sits beside those ends stays: as a plain box
+    /// it took the edge off a logo right after the buttons.
+    func cover(_ region: CGRect, pill: Bool = false) -> Bool? {
+        let x0 = max(0, Int(region.minX * scale)), x1 = min(w, Int(region.maxX * scale))
+        let y0 = max(0, Int(region.minY * scale)), y1 = min(h, Int(region.maxY * scale))
+        guard x1 > x0, y1 > y0 else { return nil }
+
+        // Fill colour: median of the pixels just outside the region (robust to a logo or text
+        // next to it, which a single sample would pick up).
+        var samples: [(UInt8, UInt8, UInt8)] = []
+        let pad = max(2, Int(scale * 1.5))
+        func sample(_ x: Int, _ y: Int) {
+            guard x >= 0, x < w, y >= 0, y < h else { return }
+            let p = base + y * stride + x * 4
+            if p[3] > 250 { samples.append((p[0], p[1], p[2])) }
+        }
+        for x in Swift.stride(from: x0, to: x1, by: 2) { sample(x, y0 - pad); sample(x, y1 + pad) }
+        for y in Swift.stride(from: y0, to: y1, by: 2) { sample(x0 - pad, y); sample(x1 + pad, y) }
+        guard !samples.isEmpty else { return nil }
+        let mid = samples.count / 2
+        let bb = samples.map { $0.0 }.sorted()[mid]
+        let bgc = samples.map { $0.1 }.sorted()[mid]
+        let br = samples.map { $0.2 }.sorted()[mid]
+        let shape = pill ? Pill(region, scale) : nil
+        let pastButtons = regions.first.map { Double($0.maxX * scale) }
+        let remembered = pill && clean != nil
+        cpx.withUnsafeBufferPointer { cp in
+            known.withUnsafeBufferPointer { kn in
+                for y in y0..<y1 {
+                    let row = base + y * stride
+                    for x in x0..<x1 {
+                        if let shape, !shape.contains(x, y) { continue }
+                        let p = row + x * 4
+                        // Under the badge: what was there when the badge wasn't, where that's known.
+                        if remembered, x < cornerW, y < cornerH, kn[y * cornerW + x] {
+                            let i = (y * cornerW + x) * 4
+                            for c in 0..<4 { p[c] = cp[i + c] }
+                            continue
+                        }
+                        if remembered, let clean, !clean.saidUnknown, let past = pastButtons, Double(x) > past {
+                            clean.saidUnknown = true
+                            log("capture badge at \(region): what's under it past the buttons isn't known (covered plain)")
+                        }
+                        // The window's own shape stays: where its rounded corner is see-through (the
+                        // badge can reach into it), the pixel keeps its alpha and takes the colour
+                        // through it (the buffer is premultiplied).
+                        let a = Int(p[3])
+                        if a == 255 {
+                            p[0] = bb; p[1] = bgc; p[2] = br
+                        } else if a > 0 {
+                            p[0] = UInt8(Int(bb) * a / 255); p[1] = UInt8(Int(bgc) * a / 255); p[2] = UInt8(Int(br) * a / 255)
+                        }
+                    }
+                }
+            }
+        }
+        return (Int(br) * 3 + Int(bgc) * 6 + Int(bb)) / 10 < 128
+    }
+
+    // The buttons' surroundings say whether the title bar is dark (the last region, when there).
+    var dark: Bool?
+    for region in regions { if let d = cover(region, pill: region == badgeRegion) { dark = d } }
+    return dark
 }
 
 /// Converts a length-prefixed HEVC sample to Annex B, prepending VPS/SPS/PPS on keyframes.
@@ -1556,20 +2285,3 @@ func pausedCopy(of pb: CVPixelBuffer, scale: CGFloat, visible: CGSize? = nil) ->
     return out
 }
 
-/// Whether any pixel away from the corners and edges is semi-transparent, looking at one pixel
-/// in 64 (every 8th in both directions).
-func hasTranslucency(_ pb: CVPixelBuffer, skip margin: Int) -> Bool {
-    guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA,
-          CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return true }
-    defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) else { return true }
-    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), stride = CVPixelBufferGetBytesPerRow(pb)
-    guard w > 2 * margin, h > 2 * margin else { return true }
-    for y in Swift.stride(from: margin, to: h - margin, by: 8) {
-        let row = base + y * stride
-        for x in Swift.stride(from: margin, to: w - margin, by: 8) where row[x * 4 + 3] < 250 {
-            return true
-        }
-    }
-    return false
-}

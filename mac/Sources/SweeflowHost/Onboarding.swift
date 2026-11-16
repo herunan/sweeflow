@@ -3,13 +3,14 @@ import ScreenCaptureKit
 import Network
 import ServiceManagement
 
-/// Puts one of Sweeflow's own windows where a person at the Mac sees it: the built-in screen,
-/// else any screen but Sweeflow's virtual display (nobody sees that, and Sweeflow's own windows
-/// aren't streamed). Lights the built-in screen up while it's open.
+/// Puts one of Sweeflow's own windows where a person at the Mac sees it: the primary display
+/// (the one with the menu bar, where they look: a monitor on a laptop), else any screen but
+/// Sweeflow's virtual display (nobody sees that, and Sweeflow's own windows aren't streamed).
+/// Lights the built-in screen up while it's open, in case that's the one.
 func presentToPerson(_ w: NSWindow) {
     BuiltInScreen.pause()
     let virtual = host.display.displayID
-    let screen = BuiltInScreen.screen ?? NSScreen.screens.first {
+    let screen = NSScreen.screens.first {
         ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) != virtual
     } ?? NSScreen.main
     if let f = screen?.visibleFrame {
@@ -145,8 +146,16 @@ final class Onboarding: NSObject, NSWindowDelegate {
         let intro = NSTextField(wrappingLabelWithString:
             "Your Mac's apps, as windows on your Linux machine. A few things first, then you link them:")
         intro.preferredMaxLayoutWidth = 420
-        screenRow.onAction = { _ = CGRequestScreenCaptureAccess() }
+        // Not allowed though Settings may show Sweeflow switched on: that entry can be an older
+        // copy's (another signature, after an update), which macOS keeps and doesn't apply to
+        // this one. Cleared first (Sweeflow's own entry only), so macOS asks afresh and Settings
+        // lists this copy.
+        screenRow.onAction = {
+            if !CGPreflightScreenCaptureAccess() { Self.resetPermission("ScreenCapture") }
+            _ = CGRequestScreenCaptureAccess()
+        }
         axRow.onAction = {
+            if !AXIsProcessTrusted() { Self.resetPermission("Accessibility") }
             _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         }
         loginRow.onAction = { if !LoginItem.enable() && LoginItem.needsApproval { SMAppService.openSystemSettingsLoginItems() } }
@@ -213,6 +222,9 @@ final class Onboarding: NSObject, NSWindowDelegate {
             } catch {
                 log("setup: test capture failed: \(error)")
             }
+            // And the sound's own question ("record your system audio"), asked when a tap is
+            // first made: here rather than when Linux first connects.
+            DispatchQueue.global().async { log("setup: audio tap \(AudioTap.ask() ? "allowed" : "not made")") }
         }
     }
 
@@ -234,6 +246,18 @@ final class Onboarding: NSObject, NSWindowDelegate {
         }
         b.start(queue: .main)
         browser = b
+    }
+
+    /// Clears this app's entry for one privacy permission (tccutil, no password needed for an
+    /// app's own entry).
+    static func resetPermission(_ service: String) {
+        guard let bid = Bundle.main.bundleIdentifier else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", service, bid]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit(); log("permission \(service): stale entry cleared") } catch {}
     }
 
     @objc private func openPairing() {
@@ -273,8 +297,7 @@ private final class PermissionRow {
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
-        let asked = UserDefaults.standard.bool(forKey: "asked." + title)
-        button = NSButton(title: settings == nil || asked ? "Open Settings" : "Allow…", target: nil, action: nil)
+        button = NSButton(title: settings == nil ? "Open Settings" : "Allow…", target: nil, action: nil)
         button.bezelStyle = .push
         mark.font = .systemFont(ofSize: 18)
         let spacer = NSView()
@@ -295,17 +318,22 @@ private final class PermissionRow {
         button.isHidden = granted
     }
 
-    /// First press: macOS's own question (which has its own way to Settings). Pressed again, or
-    /// asked before (macOS then shows nothing): the settings page. Never both at once.
+    /// macOS is asked every time (its own question, which has its own way to Settings): that
+    /// also puts Sweeflow back in the list in Settings after it was removed there (once asked,
+    /// Sweeflow used to open Settings only, and the entry never came back). When macOS shows no
+    /// question (it was turned down before), the settings page opens instead. Never both.
     @objc private func act() {
         guard let url = settingsURL else { return onAction() }
-        let key = "asked." + title
-        if UserDefaults.standard.bool(forKey: key) {
-            NSWorkspace.shared.open(url)
-        } else {
-            UserDefaults.standard.set(true, forKey: key)
-            onAction()
-            button.title = "Open Settings"
+        onAction()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if !Self.permissionPromptShowing() { NSWorkspace.shared.open(url) }
         }
+    }
+
+    /// Whether macOS has a permission question up (screen recording, accessibility).
+    private static func permissionPromptShowing() -> Bool {
+        let owners: Set<String> = ["UserNotificationCenter", "universalAccessAuthWarn", "CoreServicesUIAgent", "SecurityAgent"]
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        return list.contains { owners.contains($0[kCGWindowOwnerName as String] as? String ?? "") }
     }
 }
