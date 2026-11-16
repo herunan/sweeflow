@@ -60,7 +60,12 @@ copyright = "2026, Hernán Romero"
 license-file = ["../LICENSE", "0"]
 section = "net"
 priority = "optional"
-depends = "$auto"
+# What it links (FFmpeg and the rest, worked out), and systemd, which runs it as a user service.
+depends = "$auto, systemd"
+# Programs it runs: the Mac's sound plays through pw-cat (PipeWire) or pacat (PulseAudio), and its
+# notifications go through notify-send. Tools of a particular desktop (hyprctl, KDE's, gsettings)
+# come with that desktop.
+recommends = "pipewire-bin | pulseaudio-utils, libnotify-bin"
 extended-description = """\
 Shows the apps of a Mac as windows on this Linux desktop, over the network.
 Open Sweeflow from the app menu (or run `sweeflow install`) once as your user: \

@@ -161,6 +161,12 @@ pub fn install() -> Result<()> {
     std::fs::create_dir_all(&unit_dir)?;
     let target = installed_binary(&home);
     let me = std::env::current_exe()?;
+    // Installed by a package now, after a copy of its own: that copy comes first on PATH, and
+    // `sweeflow` typed in a terminal would have run it, old, for good.
+    let own = bin_dir.join("sweeflow");
+    if target != own && own.exists() {
+        let _ = std::fs::remove_file(&own);
+    }
     if me != target {
         std::fs::create_dir_all(&bin_dir)?;
         // Copy to a temp name then rename, so a running copy is replaced atomically.
