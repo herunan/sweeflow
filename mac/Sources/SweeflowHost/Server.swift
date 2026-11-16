@@ -106,6 +106,9 @@ final class Server {
     /// Watches the screen lock once, so the announcement says when it's locked.
     private lazy var watchLock: Void = ScreenLock.onChange { [weak self] in self?.queue.async { self?.advertise() } }
 
+    /// The announcement again, now (Start asked for a computer, or it came).
+    func announce() { queue.async { [weak self] in self?.advertise() } }
+
     private func advertise() {
         _ = watchLock
         guard let l = listener else { return }
@@ -358,6 +361,19 @@ struct Identity {
         if on { s.insert(fingerprint) } else { s.remove(fingerprint) }
         setList("disconnected", s)
     }
+
+    /// Computers Start on this Mac asked to stream: announced on the network (and to their
+    /// direct asks) until they connect, which a stopped one looks out for.
+    static func startWanted() -> Set<String> { list("start-wanted") }
+    static func setStartWanted(_ fingerprint: String, _ on: Bool) {
+        var s = startWanted()
+        if on { s = [fingerprint] } else { s.remove(fingerprint) }
+        setList("start-wanted", s)
+    }
+
+    /// The computer last streamed to: the one Start on this Mac starts when none was stopped here.
+    static var lastServed: String? { list("last-served").first }
+    static func setLastServed(_ fingerprint: String) { setList("last-served", [fingerprint]) }
 
     /// Clients forgotten here, still to be told (on their next connection).
     static func forgottenClients() -> Set<String> { list("forgotten") }

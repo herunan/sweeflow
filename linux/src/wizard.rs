@@ -678,6 +678,7 @@ fn manual_mac(text: &str) -> Option<FoundMac> {
         stream_port: 44120,
         busy: false,
         locked: false,
+        start: String::new(),
     })
 }
 

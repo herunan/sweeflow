@@ -79,6 +79,9 @@ pub struct FoundMac {
     pub busy: bool,
     /// Its screen is locked (the same).
     pub locked: bool,
+    /// Start was pressed on it for the computer whose fingerprint begins with this (16 hex
+    /// digits; empty: none).
+    pub start: String,
 }
 
 /// What a linked Mac says of itself without being connected to: streaming to a computer, and
@@ -87,6 +90,8 @@ pub struct FoundMac {
 pub struct Presence {
     pub busy: bool,
     pub locked: bool,
+    /// Start was pressed on it for this computer.
+    pub start: bool,
 }
 
 pub enum Found {
@@ -127,6 +132,7 @@ pub fn browse(service: &'static str, mut on: impl FnMut(Found) + Send + 'static)
                         stream_port: s.get_property_val_str("port").and_then(|p| p.parse().ok()).unwrap_or(44120),
                         busy: s.get_property_val_str("busy") == Some("1"),
                         locked: s.get_property_val_str("locked") == Some("1"),
+                        start: s.get_property_val_str("start").unwrap_or_default().to_string(),
                     }));
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => on(Found::Gone(instance_name(&fullname, service))),
@@ -158,6 +164,12 @@ pub fn locate(fingerprint: &str, wait: Duration) -> Option<SocketAddr> {
     rx.recv_timeout(wait).ok()
 }
 
+/// The start of this computer's certificate fingerprint, as a Mac's announcement names it.
+fn this_computer_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| crate::config::client_fingerprint().map(|f| f.get(..16).unwrap_or_default().to_string()).unwrap_or_default()).clone()
+}
+
 /// The Macs advertising streaming on the network within `wait`: the start of each one's
 /// certificate fingerprint (16 hex digits, as `locate` matches them), and what each says of
 /// itself.
@@ -166,7 +178,8 @@ pub fn seen_on_network(wait: Duration) -> std::collections::HashMap<String, Pres
     let s2 = seen.clone();
     let browser = browse(STREAM_SERVICE, move |f| {
         if let Found::Up(m) = f {
-            s2.lock().unwrap().insert(m.id, Presence { busy: m.busy, locked: m.locked });
+            let start = !m.start.is_empty() && this_computer_id() == m.start;
+            s2.lock().unwrap().insert(m.id, Presence { busy: m.busy, locked: m.locked, start });
         }
     });
     if browser.is_ok() {
@@ -431,7 +444,8 @@ async fn ask_full(conn: &quinn::Connection, ty: u8) -> Result<(u8, Option<Presen
         r.u16().ok()?;
         r.bytes().ok()?;
         let busy = r.u8().ok()? != 0;
-        Some(Presence { busy, locked: r.u8().is_ok_and(|l| l != 0) })
+        let locked = r.u8().is_ok_and(|l| l != 0);
+        Some(Presence { busy, locked, start: r.u8().is_ok_and(|s| s != 0) })
     })();
     Ok((status, presence))
 }
@@ -735,7 +749,7 @@ mod tests {
     }
 
     fn found() -> FoundMac {
-        FoundMac { name: "Air".into(), id: String::new(), hostname: "air.local".into(), addr: "192.168.1.20:44121".parse().unwrap(), stream_port: 44120, busy: false, locked: false }
+        FoundMac { name: "Air".into(), id: String::new(), hostname: "air.local".into(), addr: "192.168.1.20:44121".parse().unwrap(), stream_port: 44120, busy: false, locked: false, start: String::new() }
     }
 
     fn result(status: u8, tag: &[u8]) -> Vec<u8> {

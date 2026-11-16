@@ -308,13 +308,15 @@ final class Pairing {
     /// streaming from: one unlinked here then forgets this Mac too).
     private func check(on stream: MsgStream, _ conn: NWConnection) {
         guard let fp = Server.peerFingerprint(conn)?.lowercased() else { return reply(stream, .busy) }
-        if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) { return reply(stream, .linked) }
+        if Identity.pairedClients().contains(where: { $0.fingerprint == fp }) {
+            return reply(stream, .linked, start: Identity.startWanted().contains(fp))
+        }
         // Told now: no need to tell it when it next connects.
         if Identity.forgottenClients().contains(fp) { Identity.setForgotten(fp, false) }
         reply(stream, .notLinked)
     }
 
-    private func reply(_ stream: MsgStream, _ status: PairStatus, tag: Data = Data()) {
+    private func reply(_ stream: MsgStream, _ status: PairStatus, tag: Data = Data(), start: Bool = false) {
         var w = MsgWriter(.pairResult)
         w.u8(status.rawValue)
         w.str(macName)
@@ -325,6 +327,8 @@ final class Pairing {
         // announcement (a virtual machine's network, a network that drops it) asks instead.
         w.u8(Server.serving ? 1 : 0)
         w.u8(ScreenLock.isLocked ? 1 : 0)
+        // Start on this Mac asked for the computer asking.
+        w.u8(start ? 1 : 0)
         stream.send(w)
     }
 
@@ -352,7 +356,9 @@ final class Pairing {
 /// connecting (a connection is turned away while another computer is served).
 func serviceTXT(busy: Bool = false) -> NWTXTRecord {
     NWTXTRecord(["id": String(identity.fingerprint.prefix(16)), "port": "\(settings.config.port)", "v": "\(protocolVersion)",
-                 "busy": busy ? "1" : "0", "locked": ScreenLock.isLocked ? "1" : "0"])
+                 "busy": busy ? "1" : "0", "locked": ScreenLock.isLocked ? "1" : "0",
+                 // Start on this Mac, for that computer (the start of its fingerprint): it starts.
+                 "start": Identity.startWanted().first.map { String($0.prefix(16)) } ?? ""])
 }
 
 /// The code a computer that's linking has to type, in big digits. A window of its own rather than

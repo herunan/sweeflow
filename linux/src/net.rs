@@ -535,6 +535,12 @@ fn watch_presence(in_use: &str) {
                     said = *p;
                 }
             }
+            // Start pressed on the Mac in use, for this computer: started here too.
+            if *fp == in_use && said.start && offline() {
+                log::info!("started on the Mac: starting here too");
+                set_offline(false);
+                crate::tray::refresh();
+            }
             for (set, on) in [(&BUSY, said.busy), (&LOCKED, said.locked)] {
                 let mut set = set.lock().unwrap();
                 changed |= if on { set.insert(fp.clone()) } else { set.remove(fp) };
@@ -1230,8 +1236,9 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             return Ok(());
         }
         t::MAC_DISCONNECTED => {
-            log::info!("the Mac disconnected this computer: refused until it connects again");
-            crate::tray::set_mac_refused(true);
+            // As this computer's own Stop: the Mac stays there, online, for Start on either side.
+            log::info!("stopped on the Mac: stopped here too, until Start (here or there)");
+            set_offline(true);
             return Ok(());
         }
         t::FORGOTTEN => {

@@ -181,9 +181,16 @@ final class Session {
                 Identity.setForgotten(fp, false)
                 return sendAndClose(.forgotten)
             }
+            // Stopped from this Mac: a client from version 3 connects only when Start is pressed
+            // there (a Stop here stops it too), so its connecting starts it again. An older one
+            // keeps asking by itself: refused until Start here.
             if let fp = clientFingerprint, Identity.disconnectedClients().contains(fp) {
-                log("client \(fp.prefix(8)) was disconnected here: refused")
-                return sendAndClose(.macDisconnected)
+                guard v >= 3 else {
+                    log("client \(fp.prefix(8)) was stopped here: refused")
+                    return sendAndClose(.macDisconnected)
+                }
+                log("client \(fp.prefix(8)) was stopped here and started there: streaming again")
+                Identity.setDisconnected(fp, false)
             }
             // Newer clients say their name. One linked without a name (the development setup)
             // takes it, so the menu lists it by name rather than a code from its certificate.
@@ -193,6 +200,13 @@ final class Session {
                 Identity.renameClient(fp, to: clientName)
             }
             if let claim = onHello, !claim(self) { return }
+            if let fp = clientFingerprint {
+                Identity.setLastServed(fp)
+                if Identity.startWanted().contains(fp) {
+                    Identity.setStartWanted(fp, false)
+                    server.announce()
+                }
+            }
             ScrollAcceleration.reload()   // the scroll settings may have changed meanwhile
             DebugPort.session = self
             if !started {

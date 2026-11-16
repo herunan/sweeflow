@@ -1097,14 +1097,6 @@ pub fn mac_display_name() -> String {
     if name.is_empty() { "Your Mac".into() } else { name }
 }
 
-pub fn set_mac_refused(on: bool) {
-    let mut s = STATE.lock().unwrap();
-    if s.mac_refused != on {
-        s.mac_refused = on;
-        drop(s);
-        refresh();
-    }
-}
 
 /// The Mac in use forgot this computer (from its menu): forget it here too.
 pub fn mac_forgot_us() {

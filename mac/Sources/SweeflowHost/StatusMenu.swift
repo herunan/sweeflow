@@ -89,7 +89,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         if let fp = client {
             menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
             menu.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(fp) })
-        } else if let fp = refused.first {
+        } else if let fp = refused.first ?? Identity.lastServed.flatMap({ fp in
+            Identity.pairedClients().contains { $0.fingerprint == fp } ? fp : nil
+        }) {
+            // Stopped here or there: Start here starts it there too.
             menu.addItem(ClosureMenuItem(title: "Start") { Self.connect(fp) })
         }
         menu.addItem(.separator())
@@ -188,16 +191,21 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
-    /// Ends that computer's connection and refuses it until Start (it shows "Disconnected on
-    /// the Mac" meanwhile).
+    /// Stops streaming to that computer: it stops there too (as its own Stop would), and starts
+    /// again with Start on either side. (An older one is refused until Start here.)
     static func disconnect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, true)
+        Identity.setStartWanted(fingerprint, false)
         server.drop(fingerprint, telling: .macDisconnected)
+        server.announce()
     }
 
-    /// Lets it in again: it connects by itself within a few seconds.
+    /// Starts streaming to it: said on the network, which a stopped computer looks out for; it
+    /// connects within a few seconds.
     static func connect(_ fingerprint: String) {
         Identity.setDisconnected(fingerprint, false)
+        Identity.setStartWanted(fingerprint, true)
+        server.announce()
     }
 
     private static func rename(_ fingerprint: String) {

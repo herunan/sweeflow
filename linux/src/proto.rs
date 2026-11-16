@@ -3,7 +3,9 @@
 use anyhow::{bail, Result};
 
 /// 2: understands WINDOW_REPLACED (the Mac sends it only to clients that say 2 or more).
-pub const VERSION: u16 = 2;
+/// 3: a Stop on the Mac (MAC_DISCONNECTED) stops this computer too, which then connects only
+/// when Start is pressed (here, or on the Mac): the Mac lets it in again on connecting.
+pub const VERSION: u16 = 3;
 
 pub mod t {
     pub const HELLO: u8 = 0x01;

@@ -24,7 +24,7 @@ The first bidirectional stream the client opens. Carries everything except video
 |------|-----|------|---------|
 | 0x01 | C→S | Hello | u16 version, f32 clientScale, f32 captureScale (0 = window's native backing scale), str computerName (newer clients; see One computer at a time) |
 | 0x02 | S→C | Welcome | u16 version, str hostName, str kind ("laptop", "imac", "desktop"; newer hosts) |
-| 0x03 | S→C | MacDisconnected | — the Mac disconnected this client (its menu); refused until connected there again |
+| 0x03 | S→C | MacDisconnected | — Stop on the Mac (its menu) for this client: a client from version 3 stops as its own Stop would, and connects again only on Start, pressed there or on the Mac (the Mac then announces `start` = the start of the client's fingerprint in its TXT record, and in the PairResult of a PairCheck, until that client connects); the Mac lets a version-3 client in again on connecting. Older clients are refused until Start on the Mac |
 | 0x05 | C→S | Goodbye | — leaving on purpose (switching Macs, disconnecting, quitting): the Mac tidies up at once |
 | 0x04 | S→C | Forgotten | — the Mac forgot this client; it forgets the Mac too |
 | 0x06 | S→C | Busy | str computerName — the host is streaming to that computer: this one is turned away (closed half a second later; what it sends meanwhile is ignored) |
@@ -154,7 +154,7 @@ request).
 | 0x76 | C→S | PairGuess | bytes clientShare (32), bytes clientTag (32) |
 | 0x77 | C→S | PairUnlink | — the client unlinked the host: the host forgets the client's certificate |
 | 0x78 | C→S | PairCheck | — is the client still linked here? |
-| 0x71 | S→C | PairResult | u8 status, str hostName, u16 streamPort, u16 linkVersion (the host's), bytes hostTag (32 with status 0 after a PairGuess, else empty) |
+| 0x71 | S→C | PairResult | u8 status, str hostName, u16 streamPort, u16 linkVersion (the host's), bytes hostTag (32 with status 0 after a PairGuess, else empty), u8 busy, u8 locked, u8 start (Start was pressed on the Mac for the asking client) |
 
 (0x72–0x74 were version 2's nonce exchange, where both screens showed a code to compare.)
 
