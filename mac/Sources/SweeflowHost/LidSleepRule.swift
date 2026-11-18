@@ -1,34 +1,47 @@
 import AppKit
 import IOKit.ps
 
-/// The sudoers rule that lets Sweeflow keep the Mac awake with its lid closed while it streams,
-/// on battery too: `pmset disablesleep` is the only switch for that, and it needs root. The rule
-/// allows this user exactly the two calls Wakefulness makes, without a password, and nothing
-/// else. Installed or removed from the menu ("MacBook lid can be closed"), each time with an
-/// administrator's password in macOS's own dialog.
+/// "Stream with lid closed": the MacBook stays awake with its lid shut while it streams, on
+/// battery too. Off until the person turns it on (Sweeflow's menu, or Linux's Settings).
+/// `pmset disablesleep` is the only switch for that, and it needs root: a sudoers rule allows
+/// this user exactly the two calls Wakefulness makes, without a password, and nothing else. It's
+/// installed the first time the setting is turned on (an administrator's password, in macOS's own
+/// dialog) and then stays: turning the setting off or on again asks nothing.
 enum LidSleepRule {
     static let path = "/etc/sudoers.d/sweeflow"
 
     static var installed: Bool { FileManager.default.fileExists(atPath: path) }
 
+    /// The setting: on only once turned on, and only with the rule in place.
+    private static let wantedKey = "streamWithLidClosed"
+    static var wanted: Bool { UserDefaults.standard.bool(forKey: wantedKey) && installed }
+
     private static let lock = NSLock()
     /// The rule asked for while its password prompt is up (nil: none is).
     private static var asking: Bool?
 
-    /// What the switches show: the rule, or what was just asked for while the password is
-    /// awaited (so a switch flipped on Linux doesn't spring back meanwhile). Any thread.
-    static var shown: Bool { lock.withLock { asking } ?? installed }
+    /// What the switches show: the setting, or on while the password for it is awaited (so a
+    /// switch flipped on Linux doesn't spring back meanwhile). Any thread.
+    static var shown: Bool { lock.withLock { asking } ?? wanted }
 
-    /// Turns the rule on or off from any of its switches (the menu-bar item, the setup window,
-    /// Linux): the password prompt, unless one is up already, then everyone told the outcome.
-    /// Main thread.
-    static func ask(_ install: Bool) {
-        guard hasLid, install != installed, lock.withLock({ asking }) == nil else { return }
-        lock.withLock { asking = install }
+    /// Turns the setting on or off from either of its switches (the menu-bar item, Linux). On
+    /// for the first time: the password prompt for the rule, unless one is up already. Off: no
+    /// password, the rule stays. Then everyone told. Main thread.
+    static func ask(_ on: Bool) {
+        guard hasLid, on != wanted, lock.withLock({ asking }) == nil else { return }
+        if !on || installed {
+            UserDefaults.standard.set(on, forKey: wantedKey)
+            host.wake.lidSettingChanged()
+            return tell()
+        }
+        lock.withLock { asking = true }
         tell()
-        set(install) { ok in
+        set(true) { ok in
             lock.withLock { asking = nil }
-            if ok, installed { host.wake.lidRuleInstalled() }
+            if ok, installed {
+                UserDefaults.standard.set(true, forKey: wantedKey)
+                host.wake.lidSettingChanged()
+            }
             tell()
         }
     }

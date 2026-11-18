@@ -26,46 +26,47 @@ func presentToPerson(_ w: NSWindow) {
     w.orderFrontRegardless()
 }
 
-/// How Sweeflow starts with the Mac: a LaunchAgent inside the app bundle (registered with
-/// SMAppService), unless a development install put its own in ~/Library/LaunchAgents.
+/// How Sweeflow starts with the Mac: macOS opens the app itself at login (SMAppService.mainApp,
+/// listed under Login Items › Open at Login), unless a development install put its own
+/// LaunchAgent in ~/Library/LaunchAgents. Not a LaunchAgent inside the bundle, as before: macOS
+/// refuses to start one from an app without a Developer ID (a launch constraint, exit 78), so
+/// nothing opened at login.
 enum LoginItem {
-    static let agentLabel = "dev.sweeflow.agent"
     static let devAgentLabel = "dev.sweeflow.host"
-    static let service = SMAppService.agent(plistName: "\(agentLabel).plist")
+    static var service: SMAppService { .mainApp }
 
     static var devInstall: Bool {
         FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/\(devAgentLabel).plist").path)
     }
 
-    /// Started by launchd (at login, or kept alive), rather than opened by hand.
-    static var underLaunchd: Bool {
-        let name = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] ?? ""
-        return name == agentLabel || name == devAgentLabel
-    }
+    /// Started by the development LaunchAgent, rather than opened (by hand or at login).
+    static var underLaunchd: Bool { ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == devAgentLabel }
 
-    /// Opening at login is on: wanted, and macOS lets the login item run.
-    static var enabled: Bool { devInstall || (wanted && service.status == .enabled) }
+    /// Opening at login is on: macOS has Sweeflow among the apps it opens at login.
+    static var enabled: Bool { devInstall || service.status == .enabled }
     static var needsApproval: Bool { !devInstall && service.status == .requiresApproval }
 
-    /// Whether the person wants Sweeflow opened at login (on until they switch it off). Only a
-    /// setting: the login item stays registered either way, and a copy macOS starts at login
-    /// while it's off quits straight away (see main.swift). Switching it starts or stops nothing:
-    /// unregistering the login item ended the copy that was running (it was the login item).
+    /// Whether the person wants Sweeflow opened at login (on until they switch it off): kept,
+    /// so a first start registers it but one after switching it off doesn't.
     private static let wantedKey = "openAtLogin"
     static var wanted: Bool { UserDefaults.standard.object(forKey: wantedKey) as? Bool ?? true }
     static func set(_ on: Bool) {
         UserDefaults.standard.set(on, forKey: wantedKey)
-        if on, !devInstall, service.status != .enabled { enable() }
+        if devInstall { return }
+        do {
+            if on, service.status != .enabled { try service.register() }
+            if !on, service.status != .notRegistered { try service.unregister() }
+        } catch { log("login item: \(error)") }
     }
 
-    /// Registers the login item, for the next login. macOS starts it right away too: it finds
-    /// this copy running and quits (main.swift). True if macOS lets it run.
-    @discardableResult
-    static func enable() -> Bool {
-        if devInstall { return true }
-        do { try service.register() } catch { log("login item: \(error)") }
-        return service.status == .enabled
+    /// At start: Sweeflow registered to open at login, if wanted and not yet.
+    static func check() {
+        if devInstall { return }
+        if wanted, service.status == .notRegistered {
+            do { try service.register() } catch { log("login item: \(error)") }
+        }
+        log("login item: \(["not registered", "on", "needs approval in System Settings", "not found"][min(service.status.rawValue, 3)])")
     }
 }
 
@@ -95,8 +96,6 @@ final class Onboarding: NSObject, NSWindowDelegate {
     private let axStep = SetupStep(symbol: "accessibility", title: "Accessibility",
                                    detail: "Lets you type, click and move windows from Linux.")
     private let loginBox = NSButton(checkboxWithTitle: "Open Sweeflow when you log in", target: nil, action: nil)
-    /// MacBooks only: keeps streaming with the lid closed (LidSleepRule; asks for the password).
-    private let lidBox = NSButton(checkboxWithTitle: "MacBook lid can be closed", target: nil, action: nil)
     private let status = NSTextField(wrappingLabelWithString: "")
     private let done = NSButton(title: "Done", target: nil, action: nil)
 
@@ -183,14 +182,6 @@ final class Onboarding: NSObject, NSWindowDelegate {
 
         loginBox.target = self
         loginBox.action = #selector(toggleLogin)
-        lidBox.target = self
-        lidBox.action = #selector(toggleLid)
-        let lidNote = NSTextField(labelWithString: "Asks for your password")
-        lidNote.font = .systemFont(ofSize: 12)
-        lidNote.textColor = .secondaryLabelColor
-        let lidRow = NSStackView(views: [lidBox, lidNote])
-        lidRow.spacing = 8
-        lidRow.alignment = .firstBaseline
 
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
@@ -213,7 +204,7 @@ final class Onboarding: NSObject, NSWindowDelegate {
         line.translatesAutoresizingMaskIntoConstraints = false
         line.widthAnchor.constraint(equalToConstant: inner).isActive = true
 
-        let boxes = NSStackView(views: LidSleepRule.hasLid ? [loginBox, lidRow] : [loginBox])
+        let boxes = NSStackView(views: [loginBox])
         boxes.orientation = .vertical
         boxes.alignment = .leading
         boxes.spacing = 8
@@ -312,7 +303,6 @@ final class Onboarding: NSObject, NSWindowDelegate {
         if ax { axStep.show(done: true) } else { axStep.show(done: false, button: "Allow…") }
 
         loginBox.state = LoginItem.enabled ? .on : .off
-        lidBox.state = LidSleepRule.shown ? .on : .off
 
         let ready = screen && ax && audio == .allowed
         let linkedTo = Identity.pairedClients().map(\.name).first
@@ -368,10 +358,6 @@ final class Onboarding: NSObject, NSWindowDelegate {
         refresh()
     }
 
-    @objc private func toggleLid() {
-        LidSleepRule.ask(lidBox.state == .on)
-        refresh()
-    }
 
     @objc private func finish() {
         window?.close()

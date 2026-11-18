@@ -4,10 +4,9 @@
 set -euo pipefail
 BIN="$1"; APP="$2"; VERSION="$3"; BUILD="$4"
 BUNDLE_ID="dev.sweeflow.host"
-AGENT_LABEL="dev.sweeflow.agent"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchAgents"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/SweeflowHost"
 # Icons (drawn by make-icons.sh): the app's, and the menu-bar item's.
 RES="$(cd "$(dirname "$0")" && pwd)/Resources"
@@ -31,20 +30,5 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSAudioCaptureUsageDescription</key><string>Sweeflow plays your Mac apps' sound on your Linux desktop.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Sweeflow lets your Linux computer find this Mac and connect to it.</string>
   <key>NSBonjourServices</key><array><string>_sweeflow._udp</string><string>_sweeflow-pair._udp</string></array>
-</dict></plist>
-PLIST
-# Started at login once Sweeflow registers it with SMAppService, and again after a crash (not after
-# quitting: a successful exit). Registered whatever "Open at login" says: with that off, the copy
-# started at login quits at once (main.swift).
-cat > "$APP/Contents/Library/LaunchAgents/$AGENT_LABEL.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>$AGENT_LABEL</string>
-  <key>BundleProgram</key><string>Contents/MacOS/SweeflowHost</string>
-  <key>AssociatedBundleIdentifiers</key><array><string>$BUNDLE_ID</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 PLIST

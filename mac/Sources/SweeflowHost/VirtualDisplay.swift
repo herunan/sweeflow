@@ -198,6 +198,8 @@ final class VirtualDisplay {
 final class Wakefulness {
     private var assertions: [IOPMAssertionID] = []
     private var lidSleepDisabled = false
+    /// Between hold and release.
+    private var streaming = false
 
     func hold() {
         guard assertions.isEmpty else { return }
@@ -209,22 +211,28 @@ final class Wakefulness {
             }
         }
         // Closing the lid sleeps a MacBook regardless of assertions; `pmset disablesleep` is the
-        // only switch, run through sudo: it needs the sudoers rule allowing exactly these two
-        // calls, installed from the menu (LidSleepRule). Without it, closing the lid on battery
-        // sleeps the Mac.
-        lidSleepDisabled = true
-        Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
+        // only switch, run through sudo: only with "Stream with lid closed" on (LidSleepRule,
+        // whose sudoers rule allows exactly these two calls).
+        streaming = true
+        if LidSleepRule.wanted {
+            lidSleepDisabled = true
+            Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
+        }
     }
 
-    /// The rule was just installed: applied at once if streaming already.
-    func lidRuleInstalled() {
-        guard lidSleepDisabled else { return }
-        Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: true) }
+    /// "Stream with lid closed" turned on or off: applied at once while streaming.
+    func lidSettingChanged() {
+        guard streaming else { return }
+        let on = LidSleepRule.wanted
+        guard on != lidSleepDisabled else { return }
+        lidSleepDisabled = on
+        Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: on) }
     }
 
     func release() {
         assertions.forEach { IOPMAssertionRelease($0) }
         assertions.removeAll()
+        streaming = false
         if lidSleepDisabled {
             lidSleepDisabled = false
             Self.pmsetQueue.async { [self] in _ = setLidSleep(disabled: false) }
@@ -264,7 +272,7 @@ final class Wakefulness {
             log("lid-close sleep \(disabled ? "disabled" : "restored")")
             return true
         } catch {
-            if disabled { log("cannot disable lid-close sleep (no rule: \"MacBook lid can be closed\" in Sweeflow's menu installs it)") }
+            if disabled { log("cannot disable lid-close sleep (no rule: turning on \"Stream with lid closed\" installs it)") }
             return false
         }
     }

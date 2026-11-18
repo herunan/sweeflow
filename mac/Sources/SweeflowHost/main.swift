@@ -142,11 +142,7 @@ if ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] != LoginItem.devAgent
 // ~13 s, or left nothing running when the old copy was still quitting.
 let otherCopy = { NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
     .first { $0.processIdentifier != getpid() && !$0.isTerminated } }
-if LoginItem.underLaunchd, !LoginItem.devInstall {
-    // At login: not wanted, or Sweeflow is already up. A successful exit isn't started again.
-    if !LoginItem.wanted { log("started at login, but Open at login is off: quitting"); exit(0) }
-    if otherCopy() != nil { log("started by launchd, but Sweeflow is already running: quitting"); exit(0) }
-} else if !LoginItem.underLaunchd {
+if !LoginItem.underLaunchd {
     let me = Bundle.main.executableURL.flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
     if let other = otherCopy() {
         // Started before the app on disk was replaced: an older version. It makes way.
@@ -175,10 +171,8 @@ if LoginItem.underLaunchd, !LoginItem.devInstall {
         while !other.isTerminated && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.25)) }
         if !other.isTerminated { other.forceTerminate(); RunLoop.current.run(until: Date().addingTimeInterval(1)) }
     }
-    // For the next login (registering starts the item now too: it sees this copy and quits).
-    if LoginItem.wanted, !LoginItem.devInstall, LoginItem.service.status != .enabled {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { LoginItem.enable() }
-    }
+    // For the next login.
+    DispatchQueue.main.async { LoginItem.check() }
 }
 
 let settings = Settings(Config.load())

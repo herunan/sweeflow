@@ -78,8 +78,21 @@ final class Pairing {
     /// permission is on: no code pops up uninvited, and nothing links before this Mac can stream.
     private var linkingOpen = false
 
-    /// The Link window opened or closed (main thread).
-    func setOpen(_ open: Bool) { queue.async { self.linkingOpen = open } }
+    /// The Link window opened or closed (main thread): this Mac is findable for linking only
+    /// while it's open (the service is announced then, and taken down after).
+    func setOpen(_ open: Bool) {
+        queue.async {
+            self.linkingOpen = open
+            self.announce()
+        }
+    }
+
+    /// The linking service on the network, or not, as the Link window is.
+    private func announce() {
+        guard let l = listener else { return }
+        l.service = linkingOpen ? NWListener.Service(name: macName, type: pairServiceType, domain: nil, txtRecord: serviceTXT()) : nil
+        log("pairing: \(linkingOpen ? "findable for linking" : "not findable for linking")")
+    }
 
     private struct Attempt {
         let stream: ObjectIdentifier
@@ -120,8 +133,10 @@ final class Pairing {
         }, queue)
         do {
             let l = try NWListener(using: NWParameters(quic: quic), on: NWEndpoint.Port(rawValue: Pairing.port)!)
-            l.service = NWListener.Service(name: macName, type: pairServiceType, domain: nil,
-                                           txtRecord: serviceTXT())
+            // Announced only while the Link window is open (announce).
+            if linkingOpen {
+                l.service = NWListener.Service(name: macName, type: pairServiceType, domain: nil, txtRecord: serviceTXT())
+            }
             l.stateUpdateHandler = { [weak self] state in
                 log("pairing listener: \(state)")
                 // It's meant to be up for as long as Sweeflow runs: one that failed is started again.

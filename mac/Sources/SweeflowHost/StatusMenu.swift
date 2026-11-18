@@ -149,7 +149,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(login)
         // A MacBook sleeps when its lid closes, whatever an app asks, unless pmset is told
         // otherwise (as root: see LidSleepRule).
-        let lid = ClosureMenuItem(title: "MacBook lid can be closed") { LidSleepRule.ask(!LidSleepRule.installed) }
+        let lid = ClosureMenuItem(title: "Stream with lid closed") { LidSleepRule.ask(!LidSleepRule.shown) }
         lid.state = LidSleepRule.shown ? .on : .off
         if LidSleepRule.hasLid { menu.addItem(lid) }
         menu.addItem(.separator())
@@ -197,14 +197,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         host.display.remove()
     }
 
-    /// Leaves the Mac as it was (screen, virtual display), then stops. Started by launchd (at
-    /// login, kept running), Sweeflow is taken out of it first, or it would be started again.
+    /// Leaves the Mac as it was (screen, virtual display), then stops. Started by the development
+    /// LaunchAgent (kept running), Sweeflow is taken out of launchd first, or it would start again.
     private static func quit() {
         log("quitting (menu)")
         leaveMacAsItWas()
-        // The bundled login item is only started again after a crash (KeepAlive SuccessfulExit,
-        // bundle.sh): quitting leaves it loaded, so opening Sweeflow again just starts it. The
-        // development LaunchAgent keeps itself alive: it's taken out of launchd.
+        // The development LaunchAgent keeps itself alive: it's taken out of launchd.
         if LoginItem.underLaunchd, LoginItem.devInstall {
             // launchd ends this process as it unloads it.
             _ = try? run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(LoginItem.devAgentLabel)"])

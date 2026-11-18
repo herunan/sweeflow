@@ -35,7 +35,7 @@ final class Settings {
         var launcher: Bool?
         var quality: String?
         var desktop: Bool?
-        /// Streaming with the lid closed (LidSleepRule): not in Config, it's the rule itself.
+        /// Streaming with the lid closed (LidSleepRule): its own setting, not in Config.
         /// Asked for from Linux, it brings up the password prompt here.
         var lid: Bool?
         /// A MacBook: only then is `lid` offered (sent, not read).
