@@ -12,16 +12,20 @@ use anyhow::{Context, Result};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 slint::slint! {
-    import { Look, Btn } from "look.slint";
+    import { Look, Btn, Field } from "look.slint";
     export { Look }
 
     export struct PromptButton { index: int, label: string }
+    // A text field of the Mac prompt (a password's shows dots); focus: the one to type in first.
+    export struct PromptField { label: string, secret: bool, value: string, focus: bool }
 
     export component Prompt inherits Window {
         in property <string> heading;
         in property <string> body;
         in property <[PromptButton]> buttons;
         in property <int> default-index: -1;
+        in property <[PromptField]> fields;
+        callback edited(int, string);
         callback pressed(int);
         callback cancelled();
 
@@ -31,7 +35,7 @@ slint::slint! {
         // As big as its text and buttons need, and not resizable (so a tiling desktop leaves it
         // floating, as it does any dialog).
         width: max(480px, row.preferred-width + 40px);
-        height: body-text.y + body-text.height + row.height + 44px;
+        height: body-text.y + body-text.height + (root.fields.length > 0 ? field-box.height + 16px : 0px) + row.height + 44px;
         forward-focus: keys;
 
         keys := FocusScope {
@@ -70,9 +74,28 @@ slint::slint! {
             wrap: word-wrap;
             font-size: 14px;
         }
+        // The prompt's text fields (a user name, a password): what's typed goes into the Mac's.
+        field-box := VerticalLayout {
+            x: 20px;
+            y: body-text.y + body-text.height + 16px;
+            width: root.width - 40px;
+            height: root.fields.length > 0 ? self.preferred-height : 0px;
+            spacing: 8px;
+            for f[i] in root.fields: VerticalLayout {
+                spacing: 4px;
+                if f.label != "": Text { text: f.label; color: Look.muted; font-size: 12px; }
+                field := Field {
+                    secret: f.secret;
+                    text: f.value;
+                    init => { if (f.focus) { self.focus(); } }
+                    changed text => { root.edited(i, self.text); }
+                    accepted(t) => { if (root.default-index >= 0) { root.pressed(root.default-index); } }
+                }
+            }
+        }
         row := HorizontalLayout {
             x: 20px;
-            y: body-text.y + body-text.height + 24px;
+            y: body-text.y + body-text.height + (root.fields.length > 0 ? field-box.height + 16px : 0px) + 24px;
             width: root.width - 40px;
             height: self.preferred-height;
             alignment: end;
@@ -108,7 +131,32 @@ pub fn run(args: &[String]) -> Result<()> {
     ui.set_body(args.get(3).map(String::as_str).unwrap_or_default().into());
     ui.set_buttons(ModelRc::new(VecModel::from(buttons)));
     ui.set_default_index(default);
-    ui.on_pressed(|index| std::process::exit(10 + index));
+    // The Mac prompt's fields (blind.rs puts them here): shown, and what's typed in them printed
+    // as the dialog closes with a button, for the Mac's fields.
+    let fields: Vec<crate::blind::Field> = std::env::var("SWEEFLOW_PROMPT_FIELDS").ok().and_then(|f| serde_json::from_str(&f).ok()).unwrap_or_default();
+    let first = fields.iter().position(|f| f.value.is_empty()).unwrap_or(0);
+    let typed = std::rc::Rc::new(std::cell::RefCell::new(fields.iter().map(|f| f.value.clone()).collect::<Vec<_>>()));
+    ui.set_fields(ModelRc::new(VecModel::from(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| PromptField { label: f.label.as_str().into(), secret: f.secret, value: f.value.as_str().into(), focus: i == first })
+            .collect::<Vec<_>>(),
+    )));
+    let edits = typed.clone();
+    ui.on_edited(move |i, text| {
+        if let Some(v) = edits.borrow_mut().get_mut(i as usize) {
+            *v = text.to_string();
+        }
+    });
+    ui.on_pressed(move |index| {
+        if !typed.borrow().is_empty() {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(serde_json::to_string(&*typed.borrow()).unwrap_or_default().as_bytes());
+            let _ = std::io::stdout().flush();
+        }
+        std::process::exit(10 + index)
+    });
     ui.on_cancelled(move || std::process::exit(if cancel >= 0 { 10 + cancel } else { 0 }));
     ui.run()?;
     Ok(())

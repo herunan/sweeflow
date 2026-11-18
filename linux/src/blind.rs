@@ -33,9 +33,19 @@ fn shown_name(app: &str) -> &str {
     }
 }
 
-pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String], net: UnboundedSender<NetCmd>) {
+/// A text field of a Mac prompt: its label, whether it's a password's, and what it holds (a
+/// password's is never sent from the Mac).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Field {
+    pub label: String,
+    pub secret: bool,
+    pub value: String,
+}
+
+pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String], fields: &[Field], net: UnboundedSender<NetCmd>) {
     let app = shown_name(app);
-    let heading = if title.is_empty() || title == app { app.to_string() } else { format!("{app} — {title}") };
+    // "Untitled": a window with no title of its own (the password prompt).
+    let heading = if title.is_empty() || title == app || title == "Untitled" { app.to_string() } else { format!("{app} — {title}") };
     // "Help" only opens Apple's help viewer; the rest keep their Mac order (default last).
     let shown: Vec<(usize, &String)> = buttons.iter().enumerate().filter(|(_, b)| b.as_str() != "Help").collect();
     if shown.is_empty() {
@@ -53,12 +63,15 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
     // The Mac's cancel button (closing the dialog answers like it, as with any dialog).
     let cancel = buttons.iter().position(|b| ["Cancel", "Deny", "Don’t Allow", "Don't Allow", "No"].contains(&b.as_str()));
     let text = texts.join("\n\n");
-    if let Some(child) = spawn_prompt(&heading, &text, &shown, cancel) {
+    if let Some(child) = spawn_prompt(&heading, &text, &shown, cancel, fields) {
         let pid = child.id();
         DIALOGS.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, pid);
         let (app, title, texts, buttons) = (app.to_string(), title.to_string(), texts.to_vec(), buttons.to_vec());
         std::thread::spawn(move || {
-            let Ok(status) = child.wait_with_output().map(|o| o.status) else { return };
+            let Ok(out) = child.wait_with_output() else { return };
+            let status = out.status;
+            // What was typed in its fields (prompt.rs prints them), in their order.
+            let typed: Vec<String> = serde_json::from_slice(&out.stdout).unwrap_or_default();
             // Closed because the Mac window went away (or replaced): nothing to press.
             let ours = DIALOGS.lock().unwrap().as_mut().and_then(|m| (m.get(&id) == Some(&pid)).then(|| m.remove(&id))).flatten();
             if ours.is_none() {
@@ -78,7 +91,16 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
             };
             if let Some(i) = index {
                 log::info!("stand-in {id}: pressing button {i}");
-                let _ = net.send(NetCmd::Control(W::new(t::BLIND_PRESS).u32(id).u16(i as u16).finish()));
+                // The fields' text first goes into the Mac prompt's fields (a password included:
+                // over the encrypted link, to that prompt only, and kept nowhere).
+                let mut w = W::new(t::BLIND_PRESS).u32(id).u16(i as u16);
+                if !typed.is_empty() && Some(i) != cancel {
+                    w = w.u16(typed.len() as u16);
+                    for v in &typed {
+                        w = w.str(v);
+                    }
+                }
+                let _ = net.send(NetCmd::Control(w.finish()));
             }
         });
         return;
@@ -88,21 +110,27 @@ pub fn show(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String
 
 /// The plain prompt: this program again, as `sweeflow prompt` (prompt.rs). None when it can't
 /// be started.
-fn spawn_prompt(heading: &str, text: &str, shown: &[(usize, &String)], cancel: Option<usize>) -> Option<std::process::Child> {
-    // The Mac's default button is its last.
-    let default = shown.last().map(|(i, _)| *i as i64).unwrap_or(-1);
+fn spawn_prompt(heading: &str, text: &str, shown: &[(usize, &String)], cancel: Option<usize>, fields: &[Field]) -> Option<std::process::Child> {
+    // The Mac's default button is its last, unless that's its cancel button (the password
+    // prompt lists Allow Access, then Don't Allow): then the last other one.
+    let default = shown.iter().rev().find(|(i, _)| Some(*i) != cancel).or(shown.last()).map(|(i, _)| *i as i64).unwrap_or(-1);
     let mut cmd = Command::new(std::env::current_exe().ok()?);
     cmd.arg("prompt");
     cmd.args([default.to_string(), cancel.map_or(-1, |c| c as i64).to_string(), heading.to_string(), text.to_string()]);
     for (i, label) in shown {
         cmd.args([i.to_string(), label.to_string()]);
     }
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()
+    // Its fields as JSON in the environment; what's typed in them comes back on its output.
+    if !fields.is_empty() {
+        cmd.env("SWEEFLOW_PROMPT_FIELDS", serde_json::to_string(fields).unwrap_or_default());
+    }
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()
 }
 
 /// The same with kdialog, whose dialogs always carry an icon and icons on their buttons.
 fn show_kdialog(id: u32, app: &str, title: &str, texts: &[String], buttons: &[String], net: UnboundedSender<NetCmd>) {
-    let heading = if title.is_empty() || title == app { app.to_string() } else { format!("{app} — {title}") };
+    // "Untitled": a window with no title of its own (the password prompt).
+    let heading = if title.is_empty() || title == app || title == "Untitled" { app.to_string() } else { format!("{app} — {title}") };
     let shown: Vec<(usize, &String)> = buttons.iter().enumerate().filter(|(_, b)| b.as_str() != "Help").collect();
     let cancel = buttons.iter().position(|b| ["Cancel", "Deny", "Don’t Allow", "Don't Allow", "No"].contains(&b.as_str()));
     let text = texts.join("\n\n");

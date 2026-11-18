@@ -756,7 +756,7 @@ impl App {
             UiEvent::RawFrame { wid, w, h, px_per_pt, capture_us, bgra } => self.present_raw(wid, w, h, px_per_pt, capture_us, bgra),
             UiEvent::Corners { wid, t_px, tiles } => self.set_corners(wid, t_px, tiles),
             UiEvent::BlindShow { id, app, buttons, menu: true, .. } => crate::blind::show_menu(id, &app, &buttons, self.net.clone()),
-            UiEvent::BlindShow { id, app, title, texts, buttons, menu: false } => crate::blind::show(id, &app, &title, &texts, &buttons, self.net.clone()),
+            UiEvent::BlindShow { id, app, title, texts, buttons, menu: false, fields } => crate::blind::show(id, &app, &title, &texts, &buttons, &fields, self.net.clone()),
         }
     }
 

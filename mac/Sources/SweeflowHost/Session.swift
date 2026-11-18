@@ -431,6 +431,10 @@ final class Session {
             settings.apply(wire: try m.bytes())
         case .blindPress:
             let wid = try m.u32(), index = Int(try m.u16())
+            // What was typed in its fields on Linux (a password), when there are fields: put in
+            // the window's own fields before the button is pressed. Kept nowhere.
+            let typed: [String] = (try? m.u16()).map { n in (0..<Int(n)).compactMap { _ in try? m.str() } } ?? []
+            let fields = blindFields[wid] ?? []
             if wid == 1 { log("stand-in test: button \(index) chosen") }
             // Off the session queue: a prompt that has gone, or a busy app, answers only when
             // the Accessibility timeout runs out, and input waited that long behind each press.
@@ -440,6 +444,10 @@ final class Session {
             } else if let b = blindButtons[wid], index < b.count {
                 let button = b[index]
                 DispatchQueue.global(qos: .userInitiated).async {
+                    for (field, text) in zip(fields, typed) {
+                        let set = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, text as CFString)
+                        log("uncapturable window \(wid): field filled in (\(set == .success ? "ok" : "failed: \(set.rawValue)"))")
+                    }
                     let r = AXUIElementPerformAction(button, kAXPressAction as CFString)
                     log("uncapturable window \(wid): pressed button \(index) (\(r == .success ? "ok" : "failed"))")
                 }
@@ -1666,6 +1674,7 @@ final class Session {
             guard let self else { return }
             self.blindButtons[b.wid] = nil
             self.blindMenus[b.wid] = nil
+            self.blindFields[b.wid] = nil
             var m = MsgWriter(.blindGone); m.u32(b.wid)
             self.control?.send(m)
         }
@@ -1710,6 +1719,8 @@ final class Session {
     /// it has drawn) and have Linux show a stand-in.
     /// Open menus shown as stand-ins, to close them when the choice is cancelled on Linux.
     private var blindMenus: [UInt32: AXUIElement] = [:]
+    /// The text fields of each uncapturable window shown as a stand-in (its password, say).
+    private var blindFields: [UInt32: [AXUIElement]] = [:]
 
     private func blindAdded(_ b: WindowTracker.BlindWindow) {
         if b.menu { return blindMenuAdded(b) }
@@ -1720,13 +1731,21 @@ final class Session {
                 let title = content?.title ?? ""
                 let texts = (content?.texts ?? []).filter { $0 != title && $0 != b.owner }
                 let buttons = content?.buttons ?? []
+                let fields = content?.fields ?? []
+                // The fields' labels are texts too (User Name:, Password:): shown by the fields.
+                let labels = Set(fields.map(\.label))
+                let shownTexts = texts.filter { !labels.contains($0.trimmingCharacters(in: CharacterSet(charactersIn: ": "))) }
                 self.blindButtons[b.wid] = buttons.map(\.element)
+                self.blindFields[b.wid] = fields.map(\.element)
                 var m = MsgWriter(.blindShow)
                 m.u32(b.wid); m.str(b.owner); m.str(title)
-                m.u16(UInt16(texts.count)); texts.forEach { m.str($0) }
+                m.u16(UInt16(shownTexts.count)); shownTexts.forEach { m.str($0) }
                 m.u16(UInt16(buttons.count)); buttons.forEach { m.str($0.label) }
+                // Not a menu; then the fields (a password's without its value).
+                m.u8(0)
+                m.u16(UInt16(fields.count)); fields.forEach { m.str($0.label); m.u8($0.secret ? 1 : 0); m.str($0.value) }
                 self.control?.send(m)
-                log("uncapturable window \(b.wid) (\(b.owner)): stand-in with \(buttons.count) buttons")
+                log("uncapturable window \(b.wid) (\(b.owner)): stand-in with \(buttons.count) buttons, \(fields.count) fields")
             }
         }
     }

@@ -633,7 +633,7 @@ PlasmoidItem {
                     ToggleRow {
                         visible: root.connected && !!root.settings.hasLid
                         label: "Stream with lid closed"
-                        hint: "The MacBook stays awake with its lid shut while it streams. The Mac asks for its password"
+                        hint: "Keep the MacBook available while its lid is closed. Asks for the Mac's admin password to turn it on or off."
                         on: !!root.settings.lid
                         onFlipped: (v) => root.set({ lid: v })
                     }

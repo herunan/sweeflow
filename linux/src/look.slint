@@ -143,6 +143,8 @@ export component Btn inherits Rectangle {
 // One line of typed text.
 export component Field inherits Rectangle {
     in property <string> placeholder;
+    // A password: dots, as typed.
+    in property <bool> secret;
     in-out property <string> text <=> input.text;
     callback accepted(string);
     height: 34px;
@@ -169,6 +171,7 @@ export component Field inherits Rectangle {
         width: parent.width - 20px;
         height: parent.height;
         single-line: true;
+        input-type: root.secret ? InputType.password : InputType.text;
         vertical-alignment: center;
         color: Look.fg;
         font-size: 13px;

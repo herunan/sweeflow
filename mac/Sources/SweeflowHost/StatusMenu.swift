@@ -151,6 +151,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         // otherwise (as root: see LidSleepRule).
         let lid = ClosureMenuItem(title: "Stream with lid closed") { LidSleepRule.ask(!LidSleepRule.shown) }
         lid.state = LidSleepRule.shown ? .on : .off
+        lid.toolTip = "Keep the MacBook available while its lid is closed. Asks for your admin password to turn it on or off."
         if LidSleepRule.hasLid { menu.addItem(lid) }
         menu.addItem(.separator())
 

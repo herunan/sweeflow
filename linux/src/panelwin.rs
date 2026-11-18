@@ -23,7 +23,8 @@ slint::slint! {
     export struct MacItem { name: string, fingerprint: string, active: bool, online: string, via: string }
     // tip: why it can't be chosen now (it's then shown faded, and says so on hover); empty: it can.
     export struct Action { id: string, label: string, tip: string }
-    export struct Toggle { key: string, label: string, on: bool }
+    // tip: what it does, on hover (the Plasma widget's hint).
+    export struct Toggle { key: string, label: string, on: bool, tip: string }
 
     // A small button, for the actions on a row.
     component Chip inherits Rectangle {
@@ -414,7 +415,7 @@ slint::slint! {
                                 Text { text: t.label; color: Look.fg; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                 VerticalLayout {
                                     alignment: center;
-                                    Switch { on: t.on; toggled => { root.flip(t.key); } }
+                                    Switch { on: t.on; tip: t.tip; toggled => { root.flip(t.key); } }
                                 }
                             }
                         }
@@ -766,22 +767,26 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
     })
 }
 
+/// Stream with lid closed, on hover (here and in the Plasma widget).
+const LID_TIP: &str = "Keep the MacBook available while its lid is closed. Asks for the Mac's admin password to turn it on or off.";
+
 /// The settings, in the widget's words and order.
 fn toggles(s: &PanelState) -> Vec<Toggle> {
-    let t = |key: &str, label: &str, on: bool| Toggle { key: key.into(), label: label.into(), on };
-    // The features first, named and ordered as on the setup window's last page.
+    let t = |key: &str, label: &str, on: bool, tip: &str| Toggle { key: key.into(), label: label.into(), on, tip: tip.into() };
+    // The features first, named and ordered as on the setup window's last page; the tips as the
+    // Plasma widget's hints.
     let mut all = vec![
-        t("launcher", "Apps in launcher", s.settings.launcher),
-        t("clipboard", "Shared clipboard", s.settings.clipboard),
-        t("dragDrop", "Drag and drop files", s.settings.drag_drop),
-        t("sound", "Sound passthrough", s.settings.sound),
-        t("sharp", "High quality", s.settings.quality != "light"),
-        t("square", "Square window corners", s.square),
-        t("login", "Open at login", s.open_at_login),
+        t("launcher", "Apps in launcher", s.settings.launcher, "Mac apps in the app launcher, alongside your Linux apps"),
+        t("clipboard", "Shared clipboard", s.settings.clipboard, "Copy on one, paste on the other"),
+        t("dragDrop", "Drag and drop files", s.settings.drag_drop, "Files, between Mac windows and Linux"),
+        t("sound", "Sound passthrough", s.settings.sound, "The Mac's sound plays on this computer"),
+        t("sharp", "High quality", s.settings.quality != "light", "Retina detail and 10-bit colour. Off: half the detail and 8-bit"),
+        t("square", "Square window corners", s.square, "Mac windows end in square corners instead of the Mac's rounded ones"),
+        t("login", "Open at login", s.open_at_login, "Start Sweeflow when you log in"),
     ];
     // A MacBook, connected: its answer (the password asked for on the Mac) comes from there.
     if s.connected && s.settings.has_lid {
-        all.insert(6, t("lid", "Stream with lid closed", s.settings.lid));
+        all.insert(6, t("lid", "Stream with lid closed", s.settings.lid, LID_TIP));
     }
     all
 }

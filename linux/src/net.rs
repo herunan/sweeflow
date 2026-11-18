@@ -102,7 +102,8 @@ pub enum UiEvent {
     /// Rounded-corner tiles for a window: four `t_px`² premultiplied BGRA squares (TL, TR, BL, BR).
     Corners { wid: u32, t_px: u32, tiles: Vec<u8> },
     /// A Mac window that can't be captured: show a stand-in (see blind.rs).
-    BlindShow { id: u32, app: String, title: String, texts: Vec<String>, buttons: Vec<String>, menu: bool },
+    /// fields: its text fields (label, a password's, filled in with), typed into on the Mac.
+    BlindShow { id: u32, app: String, title: String, texts: Vec<String>, buttons: Vec<String>, menu: bool, fields: Vec<crate::blind::Field> },
     /// Lossless premultiplied BGRA (popups/menus), already decompressed.
     RawFrame { wid: u32, w: u16, h: u16, px_per_pt: u8, capture_us: u64, bgra: Vec<u8> },
 }
@@ -1361,11 +1362,18 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             let (app, title) = (r.str()?, r.str()?);
             let texts = (0..r.u16()?).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
             let buttons = (0..r.u16()?).map(|_| r.str()).collect::<Result<Vec<_>>>()?;
-            // Newer hosts say whether it's a menu.
+            // Newer hosts say whether it's a menu, and then its text fields (a password prompt's).
             let menu = r.u8().unwrap_or(0) == 1;
-            log::info!("{app} {} {id} can't be shown here: stand-in with {} item(s): {title:?} {texts:?} {buttons:?}",
-                       if menu { "menu" } else { "window" }, buttons.len());
-            UiEvent::BlindShow { id, app, title, texts, buttons, menu }
+            let fields = match r.u16() {
+                Ok(n) => (0..n)
+                    .map(|_| Ok(crate::blind::Field { label: r.str()?, secret: r.u8()? == 1, value: r.str()? }))
+                    .collect::<Result<Vec<_>>>()?,
+                Err(_) => Vec::new(),
+            };
+            // A password field's value isn't sent; the labels are all that's logged.
+            log::info!("{app} {} {id} can't be shown here: stand-in with {} item(s): {title:?} {texts:?} {buttons:?}, fields {:?}",
+                       if menu { "menu" } else { "window" }, buttons.len(), fields.iter().map(|f| &f.label).collect::<Vec<_>>());
+            UiEvent::BlindShow { id, app, title, texts, buttons, menu, fields }
         }
         t::SETTINGS => {
             crate::tray::set_settings(r.bytes()?);

@@ -270,7 +270,8 @@ final class WindowTracker {
                (info[kCGWindowSharingState as String] as? Int) == 0 || Self.promptOwners.contains(owner),
                let wid = info[kCGWindowNumber as String] as? UInt32,
                let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(),
-               let layer = info[kCGWindowLayer as String] as? Int, (0..<1000).contains(layer),
+               // The administrator password prompt (SecurityAgent) sits on layer 1000.
+               let layer = info[kCGWindowLayer as String] as? Int, (0..<1000).contains(layer) || (layer == 1000 && Self.promptOwners.contains(owner)),
                let bd = info[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd),
                !Self.notBlind.contains(owner) {
                 // An open pop-up menu (layer 101) is small; anything else that small is no dialog.

@@ -9,7 +9,10 @@ enum BlindWindows {
         var title: String
         var texts: [String]
         var buttons: [(label: String, element: AXUIElement)]
-        var debugDescription: String { "title: \(title)\ntexts: \(texts)\nbuttons: \(buttons.map(\.label))" }
+        /// Its text fields (a password prompt's user name and password): typed into from Linux.
+        /// A password field's value is never read.
+        var fields: [(label: String, secret: Bool, value: String, element: AXUIElement)] = []
+        var debugDescription: String { "title: \(title)\ntexts: \(texts)\nbuttons: \(buttons.map(\.label))\nfields: \(fields.map(\.label))" }
     }
 
     private static func attr(_ e: AXUIElement, _ a: String) -> CFTypeRef? {
@@ -70,6 +73,14 @@ enum BlindWindows {
             if role == kAXButtonRole, !["AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton"].contains(sub) {
                 let label = [attr(e, kAXTitleAttribute), attr(e, kAXDescriptionAttribute)].compactMap { $0 as? String }.first { !$0.isEmpty }
                 if let label { c.buttons.append((label, e)) }
+            } else if role == kAXTextFieldRole {
+                let secret = sub == "AXSecureTextField"
+                // Its name: a label of its own, its placeholder, or the text before it.
+                let titled = (attr(e, kAXTitleUIElementAttribute)).flatMap { attr($0 as! AXUIElement, kAXValueAttribute) as? String }
+                let label = [attr(e, kAXDescriptionAttribute) as? String, attr(e, kAXPlaceholderValueAttribute) as? String, titled]
+                    .compactMap { $0 }.first { !$0.isEmpty } ?? (secret ? "Password" : "")
+                let value = secret ? "" : (attr(e, kAXValueAttribute) as? String ?? "")
+                c.fields.append((label.trimmingCharacters(in: CharacterSet(charactersIn: ": ")), secret, value, e))
             } else if role == kAXStaticTextRole || role == kAXTextAreaRole {
                 if let v = attr(e, kAXValueAttribute) as? String, !v.trimmingCharacters(in: .whitespaces).isEmpty { c.texts.append(v) }
             }
