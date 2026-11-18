@@ -1229,6 +1229,28 @@ fn read_win_info(r: &mut R) -> Result<WinInfo> {
     })
 }
 
+/// Each app's icon as the Mac sent it, until its first window has come (taskbar_entry_first).
+static ICONS_FOR_ENTRIES: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<u8>>>> = std::sync::Mutex::new(None);
+
+/// An app's first window: its taskbar entry (name, icon) is written, and the desktop has read it,
+/// before the window is shown. A window shown without one (a first stream, an app new to this
+/// computer) was looked up as it came, found nothing, and Plasma put every such Mac window under
+/// the first Sweeflow entry it matched by process ("Claude"). Only the first time: with the entry
+/// there already, nothing waits.
+fn taskbar_entry_first(bid: &str, name: &str) {
+    let Some(png) = ICONS_FOR_ENTRIES.lock().unwrap().get_or_insert_with(Default::default).remove(bid) else { return };
+    let write = || match crate::launchers::seen(bid, name, &png) {
+        Ok(true) => log::info!("{name}: taskbar entry written before its first window"),
+        Ok(false) => {}
+        Err(e) => log::warn!("taskbar entry for {bid}: {e:#}"),
+    };
+    // A wait of the network task's: the other one goes on meanwhile.
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(write),
+        Err(_) => write(),
+    }
+}
+
 fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
     let mut r = R::new(body);
     let ev = match ty {
@@ -1262,7 +1284,11 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             crate::tray::connected(Some(name.clone()));
             UiEvent::Connected(name)
         }
-        t::WINDOW_ADDED => UiEvent::WindowAdded(read_win_info(&mut r)?),
+        t::WINDOW_ADDED => {
+            let info = read_win_info(&mut r)?;
+            taskbar_entry_first(&info.bundle_id, &info.app_name);
+            UiEvent::WindowAdded(info)
+        }
         t::WINDOW_REPLACED => {
             let old = r.u32()?;
             UiEvent::WindowReplaced(old, read_win_info(&mut r)?)
@@ -1282,7 +1308,12 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             let fixed = r.u8().map_or(true, |f| f != 0);
             UiEvent::WindowFixed(wid, spot, fixed)
         }
-        t::APP_ICON => UiEvent::AppIcon { bundle_id: r.str()?, png: r.bytes()?.to_vec() },
+        t::APP_ICON => {
+            let (bundle_id, png) = (r.str()?, r.bytes()?.to_vec());
+            // Kept for the app's first window (the Mac sends the icon just before it).
+            ICONS_FOR_ENTRIES.lock().unwrap().get_or_insert_with(Default::default).insert(bundle_id.clone(), png.clone());
+            UiEvent::AppIcon { bundle_id, png }
+        }
         t::CURSOR => UiEvent::Cursor { hot_x: r.f32()?, hot_y: r.f32()?, scale: r.f32()?, png: r.bytes()?.to_vec() },
         t::FOCUSED => UiEvent::Focused(r.u32()?),
         t::WINDOW_BUTTONS => {

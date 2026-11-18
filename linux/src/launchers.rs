@@ -49,17 +49,18 @@ const SEEN_MARK: &str = "X-Sweeflow-Seen=true\n";
 /// menu-bar app's window, a system tool) had no taskbar entry, and the taskbar showed its
 /// window's own icon, without the Quit action. Such an
 /// app gets a taskbar entry of its own here (never in the app menu: only its window says it
-/// exists). Slow (it has KDE reread the entries): not for the UI thread.
-pub fn seen(bid: &str, name: &str, png: &[u8]) -> Result<()> {
+/// exists). Slow (it has KDE reread the entries): not for the UI thread. True when the entry was
+/// just written (and KDE has reread them).
+pub fn seen(bid: &str, name: &str, png: &[u8]) -> Result<bool> {
     // Bundle ids are reverse-DNS, safe for file names; guard anyway.
     if bid.is_empty() || bid.contains('/') || png.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let apps_dir = data_dir().join("applications");
     let path = apps_dir.join(task_file(bid));
     // (One from a version with the badge is written again, with the plain icon.)
     if fs::read_to_string(&path).is_ok_and(|old| !old.contains(OLD_BADGED)) {
-        return Ok(());
+        return Ok(false);
     }
     fs::create_dir_all(&apps_dir)?;
     fs::create_dir_all(data_dir().join("sweeflow/icons"))?;
@@ -72,7 +73,7 @@ pub fn seen(bid: &str, name: &str, png: &[u8]) -> Result<()> {
     write_whole(&path, &text)?;
     log::info!("taskbar entry for {name} ({bid}): not among the Mac's listed apps");
     refresh_menu();
-    Ok(())
+    Ok(true)
 }
 
 /// Keeps ~/.local/share/applications/sweeflow-*.desktop in sync with the Mac's installed apps.
