@@ -17,6 +17,11 @@ export global Look {
     out property <color> surface: fg.transparentize(0.93);
     out property <color> line: fg.transparentize(0.7);
     out property <color> danger: #e5484d;
+    // A button that isn't the main one: its fill and line, violet under the pointer.
+    pure public function button-fill(hover: bool, pressed: bool) -> color {
+        pressed ? Look.accent.transparentize(0.7) : hover ? Look.accent.transparentize(0.84) : Look.fg.transparentize(0.92)
+    }
+    pure public function button-line(hover: bool) -> color { hover ? Look.accent : Look.line }
 }
 
 export component Label inherits Text {
@@ -87,11 +92,13 @@ export component Btn inherits Rectangle {
     vertical-stretch: 0;
     opacity: root.enabled ? 1 : 0.45;
     border-radius: Look.radius;
-    border-width: scope.has-focus ? 2px : Look.outlined ? 1px : 0px;
-    border-color: scope.has-focus ? Look.fg : root.primary ? Look.accent : Look.line;
+    // Every button the same (Look.button-*): a light fill and a thin line, violet under the
+    // pointer; the main one filled violet.
+    border-width: scope.has-focus ? 2px : 1px;
+    border-color: scope.has-focus ? Look.fg : root.primary ? Look.accent : Look.button-line(touch.has-hover && root.enabled);
     background: root.primary
         ? (touch.has-hover && root.enabled ? Look.accent.brighter(0.12) : Look.accent)
-        : Look.fg.transparentize(touch.pressed ? 0.8 : touch.has-hover && root.enabled ? 0.86 : Look.outlined ? 0.96 : 0.9);
+        : Look.button-fill(touch.has-hover && root.enabled, touch.pressed);
     accessible-role: button;
     accessible-label: root.text;
     accessible-action-default => {
@@ -280,6 +287,8 @@ component Pointer inherits Path {
 export component MacScene inherits Rectangle {
     // Larger words, where there's room.
     in property <bool> big;
+    // The Mac window's second line.
+    in property <string> note: "when focused and hovered over (with exceptions)";
     border-radius: 6px;
     border-width: 1px;
     border-color: Look.line;
@@ -323,7 +332,7 @@ export component MacScene inherits Rectangle {
                 wrap: word-wrap;
             }
             Text {
-                text: "when focused and hovered over (with exceptions)";
+                text: root.note;
                 color: Look.fg.transparentize(0.3);
                 font-size: root.big ? 12px : 10px;
                 wrap: word-wrap;
@@ -370,6 +379,38 @@ export component Pill inherits Rectangle {
         Text { text: root.text; color: Look.fg; font-size: 12px; vertical-alignment: center; }
     }
     pill-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A square button with a sign drawn as a line (✕ to remove), styled like Btn.
+export component IconBtn inherits Rectangle {
+    // The sign, as a 24×24 path.
+    in property <string> icon: "M 4 4 L 20 20 M 20 4 L 4 20";
+    in property <string> label;
+    callback clicked();
+    width: 26px;
+    height: 26px;
+    border-radius: Look.radius;
+    border-width: 1px;
+    border-color: Look.button-line(icon-touch.has-hover);
+    background: Look.button-fill(icon-touch.has-hover, icon-touch.pressed);
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    Path {
+        width: 12px;
+        height: 12px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        stroke: icon-touch.has-hover ? Look.accent : Look.fg;
+        stroke-width: 1.8px;
+    }
+    icon-touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }

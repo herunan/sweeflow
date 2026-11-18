@@ -26,7 +26,7 @@ PlasmaComponents3.ItemDelegate {
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing
         PlasmaComponents3.Label { text: row.label; elide: Text.ElideRight; Layout.fillWidth: true }
-        PlasmaComponents3.ToolButton {
+        SfButton {
             visible: row.actionText !== "" && row.on && row.enabled
             text: row.actionText
             onClicked: row.extraClicked()

@@ -16,7 +16,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 slint::slint! {
     import { ScrollView } from "std-widgets.slint";
-    import { Look, Label, Dim, Btn, Field, Sign, Tip, TipBubble, MacShortcuts, KeyCaps } from "look.slint";
+    import { Look, Label, Dim, Btn, Field, Sign, Tip, TipBubble, KeyCaps } from "look.slint";
     export { Look }
 
     export struct AppRow { id: string, name: string, icon: image, has-icon: bool, initial: string, running: bool, pinned: bool, shown: bool, heading: string }
@@ -39,10 +39,11 @@ slint::slint! {
         width: root.sign != "" ? 34px : max(44px, label.preferred-width + 18px);
         opacity: root.enabled ? 1 : 0.45;
         border-radius: Look.radius;
-        border-width: Look.outlined ? 1px : 0px;
-        border-color: root.danger ? Look.danger : Look.line;
+        // As every button (look.slint's Btn): violet under the pointer.
+        border-width: 1px;
+        border-color: root.danger ? Look.danger : Look.button-line(touch.has-hover && root.enabled);
         background: root.danger ? Look.danger.transparentize(touch.has-hover && root.enabled ? 0.7 : 0.82)
-            : Look.fg.transparentize(touch.pressed ? 0.8 : touch.has-hover && root.enabled ? 0.86 : Look.outlined ? 0.96 : 0.91);
+            : Look.button-fill(touch.has-hover && root.enabled, touch.pressed);
         accessible-role: button;
         accessible-label: root.text;
         accessible-action-default => { if (root.enabled) { root.clicked(); } }
@@ -609,55 +610,12 @@ slint::slint! {
                     }
                 }
 
-                // The keyboard shortcuts (a popover above, see below) at the left, Quit at the right.
+                // The Shortcuts window at the left, Quit at the right.
                 if root.running && root.paired: HorizontalLayout {
                     vertical-stretch: 0;
-                    Btn { text: "⌘  Shortcuts"; clicked => { root.show-keys = !root.show-keys; } }
+                    Btn { text: "⌘  Shortcuts"; clicked => { root.act("shortcuts", ""); } }
                     Rectangle { horizontal-stretch: 1; }
                     Btn { text: "Quit Sweeflow"; clicked => { root.quit-all(); } }
-                }
-            }
-        }
-
-        // The keyboard shortcuts, above the Shortcuts button; a click anywhere else closes it.
-        if root.show-keys: TouchArea {
-            width: root.width;
-            height: root.height;
-            clicked => { root.show-keys = false; }
-        }
-        if root.show-keys: keys-box := Rectangle {
-            x: 12px;
-            y: root.height - self.height - 58px;
-            width: 270px;
-            height: key-list.preferred-height;
-            border-radius: Look.radius;
-            border-width: 1px;
-            border-color: Look.line;
-            // Solid: the window's own colour (its surface colour is see-through), raised a shade.
-            background: Look.bg.mix(Look.fg, 0.94);
-            drop-shadow-blur: 16px;
-            drop-shadow-color: #00000055;
-            key-list := VerticalLayout {
-                padding: 12px;
-                spacing: 7px;
-                Text { text: "Sweeflow shortcuts"; color: Look.fg; font-size: 13px; font-weight: 700; }
-                for k in [
-                    { key: root.key-open, what: "Open Sweeflow" },
-                    { key: root.key-menu, what: "Global menu" },
-                    { key: root.key-pause, what: "Pause or resume" },
-                    { key: root.key-stop, what: "Stop or start" },
-                ]: HorizontalLayout {
-                    spacing: 10px;
-                    // The keys in a column of one width, so what they do lines up.
-                    HorizontalLayout { width: 124px; KeyCaps { caps: k.key; size: 11px; } }
-                    Text { text: k.what; color: Look.fg; font-size: 12px; vertical-alignment: center; overflow: elide; }
-                }
-                MacShortcuts { padding-top: 8px; hyprland: root.hyprland; omarchy: root.omarchy; mac-style: root.mac-style; swapped: root.swapped; }
-                // The Shortcuts window: Sweeflow's keys (and where to change them), the keys kept for Linux.
-                HorizontalLayout {
-                    alignment: start;
-                    padding-top: 6px;
-                    Btn { text: "Change shortcuts…"; clicked => { root.show-keys = false; root.act("shortcuts", ""); } }
                 }
             }
         }
@@ -811,18 +769,19 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
 /// The settings, in the widget's words and order.
 fn toggles(s: &PanelState) -> Vec<Toggle> {
     let t = |key: &str, label: &str, on: bool| Toggle { key: key.into(), label: label.into(), on };
+    // The features first, named and ordered as on the setup window's last page.
     let mut all = vec![
-        t("sound", "Mac sound on Linux", s.settings.sound),
+        t("launcher", "Apps in launcher", s.settings.launcher),
         t("clipboard", "Shared clipboard", s.settings.clipboard),
-        t("dragDrop", "Drag and drop files between", s.settings.drag_drop),
-        t("launcher", "Mac apps in your Linux launcher", s.settings.launcher),
-        t("square", "Square window corners", s.square),
+        t("dragDrop", "Drag and drop files", s.settings.drag_drop),
+        t("sound", "Sound passthrough", s.settings.sound),
         t("sharp", "High quality", s.settings.quality != "light"),
+        t("square", "Square window corners", s.square),
         t("login", "Open at login", s.open_at_login),
     ];
     // A MacBook, connected: its answer (the password asked for on the Mac) comes from there.
     if s.connected && s.settings.has_lid {
-        all.insert(6, t("lid", "MacBook lid can be closed", s.settings.lid));
+        all.insert(6, t("lid", "Stream with lid closed", s.settings.lid));
     }
     all
 }
@@ -1425,7 +1384,8 @@ mod tests {
         assert_eq!(flip_call("login", &s), Some(act("login", "off")));
         assert_eq!(flip_call("nonsense", &s), None);
         let shown: Vec<(String, bool)> = toggles(&s).into_iter().map(|t| (t.label.to_string(), t.on)).collect();
-        assert_eq!(shown[5], ("High quality".to_string(), false));
+        assert_eq!(shown[0], ("Apps in launcher".to_string(), true));
+        assert_eq!(shown[4], ("High quality".to_string(), false));
         assert_eq!(shown.len(), 7);
     }
 }

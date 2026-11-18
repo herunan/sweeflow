@@ -13,7 +13,7 @@ use crate::deskkeys::{load_exceptions, save_exceptions, Exceptions, UserKey};
 
 slint::slint! {
     import { ScrollView } from "std-widgets.slint";
-    import { Look, Label, Dim, Btn, Field, KeyMapping, KeyCaps, Pill } from "look.slint";
+    import { Look, Label, Dim, Btn, Field, KeyMapping, KeyCaps, MacScene } from "look.slint";
     export { Look }
 
     // A field for a shortcut: pressed in it (a key held with Ctrl, Alt or Super is written out,
@@ -23,6 +23,8 @@ slint::slint! {
         in property <string> placeholder;
         // Takes the keyboard as it appears (a Change field).
         in property <bool> autofocus;
+        // As tall as a small button (a Change field, on a row of the list).
+        in property <bool> small;
         init => {
             if (root.autofocus) {
                 field.focus();
@@ -31,7 +33,7 @@ slint::slint! {
         callback accepted(string);
         // The keys of a press, written out ("" when it isn't a shortcut): Rust's KeyEvent words.
         callback combo(string, bool, bool, bool, bool) -> string;
-        height: 34px;
+        height: root.small ? 26px : 34px;
         horizontal-stretch: 1;
         forward-focus: field;
         capture-key-pressed(event) => {
@@ -44,7 +46,7 @@ slint::slint! {
             }
             return reject;
         }
-        field := Field { placeholder: root.placeholder; accepted(t) => { root.accepted(t); } }
+        field := Field { height: root.height; placeholder: root.placeholder; accepted(t) => { root.accepted(t); } }
     }
 
     // One of Sweeflow's keys: its keycaps, what it does, and Change; while being changed, a
@@ -70,11 +72,12 @@ slint::slint! {
             typed := KeyField {
                 placeholder: "Press or type the new shortcut";
                 autofocus: true;
+                small: true;
                 accepted(t) => { root.save(t); }
                 combo(t, meta, ctrl, alt, shift) => { return root.combo(t, meta, ctrl, alt, shift); }
             }
-            Btn { text: "Save"; primary: true; enabled: typed.text != ""; clicked => { root.save(typed.text); } }
-            Btn { text: "Cancel"; clicked => { root.cancel(); } }
+            VerticalLayout { alignment: center; Btn { text: "Save"; small: true; primary: true; enabled: typed.text != ""; clicked => { root.save(typed.text); } } }
+            VerticalLayout { alignment: center; Btn { text: "Cancel"; small: true; clicked => { root.cancel(); } } }
         }
     }
 
@@ -111,7 +114,8 @@ slint::slint! {
         }
     }
 
-    export struct KeptKey { caps: [string], what: string, own: bool, heading: bool, open: bool, count: string }
+    // off: a default turned off (shown greyed, with Restore).
+    export struct KeptKey { caps: [string], what: string, own: bool, heading: bool, open: bool, count: string, off: bool }
 
     export component Shortcuts inherits Window {
         title: "Shortcuts";
@@ -119,7 +123,7 @@ slint::slint! {
         background: Look.bg;
         default-font-family: Look.font;
         width: 560px;
-        height: 900px;
+        height: 940px;
 
         in property <[string]> key-open;
         in property <[string]> key-menu;
@@ -128,6 +132,8 @@ slint::slint! {
         // The desktop's own dialog changes Sweeflow's keys from any window (the portal's,
         // globalkeys.rs); else they're typed here. The Global menu's is always typed here.
         in property <bool> portal;
+        // How far the kept shortcuts are scrolled: back to the top (Custom) after adding one.
+        in-out property <length> list-y;
         // Which key is being typed ("open", "menu", "pause", "stop"; "" none).
         in-out property <string> editing;
         in-out property <string> key-error;
@@ -167,9 +173,11 @@ slint::slint! {
             // modifiers as they reach it (following the swap below).
             VerticalLayout {
                 spacing: 4px;
-                Label { text: "Sweeflow maps your keyboard to Mac windows as if it were plugged into the Mac."; }
-                Label { text: root.swap-keys ? "In Mac windows Alt is ⌘, Super is ⌥." : "In Mac windows Super is ⌘, Alt is ⌥."; }
+                Label { text: root.swap-keys ? "Sweeflow maps your keys like a Mac. Alt is ⌘, Super is ⌥." : "Sweeflow maps your keys like a Mac. Super is ⌘, Alt is ⌥."; }
             }
+            // Where Mac shortcuts work (the Mac window focused and under the pointer, apart from
+            // the ones kept for Linux below) and where Linux's do: the setup window's picture.
+            MacScene { height: 76px; big: true; note: "When focused and hovered over (exceptions below)"; }
             // The swap for keyboards made for Windows, on a card: ⌘ next to the space bar in Mac
             // windows, as on a Mac keyboard.
             Rectangle {
@@ -234,17 +242,18 @@ slint::slint! {
                     VerticalLayout {
                         spacing: 3px;
                         Heading { text: "Shortcuts kept for Linux"; }
-                        Dim { text: "A superset of typical Linux shortcuts, excluded from your Mac shortcuts. Remove defaults or add new ones."; font-size: 12px; }
+                        Dim { text: "A superset of typical Linux shortcuts, excluded from your Mac shortcuts."; font-size: 12px; }
                     }
                     if root.keys.length == 0: Dim { text: "None: every shortcut goes to the Mac."; vertical-stretch: 1; vertical-alignment: center; horizontal-alignment: center; }
                     if root.keys.length > 0: ScrollView {
                         vertical-stretch: 1;
+                        content-y <=> root.list-y;
                         VerticalLayout {
                             spacing: 2px;
                             alignment: start;
                             for k[i] in root.keys: Rectangle {
-                                // Two lines for a long description.
-                                height: k.heading ? 36px : (k.what.character-count > 34 ? 46px : 34px);
+                                // As tall as its description needs (it wraps).
+                                height: k.heading ? 36px : max(34px, what.preferred-height + 12px);
                                 border-radius: Look.radius;
                                 background: k.heading && heading-touch.has-hover ? Look.fg.transparentize(0.94) : transparent;
                                 // A heading: the whole row opens or closes its section.
@@ -262,16 +271,22 @@ slint::slint! {
                                     Text { text: k.count; color: Look.muted; font-size: 12px; vertical-alignment: center; }
                                     Rectangle {}
                                 }
-                                if !k.heading: HorizontalLayout {
+                                HorizontalLayout {
+                                    visible: !k.heading;
                                     y: 0;
                                     height: parent.height;
                                     padding-left: 26px;
                                     // Clear of the scroll bar.
                                     padding-right: 12px;
                                     spacing: 10px;
-                                    HorizontalLayout { width: 150px; VerticalLayout { alignment: center; KeyCaps { caps: k.caps; size: 12px; } } }
-                                    Text { text: k.what; color: Look.fg; font-size: 13px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
-                                    VerticalLayout { alignment: center; Pill { text: "Remove"; icon: "M 6 6 L 18 18 M 18 6 L 6 18"; clicked => { root.remove(i); } } }
+                                    Rectangle { width: 180px; opacity: k.off ? 0.4 : 1; VerticalLayout { alignment: center; KeyCaps { caps: k.caps; size: 12px; } } }
+                                    what := Text { text: k.what; color: k.off ? Look.muted : Look.fg; opacity: k.off ? 0.6 : 1; font-size: 13px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                                    // Disable turns a default off (greyed, kept in the list) and Restore brings it
+                                    // back; a Custom one is removed.
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Btn { text: k.off ? "Restore" : k.own ? "Remove" : "Disable"; small: true; clicked => { root.remove(i); } }
+                                    }
                                 }
                             }
                         }
@@ -280,10 +295,11 @@ slint::slint! {
                         spacing: 8px;
                         field := KeyField {
                             placeholder: "Add a shortcut";
-                            accepted(t) => { root.add(t); field.text = ""; }
+                            small: true;
+                            accepted(t) => { root.add(t); field.text = ""; root.list-y = 0; }
                             combo(t, meta, ctrl, alt, shift) => { return root.combo(t, meta, ctrl, alt, shift); }
                         }
-                        Btn { text: "Add"; enabled: field.text != ""; clicked => { root.add(field.text); field.text = ""; } }
+                        VerticalLayout { alignment: center; Btn { text: "Add"; small: true; enabled: field.text != ""; clicked => { root.add(field.text); field.text = ""; root.list-y = 0; } } }
                     }
                     if root.error != "": Label { text: root.error; color: Look.danger; }
                     if root.hyprland: Dim { text: "On Hyprland, only shortcuts that start a program can be kept."; font-size: 12px; }
@@ -291,12 +307,22 @@ slint::slint! {
             }
             HorizontalLayout {
                 spacing: 8px;
-                Btn { text: "Reset to defaults"; enabled: root.changed; clicked => { root.reset(); } }
+                // Everything here as it came, apart from the Custom shortcuts.
+                Btn { text: "Restore defaults"; enabled: root.changed; clicked => { root.reset(); } }
                 Rectangle {}
                 Btn { text: "Done"; primary: true; clicked => { root.done(); } }
             }
         }
     }
+}
+
+/// Something in the window isn't as it came (what Restore defaults puts back): a Linux shortcut
+/// removed, one of Sweeflow's changed, or Alt and Super swapped. Custom shortcuts don't count.
+fn not_as_shipped(e: &Exceptions) -> bool {
+    let keys = crate::keys::own_json(false);
+    !e.removed.is_empty()
+        || crate::config::swap_cmd_opt()
+        || crate::keys::OWN.iter().any(|(name, default)| keys[*name].as_str().unwrap_or_default() != *default)
 }
 
 pub fn run() -> Result<()> {
@@ -314,24 +340,40 @@ pub fn run() -> Result<()> {
     ui.set_hyprland(hyprland);
     ui.set_omarchy(hyprland && crate::hyprland::omarchy());
     ui.set_swap_keys(crate::config::swap_cmd_opt());
-    ui.on_swap_changed(|on| {
+    let weak = ui.as_weak();
+    ui.on_swap_changed(move |on| {
         if let Err(e) = crate::config::set_swap_cmd_opt(on) {
             log::warn!("saving the Alt and Super swap: {e:#}");
         }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_changed(not_as_shipped(&load_exceptions()));
+        }
     });
-    ui.set_portal(crate::globalkeys::in_use() && !crate::hyprland::running());
+    // The desktop's own dialog for them: GNOME's portal has one; Plasma's doesn't, so there
+    // they're typed here like the Global menu's and Sweeflow gives Plasma the key.
+    let plasma = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE");
+    ui.set_portal(crate::globalkeys::in_use() && !crate::hyprland::running() && !plasma);
     // Sweeflow's keys as set (keys.json), shown again whenever they change: here, or in the
     // desktop's dialog (the client saves what it gives back).
+    // Only when they changed: setting them rebuilds the rows, which took away what was being
+    // typed in a Change field and put the keyboard back in it, every second.
+    let shown = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let show_own = {
         let weak = ui.as_weak();
         move || {
             let Some(ui) = weak.upgrade() else { return };
             let keys = crate::keys::own_json(crate::setup::mac_keys_remapped());
+            let now = keys.to_string();
+            if *shown.borrow() == now {
+                return;
+            }
+            *shown.borrow_mut() = now;
             let text = |name: &str| crate::keys::caps_model(keys[name].as_str().unwrap_or_default());
             ui.set_key_open(text("open"));
             ui.set_key_menu(text("menu"));
             ui.set_key_pause(text("pause"));
             ui.set_key_stop(text("stop"));
+            ui.set_changed(not_as_shipped(&load_exceptions()));
         }
     };
     show_own();
@@ -379,8 +421,9 @@ pub fn run() -> Result<()> {
     let rows: std::rc::Rc<std::cell::RefCell<Vec<Row>>> = Default::default();
     let model = std::rc::Rc::new(VecModel::<KeptKey>::default());
     ui.set_keys(ModelRc::from(model.clone()));
-    // The headings open (their keys shown): only "Your own" at first, so the list starts short.
-    let open: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::new(std::cell::RefCell::new(vec!["Your own".to_string()]));
+    // The headings open (their keys shown): only Custom at first, so the list starts short.
+    const CUSTOM: &str = "Custom";
+    let open: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::new(std::cell::RefCell::new(vec![CUSTOM.to_string()]));
     let show = {
         let (rows, model, weak, all, open) = (rows.clone(), model.clone(), ui.as_weak(), all.clone(), open.clone());
         move |e: &Exceptions| {
@@ -388,7 +431,7 @@ pub fn run() -> Result<()> {
             let mut shown = Vec::new();
             let caps = |label: &str| crate::keys::caps_model(&UserKey::parse(label).map_or(label.to_string(), |k| if mac_style { k.mac_label() } else { k.label() }));
             let open = open.borrow();
-            let heading = |name: &str, count: usize, list: &mut Vec<Row>, shown: &mut Vec<KeptKey>| {
+            let heading = |name: &str, count: String, list: &mut Vec<Row>, shown: &mut Vec<KeptKey>| {
                 list.push(Row::Heading(name.to_string()));
                 shown.push(KeptKey {
                     caps: ModelRc::default(),
@@ -396,37 +439,42 @@ pub fn run() -> Result<()> {
                     own: false,
                     heading: true,
                     open: open.iter().any(|o| o == name),
-                    count: count.to_string().into(),
+                    count: count.into(),
+                    off: false,
                 });
             };
+            // The person's own first, under Custom, so one just added shows at the top.
+            if !e.added.is_empty() {
+                heading(CUSTOM, e.added.len().to_string(), &mut list, &mut shown);
+                if open.iter().any(|o| o == CUSTOM) {
+                    for k in &e.added {
+                        let label = UserKey::parse(k).map_or(k.clone(), |k| if mac_style { k.mac_label() } else { k.label() });
+                        list.push(Row::Own(k.clone()));
+                        shown.push(KeptKey { caps: crate::keys::caps_model(&label), what: SharedString::new(), own: true, heading: false, open: false, count: SharedString::new(), off: false });
+                    }
+                }
+            }
             for group in crate::keptkeys::GROUPS {
-                let keys: Vec<_> = all.iter().filter(|k| k.group == group && !e.removed.contains(&k.label)).collect();
+                // Every default, the ones turned off too (greyed, to restore).
+                let keys: Vec<_> = all.iter().filter(|k| k.group == group).collect();
                 if keys.is_empty() {
                     continue;
                 }
-                heading(group, keys.len(), &mut list, &mut shown);
+                let on = keys.iter().filter(|k| !e.removed.contains(&k.label)).count();
+                let count = if on == keys.len() { on.to_string() } else { format!("{on} of {}", keys.len()) };
+                heading(group, count, &mut list, &mut shown);
                 if !open.iter().any(|o| o == group) {
                     continue;
                 }
                 for k in keys {
                     list.push(Row::Kind(k.label.clone()));
-                    shown.push(KeptKey { caps: caps(&k.label), what: k.what.clone().into(), own: false, heading: false, open: false, count: SharedString::new() });
-                }
-            }
-            if !e.added.is_empty() {
-                heading("Your own", e.added.len(), &mut list, &mut shown);
-                if open.iter().any(|o| o == "Your own") {
-                    for k in &e.added {
-                        let label = UserKey::parse(k).map_or(k.clone(), |k| if mac_style { k.mac_label() } else { k.label() });
-                        list.push(Row::Own(k.clone()));
-                        shown.push(KeptKey { caps: crate::keys::caps_model(&label), what: SharedString::new(), own: true, heading: false, open: false, count: SharedString::new() });
-                    }
+                    shown.push(KeptKey { caps: caps(&k.label), what: k.what.clone().into(), own: false, heading: false, open: false, count: SharedString::new(), off: e.removed.contains(&k.label) });
                 }
             }
             *rows.borrow_mut() = list;
             model.set_vec(shown);
             if let Some(ui) = weak.upgrade() {
-                ui.set_changed(*e != Exceptions::default());
+                ui.set_changed(not_as_shipped(e));
             }
         }
     };
@@ -446,6 +494,7 @@ pub fn run() -> Result<()> {
 
     let weak = ui.as_weak();
     let save = store.clone();
+    let added_open = open.clone();
     ui.on_add(move |text| {
         let Some(ui) = weak.upgrade() else { return };
         match UserKey::parse(&text) {
@@ -458,6 +507,10 @@ pub fn run() -> Result<()> {
                 }
                 e.added.push(label);
                 ui.set_error(SharedString::new());
+                // Custom open, to see it there.
+                if !added_open.borrow().iter().any(|o| o == CUSTOM) {
+                    added_open.borrow_mut().push(CUSTOM.to_string());
+                }
                 save(&ui, &e);
             }
             // A plain letter would never reach the Mac again.
@@ -473,17 +526,43 @@ pub fn run() -> Result<()> {
         let Some(row) = removed_rows.borrow().get(i as usize).cloned() else { return };
         let mut e = load_exceptions();
         match row {
-            Row::Kind(label) => e.removed.push(label),
+            // ✕ turns a default off; Restore turns it back on.
+            Row::Kind(label) => {
+                if e.removed.contains(&label) {
+                    e.removed.retain(|r| *r != label);
+                } else {
+                    e.removed.push(label);
+                }
+            }
             Row::Own(k) => e.added.retain(|a| *a != k),
             Row::Heading(_) => return,
         }
         save(&ui, &e);
     });
+    // Restore defaults: everything in the window as it came, apart from the Custom shortcuts.
     let weak = ui.as_weak();
+    let shown_again = show_own.clone();
     ui.on_reset(move || {
-        if let Some(ui) = weak.upgrade() {
-            store(&ui, &Exceptions::default());
+        let Some(ui) = weak.upgrade() else { return };
+        let e = load_exceptions();
+        store(&ui, &Exceptions { added: e.added, removed: Vec::new() });
+        let keys = crate::keys::own_json(false);
+        for (name, default) in crate::keys::OWN {
+            if keys[name].as_str().unwrap_or_default() != default {
+                match crate::keys::set_own_key(name, default) {
+                    Ok(()) => tell_client("keys-changed", name),
+                    Err(err) => log::warn!("restoring {name}'s shortcut: {err}"),
+                }
+            }
         }
+        if let Err(err) = crate::config::set_swap_cmd_opt(false) {
+            log::warn!("restoring the Alt and Super swap: {err:#}");
+        }
+        ui.set_swap_keys(false);
+        ui.set_key_error(SharedString::new());
+        ui.set_editing(SharedString::new());
+        shown_again();
+        ui.set_changed(not_as_shipped(&load_exceptions()));
     });
     // A heading clicked: its keys shown or hidden.
     let (show_again, toggled_rows) = (show.clone(), rows.clone());
@@ -559,8 +638,13 @@ fn combo(text: &str, meta: bool, ctrl: bool, alt: bool, shift: bool) -> String {
         '\u{F72D}' => "PageDown".into(),
         '\u{F727}' => "Insert".into(),
         f @ '\u{F704}'..='\u{F71B}' => format!("F{}", f as u32 - 0xF704 + 1),
-        // Shift's signs on the digits (a US layout): the digit, Shift is held anyway.
+        // Shift's signs (a US layout): the key under them, Shift is held anyway. "<" is the
+        // comma key with Shift, and a press is matched by its key (Super+Shift+,).
         s if shift && ")!@#$%^&*(".contains(s) => ")!@#$%^&*(".find(s).unwrap().to_string(),
+        s if shift && "<>?:\"{}|_+~".contains(s) => {
+            let under = ",./;'[]\\-=`";
+            under.chars().nth("<>?:\"{}|_+~".chars().position(|c| c == s).unwrap()).unwrap().to_string()
+        }
         c if c.is_control() || ('\u{F000}'..='\u{F8FF}').contains(&c) => return String::new(),
         c => c.to_uppercase().collect(),
     };
@@ -577,6 +661,9 @@ mod tests {
         assert_eq!(super::combo("e", true, false, false, false), "Super+E");
         assert_eq!(super::combo("\u{F708}", false, true, true, false), "Ctrl+Alt+F5");
         assert_eq!(super::combo("!", true, false, false, true), "Super+Shift+1");
+        // Shift's signs are the key under them, as a press is matched.
+        assert_eq!(super::combo("<", true, false, false, true), "Super+Shift+,");
+        assert_eq!(super::combo("?", false, true, false, true), "Ctrl+Shift+/");
         assert_eq!(super::combo("\t", false, false, true, false), "Alt+Tab");
         // A modifier on its own (Slint's code for it): nothing yet.
         assert_eq!(super::combo("\u{0010}", true, false, false, false), "");

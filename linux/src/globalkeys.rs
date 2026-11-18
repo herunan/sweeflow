@@ -151,19 +151,53 @@ fn plasma_fill_in(list: &OwnedValue, remapped: bool) {
         if !given.trim().is_empty() {
             continue;
         }
-        let Some(mut k) = crate::keys::own_key(&id) else { continue };
-        // Behind a remapper the ⌘ key reaches Linux apps as Ctrl.
-        if remapped && k.logo && !k.ctrl {
-            k.logo = false;
-            k.ctrl = true;
+        let Some(k) = crate::keys::own_key(&id) else { continue };
+        let codes: Vec<i32> = as_linux_gets(&k, remapped).iter().filter_map(|k| k.qt()).collect();
+        if codes.is_empty() {
+            continue;
         }
-        let Some(code) = k.qt() else { continue };
         let name = SHORTCUTS.iter().find(|(i, _)| *i == id).map_or(id.as_str(), |(_, n)| n);
-        let action = [APP_ID, id.as_str(), "Sweeflow", name];
-        match bus.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "setForeignShortcut", &(action, vec![code])) {
+        // A list of strings (as), not four separate ones: KGlobalAccel takes (as, ai).
+        let action = vec![APP_ID, id.as_str(), "Sweeflow", name];
+        match bus.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "setForeignShortcut", &(action, codes)) {
             Ok(_) => log::info!("Plasma: {name} on {}", k.label()),
             Err(e) => log::warn!("Plasma: couldn't give {name} its key: {e}"),
         }
+    }
+}
+
+/// The key as Linux apps get it when it's pressed. Behind a Mac-style remapper (Toshy, Kinto)
+/// that isn't the key pressed, and it depends on the keyboard (Toshy's modmaps): on an Apple one
+/// ⌘ (Super) becomes Ctrl and Ctrl Super; on a PC one Alt (in ⌘'s place) becomes Ctrl, Super
+/// (in ⌥'s) Alt, and Ctrl Super. Which keyboard isn't known, so both: Plasma takes two keys
+/// for a shortcut. Super+Alt comes out as Ctrl+Alt on either.
+pub fn as_linux_gets(k: &crate::deskkeys::UserKey, remapped: bool) -> Vec<crate::deskkeys::UserKey> {
+    if !remapped {
+        return vec![k.clone()];
+    }
+    let apple = crate::deskkeys::UserKey { logo: k.ctrl, ctrl: k.logo, ..k.clone() };
+    let pc = crate::deskkeys::UserKey { logo: k.ctrl, alt: k.logo, ctrl: k.alt, ..k.clone() };
+    if apple == pc { vec![apple] } else { vec![apple, pc] }
+}
+
+/// Plasma: one of Sweeflow's keys changed in its Shortcuts window (keys.json) is given to the
+/// portal's shortcut in Plasma's own list. Plasma's portal has no dialog for changing them
+/// (ConfigureShortcuts does nothing there), so Sweeflow sets it, as for a key the portal bound
+/// without one.
+pub fn plasma_set(id: &str) {
+    let Some((_, name)) = SHORTCUTS.iter().find(|(i, _)| *i == id) else { return };
+    let Ok(bus) = Connection::session() else { return };
+    let remapped = crate::setup::mac_keys_remapped();
+    let key = crate::keys::own_key(id);
+    let codes: Vec<i32> = key.as_ref().map(|k| as_linux_gets(k, remapped)).unwrap_or_default().iter().filter_map(|k| k.qt()).collect();
+    // A list of strings (as), not four separate ones: KGlobalAccel takes (as, ai).
+    let action = vec![APP_ID, id, "Sweeflow", name];
+    match bus.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "setForeignShortcut", &(action, codes)) {
+        Ok(_) => log::info!(
+            "Plasma: {name} on {}",
+            key.map_or("nothing".to_string(), |k| as_linux_gets(&k, remapped).iter().map(|k| k.label()).collect::<Vec<_>>().join(" or "))
+        ),
+        Err(e) => log::warn!("Plasma: couldn't give {name} its key: {e}"),
     }
 }
 
@@ -273,5 +307,21 @@ mod tests {
         assert_eq!(from_description("Meta+Alt+O", false).unwrap().label(), "Super+Alt+O");
         assert_eq!(from_description("Ctrl+Alt+Y", true).unwrap().label(), "Super+Alt+Y");
         assert!(from_description("", false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod remapper_tests {
+    use crate::deskkeys::UserKey;
+
+    #[test]
+    fn behind_a_remapper_both_keyboards_forms() {
+        let k = |s: &str| UserKey::parse(s).unwrap();
+        let labels = |s: &str, r: bool| super::as_linux_gets(&k(s), r).iter().map(|k| k.label()).collect::<Vec<_>>();
+        assert_eq!(labels("Super+Shift+,", false), ["Super+Shift+,"]);
+        // Apple keyboard: ⌘ is Ctrl; PC keyboard: Super (in ⌥'s place) is Alt.
+        assert_eq!(labels("Super+Shift+,", true), ["Ctrl+Shift+,", "Alt+Shift+,"]);
+        // The defaults: one form.
+        assert_eq!(labels("Super+Alt+Y", true), ["Ctrl+Alt+Y"]);
     }
 }

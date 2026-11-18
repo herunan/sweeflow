@@ -797,8 +797,15 @@ fn rename_mac(fingerprint: &str, name: &str) -> Result<()> {
 fn show_keys(ui: &Wizard) {
     // Sweeflow's keys as set (keys.json), shown again each second: a key changed in the Shortcuts
     // window (opened from here) shows here at once.
-    let set = |ui: &Wizard| {
+    // Only when they changed (setting them redraws the rows).
+    let shown = std::cell::RefCell::new(String::new());
+    let set = move |ui: &Wizard| {
         let keys = crate::keys::own_json(crate::setup::mac_keys_remapped());
+        let now = keys.to_string();
+        if *shown.borrow() == now {
+            return;
+        }
+        *shown.borrow_mut() = now;
         let text = |name: &str| crate::keys::caps_model(keys[name].as_str().unwrap_or_default());
         ui.set_key_open(text("open"));
         ui.set_key_pause(text("pause"));

@@ -307,7 +307,7 @@ PlasmoidItem {
                     Layout.fillWidth: true
                 }
             }
-            PlasmaComponents3.Button {
+            SfButton {
                 text: entry.buttonText
                 enabled: entry.available
                 onClicked: entry.asked()
@@ -403,95 +403,14 @@ PlasmoidItem {
             position: PlasmaComponents3.ToolBar.Footer
             RowLayout {
                 anchors.fill: parent
-                // The keyboard shortcuts, in a popup above this button.
-                PlasmaComponents3.ToolButton {
-                    id: keysButton
+                // The Shortcuts window: Sweeflow's shortcuts, the swap, the ones kept for Linux.
+                SfButton {
                     icon.name: "input-keyboard-symbolic"
                     text: "Shortcuts"
-                    checkable: true
-                    checked: keysPopup.visible
-                    onClicked: keysPopup.visible ? keysPopup.close() : keysPopup.open()
-                    QQC2.Popup {
-                        id: keysPopup
-                        y: -height - Kirigami.Units.smallSpacing
-                        padding: Kirigami.Units.largeSpacing
-                        contentItem: ColumnLayout {
-                            spacing: Kirigami.Units.smallSpacing
-                            Kirigami.Heading { level: 5; text: "Sweeflow shortcuts" }
-                            Repeater {
-                                model: [[root.shortcutKeys.open, "Open Sweeflow"], [root.shortcutKeys.menu || "Super+Alt+U", "Global menu (from Mac windows)"], [root.shortcutKeys.pause, "Pause or resume"], [root.shortcutKeys.stop, "Stop or start"]]
-                                delegate: RowLayout {
-                                    required property var modelData
-                                    spacing: Kirigami.Units.largeSpacing
-                                    Item {
-                                        implicitWidth: Kirigami.Units.gridUnit * 6
-                                        implicitHeight: keyRow.implicitHeight
-                                        KeyCaps { id: keyRow; caps: root.keyCaps(modelData[0]) }
-                                    }
-                                    PlasmaComponents3.Label { text: modelData[1] }
-                                }
-                            }
-                            // A Mac window on the desktop, focused and with the pointer over it: Mac
-                            // shortcuts there, Linux's outside it.
-                            Rectangle {
-                                Layout.fillWidth: true
-                                Layout.topMargin: Kirigami.Units.largeSpacing
-                                implicitWidth: Kirigami.Units.gridUnit * 16
-                                implicitHeight: 92
-                                radius: 6
-                                color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.05)
-                                border.width: 1
-                                border.color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.3)
-                                Rectangle {
-                                    id: macWin
-                                    x: 7; y: 7
-                                    width: parent.width * 0.6
-                                    height: parent.height - 14
-                                    radius: 5
-                                    border.width: 1.5
-                                    border.color: root.violet
-                                    color: Qt.rgba(0.545, 0.361, 0.965, 0.18)
-                                    Rectangle {
-                                        anchors { left: parent.left; right: parent.right; top: parent.top }
-                                        height: 12; radius: 5; color: root.violet
-                                        Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 5; color: root.violet }
-                                        Row {
-                                            x: 6; anchors.verticalCenter: parent.verticalCenter; spacing: 3
-                                            Repeater { model: ["#ff5f57", "#febc2e", "#28c840"]; Rectangle { width: 6; height: 6; radius: 3; color: modelData } }
-                                        }
-                                    }
-                                    Column {
-                                        x: 8; y: 17; width: parent.width - 16
-                                        PlasmaComponents3.Label { width: parent.width; text: "Mac shortcuts work here"; font.bold: true; font.pixelSize: 11; wrapMode: Text.WordWrap }
-                                        PlasmaComponents3.Label { width: parent.width; text: "when focused and hovered over (with exceptions)"; font.pixelSize: 10; opacity: 0.7; wrapMode: Text.WordWrap }
-                                    }
-                                    Pointer { x: parent.width - 22; y: parent.height - 19 }
-                                }
-                                PlasmaComponents3.Label {
-                                    x: macWin.x + macWin.width + 8; y: 14
-                                    width: parent.width - x - 6
-                                    text: "Linux shortcuts here"; font.bold: true; font.pixelSize: 11; wrapMode: Text.WordWrap
-                                }
-                                Pointer { x: parent.width - 22; y: parent.height - 24 }
-                            }
-                            PlasmaComponents3.Label {
-                                text: root.shortcutKeys.swapped ? "In Mac windows Alt is ⌘, Super is ⌥." : "In Mac windows Super is ⌘, Alt is ⌥."
-                                font.pixelSize: 11
-                                opacity: 0.7
-                            }
-                            // The desktop's keys that stay its own even there (ui.rs, deskkeys.rs).
-                            PlasmaComponents3.Button {
-                                text: "Change shortcuts…"
-                                Layout.topMargin: Kirigami.Units.smallSpacing
-                                icon.name: "configure-shortcuts"
-                                onClicked: { keysPopup.close(); root.act("shortcuts"); root.expanded = false; }
-                            }
-                        }
-                    }
+                    onClicked: { root.act("shortcuts"); root.expanded = false; }
                 }
                 Item { Layout.fillWidth: true }
-                PlasmaComponents3.ToolButton {
-                    icon.name: "application-exit"
+                SfButton {
                     text: "Quit Sweeflow"
                     onClicked: root.act("quit")
                     PlasmaComponents3.ToolTip.text: "Stop Sweeflow on this computer (the Mac's windows close here)"
@@ -614,7 +533,7 @@ PlasmoidItem {
                                         radius: width / 2
                                         color: Kirigami.Theme.highlightColor
                                     }
-                                    PlasmaComponents3.ToolButton {
+                                    SfButton {
                                         visible: appRow.appRunning
                                         text: "Quit"
                                         onClicked: root.act("quit-app", appRow.modelData.id)
@@ -622,7 +541,7 @@ PlasmoidItem {
                                         PlasmaComponents3.ToolTip.visible: hovered
                                         PlasmaComponents3.ToolTip.delay: Kirigami.Units.toolTipDelay
                                     }
-                                    PlasmaComponents3.ToolButton {
+                                    SfButton {
                                         text: appRow.modelData.pinned ? "Unpin" : "Pin"
                                         onClicked: root.act(appRow.modelData.pinned ? "unpin" : "pin", appRow.modelData.id)
                                         PlasmaComponents3.ToolTip.text: appRow.modelData.pinned ? "Unpin from the top" : "Pin to the top"
@@ -665,11 +584,20 @@ PlasmoidItem {
                     spacing: 0
 
                     Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
+                    // The features first, named and ordered as on the setup window's last page.
                     ToggleRow {
-                        label: "Mac sound on Linux"
-                        hint: "The Mac's sound plays on this computer"
-                        on: !!root.settings.sound
-                        onFlipped: (v) => root.set({ sound: v })
+                        label: "Apps in launcher"
+                        hint: "Mac apps in the app launcher, alongside your Linux apps"
+                        on: !!root.settings.launcher
+                        onFlipped: (v) => root.set({ launcher: v })
+                    }
+                    // Plasma only: the other desktops have no menu bar to put the menus in.
+                    ToggleRow {
+                        visible: !!root.placement.plasma
+                        label: "Global menu"
+                        hint: "The Mac apps' menus at the top of the screen"
+                        on: !!root.placement.globalMenu
+                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
                     }
                     ToggleRow {
                         label: "Shared clipboard"
@@ -678,22 +606,16 @@ PlasmoidItem {
                         onFlipped: (v) => root.set({ clipboard: v })
                     }
                     ToggleRow {
-                        label: "Drag and drop files between"
+                        label: "Drag and drop files"
                         hint: "Files, between Mac windows and Linux"
                         on: !!root.settings.dragDrop
                         onFlipped: (v) => root.set({ dragDrop: v })
                     }
                     ToggleRow {
-                        label: "Mac apps in your Linux launcher"
-                        hint: "Mac apps in the app launcher, alongside your Linux apps"
-                        on: !!root.settings.launcher
-                        onFlipped: (v) => root.set({ launcher: v })
-                    }
-                    ToggleRow {
-                        label: "Square window corners"
-                        hint: "Mac windows end in square corners instead of the Mac's rounded ones"
-                        on: !!root.st.square
-                        onFlipped: (v) => root.act("square", v ? "on" : "off")
+                        label: "Sound passthrough"
+                        hint: "The Mac's sound plays on this computer"
+                        on: !!root.settings.sound
+                        onFlipped: (v) => root.set({ sound: v })
                     }
                     ToggleRow {
                         label: "High quality"
@@ -701,19 +623,17 @@ PlasmoidItem {
                         on: root.settings.quality !== "light"
                         onFlipped: (v) => root.set({ quality: v ? "sharp" : "light" })
                     }
-                    // Plasma only: the other desktops have no menu bar to put the menus in.
                     ToggleRow {
-                        visible: !!root.placement.plasma
-                        label: "Global Menu widget"
-                        hint: "The Mac apps' menus at the top of the screen"
-                        on: !!root.placement.globalMenu
-                        onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
+                        label: "Square window corners"
+                        hint: "Mac windows end in square corners instead of the Mac's rounded ones"
+                        on: !!root.st.square
+                        onFlipped: (v) => root.act("square", v ? "on" : "off")
                     }
                     // A MacBook, connected: the Mac asks for its password (LidSleepRule.swift).
                     ToggleRow {
                         visible: root.connected && !!root.settings.hasLid
-                        label: "MacBook lid can be closed"
-                        hint: "Keeps the MacBook awake when shut. The Mac asks for its password"
+                        label: "Stream with lid closed"
+                        hint: "The MacBook stays awake with its lid shut while it streams. The Mac asks for its password"
                         on: !!root.settings.lid
                         onFlipped: (v) => root.set({ lid: v })
                     }
@@ -886,13 +806,11 @@ PlasmoidItem {
                                             selectAll();
                                         }
                                     }
-                                    PlasmaComponents3.ToolButton {
-                                        icon.name: "dialog-ok-apply"
+                                    SfButton {
                                         text: "Save"
                                         onClicked: mac.save()
                                     }
-                                    PlasmaComponents3.ToolButton {
-                                        icon.name: "dialog-cancel"
+                                    SfButton {
                                         text: "Cancel"
                                         onClicked: root.editingMac = ""
                                     }
@@ -909,13 +827,11 @@ PlasmoidItem {
                                         wrapMode: Text.Wrap
                                         Layout.fillWidth: true
                                     }
-                                    PlasmaComponents3.ToolButton {
-                                        icon.name: "edit-delete-remove"
+                                    SfButton {
                                         text: "Unlink"
                                         onClicked: { root.confirmingMac = ""; root.act("forget", mac.modelData.fingerprint); }
                                     }
-                                    PlasmaComponents3.ToolButton {
-                                        icon.name: "dialog-cancel"
+                                    SfButton {
                                         text: "Cancel"
                                         onClicked: root.confirmingMac = ""
                                     }
@@ -924,11 +840,10 @@ PlasmoidItem {
                         }
                     }
                 }
-                PlasmaComponents3.Button {
+                SfButton {
                     Layout.alignment: Qt.AlignLeft
                     Layout.leftMargin: Kirigami.Units.largeSpacing
                     Layout.bottomMargin: Kirigami.Units.smallSpacing
-                    icon.name: "list-add"
                     text: "Link a Mac…"
                     onClicked: root.act("pair")
                 }

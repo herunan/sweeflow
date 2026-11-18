@@ -275,6 +275,7 @@ impl UserKey {
 
     /// Qt's number for it, as Plasma's global shortcuts are kept.
     pub fn qt(&self) -> Option<i32> {
+        let mut shifted = false;
         let key = match self.key.as_str() {
             "Space" => 0x20,
             "Enter" => 0x0100_0004,
@@ -301,11 +302,23 @@ impl UserKey {
                 if !c.is_ascii() {
                     return None;
                 }
-                c.to_ascii_uppercase() as i32
+                // With Shift, a digit or sign is the sign Shift makes (a US layout), and Shift
+                // goes: that's how Plasma writes and matches them (Meta+! for Super+Shift+1);
+                // Ctrl+Shift+; is never pressed, Ctrl+: is.
+                if self.shift {
+                    if let Some(at) = "1234567890-=[]\\;',./`".find(c) {
+                        shifted = true;
+                        "!@#$%^&*()_+{}|:\"<>?~".as_bytes()[at] as i32
+                    } else {
+                        c.to_ascii_uppercase() as i32
+                    }
+                } else {
+                    c.to_ascii_uppercase() as i32
+                }
             }
         };
         let mut code = key;
-        for (on, bit) in [(self.logo, 0x1000_0000), (self.alt, 0x0800_0000), (self.ctrl, 0x0400_0000), (self.shift, 0x0200_0000)] {
+        for (on, bit) in [(self.logo, 0x1000_0000), (self.alt, 0x0800_0000), (self.ctrl, 0x0400_0000), (self.shift && !shifted, 0x0200_0000)] {
             if on {
                 code |= bit;
             }
@@ -415,6 +428,9 @@ mod tests {
         // Plasma's numbers: Meta 0x10000000, Shift 0x02000000, the letter's capital.
         assert_eq!(k.qt(), Some(0x1000_0000 | 0x0200_0000 | 'E' as i32));
         assert_eq!(f5.qt(), Some(0x1000_0000 | 0x0100_0034));
+        // Shift with a digit or sign: the sign Shift makes, without Shift (as Plasma has them).
+        assert_eq!(UserKey::parse("Ctrl+Shift+;").unwrap().qt(), Some(0x0400_0000 | ':' as i32));
+        assert_eq!(UserKey::parse("Super+Shift+1").unwrap().qt(), Some(0x1000_0000 | '!' as i32));
     }
 
     #[test]
@@ -427,11 +443,11 @@ mod tests {
         // Cmd+Left, Opt+Right: through text.
         assert!(!is_desktop_key(KEY_LEFT, cmd));
         assert!(!is_desktop_key(KEY_RIGHT, opt));
-        // Cmd+Tab, Alt+Tab, the volume key: every desktop's (which others depend on the desktop,
-        // keptkeys.rs).
-        assert!(is_desktop_key(KEY_TAB, cmd));
-        assert!(is_desktop_key(KEY_TAB, opt));
-        assert!(is_desktop_key(KEY_VOLUMEUP, Mods::default()));
+        // Cmd+Tab, Alt+Tab, the volume key: kept for Linux by default (keptkeys.rs; the person's
+        // own removals, in their config, aren't this test's business).
+        assert!(crate::keptkeys::is_kept(KEY_TAB, cmd));
+        assert!(crate::keptkeys::is_kept(KEY_TAB, opt));
+        assert!(crate::keptkeys::is_kept(KEY_VOLUMEUP, Mods::default()));
         // Plain Tab, Ctrl+Tab: the app's.
         assert!(!is_desktop_key(KEY_TAB, Mods::default()));
         assert!(!is_desktop_key(KEY_TAB, Mods { ctrl: true, ..Default::default() }));

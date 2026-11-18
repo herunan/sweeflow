@@ -423,6 +423,11 @@ fn is_key_note(name: &str) -> bool {
 /// shortcut Sweeflow wrote into the desktop's own settings (GNOME before the portal, Cinnamon)
 /// gets the new key. Where the portal or Hyprland's bindings have the keys, nothing here.
 pub fn apply_own_key(name: &str) {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    // Plasma through the portal: Sweeflow gives Plasma the key (globalkeys.rs).
+    if desktop.contains("KDE") && crate::globalkeys::in_use() {
+        return crate::globalkeys::plasma_set(name);
+    }
     let id = match name {
         "open" => None,
         "pause" => Some("toggle-pause"),
@@ -431,7 +436,6 @@ pub fn apply_own_key(name: &str) {
     };
     let key = crate::keys::own_key(name);
     let text = key.as_ref().map(|k| gtk_accel(k, mac_keys_remapped())).unwrap_or_default();
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let result = if desktop.contains("GNOME") && !crate::globalkeys::in_use() {
         let path = id.map_or(GNOME_KEY_PATH.to_string(), gnome_path);
         gsettings(&["set", &format!("{GNOME_KEYS}.custom-keybinding:{path}"), "binding", &gvariant_str(&text)])
@@ -611,6 +615,7 @@ const WIDGET_FILES: &[(&str, &str)] = &[
     ("dev.sweeflow.panel/contents/ui/ToggleRow.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/ToggleRow.qml")),
     ("dev.sweeflow.panel/contents/ui/VioletSwitch.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/VioletSwitch.qml")),
     ("dev.sweeflow.panel/contents/ui/FieldFrame.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/FieldFrame.qml")),
+    ("dev.sweeflow.panel/contents/ui/SfButton.qml", include_str!("../plasmoid/dev.sweeflow.panel/contents/ui/SfButton.qml")),
     ("dev.sweeflow.panel/contents/icons/sweeflow-tray.svg", LOGO),
     ("dev.sweeflow.panel/contents/icons/sweeflow-app.svg", APP_ICON),
     ("dev.sweeflow.panel/contents/icons/dock.svg", include_str!("../plasmoid/dev.sweeflow.panel/contents/icons/dock.svg")),
@@ -649,7 +654,7 @@ fn launcher_entry(bin: &str) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=Sweeflow\nGenericName=Mac apps\nComment=Mac apps on this desktop\n\
          Exec={bin} open\nIcon=sweeflow\nTerminal=false\nStartupNotify=false\n\
-         Categories=Network;RemoteAccess;\nKeywords=mac;macos;stream;\nActions={ids}\n{actions}"
+         Categories=Utility;\nKeywords=mac;macos;stream;\nActions={ids}\n{actions}"
     )
 }
 
