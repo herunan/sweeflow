@@ -101,14 +101,33 @@ final class AudioTap: SoundSource {
         }
     }
 
-    /// Makes a tap and drops it, so macOS asks its question (waits for the answer). True when
-    /// a tap could be made.
-    static func ask() -> Bool {
-        let d = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
-        var id = AudioObjectID(kAudioObjectUnknown)
-        guard AudioHardwareCreateProcessTap(d, &id) == noErr, id != kAudioObjectUnknown else { return false }
-        AudioHardwareDestroyProcessTap(id)
-        return true
+    /// Lets sound through a tap for a moment, then drops it, so macOS asks its "record your system
+    /// audio" question now (setup) rather than when Linux first connects: making a tap alone doesn't
+    /// ask, only starting it does. `done` says whether it started.
+    static func ask(_ done: @escaping (Bool) -> Void = { _ in }) {
+        let tap = AudioTap(allowed: { _ in true })
+        asking = tap
+        tap.start { ok in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                tap.stop()
+                if asking === tap { asking = nil }
+                done(ok)
+            }
+        }
+    }
+    private static var asking: AudioTap?
+
+    /// Whether macOS lets Sweeflow record system audio: true, false, or nil when it hasn't asked
+    /// yet (or can't tell). From TCC itself: macOS has no public way to ask for this one.
+    static func permission() -> Bool? {
+        typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int32
+        guard let lib = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY),
+              let sym = dlsym(lib, "TCCAccessPreflight") else { return nil }
+        switch unsafeBitCast(sym, to: Preflight.self)("kTCCServiceAudioCapture" as CFString, nil) {
+        case 0: return true
+        case 1: return false
+        default: return nil
+        }
     }
 
     // MARK: processes

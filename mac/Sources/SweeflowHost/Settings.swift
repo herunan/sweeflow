@@ -35,19 +35,25 @@ final class Settings {
         var launcher: Bool?
         var quality: String?
         var desktop: Bool?
+        /// Streaming with the lid closed (LidSleepRule): not in Config, it's the rule itself.
+        /// Asked for from Linux, it brings up the password prompt here.
+        var lid: Bool?
+        /// A MacBook: only then is `lid` offered (sent, not read).
+        var hasLid: Bool?
     }
 
     func wire() -> Data {
         let c = config
         let w = Wire(enabled: c.enabled, exclude: c.excludeApps, sound: c.soundOnLinux, dim: c.dimMacScreenWhileStreaming,
                      clipboard: c.clipboard, dragDrop: c.dragDrop, launcher: c.launcherMenu, quality: c.quality,
-                     desktop: c.ownDesktop)
+                     desktop: c.ownDesktop, lid: LidSleepRule.shown, hasLid: LidSleepRule.hasLid)
         return (try? JSONEncoder().encode(w)) ?? Data()
     }
 
     /// A change from the client: only the fields it sent.
     func apply(wire data: Data) {
         guard let w = try? JSONDecoder().decode(Wire.self, from: data) else { return log("bad settings from client") }
+        if let v = w.lid { DispatchQueue.main.async { LidSleepRule.ask(v) } }
         update { Self.merge(w, into: &$0) }
     }
 

@@ -40,6 +40,9 @@ let pairServiceType = "_sweeflow-pair._udp"
 enum PairStatus: UInt8 {
     case linked = 0, cancelled = 1, busy = 2, wait = 3, locked = 4, alreadyLinked = 5, version = 6
     case tooManyWrong = 7, expired = 8, unlinked = 9, notLinked = 10
+    /// Linking isn't open on this Mac: its Link window isn't open (or setup isn't finished). The
+    /// computer waits and asks again.
+    case closed = 11
 }
 
 /// Linking: a second QUIC listener, up whenever Sweeflow runs, that takes any client certificate.
@@ -71,6 +74,12 @@ final class Pairing {
     /// Wrong codes since the last computer was linked, and when the last one came.
     private var wrongInARow = 0
     private var lastWrong = Date.distantPast
+    /// Link requests are taken only while the Link window is open, which only opens once every
+    /// permission is on: no code pops up uninvited, and nothing links before this Mac can stream.
+    private var linkingOpen = false
+
+    /// The Link window opened or closed (main thread).
+    func setOpen(_ open: Bool) { queue.async { self.linkingOpen = open } }
 
     private struct Attempt {
         let stream: ObjectIdentifier
@@ -196,6 +205,10 @@ final class Pairing {
             log("pairing: \(name) is linked already")
             return reply(stream, .alreadyLinked)
         }
+        guard linkingOpen else {
+            log("pairing: \(name) asks, but linking isn't open here")
+            return reply(stream, .closed)
+        }
         if Self.screenLocked() {
             log("pairing: the screen is locked")
             return reply(stream, .locked)
@@ -250,7 +263,10 @@ final class Pairing {
             link(a)
             log("pairing: linked \(a.name)")
             reply(stream, .linked, tag: tags.host)
-            DispatchQueue.main.async { CodeWindow.shared.finish("Linked to \(a.name).") }
+            DispatchQueue.main.async {
+                CodeWindow.shared.finish("Linked to \(a.name).")
+                PairingWindow.shared.linked(a.name)
+            }
             return
         }
         wrongInARow += 1
@@ -361,160 +377,352 @@ func serviceTXT(busy: Bool = false) -> NWTXTRecord {
                  "start": Identity.startWanted().first.map { String($0.prefix(16)) } ?? ""])
 }
 
-/// The code a computer that's linking has to type, in big digits. A window of its own rather than
-/// a modal alert: nothing else in Sweeflow waits on it (a session may be streaming), and it's
-/// taken down when the other computer stops. One on each screen a person can see (a laptop's own
-/// and its monitor), kept in step: the code is only any use to whoever is at this Mac, and they
-/// may be looking at either. Main thread only.
-final class CodeWindow: NSObject {
+/// The code a computer that's linking has to type: shown in the Link window, under its steps.
+/// Linking only happens while that window is open, so the code always has it to appear in (one
+/// window, not a second one popping up). Main thread only.
+final class CodeWindow {
     static let shared = CodeWindow()
-    /// Each screen's copy, with its note and button.
-    private var copies: [(window: NSWindow, note: NSTextField, button: NSButton)] = []
-    private var cancelled: (() -> Void)?
-    /// Bumped with each code, so a delayed close doesn't take down a newer one.
-    private var shown = 0
-
-    var showing: Bool { !copies.isEmpty }
+    var showing: Bool { PairingWindow.shared.codeShowing }
 
     /// Shows `code` for the computer called `name`. `cancelled` runs if the person here cancels.
     func show(name: String, code: String, cancelled: @escaping () -> Void) {
-        close()
-        // The explanation has done its job once a computer asks.
-        PairingWindow.shared.close()
-        shown += 1
-        BuiltInScreen.pause()
-        let virtual = host.display.displayID
-        let screens = NSScreen.screens.filter {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) != virtual
-        }
-        for screen in screens.isEmpty ? [nil] : screens.map(Optional.some) {
-            copies.append(build(name: name, code: code, on: screen))
-        }
-        self.cancelled = cancelled
-        NSApp.activate()
-        // The primary display's copy (listed first) ends up in front, holding the keyboard.
-        for c in copies.reversed() { c.window.makeKeyAndOrderFront(nil) }
+        PairingWindow.shared.showCode(name: name, code: code, cancelled: cancelled)
     }
-
-    private func build(name: String, code: String, on screen: NSScreen?) -> (window: NSWindow, note: NSTextField, button: NSButton) {
-        let title = NSTextField(wrappingLabelWithString: "Enter this code on \(name)")
-        title.font = .systemFont(ofSize: 15, weight: .semibold)
-        title.alignment = .center
-        title.preferredMaxLayoutWidth = 300
-        // Spaced out, so it reads digit by digit.
-        let digits = NSTextField(labelWithString: code.map(String.init).joined(separator: " "))
-        digits.font = .monospacedDigitSystemFont(ofSize: 48, weight: .semibold)
-        digits.alignment = .center
-        // Said once, in the title; the note is for how it ended (wrong codes, expired, linked).
-        let note = NSTextField(wrappingLabelWithString: "")
-        note.alignment = .center
-        note.textColor = .secondaryLabelColor
-        note.preferredMaxLayoutWidth = 300
-        let button = NSButton(title: "Cancel", target: self, action: #selector(clickedButton))
-        button.keyEquivalent = "\u{1b}"
-        let stack = NSStackView(views: [title, digits, note, button])
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 20, right: 28)
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 220), styleMask: [.titled],
-                         backing: .buffered, defer: false)
-        w.title = "Link a Linux machine"
-        w.contentView = stack
-        w.isReleasedWhenClosed = false
-        // Above other windows, as an alert would be.
-        w.level = .modalPanel
-        if let f = screen?.visibleFrame {
-            w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
-        } else {
-            w.center()
-        }
-        return (w, note, button)
-    }
-
     /// A line under the code (a wrong try).
-    func note(_ text: String) {
-        for c in copies { c.note.stringValue = text }
-    }
-
-    /// Says how it ended, then goes by itself (or on OK).
-    func finish(_ text: String) {
-        guard showing else { return }
-        cancelled = nil
-        for c in copies {
-            c.note.stringValue = text
-            c.note.textColor = .labelColor
-            c.button.title = "OK"
-            c.button.keyEquivalent = "\r"
-        }
-        let n = shown
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-            if self?.shown == n { self?.close() }
-        }
-    }
-
-    /// Takes every copy down, without telling anyone.
-    func close() {
-        cancelled = nil
-        guard showing else { return }
-        let all = copies
-        copies = []
-        for c in all { c.window.close() }
-        BuiltInScreen.resume()
-    }
-
-    @objc private func clickedButton() {
-        let cancelled = self.cancelled
-        close()
-        cancelled?()
-    }
+    func note(_ text: String) { PairingWindow.shared.codeNote(text) }
+    /// Says how it ended, then the code goes by itself.
+    func finish(_ text: String) { PairingWindow.shared.codeFinished(text) }
+    /// Takes the code down, without telling anyone.
+    func close() { PairingWindow.shared.hideCode() }
 }
 
-/// What "Link a Linux machine…" opens: linking is started on the Linux machine, so this only
-/// says how, and what to type there if this Mac isn't found by itself. Main thread only.
+/// What "Link a Linux machine…" opens, and where setup ends: while it's open this Mac takes link
+/// requests (`Pairing.setOpen`). Linking starts on Linux, so it says how, with this Mac's name and
+/// address for when it isn't found by itself. Only opens once every permission is on; before that
+/// the setup window opens instead. Main thread only.
 final class PairingWindow: NSObject, NSWindowDelegate {
     static let shared = PairingWindow()
     private var window: NSWindow?
+    private var status: NSTextField?
+    private var spinner: NSProgressIndicator?
+    private var button: NSButton?
+    private var stack: NSStackView?
+    // The code, under the steps while one is up.
+    private var codeBox: NSView?
+    private var codeTitle: NSTextField?
+    private var codeDigits: NSTextField?
+    private var codeNoteLabel: NSTextField?
+    private var cancelCode: (() -> Void)?
+    private(set) var codeShowing = false
+    /// Drawn into a picture (`--render-link`): nothing of the running app is there to bring it forward.
+    private var previewing = false
+    /// Bumped with each code, so a delayed hide doesn't take down a newer one.
+    private var codesShown = 0
 
     func show() {
+        guard Onboarding.permissionsReady else { return Onboarding.shared.show() }
         // Built each time: this Mac's addresses change with the network.
         window?.close()
         let w = build()
         window = w
+        Pairing.shared.setOpen(true)
         presentToPerson(w)
     }
 
     func close() { window?.close() }
 
+    /// A computer asked to link: its code, in the window (opened if it somehow isn't).
+    func showCode(name: String, code: String, cancelled: @escaping () -> Void) {
+        if window == nil { show() }
+        guard let w = window else { return }
+        codesShown += 1
+        codeShowing = true
+        cancelCode = cancelled
+        codeTitle?.stringValue = "Enter this code on \(name)"
+        // Spaced out, so it reads digit by digit.
+        codeDigits?.stringValue = code.map(String.init).joined(separator: " ")
+        codeNoteLabel?.stringValue = ""
+        codeNoteLabel?.isHidden = true
+        codeBox?.isHidden = false
+        status?.stringValue = "Waiting for the code on \(name)."
+        button?.title = "Cancel"
+        fit()
+        if !previewing { presentToPerson(w) }
+    }
+
+    func codeNote(_ text: String) {
+        codeNoteLabel?.stringValue = text
+        codeNoteLabel?.textColor = .secondaryLabelColor
+        codeNoteLabel?.isHidden = text.isEmpty
+        fit()
+    }
+
+    func codeFinished(_ text: String) {
+        guard codeShowing else { return }
+        cancelCode = nil
+        codeNote(text)
+        codeNoteLabel?.textColor = .labelColor
+        let n = codesShown
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            if self?.codesShown == n { self?.hideCode() }
+        }
+    }
+
+    func hideCode() {
+        cancelCode = nil
+        guard codeShowing else { return }
+        codeShowing = false
+        codeBox?.isHidden = true
+        if button?.title == "Cancel" {
+            button?.title = "Close"
+            status?.stringValue = "Waiting for your Linux machine."
+        }
+        fit()
+    }
+
+    /// The window as tall as what it shows (the code comes and goes).
+    private func fit() {
+        guard let w = window, let stack else { return }
+        stack.layoutSubtreeIfNeeded()
+        let h = stack.fittingSize.height
+        guard abs(w.contentLayoutRect.height - h) > 0.5 else { return }
+        var f = w.frame
+        let newFrame = w.frameRect(forContentRect: NSRect(x: 0, y: 0, width: Self.width, height: h))
+        f.origin.y += f.height - newFrame.height
+        f.size = newFrame.size
+        w.setFrame(f, display: true, animate: w.isVisible)
+    }
+
+    /// A computer was just linked: says so, then goes.
+    func linked(_ name: String) {
+        guard window != nil else { return }
+        spinner?.stopAnimation(nil)
+        spinner?.isHidden = true
+        status?.stringValue = "Linked with \(name). Your Mac's apps show up there now."
+        cancelCode = nil
+        status?.textColor = .labelColor
+        button?.title = "Done"
+        Pairing.shared.setOpen(false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in self?.close() }
+    }
+
+    static let width: CGFloat = 520
+
     private func build() -> NSWindow {
+        let inner = Self.width - 56
+        let icon = NSImageView(image: NSApp.applicationIconImage)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 64).isActive = true
         let title = NSTextField(labelWithString: "Link a Linux machine")
-        title.font = .systemFont(ofSize: 17, weight: .semibold)
-        let how = NSTextField(wrappingLabelWithString:
-            "Open Sweeflow on the Linux machine, choose “Link a Mac…” and pick this Mac. "
-            + "This Mac then shows a code to type there.")
-        how.preferredMaxLayoutWidth = 340
-        let manual = NSTextField(wrappingLabelWithString: "If this Mac isn't found by itself, type its address there.")
-        manual.preferredMaxLayoutWidth = 340
+        title.font = .systemFont(ofSize: 22, weight: .semibold)
+        let subtitle = NSTextField(labelWithString: "This Mac can be found while this window is open.")
+        subtitle.font = .systemFont(ofSize: 13)
+        subtitle.textColor = .secondaryLabelColor
+        let words = NSStackView(views: [title, subtitle])
+        words.orientation = .vertical
+        words.alignment = .leading
+        words.spacing = 3
+        let header = NSStackView(views: [icon, words])
+        header.spacing = 14
+        header.alignment = .centerY
+
+        let steps: [(String, String)] = [
+            ("On your Linux machine, open Sweeflow.", ""),
+            ("Choose this Mac.", "It's listed as \(macName)."),
+            ("Type the code that shows here.", "It appears on this Mac by itself."),
+        ]
+        var rows: [NSView] = []
+        for (i, step) in steps.enumerated() {
+            if i > 0 { rows.append(Self.line(width: inner)) }
+            rows.append(Self.stepRow(number: i + 1, title: step.0, detail: step.1, width: inner))
+        }
+        let list = NSStackView(views: rows)
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 0
+        list.translatesAutoresizingMaskIntoConstraints = false
+        let group = GroupView()
+        group.translatesAutoresizingMaskIntoConstraints = false
+        group.addSubview(list)
+        NSLayoutConstraint.activate([
+            group.widthAnchor.constraint(equalToConstant: inner),
+            list.topAnchor.constraint(equalTo: group.topAnchor),
+            list.bottomAnchor.constraint(equalTo: group.bottomAnchor),
+            list.leadingAnchor.constraint(equalTo: group.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: group.trailingAnchor),
+        ])
+
+        // The code, once Linux asks: under the steps, hidden until then.
+        let codeTitle = NSTextField(wrappingLabelWithString: "")
+        codeTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        codeTitle.alignment = .center
+        codeTitle.preferredMaxLayoutWidth = inner - 40
+        let digits = NSTextField(labelWithString: "")
+        digits.font = .monospacedDigitSystemFont(ofSize: 44, weight: .semibold)
+        digits.textColor = .white
+        digits.alignment = .center
+        digits.translatesAutoresizingMaskIntoConstraints = false
+        // White digits on Sweeflow's deeper violet: clear in light and dark alike.
+        let plate = NSView()
+        plate.wantsLayer = true
+        plate.layer?.cornerRadius = 14
+        plate.layer?.backgroundColor = NSColor(srgbRed: 0x7C / 255, green: 0x3A / 255, blue: 0xED / 255, alpha: 1).cgColor
+        plate.translatesAutoresizingMaskIntoConstraints = false
+        plate.addSubview(digits)
+        NSLayoutConstraint.activate([
+            digits.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 30),
+            digits.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -30),
+            digits.topAnchor.constraint(equalTo: plate.topAnchor, constant: 10),
+            digits.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -10),
+        ])
+        let codeNote = NSTextField(wrappingLabelWithString: "")
+        codeNote.font = .systemFont(ofSize: 12)
+        codeNote.alignment = .center
+        codeNote.preferredMaxLayoutWidth = inner - 40
+        codeNote.isHidden = true
+        let codeStack = NSStackView(views: [codeTitle, plate, codeNote])
+        codeStack.orientation = .vertical
+        codeStack.alignment = .centerX
+        codeStack.spacing = 12
+        codeStack.translatesAutoresizingMaskIntoConstraints = false
+        let codeBox = GroupView()
+        codeBox.translatesAutoresizingMaskIntoConstraints = false
+        codeBox.addSubview(codeStack)
+        NSLayoutConstraint.activate([
+            codeBox.widthAnchor.constraint(equalToConstant: inner),
+            codeStack.topAnchor.constraint(equalTo: codeBox.topAnchor, constant: 18),
+            codeStack.bottomAnchor.constraint(equalTo: codeBox.bottomAnchor, constant: -18),
+            codeStack.centerXAnchor.constraint(equalTo: codeBox.centerXAnchor),
+        ])
+        codeBox.isHidden = true
+        self.codeBox = codeBox
+        self.codeTitle = codeTitle
+        self.codeDigits = digits
+        self.codeNoteLabel = codeNote
+
+        // Typed by hand on Linux when this Mac isn't found by itself; Tailscale's address works
+        // from anywhere the two are on the same tailnet.
         let addresses = Self.addresses()
-        let address = addresses.isEmpty ? "none, this Mac isn't on a network" : addresses.joined(separator: " or ")
-        let details = NSTextField(wrappingLabelWithString: "Name: \(macName)\nAddress: \(address)")
-        details.preferredMaxLayoutWidth = 340
-        details.isSelectable = true
-        details.textColor = .secondaryLabelColor
-        let done = NSButton(title: "Done", target: self, action: #selector(clickedDone))
-        done.keyEquivalent = "\r"
-        let stack = NSStackView(views: [title, how, manual, details, done])
+        let local = addresses.filter { !Self.isTailscale($0) }, tailnet = addresses.filter(Self.isTailscale)
+        let manual = Self.addressLine(local.isEmpty
+            ? ("This Mac isn't on a local network right now.", [])
+            : ("Not found automatically? Type this address on Linux: ", local), width: inner)
+        let tailscale = Self.addressLine(tailnet.isEmpty
+            ? ("Works with Tailscale too.", [])
+            : ("Works with Tailscale too: ", tailnet), width: inner)
+
+        let spin = NSProgressIndicator()
+        spin.style = .spinning
+        spin.controlSize = .small
+        spin.startAnimation(nil)
+        let status = NSTextField(wrappingLabelWithString: "Waiting for your Linux machine.")
+        status.font = .systemFont(ofSize: 12)
+        status.textColor = .secondaryLabelColor
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let button = NSButton(title: "Close", target: self, action: #selector(clickedClose))
+        button.bezelStyle = .push
+        button.keyEquivalent = "\u{1b}"
+        let gap = NSView()
+        gap.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = NSStackView(views: [spin, status, gap, button])
+        footer.alignment = .centerY
+        footer.spacing = 8
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.widthAnchor.constraint(equalToConstant: inner).isActive = true
+        self.status = status
+        self.spinner = spin
+        self.button = button
+
+        let stack = NSStackView(views: [header, group, codeBox, manual, tailscale, Self.line(width: inner, indent: 0), footer])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 20, right: 28)
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 280), styleMask: [.titled, .closable],
-                         backing: .buffered, defer: false)
-        w.title = "Sweeflow"
+        stack.setCustomSpacing(22, after: header)
+        stack.setCustomSpacing(14, after: group)
+        stack.setCustomSpacing(14, after: codeBox)
+        stack.setCustomSpacing(6, after: manual)
+        stack.setCustomSpacing(18, after: tailscale)
+        self.stack = stack
+        stack.edgeInsets = NSEdgeInsets(top: 40, left: 28, bottom: 20, right: 28)
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 400),
+                         styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+        w.title = "Link a Linux machine"
+        w.titleVisibility = .hidden
+        w.titlebarAppearsTransparent = true
+        w.isMovableByWindowBackground = true
         w.contentView = stack
         w.isReleasedWhenClosed = false
         w.delegate = self
+        stack.layoutSubtreeIfNeeded()
+        w.setContentSize(NSSize(width: Self.width, height: stack.fittingSize.height))
         return w
+    }
+
+    /// A numbered step: the number in a violet circle, what to do, and a second line if any.
+    private static func stepRow(number: Int, title: String, detail: String, width: CGFloat) -> NSView {
+        let badge = NSTextField(labelWithString: "\(number)")
+        badge.font = .systemFont(ofSize: 13, weight: .semibold)
+        badge.textColor = .white
+        badge.alignment = .center
+        let circle = NSView()
+        circle.wantsLayer = true
+        circle.layer?.cornerRadius = 12
+        circle.layer?.backgroundColor = NSColor.sweeflowViolet.cgColor
+        circle.translatesAutoresizingMaskIntoConstraints = false
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        circle.addSubview(badge)
+        NSLayoutConstraint.activate([
+            circle.widthAnchor.constraint(equalToConstant: 24), circle.heightAnchor.constraint(equalToConstant: 24),
+            badge.centerXAnchor.constraint(equalTo: circle.centerXAnchor), badge.centerYAnchor.constraint(equalTo: circle.centerYAnchor),
+        ])
+        let t = NSTextField(labelWithString: title)
+        t.font = .systemFont(ofSize: 13, weight: .semibold)
+        var texts: [NSView] = [t]
+        if !detail.isEmpty {
+            let d = NSTextField(wrappingLabelWithString: detail)
+            d.font = .systemFont(ofSize: 12)
+            d.textColor = .secondaryLabelColor
+            d.preferredMaxLayoutWidth = width - 80
+            texts.append(d)
+        }
+        let text = NSStackView(views: texts)
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        let row = NSStackView(views: [circle, text])
+        row.alignment = .centerY
+        row.spacing = 14
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let holder = NSView()
+        holder.translatesAutoresizingMaskIntoConstraints = false
+        holder.addSubview(row)
+        NSLayoutConstraint.activate([
+            holder.widthAnchor.constraint(equalToConstant: width),
+            row.topAnchor.constraint(equalTo: holder.topAnchor, constant: 12),
+            row.bottomAnchor.constraint(equalTo: holder.bottomAnchor, constant: -12),
+            row.leadingAnchor.constraint(equalTo: holder.leadingAnchor, constant: 18),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: holder.trailingAnchor, constant: -16),
+        ])
+        return holder
+    }
+
+    private static func line(width: CGFloat, indent: CGFloat = 56) -> NSView {
+        let line = NSBox()
+        line.boxType = .separator
+        line.translatesAutoresizingMaskIntoConstraints = false
+        let holder = NSView()
+        holder.translatesAutoresizingMaskIntoConstraints = false
+        holder.addSubview(line)
+        NSLayoutConstraint.activate([
+            holder.widthAnchor.constraint(equalToConstant: width),
+            holder.heightAnchor.constraint(equalToConstant: 1),
+            line.leadingAnchor.constraint(equalTo: holder.leadingAnchor, constant: indent),
+            line.trailingAnchor.constraint(equalTo: holder.trailingAnchor),
+            line.centerYAnchor.constraint(equalTo: holder.centerYAnchor),
+        ])
+        return holder
     }
 
     /// This Mac's IPv4 addresses another computer can use: not its own loopback, nor the ones
@@ -525,11 +733,74 @@ final class PairingWindow: NSObject, NSWindowDelegate {
         Session.ownAddresses().filter { !$0.hasSuffix(".local") }
     }
 
-    @objc private func clickedDone() { window?.close() }
+    /// A line of explanation with the addresses in it, in a fixed-width face (selectable, to copy).
+    private static func addressLine(_ parts: (String, [String]), width: CGFloat) -> NSTextField {
+        let small = NSFont.systemFont(ofSize: 12)
+        let text = NSMutableAttributedString(string: parts.0, attributes: [.font: small, .foregroundColor: NSColor.secondaryLabelColor])
+        for (i, a) in parts.1.enumerated() {
+            if i > 0 { text.append(NSAttributedString(string: " or ", attributes: [.font: small, .foregroundColor: NSColor.secondaryLabelColor])) }
+            text.append(NSAttributedString(string: a, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold),
+                                                                     .foregroundColor: NSColor.labelColor]))
+        }
+        let label = NSTextField(wrappingLabelWithString: "")
+        label.attributedStringValue = text
+        label.isSelectable = true
+        label.preferredMaxLayoutWidth = width
+        return label
+    }
+
+    /// A Tailscale address: 100.64.0.0/10, the range Tailscale hands out.
+    private static func isTailscale(_ address: String) -> Bool {
+        let parts = address.split(separator: ".").compactMap { Int($0) }
+        return parts.count == 4 && parts[0] == 100 && (64...127).contains(parts[1])
+    }
+
+    /// Close; while a code is up, Cancel (the window stays, for another try).
+    @objc private func clickedClose() {
+        if codeShowing {
+            let cancelled = cancelCode
+            hideCode()
+            cancelled?()
+        } else {
+            window?.close()
+        }
+    }
 
     func windowWillClose(_ notification: Notification) {
+        // Closed with a code up: that linking stops.
+        let cancelled = codeShowing ? cancelCode : nil
+        codeShowing = false
+        cancelCode = nil
+        cancelled?()
         window = nil
-        // The code, if it's up, keeps the screen lit until it's done.
-        if !CodeWindow.shared.showing { BuiltInScreen.resume() }
+        Pairing.shared.setOpen(false)
+        BuiltInScreen.resume()
+    }
+
+    /// `SweeflowHost --render-link FILE.png`: draws the window into a picture, then quits.
+    static func render(to path: String, code: String? = nil) -> Never {
+        let p = PairingWindow()
+        let w = p.build()
+        p.window = w
+        p.previewing = true
+        w.alphaValue = 0
+        if let code { p.showCode(name: "my-pc", code: code) {} }
+        w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        w.orderFrontRegardless()
+        RunLoop.main.run(until: Date().addingTimeInterval(1))
+        if let view = w.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        }
+        exit(0)
+    }
+}
+
+extension NSColor {
+    /// Sweeflow's violet (the app icon's, the site's), lighter on dark backgrounds.
+    static let sweeflowViolet = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0xA7 / 255, green: 0x8B / 255, blue: 0xFA / 255, alpha: 1)
+            : NSColor(srgbRed: 0x7C / 255, green: 0x3A / 255, blue: 0xED / 255, alpha: 1)
     }
 }

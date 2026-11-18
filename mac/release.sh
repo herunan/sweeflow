@@ -58,11 +58,22 @@ STAGE=$(mktemp -d)
 codesign --force --timestamp=none --options runtime --keychain "$KEYCHAIN" -s "$SIGN_NAME" \
     -i dev.sweeflow.host "$STAGE/Sweeflow.app"
 codesign --verify --strict "$STAGE/Sweeflow.app" >&2
-ln -s /Applications "$STAGE/Applications"
-
 echo "==> making the disk image" >&2
 DMG="$OUT/Sweeflow-$VERSION.dmg"
 rm -f "$DMG"
-hdiutil create -quiet -volname Sweeflow -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+# dmgbuild lays out the window that opens with the disk (background, icon places) without driving
+# Finder. Kept in its own Python environment next to the signing key, made the first time.
+DMGBUILD="$REL/dmgbuild/bin/dmgbuild"
+if [ ! -x "$DMGBUILD" ]; then
+    python3 -m venv "$REL/dmgbuild" >&2
+    "$REL/dmgbuild/bin/pip" install -q "dmgbuild==1.6.5" >&2
+fi
+if [ -x "$DMGBUILD" ]; then
+    "$DMGBUILD" -s dmg/settings.py -D app="$STAGE/Sweeflow.app" -D here="$PWD/dmg" Sweeflow "$DMG" >&2
+else
+    echo "    (dmgbuild missing: a plain disk image)" >&2
+    ln -s /Applications "$STAGE/Applications"
+    hdiutil create -quiet -volname Sweeflow -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+fi
 rm -rf "$STAGE"
 echo "$DMG"

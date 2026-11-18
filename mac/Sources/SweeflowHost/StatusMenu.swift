@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 /// The menu-bar item: what concerns this Mac (the rest is set on Linux, see Settings).
 final class StatusMenu: NSObject, NSMenuDelegate {
@@ -78,10 +79,20 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             // The name it has here (renamed here, or from linking), else what it calls itself,
             // never a code made from its certificate.
             let known = fp.isEmpty ? "" : (Identity.pairedClients().first { $0.fingerprint == fp }?.name ?? "")
-            let who = !known.isEmpty ? known : !host.clientSaysName.isEmpty ? host.clientSaysName : "a Linux computer"
+            let who = !known.isEmpty ? known : !host.clientSaysName.isEmpty ? host.clientSaysName : "a Linux machine"
             statusText = c.enabled ? "Streaming to \(who)" : "Paused · \(who)"
         } else {
             statusText = refused.isEmpty ? "Not streaming" : "Stopped"
+        }
+        // Setup not finished: first in the menu, where it's seen.
+        if !Onboarding.complete {
+            let setup = ClosureMenuItem(title: "Finish setting up…") { Onboarding.shared.show() }
+            setup.attributedTitle = NSAttributedString(string: "Finish setting up…",
+                                                       attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize)])
+            setup.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(paletteColors: [.white, .sweeflowViolet]))
+            menu.addItem(setup)
+            menu.addItem(.separator())
         }
         let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         status.isEnabled = false
@@ -131,28 +142,26 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         // Only while a Linux machine is connected (there's nothing to dim for otherwise).
         if client != nil { menu.addItem(dim) }
         let login = ClosureMenuItem(title: "Open at login") {
-            if LoginItem.enabled { LoginItem.disable() } else { LoginItem.enable() }
+            if LoginItem.needsApproval { LoginItem.set(true); SMAppService.openSystemSettingsLoginItems() } else { LoginItem.set(!LoginItem.enabled) }
         }
         login.state = LoginItem.enabled ? .on : .off
         login.isEnabled = !LoginItem.devInstall
         menu.addItem(login)
         // A MacBook sleeps when its lid closes, whatever an app asks, unless pmset is told
         // otherwise (as root: see LidSleepRule).
-        let lid = ClosureMenuItem(title: "Stream with the lid closed") {
-            LidSleepRule.set(!LidSleepRule.installed) { ok in
-                if ok, LidSleepRule.installed { host.wake.lidRuleInstalled() }
-            }
-        }
-        lid.state = LidSleepRule.installed ? .on : .off
+        let lid = ClosureMenuItem(title: "MacBook lid can be closed") { LidSleepRule.ask(!LidSleepRule.installed) }
+        lid.state = LidSleepRule.shown ? .on : .off
         if LidSleepRule.hasLid { menu.addItem(lid) }
         menu.addItem(.separator())
 
         let linked = NSMenuItem(title: "Linux machines", action: nil, keyEquivalent: "")
         let list = NSMenu()
-        let link = ClosureMenuItem(title: "Link a Linux machine…") { PairingWindow.shared.show() }
-        list.addItem(link)
+        // Linking opens only once every permission is on (PairingWindow, Pairing.setOpen).
         let paired = Identity.pairedClients()
-        if !paired.isEmpty { list.addItem(.separator()) }
+        if Onboarding.permissionsReady {
+            list.addItem(ClosureMenuItem(title: "Link a Linux machine…") { PairingWindow.shared.show() })
+            if !paired.isEmpty { list.addItem(.separator()) }
+        }
         for p in paired {
             let name = Identity.clientName(p.fingerprint)
             let computer = NSMenuItem(title: name, action: nil, keyEquivalent: "")
@@ -176,26 +185,29 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(linked)
 
         menu.addItem(.separator())
-        // Only while something's missing (a permission, starting at login, a linked computer).
-        if !Onboarding.complete {
-            let setup = ClosureMenuItem(title: "Finish setting up…") { Onboarding.shared.show() }
-            menu.addItem(setup)
-        }
         let quit = ClosureMenuItem(title: "Quit Sweeflow") { Self.quit() }
         quit.keyEquivalent = "q"
         menu.addItem(quit)
+    }
+
+    /// The built-in screen as it was, and the virtual display gone: before this copy stops.
+    static func leaveMacAsItWas() {
+        BuiltInScreen.stopDimming()
+        BuiltInScreen.restore()
+        host.display.remove()
     }
 
     /// Leaves the Mac as it was (screen, virtual display), then stops. Started by launchd (at
     /// login, kept running), Sweeflow is taken out of it first, or it would be started again.
     private static func quit() {
         log("quitting (menu)")
-        BuiltInScreen.stopDimming()
-        BuiltInScreen.restore()
-        host.display.remove()
-        if LoginItem.underLaunchd, let label = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] {
+        leaveMacAsItWas()
+        // The bundled login item is only started again after a crash (KeepAlive SuccessfulExit,
+        // bundle.sh): quitting leaves it loaded, so opening Sweeflow again just starts it. The
+        // development LaunchAgent keeps itself alive: it's taken out of launchd.
+        if LoginItem.underLaunchd, LoginItem.devInstall {
             // launchd ends this process as it unloads it.
-            _ = try? run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+            _ = try? run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(LoginItem.devAgentLabel)"])
         }
         NSApp.terminate(nil)
     }

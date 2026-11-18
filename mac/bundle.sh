@@ -33,7 +33,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSBonjourServices</key><array><string>_sweeflow._udp</string><string>_sweeflow-pair._udp</string></array>
 </dict></plist>
 PLIST
-# Started at login (and kept running) once Sweeflow registers it with SMAppService.
+# Started at login once Sweeflow registers it with SMAppService, and again after a crash (not after
+# quitting: a successful exit). Registered whatever "Open at login" says: with that off, the copy
+# started at login quits at once (main.swift).
 cat > "$APP/Contents/Library/LaunchAgents/$AGENT_LABEL.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -42,7 +44,7 @@ cat > "$APP/Contents/Library/LaunchAgents/$AGENT_LABEL.plist" <<PLIST
   <key>BundleProgram</key><string>Contents/MacOS/SweeflowHost</string>
   <key>AssociatedBundleIdentifiers</key><array><string>$BUNDLE_ID</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 PLIST

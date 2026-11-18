@@ -417,8 +417,10 @@ struct Identity {
     }
 }
 
+/// Runs a program and returns what it printed. `timeout`: ended after that long (and counted as
+/// failed), for one that can wait for ever, like `launchctl kickstart` on a job launchd can't start.
 @discardableResult
-func run(_ path: String, _ args: [String]) throws -> String {
+func run(_ path: String, _ args: [String], timeout: TimeInterval? = nil) throws -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
@@ -426,6 +428,10 @@ func run(_ path: String, _ args: [String]) throws -> String {
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
     try p.run()
+    if let timeout {
+        let pid = p.processIdentifier
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { if p.isRunning { kill(pid, SIGKILL) } }
+    }
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     guard p.terminationStatus == 0 else { throw WireError(what: "\(path) failed (\(p.terminationStatus))") }

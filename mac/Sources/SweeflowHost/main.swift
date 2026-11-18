@@ -107,6 +107,16 @@ if CommandLine.arguments.contains("--pair") {
     exit(0)
 }
 
+// `SweeflowHost --render-setup FILE.png`: draws the setup window into a picture, then quits.
+if let i = CommandLine.arguments.firstIndex(of: "--render-setup"), i + 1 < CommandLine.arguments.count {
+    Onboarding.render(to: CommandLine.arguments[i + 1], allDone: CommandLine.arguments.dropFirst(i + 2).first == "done")
+}
+
+// `SweeflowHost --render-link FILE.png`: draws the Link window into a picture, then quits.
+if let i = CommandLine.arguments.firstIndex(of: "--render-link"), i + 1 < CommandLine.arguments.count {
+    PairingWindow.render(to: CommandLine.arguments[i + 1], code: CommandLine.arguments.count > i + 2 ? CommandLine.arguments[i + 2] : nil)
+}
+
 // `SweeflowHost --hold-display`: keeps a stand-in display up while Sweeflow restarts (an update),
 // then quits once the new Sweeflow's own display is up (a minute at most). With the lid closed
 // and no monitor, the virtual display is the Mac's only one: it went with the old process, and
@@ -115,34 +125,59 @@ if CommandLine.arguments.contains("--hold-display") {
     VirtualDisplay.holdDuringRestart()
 }
 
-// Opened by hand (Finder, Launchpad): the copy macOS keeps running is the one that serves Linux.
-// Make sure that one is running (the login item), ask it to show its window, and step aside. If
-// macOS wants the login item approved first, or it won't start, carry on here; the setup window
-// explains.
-if !LoginItem.underLaunchd {
-    if LoginItem.devInstall || LoginItem.service.status == .enabled || LoginItem.enable() {
-        let wasRunning = LoginItem.running
-        if wasRunning || LoginItem.start() {
-            // One just started only listens once it's set up: keep asking for a few seconds.
-            let until = Date().addingTimeInterval(wasRunning ? 0 : 4)
-            repeat {
-                DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.show"), object: nil,
-                                                                             userInfo: nil, deliverImmediately: true)
-                RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-            } while Date() < until
-            exit(0)
-        }
-        log("the login item didn't start: running this copy instead")
-    }
-}
-
-// Started by the bundled login item, stderr goes nowhere: keep a log where the dev setup does.
+// Started by the bundled login item (or opened by hand), stderr goes nowhere: keep a log where
+// the dev setup does. Before the hand-off below, so what a copy opened by hand does is in it too.
 if ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] != LoginItem.devAgentLabel {
     let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/sweeflow.log")
     if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil) }
     if let h = try? FileHandle(forWritingTo: logURL) {
         h.seekToEndOfFile()
         dup2(h.fileDescriptor, STDERR_FILENO)
+    }
+}
+
+// Which copy runs. The one the person opens (Finder, Launchpad, macOS's Quit & Reopen) runs
+// itself; the login item only starts Sweeflow at login. That item is often refused by macOS
+// (exit 78, a launch constraint: no Developer ID yet), and handing over to it cost every opening
+// ~13 s, or left nothing running when the old copy was still quitting.
+let otherCopy = { NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+    .first { $0.processIdentifier != getpid() && !$0.isTerminated } }
+if LoginItem.underLaunchd, !LoginItem.devInstall {
+    // At login: not wanted, or Sweeflow is already up. A successful exit isn't started again.
+    if !LoginItem.wanted { log("started at login, but Open at login is off: quitting"); exit(0) }
+    if otherCopy() != nil { log("started by launchd, but Sweeflow is already running: quitting"); exit(0) }
+} else if !LoginItem.underLaunchd {
+    let me = Bundle.main.executableURL.flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
+    if let other = otherCopy() {
+        // Started before the app on disk was replaced: an older version. It makes way.
+        if let me, let started = other.launchDate, started < me {
+            log("an older Sweeflow is running: replacing it")
+            other.terminate()
+        } else {
+            // A copy that answers is the one: it shows its window, in front (this copy, opened by
+            // the person, may bring Sweeflow forward, and hands that over), and this one goes.
+            var answered = false
+            let here = DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.here"), object: nil, queue: nil) { _ in answered = true }
+            let until = Date().addingTimeInterval(3)
+            repeat {
+                NSApplication.shared.yieldActivation(toApplicationWithBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+                other.activate(from: NSRunningApplication.current, options: [])
+                DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.show"), object: nil,
+                                                                             userInfo: nil, deliverImmediately: true)
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            } while !answered && !other.isTerminated && Date() < until
+            DistributedNotificationCenter.default().removeObserver(here)
+            if answered && !other.isTerminated { exit(0) }
+            // No answer: it's quitting (Quit & Reopen opens this copy meanwhile) or stuck.
+            log("the other copy didn't answer: taking over")
+        }
+        let until = Date().addingTimeInterval(8)
+        while !other.isTerminated && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.25)) }
+        if !other.isTerminated { other.forceTerminate(); RunLoop.current.run(until: Date().addingTimeInterval(1)) }
+    }
+    // For the next login (registering starts the item now too: it sees this copy and quits).
+    if LoginItem.wanted, !LoginItem.devInstall, LoginItem.service.status != .enabled {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { LoginItem.enable() }
     }
 }
 
@@ -199,7 +234,6 @@ final class HostState {
         teardown?.cancel()
         BuiltInScreen.setConnected(true)
         undimForGood()
-        DockHider.hide()
         apply()
     }
 
@@ -248,13 +282,17 @@ final class HostState {
     func apply() {
         guard sessions > 0 else { return }
         let c = settings.config
+        // The Dock follows streaming, not the connection: Stop (here or on Linux) keeps the
+        // connection, and the Dock stayed hidden until the computer went away.
         if c.enabled {
             wake.releaseReachable()
             wake.hold()
+            DockHider.hide()
         } else {
             wake.release()
             wake.holdReachable()
             display.remove()
+            DockHider.restore()
         }
         let dim = c.enabled && c.dimMacScreenWhileStreaming
         if dim != dimmed {
@@ -319,7 +357,51 @@ DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow
 // Sweeflow opened again by hand while running (see above), or by an update: the setup window, if
 // anything is left to set up. Otherwise the menu bar item is where Sweeflow lives.
 DistributedNotificationCenter.default().addObserver(forName: .init("dev.sweeflow.host.show"), object: nil, queue: .main) { _ in
+    // Answered, so the copy that asked knows this one is alive and goes.
+    DistributedNotificationCenter.default().postNotificationName(.init("dev.sweeflow.host.here"), object: nil,
+                                                                 userInfo: nil, deliverImmediately: true)
     if !Onboarding.complete { Onboarding.shared.show() }
 }
+
+// Quit (the menu, an update) or ended by macOS or launchd (logout, `launchctl bootout`, kill): the
+// Dock as the person had it. It used to come back only at the next launch, which never came when
+// Sweeflow was removed.
+NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+    DockHider.restore()
+}
+var endSignals: [DispatchSourceSignal] = []
+for sig in [SIGTERM, SIGINT, SIGHUP] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler {
+        log("ending (signal \(sig))")
+        DockHider.restore()
+        exit(0)
+    }
+    source.resume()
+    endSignals.append(source)
+}
+
+/// Opened again while running (Finder, Launchpad, Spotlight): macOS doesn't start another copy
+/// then, it tells this one. The setup window again while there's something left in it; a newer
+/// Sweeflow installed over this one meanwhile, that one takes over (it was left running the old).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        let onDisk = Bundle.main.executableURL.flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
+        if let onDisk, let started = NSRunningApplication.current.launchDate, started < onDisk {
+            log("opened again, and a newer Sweeflow is installed: handing over to it")
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: cfg) { _, error in
+                if let error { log("opening the newer Sweeflow: \(error)") }
+            }
+            return false
+        }
+        if !Onboarding.complete { Onboarding.shared.show() }
+        return false
+    }
+}
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
 
 app.run()

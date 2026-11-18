@@ -4,12 +4,38 @@ import IOKit.ps
 /// The sudoers rule that lets Sweeflow keep the Mac awake with its lid closed while it streams,
 /// on battery too: `pmset disablesleep` is the only switch for that, and it needs root. The rule
 /// allows this user exactly the two calls Wakefulness makes, without a password, and nothing
-/// else. Installed or removed from the menu ("Stream with the lid closed"), each time with an
+/// else. Installed or removed from the menu ("MacBook lid can be closed"), each time with an
 /// administrator's password in macOS's own dialog.
 enum LidSleepRule {
     static let path = "/etc/sudoers.d/sweeflow"
 
     static var installed: Bool { FileManager.default.fileExists(atPath: path) }
+
+    private static let lock = NSLock()
+    /// The rule asked for while its password prompt is up (nil: none is).
+    private static var asking: Bool?
+
+    /// What the switches show: the rule, or what was just asked for while the password is
+    /// awaited (so a switch flipped on Linux doesn't spring back meanwhile). Any thread.
+    static var shown: Bool { lock.withLock { asking } ?? installed }
+
+    /// Turns the rule on or off from any of its switches (the menu-bar item, the setup window,
+    /// Linux): the password prompt, unless one is up already, then everyone told the outcome.
+    /// Main thread.
+    static func ask(_ install: Bool) {
+        guard hasLid, install != installed, lock.withLock({ asking }) == nil else { return }
+        lock.withLock { asking = install }
+        tell()
+        set(install) { ok in
+            lock.withLock { asking = nil }
+            if ok, installed { host.wake.lidRuleInstalled() }
+            tell()
+        }
+    }
+
+    private static func tell() {
+        NotificationCenter.default.post(name: .sweeflowSettingsChanged, object: nil)
+    }
 
     /// A Mac with a lid (a MacBook, which has an internal battery): the only kind the switch
     /// means anything on.

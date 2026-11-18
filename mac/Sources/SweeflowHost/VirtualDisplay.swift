@@ -264,7 +264,7 @@ final class Wakefulness {
             log("lid-close sleep \(disabled ? "disabled" : "restored")")
             return true
         } catch {
-            if disabled { log("cannot disable lid-close sleep (no rule: \"Stream with the lid closed\" in Sweeflow's menu installs it)") }
+            if disabled { log("cannot disable lid-close sleep (no rule: \"MacBook lid can be closed\" in Sweeflow's menu installs it)") }
             return false
         }
     }
