@@ -33,4 +33,28 @@ text="$slint_dir/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md"
 } > target/slint-licence.html
 sed -i -e '/<!--SLINT-->/{r target/slint-licence.html' -e 'd}' "$out"
 rm target/slint-licence.html
+
+# The release build (release/build.sh) carries FFmpeg, built by release/ffmpeg.sh under the LGPL: its
+# licence, version, configuration and where its source is go on the page too. Other builds load the
+# system's FFmpeg, and the marker just goes.
+ff=/opt/ffmpeg/share/source
+if [ "${SWEEFLOW_PORTABLE:-}" = 1 ]; then
+    [ -f "$ff/COPYING.LGPLv2.1" ] || { echo "licenses.sh: no FFmpeg licence in $ff (release/ffmpeg.sh)" >&2; exit 1; }
+    {
+        echo '<h2>FFmpeg</h2>'
+        echo "<p>This build of Sweeflow contains FFmpeg $(pkg-config --modversion libavcodec | sed 's/^/(libavcodec /;s/$/)/'),"
+        echo 'built from <a href="https://ffmpeg.org/">ffmpeg.org</a>'"'"'s '"$(ls "$ff" | grep -o 'ffmpeg-[0-9.]*[0-9]')"' source and licensed under the'
+        echo 'GNU Lesser General Public License 2.1 or later. Its source and the configuration used are published with each'
+        echo 'Sweeflow release (ffmpeg-*.tar.xz and FFMPEG-CONFIGURE.txt, at https://github.com/herunan/sweeflow/releases),'
+        echo 'and Sweeflow'"'"'s own source is open, so it can be rebuilt with a modified FFmpeg. Configuration:</p><pre>'
+        sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$ff/CONFIGURE.txt"
+        echo '</pre><pre>'
+        sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$ff/COPYING.LGPLv2.1"
+        echo '</pre>'
+    } > target/ffmpeg-licence.html
+    sed -i -e '/<!--FFMPEG-->/{r target/ffmpeg-licence.html' -e 'd}' "$out"
+    rm target/ffmpeg-licence.html
+else
+    sed -i '/<!--FFMPEG-->/d' "$out"
+fi
 echo "wrote linux/$out"

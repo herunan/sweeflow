@@ -13,8 +13,6 @@ use crate::config::{self, Config};
 
 // The Mac host's sources, embedded by build.rs so the Linux binary is all you need.
 include!(concat!(env!("OUT_DIR"), "/mac_files.rs"));
-// The Mac app's installer, if one was built before this binary (see build.rs).
-include!(concat!(env!("OUT_DIR"), "/mac_dmg.rs"));
 
 const REMOTE_SRC: &str = "~/.sweeflow/src";
 const SUPPORT: &str = "\"$HOME/Library/Application Support/sweeflow\"";
@@ -212,28 +210,349 @@ pub fn install() -> Result<()> {
     write_icons(&home)?;
     run(&["restart", "sweeflow.service"])?;
     install_icon_and_widget(&home)?;
-    register_open_key(&home);
-    register_stream_keys(&home);
-    install_mac_dmg(&home)?;
+    // Where the desktop has the Global Shortcuts portal, the running client asks for the keys
+    // that way (globalkeys.rs); elsewhere they go into the desktop's own settings.
+    if !crate::globalkeys::available() {
+        register_open_key(&home);
+        register_stream_keys(&home);
+    }
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
     Ok(())
 }
 
-/// Puts the Mac app's installer where the "Link a Mac" window serves it from (installer.rs).
-fn install_mac_dmg(home: &std::path::Path) -> Result<()> {
-    let Some(dmg) = MAC_DMG else {
-        println!("    (no Mac installer in this build: run ./release-mac.sh first to include one)");
-        return Ok(());
-    };
-    let dir = home.join(".local/share/sweeflow");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("Sweeflow.dmg");
-    if std::fs::read(&path).ok().as_deref() != Some(dmg) {
-        std::fs::write(&path, dmg)?;
+/// `sweeflow uninstall`: undoes what `install` and the running client set up for this user, so
+/// nothing is left running a binary a removed package took with it, nor launchers and shortcuts
+/// for it. Every step on its own: one that fails says so and the rest still run. The package's
+/// own files (under /usr) are its package manager's. The pairing with the Mac (the config
+/// folder) stays unless `purge`: installed again, Sweeflow knows its Mac.
+pub fn uninstall(purge: bool) -> Result<()> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
+    let kde = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE");
+    let rm = |path: &std::path::Path| remove_path(&home, path);
+    let warn = |what: &str| println!("    warning: {what}");
+
+    // First, so the client doesn't write its launchers and icons again while they go.
+    let units = home.join(".config/systemd/user");
+    if units.join("sweeflow.service").exists() {
+        let systemctl = |args: &[&str]| {
+            Command::new("systemctl").arg("--user").args(args).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+        };
+        if systemctl(&["disable", "--now", "sweeflow.service"]) {
+            println!("    stopped and disabled the sweeflow user service");
+        } else {
+            warn("couldn't stop the sweeflow service (systemctl --user disable --now sweeflow)");
+        }
+        rm(&units.join("sweeflow.service"));
+        // The link `enable` made, should systemctl not have taken it away.
+        rm(&units.join("graphical-session.target.wants/sweeflow.service"));
+        if !systemctl(&["daemon-reload"]) {
+            warn("couldn't reload systemd's user units (systemctl --user daemon-reload)");
+        }
+        // A service that kept failing is still listed until this.
+        let _ = systemctl(&["reset-failed", "sweeflow.service"]);
     }
-    println!("    Mac installer ready for \"Link a Mac\" ({} MB)", dmg.len() / 1_000_000);
+    rm(&home.join(".config/autostart/sweeflow.desktop"));
+
+    // The shortcuts, before the widget: Plasma's open key belongs to it.
+    let widgets = if kde { plasma_widgets().unwrap_or_default() } else { Vec::new() };
+    unregister_plasma_keys(&home, kde, &widgets);
+    unregister_gsettings_keys("GNOME", GNOME_KEYS, "custom-keybindings", gnome_ours, |p| format!("{GNOME_KEYS}.custom-keybinding:{p}"));
+    unregister_gsettings_keys("Cinnamon", CINNAMON_KEYS, "custom-list", cinnamon_ours, |id| cinnamon_schema(id));
+    if crate::hyprland::running() {
+        match crate::hyprland::unbind_ours() {
+            Ok(0) => {}
+            Ok(n) => println!("    removed Sweeflow's {n} Hyprland key bindings"),
+            Err(e) => warn(&format!("couldn't remove Sweeflow's Hyprland key bindings: {e:#}")),
+        }
+    }
+
+    if kde {
+        // Taken out of the trays (and off any panel it was dragged onto). What earlier versions
+        // put on the panels goes too, as `install` does.
+        let script = format!(
+            r#"panels().forEach(function(p){{ p.widgets("{WIDGET}").forEach(function(w){{ w.remove(); print("ok"); }});
+            p.widgets("org.kde.plasma.systemtray").forEach(function(w){{
+            w.currentConfigGroup = ["Applets"]; var ids = w.configGroups.slice();
+            for (var i = 0; i < ids.length; i++) {{ w.currentConfigGroup = ["Applets", String(ids[i])];
+                if (String(w.readConfig("plugin", "")) == "{WIDGET}") {{ w.currentConfigGroup = ["Applets", String(ids[i]), "Shortcuts"]; w.writeConfig("global", ""); }} }}
+            w.currentConfigGroup = ["General"];
+            ["extraItems","knownItems"].forEach(function(k){{ var v = w.readConfig(k, []); if (typeof v === "string") v = v.split(",");
+                var at = v.indexOf("{WIDGET}"); if (at >= 0) {{ v.splice(at, 1); w.writeConfig(k, v); print("ok"); }} }});
+            w.reloadConfig(); }}); }});"#
+        );
+        match plasma_script(&script) {
+            Ok(out) if out.contains("ok") => println!("    removed the Sweeflow widget from Plasma's system tray"),
+            Ok(_) => {}
+            Err(e) => warn(&format!("couldn't take the Sweeflow widget out of the system tray ({e:#}): it's gone from the next login")),
+        }
+        crate::placement::retire_old_choices();
+        match crate::placement::remove_menu_panel() {
+            Ok(true) => println!("    removed the top bar Sweeflow made for the Global Menu"),
+            Ok(false) => {}
+            Err(e) => warn(&format!("couldn't remove the Global Menu's top bar: {e:#}")),
+        }
+    }
+    let plasmoids = home.join(".local/share/plasma/plasmoids");
+    for widget in [WIDGET, "dev.sweeflow.dock", "dev.sweeflow.running"] {
+        rm(&plasmoids.join(widget));
+    }
+
+    // The launchers: Sweeflow's own (setup.rs) under the home folder, the Mac apps' (launchers.rs)
+    // under XDG_DATA_HOME. The same folder unless that is set elsewhere.
+    let data = config::xdg_home("XDG_DATA_HOME", ".local/share");
+    let mut shares = vec![home.join(".local/share"), data];
+    shares.dedup();
+    for share in &shares {
+        let apps = share.join("applications");
+        let mut mac_apps = 0;
+        for e in std::fs::read_dir(&apps).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name == LAUNCHER || name == crate::launchers::DISPLAY_ENTRY {
+                rm(&e.path());
+            } else if is_our_entry(&name) {
+                match std::fs::remove_file(e.path()) {
+                    Ok(()) => mac_apps += 1,
+                    Err(err) => warn(&format!("couldn't remove {}: {err}", tilde(&home, &e.path()))),
+                }
+            }
+        }
+        if mac_apps > 0 {
+            println!("    removed {mac_apps} Mac app launchers from {}", tilde(&home, &apps));
+        }
+        rm(&share.join("desktop-directories/sweeflow.directory"));
+        // The Mac apps' icons (and the Mac installer earlier versions put there).
+        rm(&share.join("sweeflow"));
+    }
+    rm(&config::xdg_home("XDG_CONFIG_HOME", ".config").join("menus/applications-merged/sweeflow.menu"));
+    if kde {
+        // KDE's app menu drops them now rather than whenever it notices.
+        let _ = crate::desktop::run_quiet(&mut Command::new("kbuildsycoca6"));
+    }
+
+    let hicolor = home.join(".local/share/icons/hicolor");
+    let mut icons = 0;
+    for dir in ["scalable/apps", "symbolic/apps", "scalable/status"] {
+        for e in std::fs::read_dir(hicolor.join(dir)).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("sweeflow") && name.ends_with(".svg") {
+                match std::fs::remove_file(e.path()) {
+                    Ok(()) => icons += 1,
+                    Err(err) => warn(&format!("couldn't remove {}: {err}", tilde(&home, &e.path()))),
+                }
+            }
+        }
+    }
+    if icons > 0 {
+        println!("    removed {icons} Sweeflow icons from {}", tilde(&home, &hicolor));
+        // So desktops look at the theme folder again (see write_icons).
+        if let Ok(f) = std::fs::File::open(&hicolor) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
+
+    rm(&config::xdg_home("XDG_CACHE_HOME", ".cache").join("sweeflow"));
+    // Running from it is fine: the running program keeps the file until it exits.
+    rm(&home.join(".local/bin/sweeflow"));
+    rm(&home.join(".local/bin/.sweeflow.new"));
+
+    let dir = config::dir();
+    if purge {
+        rm(&dir);
+    } else {
+        // The notes that the shortcuts were set once (see `register_key`): they are gone now, so
+        // installed again, Sweeflow sets them again.
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if is_key_note(&e.file_name().to_string_lossy()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        if dir.exists() {
+            println!("    kept {} (the pairing with your Mac): `sweeflow uninstall --purge` removes it too", tilde(&home, &dir));
+        }
+    }
+    println!("==> sweeflow uninstalled for this user");
+    if std::path::Path::new("/usr/bin/sweeflow").exists() {
+        println!("    (/usr/bin/sweeflow is the package's: your package manager removes it)");
+    }
     Ok(())
+}
+
+/// Removes a file or a whole folder for `uninstall`, with a line saying so; nothing when it
+/// isn't there.
+fn remove_path(home: &std::path::Path, path: &std::path::Path) {
+    let removed = match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        _ => std::fs::remove_file(path),
+    };
+    match removed {
+        Ok(()) => println!("    removed {}", tilde(home, path)),
+        Err(e) => println!("    warning: couldn't remove {}: {e}", tilde(home, path)),
+    }
+}
+
+/// A path as ~/… when it is in the home folder: shorter lines.
+fn tilde(home: &std::path::Path, path: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// One of the entries Sweeflow writes in the applications folder: its own (`write_launcher`),
+/// the Mac apps' (`launchers::sync`, `sweeflow-<bundle id>.desktop` and `sweeflow-menu-…`), and
+/// one of those half written (launchers::write_whole's temporary file).
+fn is_our_entry(name: &str) -> bool {
+    name == LAUNCHER
+        || (name.starts_with("sweeflow-") && name.ends_with(".desktop"))
+        || (name.starts_with(".sweeflow-") && name.ends_with(".tmp"))
+}
+
+/// The notes `register_key` leaves in the config folder, one per shortcut set ("open-key.gnome",
+/// "toggle-pause-key-y.plasma"…).
+fn is_key_note(name: &str) -> bool {
+    name.starts_with("open-key.") || STREAM_KEYS.iter().any(|k| name.starts_with(&format!("{}-key-", k.id)))
+}
+
+/// Sweeflow's custom shortcuts on Plasma go: the streaming toggles (the app menu entry's
+/// actions), the "launch" key earlier versions gave the entry, and the tray widget's own key.
+/// Through Plasma's shortcut service while it runs (it would write its own copy back over the
+/// file), and out of its file either way.
+/// One of Sweeflow's keys changed in its Shortcuts window ("open", "pause", "stop"): the
+/// shortcut Sweeflow wrote into the desktop's own settings (GNOME before the portal, Cinnamon)
+/// gets the new key. Where the portal or Hyprland's bindings have the keys, nothing here.
+pub fn apply_own_key(name: &str) {
+    let id = match name {
+        "open" => None,
+        "pause" => Some("toggle-pause"),
+        "stop" => Some("toggle-stream"),
+        _ => return,
+    };
+    let key = crate::keys::own_key(name);
+    let text = key.as_ref().map(|k| gtk_accel(k, mac_keys_remapped())).unwrap_or_default();
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let result = if desktop.contains("GNOME") && !crate::globalkeys::in_use() {
+        let path = id.map_or(GNOME_KEY_PATH.to_string(), gnome_path);
+        gsettings(&["set", &format!("{GNOME_KEYS}.custom-keybinding:{path}"), "binding", &gvariant_str(&text)])
+    } else if desktop.contains("Cinnamon") {
+        let cid = id.map_or(CINNAMON_OPEN.to_string(), cinnamon_id);
+        let list = if text.is_empty() { "@as []".to_string() } else { format!("[{}]", gvariant_str(&text)) };
+        gsettings(&["set", &cinnamon_schema(&cid), "binding", &list])
+    } else {
+        return;
+    };
+    match result {
+        Ok(_) => log::info!("{name}: the desktop's shortcut is {text} now"),
+        Err(e) => log::warn!("{name}: couldn't give the desktop's shortcut its new key: {e:#}"),
+    }
+}
+
+/// A key as GNOME and Cinnamon write one: "<Super><Alt>o". Behind a Mac-style remapper ⌘
+/// arrives as Ctrl outside the Mac windows: that's the key set.
+fn gtk_accel(k: &crate::deskkeys::UserKey, remapped: bool) -> String {
+    let mut out = String::new();
+    if k.logo && !remapped {
+        out.push_str("<Super>");
+    }
+    if k.ctrl || (k.logo && remapped) {
+        out.push_str("<Control>");
+    }
+    if k.alt {
+        out.push_str("<Alt>");
+    }
+    if k.shift {
+        out.push_str("<Shift>");
+    }
+    let key = match k.key.as_str() {
+        "Space" => "space".to_string(),
+        "Enter" => "Return".into(),
+        "Esc" => "Escape".into(),
+        "PageUp" => "Page_Up".into(),
+        "PageDown" => "Page_Down".into(),
+        "Backspace" => "BackSpace".into(),
+        "ScrollLock" => "Scroll_Lock".into(),
+        one if one.chars().count() == 1 => one.to_lowercase(),
+        other => other.to_string(),
+    };
+    out + &key
+}
+
+/// The shortcuts Sweeflow wrote into the desktop's own settings (Plasma's, GNOME's), gone:
+/// its keys go through the Global Shortcuts portal now (globalkeys.rs).
+pub fn drop_desktop_keys() {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let kde = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE");
+    if kde {
+        let widgets = plasma_widgets().unwrap_or_default();
+        unregister_plasma_keys(&home, kde, &widgets);
+    }
+    if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") {
+        unregister_gsettings_keys("GNOME", GNOME_KEYS, "custom-keybindings", gnome_ours, |p| format!("{GNOME_KEYS}.custom-keybinding:{p}"));
+    }
+}
+
+fn unregister_plasma_keys(home: &std::path::Path, kde: bool, widgets: &[(i64, String, String)]) {
+    let actions: Vec<&str> = STREAM_KEYS.iter().map(|k| k.id).chain(["_launch"]).collect();
+    let mut removed = 0;
+    if kde {
+        if let Ok(bus) = zbus::blocking::Connection::session() {
+            let unregister = |component: &str, action: &str| -> bool {
+                kglobalaccel(&bus, "unregister", &(component, action)).ok().and_then(|r| r.body().deserialize::<bool>().ok()).unwrap_or(false)
+            };
+            removed += actions.iter().filter(|a| unregister(LAUNCHER, a)).count();
+            removed += widgets.iter().filter(|w| unregister("plasmashell", &widget_action(&w.1))).count();
+        }
+    }
+    if home.join(".config/kglobalshortcutsrc").exists() {
+        for action in &actions {
+            let key = ["--file", "kglobalshortcutsrc", "--group", "services", "--group", LAUNCHER, "--key", action, "--delete"];
+            let _ = crate::desktop::run_quiet(Command::new("kwriteconfig6").args(key));
+        }
+    }
+    if removed > 0 {
+        println!("    removed Sweeflow's Plasma shortcuts");
+    }
+}
+
+/// Sweeflow's custom shortcuts on GNOME or Cinnamon go: their entries out of the list of custom
+/// shortcuts (the user's own stay, in their order), then their settings (`schema` gives each
+/// one's). Nothing where the desktop's settings aren't installed.
+fn unregister_gsettings_keys(desktop: &str, keys: &str, list_key: &str, ours: fn(&str) -> bool, schema: impl Fn(&str) -> String) {
+    let Ok(list) = gsettings(&["get", keys, list_key]) else { return };
+    let Some(rest) = without_ours(&list, ours) else { return };
+    match gsettings(&["set", keys, list_key, &rest]) {
+        Ok(_) => println!("    removed Sweeflow's {desktop} shortcuts"),
+        Err(e) => return println!("    warning: couldn't remove Sweeflow's {desktop} shortcuts: {e:#}"),
+    }
+    for entry in quoted(&list).into_iter().filter(|e| ours(e)) {
+        let _ = gsettings(&["reset-recursively", &schema(&entry)]);
+    }
+}
+
+/// One of Sweeflow's GNOME custom shortcuts' paths: `GNOME_KEY_PATH` and the streaming toggles'
+/// next to it (`gnome_path`).
+fn gnome_ours(path: &str) -> bool {
+    let folder = GNOME_KEY_PATH.trim_end_matches("sweeflow/");
+    path.strip_prefix(folder).and_then(|p| p.strip_suffix('/')).is_some_and(|name| !name.contains('/') && cinnamon_ours(name))
+}
+
+/// One of Sweeflow's Cinnamon custom shortcuts (`CINNAMON_OPEN`, `cinnamon_id`); also the last
+/// part of its GNOME ones' paths.
+fn cinnamon_ours(id: &str) -> bool {
+    id == CINNAMON_OPEN || id.starts_with(&format!("{CINNAMON_OPEN}-"))
+}
+
+/// A list as gsettings prints it without Sweeflow's entries, the others as they were, written
+/// as gsettings takes it. None when none of Sweeflow's are in it.
+fn without_ours(list: &str, ours: fn(&str) -> bool) -> Option<String> {
+    let all = quoted(list);
+    let rest: Vec<String> = all.iter().filter(|e| !ours(e)).map(|e| gvariant_str(e)).collect();
+    if rest.len() == all.len() {
+        return None;
+    }
+    // An empty list says its type: gsettings can't tell it from the bare brackets.
+    Some(if rest.is_empty() { "@as []".to_string() } else { format!("[{}]", rest.join(", ")) })
 }
 
 pub fn status() -> Result<()> {
@@ -352,8 +671,12 @@ fn service_active() -> bool {
 /// it isn't running, and shows it: the tray widget's popup, or "Link a Mac" while none is paired.
 pub fn open() -> Result<()> {
     if !service_installed() {
-        // The service opens "Link a Mac" itself when there's no Mac yet.
         install()?;
+        // The service opens "Link a Mac" itself when there's no Mac yet: Sweeflow's own window on
+        // top of it would hide its steps (the first open after installing a package did that).
+        if Config::load_or_default()?.host.is_empty() {
+            return Ok(());
+        }
     } else if Config::load_or_default()?.host.is_empty() {
         if !service_active() {
             // Asks for a Mac as it starts.
@@ -466,14 +789,14 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     }
     crate::placement::retire_old_choices();
     let plasmoids = home.join(".local/share/plasma/plasmoids");
-    let mut updated = false;
+    let (mut updated, mut new) = (false, false);
     for (path, contents) in WIDGET_FILES {
         let file = plasmoids.join(path);
         std::fs::create_dir_all(file.parent().context("widget path")?)?;
         match std::fs::read_to_string(&file) {
             Ok(old) if old == *contents => continue,
             Ok(_) => updated = true,
-            Err(_) => {}
+            Err(_) => new = true,
         }
         std::fs::write(file, contents)?;
     }
@@ -489,7 +812,23 @@ fn install_icon_and_widget(home: &std::path::Path) -> Result<()> {
     if !ok {
         println!("    (couldn't add the Sweeflow widget to the system tray: add it from the tray's settings)");
     }
+    if new && !updated {
+        announce_widget();
+    }
     Ok(())
+}
+
+/// Tells Plasma's shell the widget is installed, as KDE's package tool does once it has put one
+/// in place: the system trays then load it at once. A shell that is running only knows the
+/// widgets there were when it started, so a first install otherwise showed no Sweeflow in the
+/// tray until Plasma's shell was restarted (the whole desktop went black for a moment).
+fn announce_widget() {
+    let sent = zbus::blocking::Connection::session().and_then(|bus| {
+        bus.emit_signal(None::<&str>, "/KPackage/Plasma/Applet", "org.kde.plasma.kpackage", "packageInstalled", &(WIDGET,))
+    });
+    if let Err(e) = sent {
+        println!("    (couldn't tell Plasma the Sweeflow widget is installed: {e})");
+    }
 }
 
 /// Cmd+Opt+O opens Sweeflow from any window, as a click on its tray icon does: on Plasma the
@@ -616,7 +955,7 @@ fn register_key(note: &str, key: &str, letter: char, remapped: bool, does: &str,
         return false;
     }
     // What's pressed is Cmd+Opt+<letter> either way.
-    let key = if remapped { format!("Cmd+Opt+{letter} ({key} once your key remapper has turned Cmd into Ctrl)") } else { key.to_string() };
+    let key = if remapped { format!("Super+Alt+{letter} ({key} outside Mac windows, as your key remapper turns it into Ctrl)") } else { key.to_string() };
     let set_now = match set() {
         Ok(OpenKey::Set { now: true }) => {
             println!("    {key} {does} from any window");
@@ -647,15 +986,52 @@ fn shown_key(letter: char, remapped: bool) -> String {
     format!("{}+Alt+{letter}", if remapped { "Ctrl" } else { "Super" })
 }
 
-/// A Mac-style key remapper is installed (Toshy, Kinto): outside the Mac windows (which it
-/// leaves alone, as a remote desktop) it turns Cmd into Ctrl, so the desktop sees Cmd+Opt+O as
+/// A Mac-style key remapper is running (Toshy, Kinto): outside the Mac windows (which it leaves
+/// alone, as a remote desktop) it turns Cmd into Ctrl, so the desktop sees Cmd+Opt+O as
 /// Ctrl+Alt+O, and a shortcut on Super+Alt+O never fires. The shortcut is then put on the key
-/// that arrives.
+/// that arrives. Running: its config is there and its key mapper is (the process that reads that
+/// config: xwaykeyz for Toshy, xkeysnail for Kinto), checked again every few seconds.
 pub fn mac_keys_remapped() -> bool {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
-    config.is_some_and(|c| c.join("toshy/toshy_config.py").exists() || c.join("kinto/kinto.py").exists())
+    remapper().is_some()
+}
+
+/// The Mac-style key remapper running, by name ("Toshy", "Kinto"), checked again every few seconds.
+pub fn remapper() -> Option<&'static str> {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<(std::time::Instant, Option<&'static str>)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if let Some((at, which)) = *last {
+        if at.elapsed() < std::time::Duration::from_secs(3) {
+            return which;
+        }
+    }
+    let which = remapper_running();
+    *last = Some((std::time::Instant::now(), which));
+    which
+}
+
+fn remapper_running() -> Option<&'static str> {
+    let config = config::xdg_home("XDG_CONFIG_HOME", ".config");
+    let known = [("Toshy", config.join("toshy/toshy_config.py")), ("Kinto", config.join("kinto/kinto.py"))];
+    let configs: Vec<(&'static str, String)> = known.iter().filter(|(_, c)| c.exists()).map(|(n, c)| (*n, c.display().to_string())).collect();
+    if configs.is_empty() {
+        return None;
+    }
+    // A process of this user whose command line names one of those configs.
+    let procs = std::fs::read_dir("/proc").ok()?;
+    let me = unsafe { libc::getuid() };
+    procs.flatten().find_map(|p| {
+        use std::os::unix::fs::MetadataExt;
+        if p.metadata().map(|m| m.uid()).ok() != Some(me) {
+            return None;
+        }
+        let cmd = std::fs::read(p.path().join("cmdline")).ok()?;
+        let cmd = String::from_utf8_lossy(&cmd);
+        if !(cmd.contains("xwaykeyz") || cmd.contains("keyszer") || cmd.contains("xkeysnail")) {
+            return None;
+        }
+        configs.iter().find(|(_, c)| cmd.contains(c.as_str())).map(|(n, _)| *n)
+    })
 }
 
 /// How setting the desktop's shortcut went.
@@ -775,15 +1151,30 @@ fn widget_action(id: &str) -> String {
 }
 
 /// The Sweeflow tray widget's own shortcut, which Plasma gives to the widget's popup like a
-/// click on its icon. Kept in the widget's config ([Shortcuts] global), which Plasma's shell
-/// reads as it starts: the shell is restarted for it (the panels are gone for a second).
+/// click on its icon. The widget gives it to itself (Plasma takes that at once and keeps it in
+/// the widget's config): the key is left for it in WIDGET_KEY, which the client passes on.
+/// (Written into the config here instead, it needed Plasma's shell restarted, and the whole
+/// desktop went black for a moment.)
 /// Earlier versions gave the key to the app menu entry instead (`sweeflow open`): that one is
 /// taken away when it still has the key they gave it.
 fn plasma_open_key(_home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
-    let widgets = plasma_widgets()?;
-    let Some((_, id, _)) = main_widget(&widgets) else {
-        bail!("the Sweeflow widget isn't in a system tray yet");
-    };
+    // Just added to the trays (install_icon_and_widget): there in a moment.
+    let mut widgets = plasma_widgets()?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut tries = 0;
+    while widgets.is_empty() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        widgets = plasma_widgets()?;
+        // Told again now and then: told straight after the tray got it on its list, the shell
+        // may not have taken it up yet.
+        tries += 1;
+        if widgets.is_empty() && tries % 4 == 0 {
+            announce_widget();
+        }
+    }
+    // Still not there (Plasma can take a while to load a new widget): the key waits for the
+    // first Sweeflow widget that comes up ("*"), which gives it to itself then.
+    let id = main_widget(&widgets).map_or("*", |w| w.1.as_str()).to_string();
     // One the user gave it (or an earlier install did).
     if widgets.iter().any(|w| !w.2.is_empty()) {
         return Ok(OpenKey::Kept);
@@ -807,22 +1198,20 @@ fn plasma_open_key(_home: &std::path::Path, remapped: bool) -> Result<OpenKey> {
         let _ = Command::new("kwriteconfig6").args(launch).arg("--delete").status();
     }
 
-    let script = format!(
-        r#"panels().forEach(function(p){{ p.widgets("org.kde.plasma.systemtray").forEach(function(w){{
-        w.currentConfigGroup = ["Applets", "{id}"]; if (String(w.readConfig("plugin", "")) != "{WIDGET}") return;
-        w.currentConfigGroup = ["Applets", "{id}", "Shortcuts"]; w.writeConfig("global", "{key_text}"); print("ok"); }}); }});"#
-    );
-    anyhow::ensure!(plasma_script(&script)?.contains("ok"), "Plasma's shell didn't take the widget's shortcut");
-    // The shell writes its config a moment later; it must be on disk when it restarts.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let restarted = Command::new("systemctl")
-        .args(["--user", "restart", "plasma-plasmashell.service"])
-        .status()
-        .is_ok_and(|s| s.success());
-    if restarted {
-        println!("    (Plasma's panels restarted to take the Sweeflow widget's shortcut)");
-    }
-    Ok(OpenKey::Set { now: restarted })
+    std::fs::create_dir_all(config::dir())?;
+    std::fs::write(config::dir().join(WIDGET_KEY), format!("{id}\t{key_text}\n"))?;
+    Ok(OpenKey::Set { now: true })
+}
+
+/// The key setup leaves for the tray widget to give itself (applet id, a tab, the key as Qt
+/// writes it). The widget says when it has, and the client removes the file.
+pub const WIDGET_KEY: &str = "widget-open-key";
+
+/// What WIDGET_KEY holds, as (applet id, key).
+pub fn widget_key() -> Option<(String, String)> {
+    let text = std::fs::read_to_string(config::dir().join(WIDGET_KEY)).ok()?;
+    let (id, key) = text.trim().split_once('\t')?;
+    Some((id.trim().to_string(), key.trim().to_string()))
 }
 
 /// The app menu entry's shortcut (as kreadconfig6 prints it, several keys a tab apart) is the
@@ -1141,6 +1530,50 @@ mod tests {
         // A second install finds it there and writes nothing.
         assert_eq!(with_path(&added, ours), None);
         assert_eq!(with_path(&format!("['{ours}']"), ours), None);
+    }
+
+    #[test]
+    fn uninstall_takes_only_ours_out_of_the_custom_shortcuts() {
+        let folder = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings";
+        let list = format!(
+            "['{folder}/custom0/', '{GNOME_KEY_PATH}', '{}', '{folder}/custom1/', '{}']",
+            gnome_path("toggle-pause"),
+            gnome_path("toggle-stream")
+        );
+        // The user's stay, in their order.
+        assert_eq!(without_ours(&list, gnome_ours), Some(format!("['{folder}/custom0/', '{folder}/custom1/']")));
+        assert_eq!(without_ours(&format!("['{GNOME_KEY_PATH}']"), gnome_ours).as_deref(), Some("@as []"));
+        // Nothing of ours: nothing to write.
+        assert_eq!(without_ours(&format!("['{folder}/custom0/']"), gnome_ours), None);
+        assert_eq!(without_ours("@as []", gnome_ours), None);
+        // Only Sweeflow's own paths, not ones that merely start alike.
+        assert!(!gnome_ours(&format!("{folder}/sweeflowish/")));
+        assert!(!gnome_ours("/elsewhere/sweeflow/"));
+        assert!(!gnome_ours(&format!("{folder}/sweeflow-x/deeper/")));
+        // Cinnamon's list, by name; a name with a quote is written back as it was read.
+        let cinnamon = r"['custom0', 'sweeflow', 'sweeflow-toggle-pause', 'it\'s mine', 'sweeflow-toggle-stream']";
+        assert_eq!(without_ours(cinnamon, cinnamon_ours).as_deref(), Some(r"['custom0', 'it\'s mine']"));
+        assert!(cinnamon_ours(&cinnamon_id("toggle-pause")) && !cinnamon_ours("sweeflowish"));
+    }
+
+    #[test]
+    fn uninstall_knows_its_own_files() {
+        for ours in ["sweeflow.desktop", "sweeflow-display.desktop", "sweeflow-com.apple.mail.desktop", "sweeflow-menu-com.apple.mail.desktop", ".sweeflow-com.apple.mail.desktop.42.tmp"] {
+            assert!(is_our_entry(ours), "{ours}");
+        }
+        for theirs in ["sweeflowy.desktop", "org.kde.dolphin.desktop", "sweeflow-notes.txt", "mimeapps.list"] {
+            assert!(!is_our_entry(theirs), "{theirs}");
+        }
+        for note in ["open-key.plasma-widget", "open-key.kde", "open-key.gnome", "open-key.cinnamon", "toggle-pause-key-y.plasma", "toggle-stream-key-x.gnome"] {
+            assert!(is_key_note(note), "{note}");
+        }
+        // The pairing and the settings stay.
+        for kept in ["config.toml", "client.crt", "mac-address", "pinned", "apps.json", "global-menu-panel"] {
+            assert!(!is_key_note(kept), "{kept}");
+        }
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(tilde(home, &home.join(".local/bin/sweeflow")), "~/.local/bin/sweeflow");
+        assert_eq!(tilde(home, std::path::Path::new("/xdg/data/applications")), "/xdg/data/applications");
     }
 
     #[test]

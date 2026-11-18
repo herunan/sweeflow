@@ -3182,36 +3182,10 @@ pub(crate) fn open_search() {
     });
 }
 
-/// Cmd+Opt+U (Super+Alt+U here), with no other modifier: the key for the Global menu (M
-/// logs out on Omarchy, G is taken there). The letter the layout puts on the key, so it's the
-/// key marked U on any Latin layout.
-fn is_global_menu_key(mods: &Modifiers, key: Keysym) -> bool {
-    mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::u | Keysym::U)
-}
-
-/// Cmd+Opt+O (Super+Alt+O), with no other modifier: opens Sweeflow itself (its window, or on
-/// Plasma its tray popup), as `sweeflow open` does.
 /// A popup the compositor moves back onto the screen (slid, not flipped: it stays by what opened
 /// it) when it would run off an edge.
 fn on_screen() -> xdg_positioner::ConstraintAdjustment {
     xdg_positioner::ConstraintAdjustment::SlideX | xdg_positioner::ConstraintAdjustment::SlideY
-}
-
-fn is_open_sweeflow_key(mods: &Modifiers, key: Keysym) -> bool {
-    mods.logo && mods.alt && !mods.ctrl && !mods.shift && matches!(key, Keysym::o | Keysym::O)
-}
-
-/// Cmd+Opt+Y (pause or resume) and Cmd+Opt+Z (stop, or start when stopped), with no other
-/// modifier: the tray's toggle for it (tray::panel_do), as the desktop's shortcuts run it.
-fn stream_toggle_key(mods: &Modifiers, key: Keysym) -> Option<&'static str> {
-    if !(mods.logo && mods.alt && !mods.ctrl && !mods.shift) {
-        return None;
-    }
-    match key {
-        Keysym::y | Keysym::Y => Some("pause-toggle"),
-        Keysym::z | Keysym::Z => Some("stream-toggle"),
-        _ => None,
-    }
 }
 
 /// Opens the Global menu (`sweeflow menu`, palette.rs): a process of its own, as from the tray.
@@ -3888,43 +3862,63 @@ impl KeyboardHandler for App {
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down += 1,
             _ => {}
         }
-        if is_global_menu_key(&self.mods, e.keysym) && self.app_window_focused() {
-            // Cmd+Opt+U: the Global menu, for the app of this window (menus::focused). The desktop
-            // never sees the key while a Mac window has focus (they pass every shortcut through
-            // to the Mac), so it's caught here, on every desktop alike.
-            open_global_menu();
-            self.swallowed.push(e.raw_code);
-            return;
-        }
-        if is_open_sweeflow_key(&self.mods, e.keysym) {
-            // Cmd+Opt+O: Sweeflow's own window. Caught here for the same reason (on Hyprland its
-            // binding gets the key first, see hyprland.rs; elsewhere this is the way while a
-            // Mac window has focus).
-            run_own("open", "Sweeflow");
-            self.swallowed.push(e.raw_code);
-            return;
-        }
-        if let Some(toggle) = stream_toggle_key(&self.mods, e.keysym) {
-            // Cmd+Opt+Y / Cmd+Opt+Z, for the same reason. Off this thread: it may wait on the
-            // tray's state.
-            std::thread::spawn(move || crate::tray::panel_do(toggle, ""));
-            self.swallowed.push(e.raw_code);
-            return;
+        // Sweeflow's own keys (as set in its Shortcuts window, keys.rs): the desktop never sees a
+        // key while a Mac window has focus (they pass every shortcut through to the Mac), so they
+        // are caught here, on every desktop alike (on Hyprland its bindings get them first).
+        let own = crate::deskkeys::Mods { logo: self.mods.logo, alt: self.mods.alt, ctrl: self.mods.ctrl, shift: self.mods.shift };
+        match crate::keys::own_action(e.raw_code, e.keysym.key_char(), e.keysym.name(), own) {
+            // The Global menu, for the app of this window (menus::focused).
+            Some("menu") if self.app_window_focused() => {
+                open_global_menu();
+                self.swallowed.push(e.raw_code);
+                return;
+            }
+            // Sweeflow's own window.
+            Some("open") => {
+                run_own("open", "Sweeflow");
+                self.swallowed.push(e.raw_code);
+                return;
+            }
+            // Pause or stop. Off this thread: it may wait on the tray's state.
+            Some(t @ ("pause" | "stop")) => {
+                let toggle = if t == "pause" { "pause-toggle" } else { "stream-toggle" };
+                std::thread::spawn(move || crate::tray::panel_do(toggle, ""));
+                self.swallowed.push(e.raw_code);
+                return;
+            }
+            _ => {}
         }
         let kde = crate::keys::desktop().contains("KDE");
-        if kde && self.inhibiting() && e.raw_code == KEY_TAB && self.meta_down > 0 {
+        let held = crate::deskkeys::Mods { logo: self.meta_down > 0, alt: self.mods.alt, ctrl: self.mods.ctrl, shift: self.shift_down > 0 };
+        if kde && self.inhibiting() && e.raw_code == KEY_TAB && self.meta_down > 0 && !crate::deskkeys::press_removed(e.raw_code, held) {
             // Cmd+Tab switches between *all* desktop windows, like it does everywhere else.
             switch_windows(self.shift_down > 0);
             self.swallowed.push(e.raw_code);
             return;
         }
-        if kde && self.inhibiting() && e.raw_code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 {
+        if kde && self.inhibiting() && e.raw_code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 && !crate::deskkeys::press_removed(e.raw_code, held) {
             open_search();
             self.swallowed.push(e.raw_code);
             return;
         }
         // Keys for windows and the desktop stay the desktop's (deskkeys): run, or handed back.
         let m = crate::deskkeys::Mods { logo: self.meta_down > 0, alt: self.mods.alt, ctrl: self.mods.ctrl, shift: self.shift_down > 0 };
+        // And the person's own (deskkeys::UserKey, the Exceptions window): Plasma runs the
+        // shortcut it has on the key; elsewhere the desktop gets its keys back from the next press.
+        let own = if self.inhibiting() {
+            crate::deskkeys::is_user_key(e.raw_code, e.keysym.key_char(), e.keysym.name(), m)
+        } else {
+            None
+        };
+        if let Some(k) = &own {
+            let ran = kde && k.qt().and_then(crate::deskkeys::plasma_action_any).map(|(c, a)| crate::deskkeys::plasma_invoke(&c, &a)).is_some();
+            if !ran {
+                self.let_go_now(qh);
+            }
+            log::debug!("key {} with {m:?}: kept for Linux ({})", e.raw_code, k.label());
+            self.swallowed.push(e.raw_code);
+            return;
+        }
         if self.inhibiting() && crate::deskkeys::is_desktop_key(e.raw_code, m) {
             let handled = if kde {
                 crate::deskkeys::plasma_action(e.raw_code, m).map(|(c, a)| crate::deskkeys::plasma_invoke(&c, &a)).is_some()
@@ -3941,7 +3935,7 @@ impl KeyboardHandler for App {
                 return;
             }
         }
-        self.send(W::new(t::KEY).u32(e.raw_code).u8(1).finish());
+        self.send(W::new(t::KEY).u32(crate::keys::mac_code(e.raw_code)).u8(1).finish());
     }
 
     fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
@@ -3951,7 +3945,7 @@ impl KeyboardHandler for App {
             }
             return;
         }
-        self.send(W::new(t::KEY).u32(e.raw_code).u8(2).finish());
+        self.send(W::new(t::KEY).u32(crate::keys::mac_code(e.raw_code)).u8(2).finish());
     }
 
     fn release_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
@@ -3967,7 +3961,7 @@ impl KeyboardHandler for App {
             self.swallowed.remove(i);
             return;
         }
-        self.send(W::new(t::KEY).u32(e.raw_code).u8(0).finish());
+        self.send(W::new(t::KEY).u32(crate::keys::mac_code(e.raw_code)).u8(0).finish());
     }
 
     fn update_modifiers(
@@ -4444,19 +4438,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn global_menu_key_is_cmd_opt_u_alone() {
-        let mods = |logo, alt, ctrl, shift| Modifiers { logo, alt, ctrl, shift, ..Default::default() };
-        assert!(is_global_menu_key(&mods(true, true, false, false), Keysym::u));
-        // Caps lock on.
-        assert!(is_global_menu_key(&Modifiers { caps_lock: true, ..mods(true, true, false, false) }, Keysym::U));
-        assert!(!is_global_menu_key(&mods(true, false, false, false), Keysym::u));
-        assert!(!is_global_menu_key(&mods(false, true, false, false), Keysym::u));
-        assert!(!is_global_menu_key(&mods(true, true, true, false), Keysym::u));
-        assert!(!is_global_menu_key(&mods(true, true, false, true), Keysym::U));
-        assert!(!is_global_menu_key(&mods(true, true, false, false), Keysym::m));
-    }
 
     #[test]
     fn a_picture_is_drawn_1_to_1_and_cut_off_at_the_window() {

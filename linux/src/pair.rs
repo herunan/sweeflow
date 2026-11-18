@@ -201,6 +201,8 @@ pub enum Outcome {
     Wait,
     /// The Mac's screen is locked.
     Locked,
+    /// Linking isn't open on the Mac: its setup isn't finished, or its Link window isn't open.
+    Closed,
     /// The Mac has this computer linked already (unlinked here only, while the Mac was away).
     AlreadyLinked,
     /// This computer has the Mac linked already.
@@ -237,6 +239,7 @@ impl Outcome {
             Outcome::Busy => format!("{mac} is showing a code for another computer. Try again in a moment."),
             Outcome::Wait => format!("{mac} had too many wrong codes. Try again in a few minutes."),
             Outcome::Locked => format!("{mac} is locked. Unlock it and try again."),
+            Outcome::Closed => format!("{mac} isn't ready to link. On the Mac, finish setting up Sweeflow or choose Link a Linux machine in its menu."),
             Outcome::AlreadyLinked => {
                 format!("{mac} still has this computer linked. To link again, unlink this computer on the Mac first (Sweeflow menu → Linux machines).")
             }
@@ -407,6 +410,7 @@ fn outcome_of(body: &[u8], found: &FoundMac, host_fingerprint: &str, expected: O
         6 => Outcome::TooNew,
         7 => Outcome::TooManyWrong,
         8 => Outcome::Expired,
+        11 => Outcome::Closed,
         s => bail!("unexpected answer {s} from the Mac"),
     })
 }

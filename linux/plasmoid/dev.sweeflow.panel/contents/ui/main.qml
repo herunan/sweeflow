@@ -56,6 +56,18 @@ PlasmoidItem {
     readonly property string macName: st.mac || "Mac"
     readonly property var placement: st.placement || {}
 
+    // Setup's shortcut for this widget (Cmd+Opt+O): given here, Plasma takes it at once, with no
+    // restart of its shell. Not over one the widget has already.
+    readonly property var setKey: st.setKey || null
+    function takeKey() {
+        // For this widget, or ("*") whichever comes up first.
+        if (!setKey || (setKey.id !== "*" && String(setKey.id) !== String(Plasmoid.id))) return;
+        if (String(Plasmoid.globalShortcut) === "") Plasmoid.globalShortcut = setKey.key;
+        act("key-set");
+    }
+    onSetKeyChanged: takeKey()
+    Component.onCompleted: takeKey()
+
     // Opened from the app menu or by the key (sweeflow open): pop up.
     readonly property real showAt: st.showAt || 0
     onShowAtChanged: if (showAt > 0 && Math.abs(Date.now() - showAt) < 10000) root.expanded = true
@@ -110,6 +122,58 @@ PlasmoidItem {
     })))
     // Sweeflow's violet: every highlight, and the streaming dot.
     readonly property color violet: "#8b5cf6"
+
+    // A shortcut as keycaps, one per key: "Super+Alt+O" → [Super] [Alt] [O], "⌘⌥O" → [⌘] [⌥] [O]
+    // (keys.rs caps); none: a dim "none".
+    function keyCaps(shown) {
+        shown = (shown || "").trim();
+        if (shown === "") return [];
+        if (shown.indexOf("+") >= 0 && shown.length > 1 && shown.indexOf(" ") < 0) {
+            const parts = shown.split("+").filter(p => p !== "");
+            if (shown.endsWith("++")) parts.push("+");
+            return parts;
+        }
+        let i = 0;
+        while (i < shown.length && "⌃⌥⇧⌘".indexOf(shown[i]) >= 0) i++;
+        if (i === 0) return [shown];
+        const named = { "⌘": "⌘ Cmd", "⌥": "⌥ Opt", "⌃": "⌃ Ctrl", "⇧": "⇧ Shift" };
+        const out = shown.slice(0, i).split("").map(c => named[c] || c);
+        const rest = shown.slice(i).trim();
+        if (rest !== "") out.push(rest);
+        return out;
+    }
+    component KeyCaps: Row {
+        property var caps: []
+        id: capsRow
+        property int fontSize: 12
+        spacing: 3
+        Repeater {
+            model: parent.caps.length ? parent.caps : ["none"]
+            delegate: Rectangle {
+                required property string modelData
+                width: Math.max(height, capText.implicitWidth + 10)
+                height: capText.implicitHeight + 4
+                radius: Kirigami.Units.cornerRadius
+                color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.1)
+                PlasmaComponents3.Label { id: capText; anchors.centerIn: parent; text: modelData; font.pixelSize: capsRow.fontSize; opacity: modelData === "none" ? 0.6 : 1 }
+            }
+        }
+    }
+
+    // The pointer in the Mac shortcuts picture: the text's colour, edged in the background's.
+    component Pointer: Canvas {
+        width: 12
+        height: 16
+        onPaint: {
+            const c = getContext("2d");
+            c.reset();
+            c.beginPath();
+            c.moveTo(0.6, 0.6); c.lineTo(0.6, 13); c.lineTo(3.5, 10); c.lineTo(6, 15.4);
+            c.lineTo(8, 14.5); c.lineTo(5.5, 9); c.lineTo(10, 9); c.closePath();
+            c.fillStyle = Kirigami.Theme.textColor; c.fill();
+            c.lineWidth = 1; c.strokeStyle = Kirigami.Theme.backgroundColor; c.stroke();
+        }
+    }
     readonly property var viaWords: ({ lan: "Local", tailscale: "Remote", vm: "VM", internet: "Remote" })
     // How a Mac is reached, in a few words: "Remote: 100.64.0.3".
     function viaLine(m) {
@@ -131,9 +195,9 @@ PlasmoidItem {
     // The streaming actions, as they're named and drawn.
     readonly property var actionLabels: ({ start: "Start", pause: "Pause", resume: "Resume", stop: "Stop" })
     // What each sign does, said on hover.
-    // The keys Plasma has now for open / pause / stop (the client reads them: "⌘⌥P", or as
+    // The keys Plasma has now for open / pause / stop (the client reads them: "Super+Alt+P", or as
     // Plasma writes them; "" for one with none), and the Global menu's (fixed).
-    readonly property var shortcutKeys: st.keys || ({ open: "⌘⌥O", pause: "⌘⌥Y", stop: "⌘⌥Z", menu: "⌘⌥U" })
+    readonly property var shortcutKeys: st.keys || ({ open: "Super+Alt+O", pause: "Super+Alt+Y", stop: "Super+Alt+Z", menu: "Super+Alt+U" })
     function withKey(text, key) { return key ? text + " (" + key + ")" : text }
     readonly property var actionTips: ({ start: withKey("Start streaming", shortcutKeys.stop), pause: withKey("Pause streaming", shortcutKeys.pause),
                                          resume: withKey("Resume streaming", shortcutKeys.pause), stop: withKey("Stop streaming", shortcutKeys.stop) })
@@ -353,33 +417,74 @@ PlasmoidItem {
                         padding: Kirigami.Units.largeSpacing
                         contentItem: ColumnLayout {
                             spacing: Kirigami.Units.smallSpacing
-                            Kirigami.Heading { level: 5; text: "Keyboard shortcuts" }
+                            Kirigami.Heading { level: 5; text: "Sweeflow shortcuts" }
                             Repeater {
-                                model: [[root.shortcutKeys.open, "Open Sweeflow"], [root.shortcutKeys.pause, "Pause or resume"], [root.shortcutKeys.stop, "Stop or start"], ["⌘⌥U", "Mac app's Global Menu"]]
+                                model: [[root.shortcutKeys.open, "Open Sweeflow"], [root.shortcutKeys.menu || "Super+Alt+U", "Global menu (from Mac windows)"], [root.shortcutKeys.pause, "Pause or resume"], [root.shortcutKeys.stop, "Stop or start"]]
                                 delegate: RowLayout {
                                     required property var modelData
                                     spacing: Kirigami.Units.largeSpacing
-                                    Rectangle {
-                                        // Wider for a key written out ("Ctrl+Shift+F5").
-                                        implicitWidth: Math.max(Kirigami.Units.gridUnit * 2.6, keyText.implicitWidth + Kirigami.Units.largeSpacing)
-                                        implicitHeight: keyText.implicitHeight + Kirigami.Units.smallSpacing
-                                        radius: Kirigami.Units.cornerRadius
-                                        color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.1)
-                                        // A shortcut the user removed: none.
-                                        PlasmaComponents3.Label { id: keyText; anchors.centerIn: parent; text: modelData[0] || "none"; opacity: modelData[0] ? 1 : 0.6 }
+                                    Item {
+                                        implicitWidth: Kirigami.Units.gridUnit * 6
+                                        implicitHeight: keyRow.implicitHeight
+                                        KeyCaps { id: keyRow; caps: root.keyCaps(modelData[0]) }
                                     }
                                     PlasmaComponents3.Label { text: modelData[1] }
                                 }
                             }
+                            // A Mac window on the desktop, focused and with the pointer over it: Mac
+                            // shortcuts there, Linux's outside it.
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.topMargin: Kirigami.Units.largeSpacing
+                                implicitWidth: Kirigami.Units.gridUnit * 16
+                                implicitHeight: 92
+                                radius: 6
+                                color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.05)
+                                border.width: 1
+                                border.color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.3)
+                                Rectangle {
+                                    id: macWin
+                                    x: 7; y: 7
+                                    width: parent.width * 0.6
+                                    height: parent.height - 14
+                                    radius: 5
+                                    border.width: 1.5
+                                    border.color: root.violet
+                                    color: Qt.rgba(0.545, 0.361, 0.965, 0.18)
+                                    Rectangle {
+                                        anchors { left: parent.left; right: parent.right; top: parent.top }
+                                        height: 12; radius: 5; color: root.violet
+                                        Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 5; color: root.violet }
+                                        Row {
+                                            x: 6; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                                            Repeater { model: ["#ff5f57", "#febc2e", "#28c840"]; Rectangle { width: 6; height: 6; radius: 3; color: modelData } }
+                                        }
+                                    }
+                                    Column {
+                                        x: 8; y: 17; width: parent.width - 16
+                                        PlasmaComponents3.Label { width: parent.width; text: "Mac shortcuts work here"; font.bold: true; font.pixelSize: 11; wrapMode: Text.WordWrap }
+                                        PlasmaComponents3.Label { width: parent.width; text: "when focused and hovered over (with exceptions)"; font.pixelSize: 10; opacity: 0.7; wrapMode: Text.WordWrap }
+                                    }
+                                    Pointer { x: parent.width - 22; y: parent.height - 19 }
+                                }
+                                PlasmaComponents3.Label {
+                                    x: macWin.x + macWin.width + 8; y: 14
+                                    width: parent.width - x - 6
+                                    text: "Linux shortcuts here"; font.bold: true; font.pixelSize: 11; wrapMode: Text.WordWrap
+                                }
+                                Pointer { x: parent.width - 22; y: parent.height - 24 }
+                            }
                             PlasmaComponents3.Label {
-                                text: "⌘ is the Meta key."
-                                font: Kirigami.Theme.smallFont
+                                text: root.shortcutKeys.swapped ? "In Mac windows Alt is ⌘, Super is ⌥." : "In Mac windows Super is ⌘, Alt is ⌥."
+                                font.pixelSize: 11
                                 opacity: 0.7
                             }
+                            // The desktop's keys that stay its own even there (ui.rs, deskkeys.rs).
                             PlasmaComponents3.Button {
                                 text: "Change shortcuts…"
+                                Layout.topMargin: Kirigami.Units.smallSpacing
                                 icon.name: "configure-shortcuts"
-                                onClicked: { keysPopup.close(); root.act("shortcut-settings"); root.expanded = false; }
+                                onClicked: { keysPopup.close(); root.act("shortcuts"); root.expanded = false; }
                             }
                         }
                     }
@@ -573,13 +678,13 @@ PlasmoidItem {
                         onFlipped: (v) => root.set({ clipboard: v })
                     }
                     ToggleRow {
-                        label: "Drag and drop"
+                        label: "Drag and drop files between"
                         hint: "Files, between Mac windows and Linux"
                         on: !!root.settings.dragDrop
                         onFlipped: (v) => root.set({ dragDrop: v })
                     }
                     ToggleRow {
-                        label: "Mac apps in app launcher"
+                        label: "Mac apps in your Linux launcher"
                         hint: "Mac apps in the app launcher, alongside your Linux apps"
                         on: !!root.settings.launcher
                         onFlipped: (v) => root.set({ launcher: v })
@@ -603,6 +708,14 @@ PlasmoidItem {
                         hint: "The Mac apps' menus at the top of the screen"
                         on: !!root.placement.globalMenu
                         onFlipped: (v) => root.act("global-menu", v ? "on" : "off")
+                    }
+                    // A MacBook, connected: the Mac asks for its password (LidSleepRule.swift).
+                    ToggleRow {
+                        visible: root.connected && !!root.settings.hasLid
+                        label: "MacBook lid can be closed"
+                        hint: "Keeps the MacBook awake when shut. The Mac asks for its password"
+                        on: !!root.settings.lid
+                        onFlipped: (v) => root.set({ lid: v })
                     }
                     ToggleRow {
                         label: "Open at login"

@@ -16,7 +16,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 slint::slint! {
     import { ScrollView } from "std-widgets.slint";
-    import { Look, Label, Dim, Btn, Field, Sign, Tip, TipBubble } from "look.slint";
+    import { Look, Label, Dim, Btn, Field, Sign, Tip, TipBubble, MacShortcuts, KeyCaps } from "look.slint";
     export { Look }
 
     export struct AppRow { id: string, name: string, icon: image, has-icon: bool, initial: string, running: bool, pinned: bool, shown: bool, heading: string }
@@ -190,11 +190,12 @@ slint::slint! {
         in property <bool> running;
         // The desktop has a place to change keyboard shortcuts (Plasma, GNOME; not Hyprland).
         in property <bool> shortcut-settings;
-        // The keys the desktop has now for opening Sweeflow, pausing and stopping ("⌘⌥P", or as
+        // The keys the desktop has now for opening Sweeflow, pausing and stopping ("Super+Alt+P", or as
         // the desktop writes them; "" for none).
-        in property <string> key-open: "⌘⌥O";
-        in property <string> key-pause: "⌘⌥Y";
-        in property <string> key-stop: "⌘⌥Z";
+        in property <[string]> key-open;
+        in property <[string]> key-pause;
+        in property <[string]> key-stop;
+        in property <[string]> key-menu;
         in property <bool> paired;
         in property <string> mac-name;
         in property <string> status;
@@ -215,6 +216,13 @@ slint::slint! {
         in-out property <int> tab: 0;
         // The keyboard shortcuts' popover is showing (the ⌘ button in the header).
         in-out property <bool> show-keys: false;
+        // Hyprland (and Omarchy on it): its own keys stay first over Mac windows.
+        in property <bool> hyprland;
+        in property <bool> omarchy;
+        // A Mac-style key remapper (Toshy): keys written the Mac's way, no mapping line.
+        in property <bool> mac-style;
+        // Alt and Super swapped in Mac windows (config::swap_cmd_opt).
+        in property <bool> swapped;
         // The Mac being renamed, or asked about forgetting (fingerprints).
         in-out property <string> editing;
         in-out property <string> confirming;
@@ -629,48 +637,28 @@ slint::slint! {
             background: Look.bg.mix(Look.fg, 0.94);
             drop-shadow-blur: 16px;
             drop-shadow-color: #00000055;
-            // One width for every key, the widest one's: the names beside them line up in any
-            // font (in Ubuntu's, ⌘⌥O is wider than ⌘⌥Y).
-            property <length> key-width: max(46px, max(max(m-open.preferred-width, m-pause.preferred-width),
-                max(m-stop.preferred-width, m-menu.preferred-width)) + 12px);
-            m-open := Text { visible: false; font-size: 12px; text: root.key-open == "" ? "none" : root.key-open; }
-            m-pause := Text { visible: false; font-size: 12px; text: root.key-pause == "" ? "none" : root.key-pause; }
-            m-stop := Text { visible: false; font-size: 12px; text: root.key-stop == "" ? "none" : root.key-stop; }
-            m-menu := Text { visible: false; font-size: 12px; text: "⌘⌥U"; }
             key-list := VerticalLayout {
                 padding: 12px;
                 spacing: 7px;
-                Text { text: "Keyboard shortcuts"; color: Look.fg; font-size: 13px; font-weight: 600; }
+                Text { text: "Sweeflow shortcuts"; color: Look.fg; font-size: 13px; font-weight: 700; }
                 for k in [
                     { key: root.key-open, what: "Open Sweeflow" },
+                    { key: root.key-menu, what: "Global menu" },
                     { key: root.key-pause, what: "Pause or resume" },
                     { key: root.key-stop, what: "Stop or start" },
-                    { key: "⌘⌥U", what: "Mac app's Global Menu" },
                 ]: HorizontalLayout {
                     spacing: 10px;
-                    Rectangle {
-                        // Wider for a key written out ("Ctrl+Shift+F5").
-                        width: keys-box.key-width;
-                        height: 20px;
-                        border-radius: 5px;
-                        background: Look.fg.transparentize(0.9);
-                        key-text := Text {
-                            // A shortcut the user removed: none.
-                            text: k.key == "" ? "none" : k.key;
-                            color: k.key == "" ? Look.muted : Look.fg;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
+                    // The keys in a column of one width, so what they do lines up.
+                    HorizontalLayout { width: 124px; KeyCaps { caps: k.key; size: 11px; } }
                     Text { text: k.what; color: Look.fg; font-size: 12px; vertical-alignment: center; overflow: elide; }
                 }
-                Text { text: "⌘ is the Super key."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
-                if root.shortcut-settings: HorizontalLayout {
+                MacShortcuts { padding-top: 8px; hyprland: root.hyprland; omarchy: root.omarchy; mac-style: root.mac-style; swapped: root.swapped; }
+                // The Shortcuts window: Sweeflow's keys (and where to change them), the keys kept for Linux.
+                HorizontalLayout {
                     alignment: start;
-                    Btn { text: "Change shortcuts…"; clicked => { root.show-keys = false; root.act("shortcut-settings", ""); } }
+                    padding-top: 6px;
+                    Btn { text: "Change shortcuts…"; clicked => { root.show-keys = false; root.act("shortcuts", ""); } }
                 }
-                if !root.shortcut-settings: Text { text: "Sweeflow sets these in Hyprland as it starts; bind other keys in your Hyprland config to change them."; color: Look.muted; font-size: 11px; wrap: word-wrap; }
             }
         }
 
@@ -718,6 +706,7 @@ struct ShownKeys {
     open: String,
     pause: String,
     stop: String,
+    menu: String,
 }
 
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
@@ -731,6 +720,8 @@ struct Settings {
     drag_drop: bool,
     launcher: bool,
     quality: String,
+    lid: bool,
+    has_lid: bool,
 }
 
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
@@ -809,6 +800,7 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
         "clipboard" => Call::Set(serde_json::json!({ "clipboard": !s.settings.clipboard })),
         "dragDrop" => Call::Set(serde_json::json!({ "dragDrop": !s.settings.drag_drop })),
         "launcher" => Call::Set(serde_json::json!({ "launcher": !s.settings.launcher })),
+        "lid" => Call::Set(serde_json::json!({ "lid": !s.settings.lid })),
         "sharp" => Call::Set(serde_json::json!({ "quality": if s.settings.quality == "light" { "sharp" } else { "light" } })),
         "square" => act("square", on_off(s.square)),
         "login" => act("login", on_off(s.open_at_login)),
@@ -819,15 +811,20 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
 /// The settings, in the widget's words and order.
 fn toggles(s: &PanelState) -> Vec<Toggle> {
     let t = |key: &str, label: &str, on: bool| Toggle { key: key.into(), label: label.into(), on };
-    vec![
+    let mut all = vec![
         t("sound", "Mac sound on Linux", s.settings.sound),
         t("clipboard", "Shared clipboard", s.settings.clipboard),
-        t("dragDrop", "Drag and drop", s.settings.drag_drop),
-        t("launcher", "Mac apps in app launcher", s.settings.launcher),
+        t("dragDrop", "Drag and drop files between", s.settings.drag_drop),
+        t("launcher", "Mac apps in your Linux launcher", s.settings.launcher),
         t("square", "Square window corners", s.square),
         t("sharp", "High quality", s.settings.quality != "light"),
         t("login", "Open at login", s.open_at_login),
-    ]
+    ];
+    // A MacBook, connected: its answer (the password asked for on the Mac) comes from there.
+    if s.connected && s.settings.has_lid {
+        all.insert(6, t("lid", "MacBook lid can be closed", s.settings.lid));
+    }
+    all
 }
 
 /// Sends the calls to the client, one after another, on a thread of their own (some take a
@@ -1008,9 +1005,12 @@ fn show(ui: &PanelWin, v: &mut View) {
     ui.set_running(true);
     ui.set_shortcut_settings(crate::tray::shortcut_settings_place().is_some());
     if let Some(k) = &s.keys {
-        ui.set_key_open(k.open.as_str().into());
-        ui.set_key_pause(k.pause.as_str().into());
-        ui.set_key_stop(k.stop.as_str().into());
+        ui.set_key_open(crate::keys::caps_model(&k.open));
+        ui.set_key_pause(crate::keys::caps_model(&k.pause));
+        ui.set_key_stop(crate::keys::caps_model(&k.stop));
+        if !k.menu.is_empty() {
+            ui.set_key_menu(crate::keys::caps_model(&k.menu));
+        }
     }
     ui.set_paired(s.paired);
     ui.set_mac_name(if s.mac.is_empty() { "Mac".into() } else { s.mac.as_str().into() });
@@ -1105,6 +1105,8 @@ pub fn run() -> Result<()> {
     let _ = std::fs::write(&lock_path, std::process::id().to_string());
     let ui = PanelWin::new()?;
     crate::look::apply!(ui);
+    ui.set_hyprland(crate::hyprland::running());
+    ui.set_omarchy(crate::hyprland::running() && crate::hyprland::omarchy());
     // Hyprland maximises any window it's told to; this one has one size.
     crate::hyprland::keep_window_size();
     // Matches sweeflow.desktop (written by `sweeflow install`): Sweeflow's logo in the title bar
@@ -1228,6 +1230,7 @@ pub fn run() -> Result<()> {
         });
     }
     crate::look::fit_to_screen_soon(&ui, |ui, h| ui.set_room(h));
+    ui.set_swapped(crate::config::swap_cmd_opt());
     ui.run()?;
     Ok(())
 }

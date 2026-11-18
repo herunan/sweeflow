@@ -6,11 +6,13 @@ mod decode;
 mod deskkeys;
 mod desktop;
 mod frames;
+mod globalkeys;
 mod hyprland;
-mod installer;
+mod keptkeys;
 mod keys;
 mod launchers;
 mod lights;
+mod linuxkeys;
 mod look;
 mod menus;
 mod net;
@@ -49,6 +51,8 @@ USAGE:
     sweeflow quit BUNDLEID   quit a Mac app (the Mac app launchers' Quit action)
     sweeflow menu            the last focused Mac app's menu, to browse or search and choose an item
     sweeflow install         install this binary and start it with your desktop (systemd user service)
+    sweeflow uninstall       undo `install` for this user: service, launchers, icons, widget, shortcuts
+                             (keeps the pairing with the Mac; --purge removes it too)
     sweeflow status          show configuration and pairing info
 ";
 
@@ -96,7 +100,6 @@ fn wait_for_a_mac() -> Result<config::Config> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zbus=warn,tracing=warn")).init();
-    ffmpeg_next::init()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("run") => {
@@ -120,12 +123,16 @@ fn main() -> Result<()> {
             hyprland::add_to_config();
             // Before a Mac is linked too: the tray icon is the way back to "Link a Mac".
             tray::start();
+            // Sweeflow's keys from any window, the standard way where the desktop has it.
+            globalkeys::start();
             if x11ui::wanted() { x11ui::run(wait_for_a_mac()?) } else { ui::run(wait_for_a_mac()?) }
         }
         Some("pair") if args.get(1).is_some_and(|a| a == "--text") => pair::run_text(),
         Some("pair") => wizard::run(),
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
+        Some("uninstall") if args.len() == 1 => setup::uninstall(false),
+        Some("uninstall") if args.len() == 2 && args[1] == "--purge" => setup::uninstall(true),
         Some("open") => setup::open(),
         Some("toggle-pause") => setup::toggle("pause-toggle"),
         Some("toggle-stream") => setup::toggle("stream-toggle"),
@@ -133,6 +140,16 @@ fn main() -> Result<()> {
         Some("quit") => launchers::quit(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("menu") => palette::run(),
         Some("panel") => panelwin::run(),
+        // Not in the usage: the Shortcuts window (Sweeflow's keys, keys kept for Linux).
+        Some("shortcuts") | Some("linux-keys") => linuxkeys::run(),
+        // Not in the usage: the keys kept for Linux over Mac windows (keptkeys.rs),
+        // one per line, for checking a desktop from a terminal.
+        Some("kept-keys") => {
+            for k in keptkeys::all() {
+                println!("{:<26} {:<24} {}", k.group, k.label, k.what);
+            }
+            Ok(())
+        }
         // Not in the usage: what the client runs to show a Mac prompt (see prompt.rs).
         Some("prompt") => prompt::run(&args[1..]),
         // Not in the usage: draws made-up Mac windows through the X11 frontend (x11ui.rs).

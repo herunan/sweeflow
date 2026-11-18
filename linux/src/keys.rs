@@ -94,12 +94,15 @@ impl Key {
         vec![keys]
     }
 
-    /// As the panels show it: ⌘⌥P for Cmd+Opt+P (Super+Alt, or Ctrl+Alt behind a Mac-style key
-    /// remapper, which is the same keys pressed), otherwise as the desktop writes it
-    /// ("Ctrl+Alt+P"; `super_name`: "Meta" on Plasma, "Super" elsewhere).
+    /// As the panels show it: Super+Alt+P, with or without a key remapper (Super is the key Mac
+    /// windows get as ⌘; behind a remapper it's set as Ctrl+Alt, the same key pressed); others as
+    /// the desktop writes them ("Ctrl+Shift+P"; `super_name`: "Meta" on Plasma, "Super" elsewhere).
     pub fn shown(&self, remapped: bool, super_name: &str) -> String {
-        if self.alt && !self.shift && ((self.super_ && !self.ctrl) || (remapped && self.ctrl && !self.super_)) {
-            return format!("⌘⌥{}", self.key);
+        if remapped && self.alt && !self.shift && self.ctrl && !self.super_ {
+            return format!("Super+Alt+{}", self.key);
+        }
+        if self.alt && !self.shift && self.super_ && !self.ctrl {
+            return format!("Super+Alt+{}", self.key);
         }
         let mods = [(self.super_, super_name), (self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")];
         let mut parts: Vec<&str> = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
@@ -125,10 +128,12 @@ impl Keys {
     /// For the panel state (tray::panel_state): each as the panels show it, "" for none. The
     /// Global menu's key is fixed (caught in Mac windows only, ui.rs).
     pub fn json(&self) -> serde_json::Value {
-        let remapped = crate::setup::mac_keys_remapped();
-        let super_name = if desktop().contains("KDE") { "Meta" } else { "Super" };
-        let shown = |k: &Option<Key>| k.as_ref().map(|k| k.shown(remapped, super_name)).unwrap_or_default();
-        serde_json::json!({ "open": shown(&self.open), "pause": shown(&self.pause), "stop": shown(&self.stop), "menu": "⌘⌥U" })
+        self.json_for(crate::setup::mac_keys_remapped())
+    }
+
+    /// As `json`, for a keyboard made Mac-style by a remapper (`remapped`) or not.
+    fn json_for(&self, remapped: bool) -> serde_json::Value {
+        own_json(remapped)
     }
 }
 
@@ -137,7 +142,7 @@ pub(crate) fn desktop() -> String {
 }
 
 /// Asks the desktop (slow: other processes, D-Bus calls).
-fn read() -> Keys {
+pub(crate) fn read() -> Keys {
     let desktop = desktop();
     let remapped = crate::setup::mac_keys_remapped();
     if desktop.contains("KDE") {
@@ -242,11 +247,12 @@ mod tests {
     #[test]
     fn shown_as_mac_keys_when_they_are() {
         let p = Key::cmd_opt('P', false);
-        assert_eq!(p.shown(false, "Super"), "⌘⌥P");
+        assert_eq!(p.shown(false, "Meta"), "Super+Alt+P");
         assert_eq!(p.menu(), [["Alt", "Super", "P"]]);
         // Behind a key remapper Ctrl+Alt is what Cmd+Opt arrives as.
         let ctrl = Key::cmd_opt('P', true);
-        assert_eq!(ctrl.shown(true, "Super"), "⌘⌥P");
+        assert_eq!(ctrl.shown(true, "Super"), "Super+Alt+P");
+        assert_eq!(p.shown(true, "Super"), "Super+Alt+P");
         assert_eq!(ctrl.shown(false, "Super"), "Ctrl+Alt+P");
         assert_eq!(ctrl.menu(), [["Control", "Alt", "P"]]);
         // Others as the desktop writes them.
@@ -257,11 +263,202 @@ mod tests {
 
     #[test]
     fn the_panels_get_each_key_or_none() {
-        let keys = Keys { open: Some(Key::cmd_opt('O', false)), pause: None, stop: Key::from_qt_text("Meta+Ctrl+S") };
-        let json = keys.json();
-        assert_eq!(json["open"], "⌘⌥O");
+        // As set (none set: the defaults), the keyboard's way or the Mac's.
+        let defaults = super::own_keys_from(&Default::default());
+        let json = super::json_of(&defaults, false);
+        assert_eq!(json["open"], "Super+Alt+O");
+        assert_eq!(json["menu"], "Super+Alt+U");
+        // A remapper changes nothing in how they're written: Super is the ⌘ key in Mac windows.
+        assert_eq!(super::json_of(&defaults, true)["menu"], "Super+Alt+U");
+        assert_eq!(super::json_of(&defaults, true)["remapped"], true);
+        // One set to none, one changed.
+        let set = [("pause".to_string(), String::new()), ("stop".to_string(), "Super+Shift+S".to_string())].into();
+        let json = super::json_of(&super::own_keys_from(&set), false);
         assert_eq!(json["pause"], "");
-        assert!(json["stop"].as_str().unwrap().ends_with("Ctrl+S"));
-        assert_eq!(json["menu"], "⌘⌥U");
+        assert_eq!(json["stop"], "Super+Shift+S");
+    }
+}
+
+/// `caps` for a Slint model (the keycaps a window shows).
+pub fn caps_model(shown: &str) -> slint::ModelRc<slint::SharedString> {
+    let caps: Vec<slint::SharedString> = caps(shown).into_iter().map(Into::into).collect();
+    slint::ModelRc::new(slint::VecModel::from(caps))
+}
+
+/// A shortcut as shown ("Super+Alt+O", "⌘⌥O", "Ctrl++", "Volume +") split into its keys, one
+/// keycap each: ["Super", "Alt", "O"], ["⌘", "⌥", "O"]. Empty: none.
+pub fn caps(shown: &str) -> Vec<String> {
+    let shown = shown.trim();
+    if shown.is_empty() {
+        return Vec::new();
+    }
+    if shown.contains('+') && shown.len() > 1 && !shown.contains(' ') {
+        let mut parts: Vec<String> = shown.split('+').map(str::to_string).collect();
+        // "Ctrl++": the last key is "+".
+        if shown.ends_with("++") {
+            parts.retain(|p| !p.is_empty());
+            parts.push("+".into());
+        }
+        return parts.into_iter().filter(|p| !p.is_empty()).collect();
+    }
+    let signs: String = shown.chars().take_while(|c| "⌃⌥⇧⌘".contains(*c)).collect();
+    if signs.is_empty() {
+        return vec![shown.to_string()];
+    }
+    // Each sign with its name, as a Mac keyboard has them: the signs alone are hard to tell apart.
+    let named = |c: char| match c {
+        '⌘' => "⌘ Cmd".to_string(),
+        '⌥' => "⌥ Opt".into(),
+        '⌃' => "⌃ Ctrl".into(),
+        '⇧' => "⇧ Shift".into(),
+        other => other.to_string(),
+    };
+    let mut out: Vec<String> = signs.chars().map(named).collect();
+    let rest = shown[signs.len()..].trim();
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod caps_tests {
+    #[test]
+    fn shortcuts_split_into_keycaps() {
+        assert_eq!(super::caps("Super+Alt+O"), ["Super", "Alt", "O"]);
+        assert_eq!(super::caps("⌘⌥O"), ["⌘ Cmd", "⌥ Opt", "O"]);
+        assert_eq!(super::caps("⌘Space"), ["⌘ Cmd", "Space"]);
+        assert_eq!(super::caps("⌃⇧Tab"), ["⌃ Ctrl", "⇧ Shift", "Tab"]);
+        assert_eq!(super::caps("Ctrl++"), ["Ctrl", "+"]);
+        assert_eq!(super::caps("Volume +"), ["Volume +"]);
+        assert!(super::caps("").is_empty());
+    }
+}
+
+/// For the panels: Sweeflow's keys as set (keys.rs's own keys, which the desktop is given), as
+/// the keyboard names them (Super+Alt+O; Super is ⌘ in Mac windows, a remapper or not); "" for
+/// none.
+pub fn own_json(remapped: bool) -> serde_json::Value {
+    json_of(&own_keys(), remapped)
+}
+
+fn json_of(keys: &[(&'static str, Option<crate::deskkeys::UserKey>)], remapped: bool) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (name, key) in keys {
+        out.insert(name.to_string(), key.as_ref().map(|k| k.label()).unwrap_or_default().into());
+    }
+    // A Mac-style key remapper is set up (its note says so; the keys are written the same).
+    out.insert("remapped".into(), remapped.into());
+    // Alt and Super swapped in Mac windows (config::swap_cmd_opt), for the mapping line.
+    out.insert("swapped".into(), crate::config::swap_cmd_opt().into());
+    serde_json::Value::Object(out)
+}
+
+/// Sweeflow's own keys, by name, with what they are unless set otherwise (in Mac terms: Super
+/// is ⌘, as in Mac windows). The Global menu acts only in Mac windows.
+pub const OWN: [(&str, &str); 4] = [("open", "Super+Alt+O"), ("menu", "Super+Alt+U"), ("pause", "Super+Alt+Y"), ("stop", "Super+Alt+Z")];
+
+fn own_file() -> std::path::PathBuf {
+    crate::config::dir().join("keys.json")
+}
+
+/// Sweeflow's keys as set in its Shortcuts window (`keys.json`: name → "Super+Alt+O", "" for
+/// none), the defaults for the rest. Read again only when the file changed.
+pub fn own_keys() -> Vec<(&'static str, Option<crate::deskkeys::UserKey>)> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(Option<std::time::SystemTime>, Vec<(&'static str, Option<crate::deskkeys::UserKey>)>)>> = Mutex::new(None);
+    let stamp = std::fs::metadata(own_file()).and_then(|m| m.modified()).ok();
+    let mut cache = CACHE.lock().unwrap();
+    if cache.as_ref().is_none_or(|(s, _)| *s != stamp) {
+        let set: std::collections::HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(own_file()).unwrap_or_default()).unwrap_or_default();
+        *cache = Some((stamp, own_keys_from(&set)));
+    }
+    cache.as_ref().map(|(_, k)| k.clone()).unwrap_or_default()
+}
+
+/// Sweeflow's keys from what's set (name → "Super+Alt+O", "" for none), the defaults for the rest.
+fn own_keys_from(set: &std::collections::HashMap<String, String>) -> Vec<(&'static str, Option<crate::deskkeys::UserKey>)> {
+    OWN.iter().map(|(name, default)| (*name, crate::deskkeys::UserKey::parse(set.get(*name).map_or(default, String::as_str)))).collect()
+}
+
+/// Sweeflow's keys as set (keys.json), for the tray menu: what every place shows, so a key changed
+/// in the Shortcuts window shows the same everywhere.
+pub fn own_as_keys() -> Keys {
+    let to_key = |name: &str| own_key(name).and_then(|k| Key::new(k.logo, k.ctrl, k.alt, k.shift, &k.key));
+    Keys { open: to_key("open"), pause: to_key("pause"), stop: to_key("stop") }
+}
+
+/// One of Sweeflow's keys, as set.
+pub fn own_key(name: &str) -> Option<crate::deskkeys::UserKey> {
+    own_keys().into_iter().find(|(n, _)| *n == name).and_then(|(_, k)| k)
+}
+
+/// Sets one of Sweeflow's keys ("" for none).
+pub fn set_own_key(name: &str, label: &str) -> std::io::Result<()> {
+    let mut set: std::collections::HashMap<String, String> =
+        serde_json::from_slice(&std::fs::read(own_file()).unwrap_or_default()).unwrap_or_default();
+    set.insert(name.to_string(), label.to_string());
+    std::fs::create_dir_all(crate::config::dir())?;
+    std::fs::write(own_file(), serde_json::to_vec_pretty(&set).unwrap_or_default())
+}
+
+/// Which of Sweeflow's keys a press in a Mac window is, if any ("open", "menu", "pause", "stop").
+/// The key code sent to the Mac for a key pressed in a Mac window: Alt and Super swapped when
+/// that's set (config::swap_cmd_opt), so ⌘ is next to the space bar on a PC keyboard.
+pub fn mac_code(raw: u32) -> u32 {
+    if crate::config::swap_cmd_opt() { swapped(raw) } else { raw }
+}
+
+/// Left Alt and left Super, right Alt and right Super, the other way round.
+fn swapped(raw: u32) -> u32 {
+    match raw {
+        56 => 125,
+        125 => 56,
+        100 => 126,
+        126 => 100,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn swap_turns_alt_into_cmd_and_super_into_opt() {
+    // evdev codes: left Alt 56, left Super 125, right Alt 100, right Super 126.
+    assert_eq!(swapped(56), 125);
+    assert_eq!(swapped(125), 56);
+    assert_eq!(swapped(100), 126);
+    assert_eq!(swapped(126), 100);
+    // Everything else as it is: Ctrl, Shift, letters.
+    for code in [29, 42, 30, 24, 57] {
+        assert_eq!(swapped(code), code);
+    }
+}
+
+pub fn own_action(raw: u32, ch: Option<char>, sym_name: Option<&str>, m: crate::deskkeys::Mods) -> Option<&'static str> {
+    action_in(&own_keys(), raw, ch, sym_name, m)
+}
+
+fn action_in(keys: &[(&'static str, Option<crate::deskkeys::UserKey>)], raw: u32, ch: Option<char>, sym_name: Option<&str>, m: crate::deskkeys::Mods) -> Option<&'static str> {
+    keys.iter().find(|(_, k)| k.as_ref().is_some_and(|k| k.matches(raw, ch, sym_name, m))).map(|(n, _)| *n)
+}
+
+#[cfg(test)]
+mod own_tests {
+    use crate::deskkeys::Mods;
+
+    #[test]
+    fn mac_windows_follow_the_keys_as_set() {
+        let cmd_opt = Mods { logo: true, alt: true, ..Default::default() };
+        let keys = super::own_keys_from(&Default::default());
+        // The defaults, by what the key types (any layout, Caps Lock or not).
+        assert_eq!(super::action_in(&keys, 24, Some('u'), Some("XK_u"), cmd_opt), Some("menu"));
+        assert_eq!(super::action_in(&keys, 24, Some('U'), Some("XK_U"), cmd_opt), Some("menu"));
+        assert_eq!(super::action_in(&keys, 24, Some('o'), Some("XK_o"), cmd_opt), Some("open"));
+        assert_eq!(super::action_in(&keys, 21, Some('y'), Some("XK_y"), cmd_opt), Some("pause"));
+        assert_eq!(super::action_in(&keys, 44, Some('z'), Some("XK_z"), cmd_opt), Some("stop"));
+        // Other modifiers held: not Sweeflow's.
+        assert_eq!(super::action_in(&keys, 24, Some('u'), Some("XK_u"), Mods { shift: true, ..cmd_opt }), None);
+        assert_eq!(super::action_in(&keys, 24, Some('u'), Some("XK_u"), Mods { logo: true, ..Default::default() }), None);
     }
 }

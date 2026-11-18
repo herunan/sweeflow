@@ -33,6 +33,14 @@ pub struct Settings {
     /// Mac windows on a desktop of their own (see desktop.rs).
     #[serde(default = "yes")]
     pub desktop: bool,
+    /// The MacBook stays awake with its lid closed while it streams (its rule, LidSleepRule.swift).
+    /// Asking for it brings up a password prompt on the Mac; what the Mac sends back says whether
+    /// it was given.
+    #[serde(default)]
+    pub lid: bool,
+    /// The Mac has a lid (a MacBook): only then is `lid` offered. Older Macs don't say: none.
+    #[serde(default)]
+    pub has_lid: bool,
 }
 
 fn yes() -> bool {
@@ -52,6 +60,8 @@ impl Default for Settings {
             launcher: true,
             quality: "sharp".into(),
             desktop: true,
+            lid: false,
+            has_lid: false,
         }
     }
 }
@@ -183,9 +193,8 @@ fn tray_host_present() -> bool {
 
 /// A desktop notification that Sweeflow is running and which key opens it (when there's no tray).
 fn tell_no_tray() {
-    let key = crate::keys::current().open.map(|k| k.shown(crate::setup::mac_keys_remapped(), "Super"));
+    let key = crate::keys::current().open.map(|k| k.shown(false, "Super"));
     let body = match key {
-        Some(k) if k.starts_with('⌘') => format!("{} (Super+Alt+{}) opens it; it's in your app launcher too.", k, k.chars().last().unwrap_or('O')),
         Some(k) => format!("{k} opens it; it's in your app launcher too."),
         None => "Open it from your app launcher (or run `sweeflow open`).".to_string(),
     };
@@ -403,8 +412,8 @@ impl ksni::Tray for Tray {
         let actions = stream_actions(standing(&state));
         let elsewhere = state.elsewhere;
         drop(state);
-        // Each item shows the key the desktop has for it now (the user may have changed it).
-        let keys = crate::keys::current();
+        // Each item shows Sweeflow's key for it as set (the Shortcuts window), as every window does.
+        let keys = crate::keys::own_as_keys();
         // Where streaming stands, and what can be done about it.
         // The status line leads with the same coloured dot the window gives the Mac in use.
         let mut items: Vec<MenuItem<Self>> = vec![StandardItem { label: status, enabled: false, icon_name: dot.into(), ..Default::default() }.into()];
@@ -478,7 +487,7 @@ pub fn shortcut_settings_place() -> Option<&'static [&'static str]> {
     }
 }
 
-fn open_shortcut_settings() {
+pub(crate) fn open_shortcut_settings() {
     if let Some(cmd) = shortcut_settings_place() {
         if let Err(e) = std::process::Command::new(cmd[0]).args(&cmd[1..]).spawn() {
             log::warn!("opening the shortcut settings ({}): {e}", cmd[0]);
@@ -501,10 +510,10 @@ fn with_key(label: &str, key: &Option<crate::keys::Key>, column: f32) -> String 
             // Lined up in a column at the end of the rows, by tabs (key_column).
             // Omarchy's bar draws its menus at a fixed width: tabs pushed the key out of sight.
             if crate::hyprland::running() {
-                return format!("{label}  {}", k.shown(crate::setup::mac_keys_remapped(), "Super"));
+                return format!("{label}  {}", k.shown(false, "Super"));
             }
             let tabs = (column - tab_stop(text_width(label))) as usize + 1;
-            format!("{label}{}{}", "\t".repeat(tabs), k.shown(crate::setup::mac_keys_remapped(), "Super"))
+            format!("{label}{}{}", "\t".repeat(tabs), k.shown(false, "Super"))
         }
         _ => label.to_string(),
     }
@@ -525,10 +534,10 @@ fn tab_stop(width: f32) -> f32 {
 /// The tab stop the keys start at, so they end where the rows do: the status line (with its dot
 /// after it) is the widest; never before the first stop after "Open Sweeflow".
 fn key_column(status: &str) -> f32 {
-    const KEY: f32 = 38.0; // "⌘⌥Y"
     const DOT: f32 = 22.0;
+    let key = text_width("Super+Alt+Y");
     // One stop further than where the status line ends: set apart from the item's text.
-    let end = ((text_width(status) + DOT - KEY) / tab()).floor() + 1.0;
+    let end = ((text_width(status) + DOT - key) / tab()).floor() + 1.0;
     end.max(tab_stop(text_width("Open Sweeflow")))
 }
 
@@ -938,6 +947,8 @@ pub fn panel_state() -> serde_json::Value {
         // The keys the desktop has now for open / pause / stop (and the Global menu's): as
         // shown, "" for one with none.
         "keys": crate::keys::current().json(),
+        // The shortcut setup wants the tray widget to give itself (setup.rs, WIDGET_KEY).
+        "setKey": crate::setup::widget_key().map(|(id, key)| serde_json::json!({ "id": id, "key": key })),
     })
 }
 
@@ -1028,6 +1039,34 @@ pub fn panel_do(action: &str, arg: &str) {
             }
         }
         "shortcut-settings" => open_shortcut_settings(),
+        "linux-keys" | "shortcuts" => crate::ui::run_own("shortcuts", "Shortcuts"),
+        // One of Sweeflow's keys was changed in its Shortcuts window (keys.json): the desktop
+        // gets it (Hyprland's bindings, the shortcut in GNOME's or Cinnamon's settings), and the
+        // menu and panels show it.
+        "keys-changed" => {
+            let name = arg.to_string();
+            crate::hyprland::rebind_own_keys();
+            std::thread::spawn(move || {
+                crate::setup::apply_own_key(&name);
+                refresh();
+            });
+        }
+        // The keys kept for Linux changed (Shortcuts window): Hyprland's key mode is made
+        // again with them (the other desktops read them on each key).
+        "exceptions-changed" => crate::hyprland::refresh_mac_keys(),
+        // The desktop's own dialog for Sweeflow's keys (the portal's: globalkeys.rs).
+        "configure-keys" => {
+            std::thread::spawn(|| {
+                if !crate::globalkeys::configure() {
+                    open_shortcut_settings();
+                }
+            });
+        }
+        // The tray widget has given itself the key setup left for it.
+        "key-set" => {
+            let _ = std::fs::remove_file(crate::config::dir().join(crate::setup::WIDGET_KEY));
+            refresh();
+        }
         "display" => {
             if let Some(net) = NET.get() {
                 let show = !DISPLAY_SHOWN.load(std::sync::atomic::Ordering::Relaxed);
@@ -1165,17 +1204,32 @@ fn open_panel() {
 }
 
 /// Opens one of Sweeflow's own windows: this binary again, with `arg`.
+///
+/// Run by the service, the window goes into a scope of its own (systemd-run --scope): left in
+/// the service's group, the service restarting (as it does to stream from a Mac just linked)
+/// took it down too, and "Link a Mac" vanished before its last pages.
 fn run_window(arg: &str, what: &str) {
-    match std::env::current_exe() {
-        Ok(me) => match std::process::Command::new(me).arg(arg).spawn() {
-            // Waited for, so it doesn't stay behind as a dead process once its window closes.
-            Ok(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-            }
-            Err(e) => log::warn!("couldn't open {what}: {e}"),
-        },
+    let me = match std::env::current_exe() {
+        Ok(me) => me,
+        Err(e) => return log::warn!("couldn't open {what}: {e}"),
+    };
+    let scoped = std::env::var_os("INVOCATION_ID").is_some().then(|| {
+        let mut c = std::process::Command::new("systemd-run");
+        c.args(["--user", "--scope", "--quiet", "--collect", "--"]).arg(&me).arg(arg);
+        c
+    });
+    let child = scoped.and_then(|mut c| c.spawn().inspect_err(|e| log::info!("systemd-run: {e}")).ok());
+    let child = match child {
+        Some(c) => Ok(c),
+        None => std::process::Command::new(&me).arg(arg).spawn(),
+    };
+    match child {
+        // Waited for, so it doesn't stay behind as a dead process once its window closes.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
         Err(e) => log::warn!("couldn't open {what}: {e}"),
     }
 }

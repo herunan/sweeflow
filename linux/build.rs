@@ -40,14 +40,4 @@ fn main() {
     walk(&root, &root, &mut files);
     let code = format!("pub const MAC_FILES: &[(&str, &[u8])] = &[\n{}\n];\n", files.join("\n"));
     fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("mac_files.rs"), code).unwrap();
-
-    // The Mac app's installer, when one has been built (release-mac.sh → dist/Sweeflow.dmg):
-    // carried in the binary, so `sweeflow install` can set it up for the "Add a Mac" window.
-    let dmg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist/Sweeflow.dmg");
-    println!("cargo:rerun-if-changed={}", dmg.display());
-    let code = match fs::canonicalize(&dmg) {
-        Ok(abs) => format!("pub const MAC_DMG: Option<&[u8]> = Some(include_bytes!({:?}));\n", abs.to_string_lossy()),
-        Err(_) => "pub const MAC_DMG: Option<&[u8]> = None;\n".to_string(),
-    };
-    fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("mac_dmg.rs"), code).unwrap();
 }

@@ -1,0 +1,16 @@
+post_install() {
+    echo "==> Open Sweeflow from your app menu (or run: sweeflow open) to set it up for your user and link a Mac."
+}
+post_upgrade() {
+    # The per-user service runs /usr/bin/sweeflow: restart it in each session so the new version runs.
+    for bus in /run/user/*/bus; do
+        [ -S "$bus" ] || continue
+        uid=$(basename "$(dirname "$bus")")
+        user=$(id -nu "$uid" 2>/dev/null) || continue
+        runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+            systemctl --user try-restart sweeflow.service 2>/dev/null || true
+    done
+}
+pre_remove() {
+    echo "==> To remove Sweeflow's per-user setup (service, launchers, shortcuts), run before removing: sweeflow uninstall"
+}

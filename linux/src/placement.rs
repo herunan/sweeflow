@@ -138,3 +138,21 @@ pub fn set_global_menu(on: bool) -> Result<()> {
     Ok(())
 }
 
+/// `sweeflow uninstall`: the top bar Sweeflow made for the Global Menu goes, while it holds
+/// nothing but the menu (one the user added things to is theirs now). A Global Menu put into a
+/// panel that was there already stays: it can't be told from one the user added. True when the
+/// bar went.
+pub fn remove_menu_panel() -> Result<bool> {
+    let ours = std::fs::read_to_string(menu_panel_file()).unwrap_or_default().trim().to_string();
+    if ours.is_empty() {
+        return Ok(false);
+    }
+    let out = plasma(&format!(
+        "panels().forEach(function(p){{\n\
+           if (p.id == '{ours}' && p.widgets().length == p.widgets('{APPMENU}').length) {{ p.remove(); print('removed'); }}\n\
+         }});"
+    ))?;
+    let _ = std::fs::remove_file(menu_panel_file());
+    Ok(out.contains("removed"))
+}
+

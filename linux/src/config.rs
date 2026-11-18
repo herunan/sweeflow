@@ -40,6 +40,9 @@ pub struct Config {
     /// Mac windows with square corners (true) or the Mac's rounded ones (false). Not set: what
     /// suits the desktop (see `square_corners`).
     pub square_corners: Option<bool>,
+    /// In Mac windows, Alt is ⌘ and Super is ⌥: ⌘ next to the space bar on a PC keyboard, for
+    /// people used to an Apple keyboard's layout (see `swap_cmd_opt`).
+    pub swap_cmd_opt: bool,
 }
 
 /// The Mac (by fingerprint) said where else it can be reached: kept with it. And, if it was
@@ -116,6 +119,31 @@ pub fn set_square_corners(on: bool) {
     });
 }
 
+/// Whether Mac windows swap Alt and Super (`Config::swap_cmd_opt`). Read again when the config
+/// file changes: the Shortcuts window saves it from its own process.
+pub fn swap_cmd_opt() -> bool {
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+    static CACHE: Mutex<Option<(Option<SystemTime>, bool)>> = Mutex::new(None);
+    let stamp = fs::metadata(Config::path()).and_then(|m| m.modified()).ok();
+    let mut cache = CACHE.lock().unwrap();
+    match *cache {
+        Some((s, on)) if s == stamp => on,
+        _ => {
+            let on = Config::load_or_default().map(|c| c.swap_cmd_opt).unwrap_or(false);
+            *cache = Some((stamp, on));
+            on
+        }
+    }
+}
+
+/// Switches the Alt and Super swap on or off, and saves it.
+pub fn set_swap_cmd_opt(on: bool) -> Result<()> {
+    let mut c = Config::load_or_default()?;
+    c.swap_cmd_opt = on;
+    c.save()
+}
+
 pub fn dir() -> PathBuf {
     xdg_home("XDG_CONFIG_HOME", ".config").join("sweeflow")
 }
@@ -143,6 +171,7 @@ impl Default for Config {
             scale: 1.0,
             render_node: default_render_node(),
             square_corners: None,
+            swap_cmd_opt: false,
         }
     }
 }
@@ -210,6 +239,7 @@ impl Config {
                 "capture_scale" => {}
                 "render_node" => c.render_node = v,
                 "square_corners" => c.square_corners = Some(v != "false"),
+                "swap_cmd_opt" => c.swap_cmd_opt = v == "true",
                 _ => {}
             }
         }
@@ -283,6 +313,9 @@ impl Config {
         );
         if let Some(square) = self.square_corners {
             out += &format!("square_corners = {square}\n");
+        }
+        if self.swap_cmd_opt {
+            out += "swap_cmd_opt = true\n";
         }
         for m in &self.macs {
             out += &format!(
@@ -380,6 +413,15 @@ mod tests {
         assert_eq!(Config::parse(&c.render()).unwrap().square_corners, None, "not set unless chosen");
         c.square_corners = Some(false);
         assert_eq!(Config::parse(&c.render()).unwrap().square_corners, Some(false));
+    }
+
+    #[test]
+    fn the_swap_setting_round_trips() {
+        let mut c = Config::parse(&format!("host = \"MAC1.local:44120\"\nhost_fingerprint = \"{FP_A}\"\n")).unwrap();
+        assert!(!c.swap_cmd_opt, "off unless chosen");
+        assert!(!c.render().contains("swap_cmd_opt"));
+        c.swap_cmd_opt = true;
+        assert!(Config::parse(&c.render()).unwrap().swap_cmd_opt);
     }
 
     #[test]

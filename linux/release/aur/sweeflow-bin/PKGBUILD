@@ -1,0 +1,29 @@
+# Maintainer: Hernán Romero <herunan at users dot noreply dot github dot com>
+# The release's prebuilt binary (linux/release/build.sh): FFmpeg is built in, so it doesn't break when
+# Arch's FFmpeg changes version. For a build from source, see the sweeflow package.
+pkgname=sweeflow-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Mac apps as windows on a Linux desktop'
+arch=('x86_64')
+url='https://github.com/herunan/sweeflow'
+license=('MIT' 'LGPL-2.1-or-later')
+depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'libxkbcommon' 'fontconfig' 'freetype2' 'systemd')
+optdepends=('pipewire-audio: the Mac'"'"'s sound (pw-cat)'
+            'libpulse: the Mac'"'"'s sound on PulseAudio (pacat)'
+            'libnotify: notifications (notify-send)')
+provides=('sweeflow')
+conflicts=('sweeflow')
+install=sweeflow.install
+options=('!strip' '!debug')
+source=("$url/releases/download/v$pkgver/sweeflow-$pkgver-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "sweeflow-$pkgver"
+    install -Dm755 sweeflow "$pkgdir/usr/bin/sweeflow"
+    install -Dm644 sweeflow.desktop "$pkgdir/usr/share/applications/sweeflow.desktop"
+    install -Dm644 sweeflow.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/sweeflow.svg"
+    install -Dm644 THIRD-PARTY-LICENSES.html "$pkgdir/usr/share/doc/sweeflow/THIRD-PARTY-LICENSES.html"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

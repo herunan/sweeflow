@@ -1,14 +1,13 @@
 //! Which keys stay the desktop's while a Mac window has the keyboard and the pointer is over a
-//! Mac window (then every other shortcut goes to the Mac, Super as Cmd). The rule, the same on
-//! every desktop: shortcuts with a letter are the app's (Cmd+C, Cmd+T, Cmd+F, Opt+letter for
-//! accents), and so are arrows with Cmd or Opt (moving through text); the ones for windows and
-//! the desktop are the desktop's: switching windows (Super+Tab, Alt+Tab), the launcher
-//! (Super+Space), workspaces and the like (digits, Page Up/Down, F-keys… with Super or Alt;
-//! Ctrl+Alt+arrows), and the media and brightness keys. Of those, only the ones the desktop
-//! actually uses are taken from the Mac where that can be known (Plasma says, Hyprland and X11
-//! X11 gets the key back and passes on what it doesn't use; GNOME runs none for an app, so its
-//! window keys are let through from the next press). Not on Hyprland, where the desktop's keys
-//! stay first (see ui.rs sync_inhibitor).
+//! Mac window (then every other shortcut goes to the Mac, Super as Cmd). The keys: one list, the
+//! same on every desktop (keptkeys.rs), a superset of the standard defaults of Plasma, GNOME,
+//! Cinnamon and Omarchy for switching, workspaces and windows, plus the media keys; shortcuts
+//! with a letter are the app's (Cmd+C, Cmd+T, Opt+letter for accents), and so are Cmd or Opt
+//! with arrows (moving through text). The person can take keys out of the list and add their
+//! own (the Shortcuts window, linuxkeys.rs). Of those, only the ones the desktop actually uses
+//! are taken from the Mac where that can be known (Plasma says; X11 gets the key back and passes
+//! on what it doesn't use; GNOME runs none for an app, so its window keys are let through from
+//! the next press). Not on Hyprland, where Sweeflow's key mode binds them (hyprland::mac_keys).
 
 use std::process::Command;
 
@@ -64,23 +63,7 @@ pub fn is_media(raw: u32) -> bool {
 /// Whether a key (raw code) with these modifiers is one for windows or the desktop (see the
 /// module's rule), to be left to the desktop if it uses it.
 pub fn is_desktop_key(raw: u32, m: Mods) -> bool {
-    if is_media(raw) {
-        return true;
-    }
-    let arrow = matches!(raw, KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
-    if arrow {
-        // Cmd/Opt(+Shift)+arrows move and select through text on the Mac; with Ctrl and
-        // another modifier they're the desktop's (workspaces, moving windows).
-        return m.ctrl && (m.alt || m.logo);
-    }
-    if !(m.logo || m.alt) {
-        return false;
-    }
-    matches!(raw, KEY_TAB | KEY_SPACE | KEY_ESC | KEY_ENTER | KEY_HOME | KEY_END | KEY_PAGEUP | KEY_PAGEDOWN | KEY_DELETE)
-        || (KEY_1..=KEY_0).contains(&raw)
-        || (KEY_F1..=KEY_F10).contains(&raw)
-        || raw == KEY_F11
-        || raw == KEY_F12
+    crate::keptkeys::is_kept(raw, m) && !press_removed(raw, m)
 }
 
 /// The key as Qt counts it (Qt::META | Qt::Key_Tab…), which is how Plasma's shortcuts are kept.
@@ -136,7 +119,12 @@ pub fn qt_key(raw: u32, m: Mods) -> Option<i32> {
 /// management, the launcher, the session's lock and log out, media and brightness, the panel's
 /// task manager): (component, action).
 pub fn plasma_action(raw: u32, m: Mods) -> Option<(String, String)> {
-    let code = qt_key(raw, m)?;
+    plasma_lookup(qt_key(raw, m)?, true)
+}
+
+/// The global shortcut Plasma has on a key (Qt's number): (component, action). `desktop_only`:
+/// only the desktop's own components.
+fn plasma_lookup(code: i32, desktop_only: bool) -> Option<(String, String)> {
     let out = Command::new("busctl")
         .args(["--user", "call", "org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "getGlobalShortcutsByKey", "i", &code.to_string()])
         .output()
@@ -146,7 +134,7 @@ pub fn plasma_action(raw: u32, m: Mods) -> Option<(String, String)> {
     let quoted: Vec<&str> = text.split('"').skip(1).step_by(2).collect();
     let (action, component) = (quoted.first()?.to_string(), quoted.get(2)?.to_string());
     const DESKTOP: [&str; 8] = ["kwin", "krunner", "org_kde_krunner_desktop", "ksmserver", "kmix", "mediacontrol", "org_kde_powerdevil", "plasmashell"];
-    DESKTOP.contains(&component.as_str()).then_some((component, action))
+    (!desktop_only || DESKTOP.contains(&component.as_str())).then_some((component, action))
 }
 
 /// Runs one of Plasma's global shortcuts, as its key would.
@@ -169,9 +157,265 @@ pub fn gnome_uses(raw: u32, m: Mods) -> bool {
         || (matches!(raw, KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT) && m.ctrl && m.alt)
 }
 
+/// A key the person keeps for Linux even over a focused Mac window ("Super+E"), on top of the
+/// ones above: set in the Exceptions window (linuxkeys.rs), saved in `linux-keys.json`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserKey {
+    pub logo: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    /// The key's name: a letter, digit or sign in capitals ("E", "1", "/"), or one of KEYS.
+    pub key: String,
+}
+
+/// The keys with names, as written ("PageUp") and as xkb calls them ("Prior").
+const KEYS: [(&str, &str); 19] = [
+    ("Space", "space"), ("Enter", "Return"), ("Esc", "Escape"), ("Tab", "Tab"), ("Backspace", "BackSpace"),
+    ("Delete", "Delete"), ("Insert", "Insert"), ("Home", "Home"), ("End", "End"), ("PageUp", "Prior"),
+    ("PageDown", "Next"), ("Left", "Left"), ("Right", "Right"), ("Up", "Up"), ("Down", "Down"), ("Print", "Print"),
+    ("Pause", "Pause"), ("Menu", "Menu"), ("ScrollLock", "Scroll_Lock"),
+];
+
+impl UserKey {
+    /// "Super+Shift+E", "ctrl+alt+t", "Meta+F5", "Cmd+Space": None when it isn't a key.
+    pub fn parse(text: &str) -> Option<UserKey> {
+        let mut k = UserKey { logo: false, alt: false, ctrl: false, shift: false, key: String::new() };
+        // The Mac's way: "⌘E", "⌃⌥T" (signs, then the key).
+        let text = text.trim();
+        if !text.contains('+') && text.starts_with(['⌘', '⌃', '⌥', '⇧']) {
+            let rest = text.trim_start_matches(['⌘', '⌃', '⌥', '⇧']);
+            for c in text[..text.len() - rest.len()].chars() {
+                match c {
+                    '⌘' => k.logo = true,
+                    '⌃' => k.ctrl = true,
+                    '⌥' => k.alt = true,
+                    _ => k.shift = true,
+                }
+            }
+            k.key = Self::name(rest.trim())?;
+            return Some(k);
+        }
+        let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+        // "Ctrl++": the key is "+".
+        let (mods, key) = match parts.as_slice() {
+            [mods @ .., "", ""] if !mods.is_empty() => (mods, "+"),
+            [mods @ .., key] => (mods, *key),
+            [] => return None,
+        };
+        for m in mods {
+            match m.to_lowercase().as_str() {
+                "super" | "meta" | "cmd" | "command" | "win" | "windows" | "logo" | "⌘" => k.logo = true,
+                "alt" | "opt" | "option" | "⌥" => k.alt = true,
+                "ctrl" | "control" | "⌃" => k.ctrl = true,
+                "shift" | "⇧" => k.shift = true,
+                _ => return None,
+            }
+        }
+        k.key = Self::name(key)?;
+        Some(k)
+    }
+
+    /// A key as written: one character in capitals, or one of KEYS (or F1–F24), any case.
+    fn name(key: &str) -> Option<String> {
+        let mut chars = key.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return (!c.is_whitespace() && !c.is_control()).then(|| c.to_uppercase().collect());
+        }
+        let lower = key.to_lowercase();
+        let alias = match lower.as_str() {
+            "return" => "enter",
+            "escape" => "esc",
+            "del" => "delete",
+            "pgup" => "pageup",
+            "pgdn" | "pgdown" => "pagedown",
+            other => other,
+        };
+        if let Some((name, _)) = KEYS.iter().find(|(n, _)| n.to_lowercase() == alias) {
+            return Some(name.to_string());
+        }
+        let f = alias.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()).filter(|n| (1..=24).contains(n));
+        f.map(|n| format!("F{n}"))
+    }
+
+    /// As shown and saved: "Super+Ctrl+Alt+Shift+E", in that order.
+    pub fn label(&self) -> String {
+        let mods = [(self.logo, "Super"), (self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")];
+        let mut parts: Vec<&str> = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
+        parts.push(&self.key);
+        parts.join("+")
+    }
+
+    /// In Mac signs, in the order of `label` (so [Super][Alt][O] and [⌘][⌥][O] line up): "⌘⌥O".
+    pub fn mac_label(&self) -> String {
+        let signs = [(self.logo, "⌘"), (self.ctrl, "⌃"), (self.alt, "⌥"), (self.shift, "⇧")];
+        let mut out: String = signs.iter().filter(|s| s.0).map(|s| s.1).collect();
+        out.push_str(&self.key);
+        out
+    }
+
+    /// Whether a press is this key: by what it types (its symbol's character, so it follows the
+    /// keyboard's layout) or its symbol's xkb name; digits by their place (Shift+1 types "!").
+    pub fn matches(&self, raw: u32, ch: Option<char>, sym_name: Option<&str>, m: Mods) -> bool {
+        if (self.logo, self.alt, self.ctrl, self.shift) != (m.logo, m.alt, m.ctrl, m.shift) {
+            return false;
+        }
+        if (KEY_1..=KEY_0).contains(&raw) {
+            let digit = if raw == KEY_0 { 0 } else { raw - KEY_1 + 1 };
+            return self.key == digit.to_string();
+        }
+        let xkb = sym_name.map(|n| n.trim_start_matches("XK_"));
+        if let Some(xkb) = xkb {
+            if KEYS.iter().any(|(name, x)| *x == xkb && *name == self.key) || (xkb.starts_with('F') && xkb == self.key) {
+                return true;
+            }
+        }
+        ch.filter(|c| !c.is_control() && !c.is_whitespace()).is_some_and(|c| c.to_uppercase().collect::<String>() == self.key)
+    }
+
+    /// Qt's number for it, as Plasma's global shortcuts are kept.
+    pub fn qt(&self) -> Option<i32> {
+        let key = match self.key.as_str() {
+            "Space" => 0x20,
+            "Enter" => 0x0100_0004,
+            "Esc" => 0x0100_0000,
+            "Tab" => 0x0100_0001,
+            "Backspace" => 0x0100_0003,
+            "Delete" => 0x0100_0007,
+            "Insert" => 0x0100_0006,
+            "Home" => 0x0100_0010,
+            "End" => 0x0100_0011,
+            "Left" => 0x0100_0012,
+            "Up" => 0x0100_0013,
+            "Right" => 0x0100_0014,
+            "Down" => 0x0100_0015,
+            "PageUp" => 0x0100_0016,
+            "PageDown" => 0x0100_0017,
+            "Print" => 0x0100_0009,
+            "Pause" => 0x0100_0008,
+            "Menu" => 0x0100_0055,
+            "ScrollLock" => 0x0100_0026,
+            f if f.starts_with('F') && f.len() > 1 => 0x0100_0030 + f[1..].parse::<i32>().ok()? - 1,
+            c => {
+                let c = c.chars().next()?;
+                if !c.is_ascii() {
+                    return None;
+                }
+                c.to_ascii_uppercase() as i32
+            }
+        };
+        let mut code = key;
+        for (on, bit) in [(self.logo, 0x1000_0000), (self.alt, 0x0800_0000), (self.ctrl, 0x0400_0000), (self.shift, 0x0200_0000)] {
+            if on {
+                code |= bit;
+            }
+        }
+        Some(code)
+    }
+}
+
+fn user_keys_file() -> std::path::PathBuf {
+    crate::config::dir().join("linux-keys.json")
+}
+
+/// The keys kept for Linux, as saved (labels).
+/// What the Shortcuts window keeps in `linux-keys.json`: the person's own keys ("Super+E") and
+/// the built-in ones they took out, by name ("Super+Tab", keptkeys.rs). An earlier version kept only a list
+/// of own keys.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Exceptions {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+pub fn load_exceptions() -> Exceptions {
+    let bytes = std::fs::read(user_keys_file()).unwrap_or_default();
+    serde_json::from_slice(&bytes)
+        .or_else(|_| serde_json::from_slice::<Vec<String>>(&bytes).map(|added| Exceptions { added, removed: Vec::new() }))
+        .unwrap_or_default()
+}
+
+pub fn save_exceptions(e: &Exceptions) -> std::io::Result<()> {
+    std::fs::create_dir_all(crate::config::dir())?;
+    std::fs::write(user_keys_file(), serde_json::to_vec_pretty(e).unwrap_or_default())
+}
+
+/// The person's own keys for Linux, as saved.
+pub fn load_user_keys() -> Vec<String> {
+    load_exceptions().added
+}
+
+/// The exceptions as now, parsed, read again only when the file changed.
+fn exceptions_now() -> (Vec<UserKey>, Vec<String>) {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(Option<std::time::SystemTime>, Vec<UserKey>, Vec<String>)>> = Mutex::new(None);
+    let stamp = std::fs::metadata(user_keys_file()).and_then(|m| m.modified()).ok();
+    let mut cache = CACHE.lock().unwrap();
+    if cache.as_ref().is_none_or(|(s, _, _)| *s != stamp) {
+        let e = load_exceptions();
+        let keys = e.added.iter().filter_map(|k| UserKey::parse(k)).collect();
+        *cache = Some((stamp, keys, e.removed));
+    }
+    let (_, keys, removed) = cache.as_ref().unwrap();
+    (keys.clone(), removed.clone())
+}
+
+/// The press is one of the person's own keys for Linux.
+pub fn is_user_key(raw: u32, ch: Option<char>, sym_name: Option<&str>, m: Mods) -> Option<UserKey> {
+    exceptions_now().0.into_iter().find(|k| k.matches(raw, ch, sym_name, m))
+}
+
+/// A built-in key the person took out (in the Shortcuts window), by name ("Super+Tab",
+/// keptkeys::press_label).
+pub fn key_removed(label: &str) -> bool {
+    exceptions_now().1.iter().any(|k| k == label)
+}
+
+/// A press of a built-in key the person took out.
+pub fn press_removed(raw: u32, m: Mods) -> bool {
+    crate::keptkeys::press_label(raw, m).is_some_and(|l| key_removed(&l))
+}
+
+/// Plasma: whatever global shortcut is on this key (any app's too, not only the desktop's):
+/// (component, action).
+pub fn plasma_action_any(qt: i32) -> Option<(String, String)> {
+    plasma_lookup(qt, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_keys_are_read_written_and_matched() {
+        let k = UserKey::parse("super+shift+e").unwrap();
+        assert_eq!(k.label(), "Super+Shift+E");
+        assert_eq!(UserKey::parse("Meta+Ctrl+Alt+pgup").unwrap().label(), "Super+Ctrl+Alt+PageUp");
+        assert_eq!(UserKey::parse("Ctrl++").unwrap().label(), "Ctrl++");
+        assert_eq!(UserKey::parse("Cmd+F5").unwrap().label(), "Super+F5");
+        assert!(UserKey::parse("Hyper+E").is_none());
+        assert!(UserKey::parse("Super+Banana").is_none());
+        assert_eq!(UserKey::parse("⌃⌥T").unwrap().label(), "Ctrl+Alt+T");
+        assert_eq!(UserKey::parse("⌘E").unwrap().mac_label(), "⌘E");
+
+        let m = Mods { logo: true, shift: true, ..Default::default() };
+        // By what the key types (Shift makes it "E"), whatever the layout.
+        assert!(k.matches(18, Some('E'), Some("XK_E"), m));
+        assert!(!k.matches(18, Some('E'), Some("XK_E"), Mods { logo: true, ..Default::default() }));
+        // Digits by their place: Shift+1 types "!".
+        let one = UserKey::parse("Super+Shift+1").unwrap();
+        assert!(one.matches(KEY_1, Some('!'), Some("XK_exclam"), m));
+        // Named keys by their xkb name.
+        let up = UserKey::parse("Super+PageUp").unwrap();
+        assert!(up.matches(KEY_PAGEUP, None, Some("XK_Prior"), Mods { logo: true, ..Default::default() }));
+        let f5 = UserKey::parse("Super+F5").unwrap();
+        assert!(f5.matches(63, None, Some("XK_F5"), Mods { logo: true, ..Default::default() }));
+
+        // Plasma's numbers: Meta 0x10000000, Shift 0x02000000, the letter's capital.
+        assert_eq!(k.qt(), Some(0x1000_0000 | 0x0200_0000 | 'E' as i32));
+        assert_eq!(f5.qt(), Some(0x1000_0000 | 0x0100_0034));
+    }
 
     #[test]
     fn letters_and_text_navigation_are_the_apps_window_keys_the_desktops() {
@@ -183,12 +427,10 @@ mod tests {
         // Cmd+Left, Opt+Right: through text.
         assert!(!is_desktop_key(KEY_LEFT, cmd));
         assert!(!is_desktop_key(KEY_RIGHT, opt));
-        // Cmd+Tab, Alt+Tab, Cmd+Space, Cmd+1, Ctrl+Alt+Left, the volume key.
+        // Cmd+Tab, Alt+Tab, the volume key: every desktop's (which others depend on the desktop,
+        // keptkeys.rs).
         assert!(is_desktop_key(KEY_TAB, cmd));
         assert!(is_desktop_key(KEY_TAB, opt));
-        assert!(is_desktop_key(KEY_SPACE, cmd));
-        assert!(is_desktop_key(KEY_1, cmd));
-        assert!(is_desktop_key(KEY_LEFT, Mods { ctrl: true, alt: true, ..Default::default() }));
         assert!(is_desktop_key(KEY_VOLUMEUP, Mods::default()));
         // Plain Tab, Ctrl+Tab: the app's.
         assert!(!is_desktop_key(KEY_TAB, Mods::default()));

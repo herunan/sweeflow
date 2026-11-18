@@ -6,7 +6,7 @@
 use std::{ffi::CString, os::fd::RawFd, ptr};
 
 use anyhow::{anyhow, bail, Result};
-use ffmpeg_next::ffi::*;
+use ffmpeg_sys_next::*;
 
 // libavutil/hwcontext_drm.h (not covered by ffmpeg-sys bindings).
 const AV_DRM_MAX_PLANES: usize = 4;

@@ -1318,6 +1318,10 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
                 if let Err(e) = crate::launchers::sync(&apps) {
                     log::warn!("launcher entries: {e:#}");
                 }
+                // The list above went out before the icons were written: on a first connection
+                // there were none yet, and every app showed a blank icon until something else
+                // changed. Again, with them.
+                crate::tray::refresh();
             });
             return Ok(());
         }

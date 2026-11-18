@@ -4,15 +4,7 @@
 //! Install Sweeflow on the Mac → pick the Mac (found on the network, or typed by address) → the
 //! Mac shows a 4-digit code, typed here → linked, and streaming from it straight away.
 
-use std::{
-    cell::RefCell,
-    io::{BufRead, BufReader},
-    net::ToSocketAddrs,
-    process::{Child, Command, Stdio},
-    rc::Rc,
-    sync::{Arc, Mutex},
-    thread::JoinHandle,
-};
+use std::{cell::RefCell, net::ToSocketAddrs, rc::Rc, sync::Arc, thread::JoinHandle};
 
 use anyhow::Result;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -25,7 +17,7 @@ use crate::{
 
 slint::slint! {
     import { ScrollView } from "std-widgets.slint";
-    import { Look, Label, Dim, Btn, Field, Spin } from "look.slint";
+    import { Look, Label, Dim, Btn, Field, Spin, MacScene, KeyMapping, KeyCaps } from "look.slint";
     export { Look }
 
     export struct MacRow { name: string, detail: string }
@@ -37,44 +29,38 @@ slint::slint! {
         wrap: word-wrap;
     }
 
-    // One numbered step: its number, a title level with it, a line of detail, and anything else
-    // below.
-    component Step inherits HorizontalLayout {
-        in property <string> n;
-        in property <string> title;
-        in property <string> detail;
-        spacing: 12px;
-        VerticalLayout {
-            alignment: start;
-            Rectangle {
-                width: 24px;
-                height: 24px;
-                border-radius: Look.outlined ? Look.radius : 12px;
-                background: Look.accent.transparentize(0.8);
-                Text {
-                    text: root.n;
-                    color: Look.accent;
-                    font-size: 12px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
+    // A small picture in an accent tile: an SVG path on a 24×24 grid, drawn as lines (or filled).
+    component Glyph inherits Rectangle {
+        in property <string> d;
+        in property <bool> filled;
+        in property <length> size: 30px;
+        // A colour of its own, the picture in white (as in the Mac's settings); else the accent's tint.
+        in property <bool> colorful;
+        in property <color> tint;
+        width: root.size;
+        height: root.size;
+        border-radius: Look.outlined ? Look.radius : root.size * 0.3;
+        background: root.colorful ? @linear-gradient(180deg, root.tint.brighter(0.15) 0%, root.tint.darker(0.15) 100%) : Look.accent.transparentize(0.82);
+        Path {
+            width: root.size * 0.58;
+            height: root.size * 0.58;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: root.d;
+            stroke: root.filled ? transparent : root.colorful ? white : Look.accent;
+            stroke-width: 1.8px;
+            fill: root.filled ? (root.colorful ? white : Look.accent) : transparent;
         }
-        VerticalLayout {
-            spacing: 6px;
-            horizontal-stretch: 1;
-            Text {
-                text: root.title;
-                color: Look.fg;
-                font-size: 14px;
-                font-weight: 600;
-                height: 24px;
-                vertical-alignment: center;
-            }
-            if root.detail != "": Dim { text: root.detail; }
-            @children
-        }
+    }
+
+    // One of Sweeflow's keys: the key in a chip, what it does.
+    component KeyLine inherits HorizontalLayout {
+        in property <[string]> key;
+        in property <string> what;
+        spacing: 8px;
+        // The keys in a column of one width, so what they do lines up.
+        HorizontalLayout { width: 112px; KeyCaps { caps: root.key; } }
+        Label { text: root.what; vertical-alignment: center; }
     }
 
     // A Mac found on the network, in the list.
@@ -103,6 +89,25 @@ slint::slint! {
             }
             Rectangle {}
             Text { text: "›"; color: Look.muted; font-size: 22px; vertical-alignment: center; }
+        }
+    }
+
+    // A piece of confetti drifting down the welcome banner, over and over.
+    component Confetti inherits Rectangle {
+        in property <length> left;
+        in property <float> phase;
+        in property <length> fall;
+        in property <angle> spin;
+        property <float> t: mod(animation-tick() / 4200ms + root.phase, 1);
+        in property <color> tint;
+        x: root.left + 8px * sin(root.t * 720deg);
+        y: -14px + (root.fall + 14px) * root.t;
+        width: 7px;
+        height: 11px;
+        Rectangle {
+            border-radius: 2px;
+            background: root.tint;
+            transform-rotation: root.spin + root.t * 540deg;
         }
     }
 
@@ -147,16 +152,12 @@ slint::slint! {
         width: 560px;
         // Less on a short screen (see look::fit_to_screen): the page scrolls.
         in property <length> room: 10000px;
-        height: min(tailscale-url != "" ? 564px : 540px, room);
+        height: min(636px, room);
 
         in-out property <int> page: 0;
-        in property <string> installer-url;
-        // The same page over Tailscale, when this computer is on a tailnet.
-        in property <string> tailscale-url;
-        // A firewall (ufw) is on and may block the page: offer to let it through.
-        in property <bool> firewall-on;
-        in-out property <string> firewall-note;
-        callback open-firewall();
+        // Where the Mac downloads Sweeflow.
+        in property <string> download-site: "sweeflow.app";
+        callback open-site();
         in property <[MacRow]> macs;
         in property <string> mac-name;
         // The Mac is showing its code (until then, it's being asked).
@@ -176,6 +177,28 @@ slint::slint! {
         callback cancel-wait();
         callback submit-code(string);
         callback finish();
+        // The keyboard shortcuts, as the desktop has them now ("" for one removed), shown once
+        // linked; and whether the desktop has a settings page to change them in.
+        in property <[string]> key-open;
+        in property <[string]> key-pause;
+        in property <[string]> key-stop;
+        in property <[string]> key-menu;
+        in property <bool> shortcut-settings;
+        callback change-shortcuts();
+        // The name typed for the Mac just linked; it was renamed to it.
+        in-out property <string> new-name;
+        in-out property <bool> renamed;
+        // The Mac's name is being changed (the banner's pencil).
+        in-out property <bool> editing-name;
+        // Hyprland (and Omarchy on it): its own keys stay first over Mac windows.
+        in property <bool> hyprland;
+        in property <bool> omarchy;
+        // A Mac-style key remapper (Toshy): keys written the Mac's way, no mapping line.
+        in property <bool> mac-style;
+        // Alt and Super swapped in Mac windows (config::swap_cmd_opt).
+        in property <bool> swapped;
+        callback rename(string);
+
 
         sv := ScrollView {
           content-width: box.width;
@@ -185,103 +208,72 @@ slint::slint! {
             height: max(self.preferred-height, sv.visible-height);
             padding: 24px;
 
+            // Getting the Mac ready, in three pictures, and the Macs found: one page.
             if page == 0: VerticalLayout {
-                spacing: 18px;
+                spacing: 16px;
                 HorizontalLayout {
-                    spacing: 14px;
+                    spacing: 12px;
                     alignment: start;
-                    Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 48px; height: 48px; }
+                    Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 40px; height: 40px; }
                     VerticalLayout {
                         alignment: center;
-                        spacing: 2px;
                         Title { text: "Link a Mac"; }
-                        Dim { text: "Install Sweeflow on your Mac, then link it to this computer."; }
                     }
                 }
-                Step {
-                    n: "1";
-                    title: "Download Sweeflow on your Mac";
-                    detail: installer-url != "" ? "Open this address in Safari on your Mac:" : "Copy Sweeflow.dmg to your Mac.";
-                    if installer-url != "": Rectangle {
-                        height: tailscale-url != "" ? 64px : 40px;
-                        border-radius: Look.radius;
-                        border-width: Look.outlined ? 1px : 0px;
-                        border-color: Look.line;
-                        background: Look.surface;
+                // What to do on the Mac first, in one go.
+                Rectangle {
+                    border-radius: Look.radius + 2px;
+                    border-width: Look.outlined ? 1px : 0px;
+                    border-color: Look.line;
+                    background: Look.surface;
+                    HorizontalLayout {
+                        padding: 14px;
+                        spacing: 12px;
                         VerticalLayout {
-                            alignment: center;
+                            alignment: start;
+                            Glyph { d: "M 12 3 L 12 15 M 7 10 L 12 15 L 17 10 M 4 20 L 20 20"; size: 34px; }
+                        }
+                        VerticalLayout {
                             spacing: 4px;
-                            Text {
-                                text: installer-url;
-                                color: Look.fg;
-                                font-size: 16px;
-                                font-family: Look.mono;
-                                horizontal-alignment: center;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                alignment: start;
+                                Text { text: "On your Mac, download Sweeflow from "; color: Look.fg; font-size: 13px; vertical-alignment: center; }
+                                Rectangle { width: 2px; }
+                                // A violet pill, brighter under the pointer.
+                                Rectangle {
+                                    width: site.preferred-width + 18px;
+                                    height: 22px;
+                                    border-radius: 11px;
+                                    background: link.has-hover ? Look.accent.brighter(0.15) : Look.accent;
+                                    site := Text {
+                                        text: root.download-site;
+                                        color: white;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    link := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.open-site(); }
+                                    }
+                                }
                             }
-                            if tailscale-url != "": Text {
-                                text: "Over Tailscale: " + tailscale-url;
-                                color: Look.muted;
-                                font-size: 12px;
-                                font-family: Look.mono;
-                                horizontal-alignment: center;
-                            }
-                        }
-                    }
-                    if installer-url != "" && !firewall-on: Dim {
-                        text: "If the page doesn't load, this computer's firewall may be blocking port 44130.";
-                    }
-                    // A fixed height (three lines of text fit, as Omarchy's wider font needs):
-                    // wrapped text beside a button doesn't report its height to the layout, and
-                    // it ran into the next step.
-                    if installer-url != "" && firewall-on: Rectangle {
-                        height: 66px;
-                        border-radius: Look.radius;
-                        border-width: Look.outlined ? 1px : 0px;
-                        border-color: Look.line;
-                        background: Look.surface;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 11px;
-                            spacing: 12px;
-                            Dim {
-                                text: firewall-note != "" ? firewall-note : "This computer's firewall is blocking that page. You can allow it while this window is open.";
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-                            if firewall-note == "": VerticalLayout {
-                                alignment: center;
-                                Btn { text: "Allow"; clicked => { open-firewall(); } }
+                            // The Mac window's name in bold.
+                            HorizontalLayout {
+                                alignment: start;
+                                Dim { text: "Install it, allow all permissions and reach the "; font-size: 12px; wrap: no-wrap; }
+                                Text { text: "Link a Linux machine"; color: Look.fg; font-size: 12px; font-weight: 700; }
+                                Dim { text: " screen."; font-size: 12px; wrap: no-wrap; }
                             }
                         }
                     }
-                }
-                Step {
-                    n: "2";
-                    title: "Install it and open it";
-                    detail: "Drag Sweeflow into Applications and open it. If macOS refuses to open it, go to System Settings → Privacy & Security and click Open Anyway.";
-                }
-                Step {
-                    n: "3";
-                    title: "Follow its setup";
-                    detail: "Sweeflow asks for the permissions it needs. Leave it running on your Mac and continue here.";
-                }
-                Rectangle {}
-                HorizontalLayout {
-                    alignment: end;
-                    Btn { text: "Continue"; primary: true; clicked => { page = 1; } }
-                }
-            }
-
-            if page == 1: VerticalLayout {
-                spacing: 14px;
-                VerticalLayout {
-                    spacing: 4px;
-                    Title { text: "Choose your Mac"; }
-                    Dim { text: "These Macs are running Sweeflow on this network. Choose yours, and it will show a code to type here."; }
                 }
                 // The Macs found on this network, or the wait for one.
                 Rectangle {
                     vertical-stretch: 1;
+                    min-height: 96px;
                     border-radius: Look.radius;
                     border-width: Look.outlined ? 1px : 0px;
                     border-color: Look.line;
@@ -289,8 +281,8 @@ slint::slint! {
                     if macs.length == 0: VerticalLayout {
                         alignment: center;
                         spacing: 10px;
-                        HorizontalLayout { alignment: center; Spin { size: 22px; } }
-                        Dim { text: "Looking for your Mac on this network…"; horizontal-alignment: center; }
+                        HorizontalLayout { alignment: center; Spin { size: 20px; } }
+                        Dim { text: "Looking for your Mac…"; horizontal-alignment: center; }
                     }
                     if macs.length > 0: ScrollView {
                         VerticalLayout {
@@ -303,22 +295,17 @@ slint::slint! {
                 }
                 VerticalLayout {
                     spacing: 8px;
-                    Dim { text: "If your Mac isn't listed, type its name or IP address:"; }
                     HorizontalLayout {
                         spacing: 8px;
-                        // Its examples: a Tailscale address, a name, a virtual machine with its ports forwarded.
-                        addr := Field { placeholder: "100.101.102.103, my-mac, localhost"; accepted(t) => { root.manual(t); } }
-                        Btn { text: "Use address"; enabled: addr.text != ""; clicked => { root.manual(addr.text); } }
+                        // A name, an IP address (Tailscale's too), or localhost for a virtual machine with its ports forwarded.
+                        addr := Field { placeholder: "Not listed? Its name or IP address (Tailscale, VM)"; accepted(t) => { root.manual(t); } }
+                        Btn { text: "Link"; enabled: addr.text != ""; clicked => { root.manual(addr.text); } }
                     }
                     if error != "": Label { text: error; color: Look.danger; }
                 }
-                HorizontalLayout {
-                    alignment: start;
-                    Btn { text: "Back"; clicked => { error = ""; page = 0; } }
-                }
             }
 
-            if page == 2: VerticalLayout {
+            if page == 1: VerticalLayout {
                 spacing: 16px;
                 alignment: center;
                 Title {
@@ -353,26 +340,148 @@ slint::slint! {
                 }
             }
 
-            if page == 3: VerticalLayout {
-                spacing: 16px;
-                HorizontalLayout {
-                    spacing: 14px;
-                    alignment: start;
-                    Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 48px; height: 48px; }
-                    Title { text: "Linked to " + mac-name; vertical-alignment: center; }
-                }
-                Dim {
-                    text: (switched-from != "" ? "Switched from " + switched-from + ". " : "")
-                        + "Its apps will open on this desktop in windows of their own.";
+            // Linked, and streaming: a welcome (the Mac renamed from there), what Sweeflow does,
+            // its keys, and where Mac shortcuts go.
+            if page == 2: VerticalLayout {
+                spacing: 14px;
+                Rectangle {
+                    height: max(64px, hello.preferred-height);
+                    border-radius: Look.radius + 4px;
+                    clip: true;
+                    background: @linear-gradient(135deg, Look.accent 0%, Look.accent.darker(0.5) 100%);
+                    for c in [
+                        { left: 0.06, phase: 0.05, tint: #fbbf24, spin: 20deg },
+                        { left: 0.15, phase: 0.55, tint: #f472b6, spin: 70deg },
+                        { left: 0.24, phase: 0.30, tint: #ffffff, spin: 140deg },
+                        { left: 0.33, phase: 0.80, tint: #34d399, spin: 200deg },
+                        { left: 0.62, phase: 0.15, tint: #60a5fa, spin: 260deg },
+                        { left: 0.71, phase: 0.65, tint: #fbbf24, spin: 320deg },
+                        { left: 0.80, phase: 0.40, tint: #ffffff, spin: 30deg },
+                        { left: 0.89, phase: 0.90, tint: #f472b6, spin: 110deg },
+                        { left: 0.95, phase: 0.25, tint: #34d399, spin: 170deg },
+                    ]: Confetti {
+                        left: parent.width * c.left;
+                        phase: c.phase;
+                        fall: parent.height;
+                        tint: c.tint;
+                        spin: c.spin;
+                    }
+                    hello := HorizontalLayout {
+                        padding: 12px;
+                        padding-left: 14px;
+                        spacing: 12px;
+                        Rectangle {
+                            width: 40px;
+                            height: 40px;
+                            border-radius: 11px;
+                            background: #ffffff30;
+                            Image { source: @image-url("../../assets/sweeflow-app.svg"); width: 32px; height: 32px; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            Text { text: "Welcome to your new home,"; color: white; font-size: 16px; font-weight: 600; }
+                            // The Mac's name, renamed in place: the pencil opens a field.
+                            if !root.editing-name: HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                Text { text: mac-name + "!"; color: white; font-size: 16px; font-weight: 600; wrap: word-wrap; }
+                                Rectangle {
+                                    width: rename-row.preferred-width + 20px;
+                                    height: 26px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 13px;
+                                    background: pencil.has-hover ? #ffffff40 : #ffffff22;
+                                    rename-row := HorizontalLayout {
+                                        x: 10px;
+                                        spacing: 5px;
+                                        Path {
+                                            width: 12px;
+                                            height: 12px;
+                                            y: (26px - 12px) / 2;
+                                            viewbox-width: 24;
+                                            viewbox-height: 24;
+                                            commands: "M 4 20 L 4 16 L 15 5 L 19 9 L 8 20 Z M 13 7 L 17 11";
+                                            stroke: white;
+                                            stroke-width: 1.6px;
+                                        }
+                                        Text { text: "Rename"; color: white; font-size: 12px; vertical-alignment: center; }
+                                    }
+                                    pencil := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.new-name = root.mac-name; root.editing-name = true; }
+                                    }
+                                }
+                            }
+                            if root.editing-name: HorizontalLayout {
+                                spacing: 8px;
+                                Field { text <=> root.new-name; accepted(t) => { root.rename(t); root.editing-name = false; } }
+                                Btn {
+                                    text: "Save";
+                                    enabled: root.new-name != "";
+                                    clicked => { root.rename(root.new-name); root.editing-name = false; }
+                                }
+                            }
+                            if switched-from != "": Text {
+                                text: "Switched over from " + switched-from + ".";
+                                color: #ffffffc0;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
                 }
                 if error != "": Label { text: error; color: Look.danger; }
+                // What Sweeflow does: a strip of pictures, each with its words under it.
+                strip := HorizontalLayout {
+                    vertical-stretch: 0;
+                    padding-top: 6px;
+                    spacing: 4px;
+                    for f in [
+                        { d: "M 13 2 L 4 14 L 11 14 L 10 22 L 20 10 L 13 10 Z", filled: true, title: "Fast, sharp and smooth" },
+                        { d: "M 4 4 L 10 4 L 10 10 L 4 10 Z M 14 4 L 20 4 L 20 10 L 14 10 Z M 4 14 L 10 14 L 10 20 L 4 20 Z M 14 14 L 20 14 L 20 20 L 14 20 Z", filled: false, title: "Apps in launcher" },
+                        { d: "M 3 5 L 21 5 M 6 10 L 18 10 M 6 14 L 18 14 M 6 18 L 13 18", filled: false, title: "Global menu" },
+                        { d: "M 9 4 L 6 4 L 6 21 L 18 21 L 18 4 L 15 4 M 9 2 L 15 2 L 15 6 L 9 6 Z", filled: false, title: "Shared clipboard" },
+                        { d: "M 6 2 L 14 2 L 19 7 L 19 22 L 6 22 Z M 14 2 L 14 7 L 19 7 M 9 15 L 16 15 M 13 12 L 16 15 L 13 18", filled: false, title: "Drag and drop files" },
+                        { d: "M 4 9 L 8 9 L 13 5 L 13 19 L 8 15 L 4 15 Z M 16 9 Q 18 12 16 15 M 18.5 6.5 Q 22.5 12 18.5 17.5", filled: false, title: "Sound passthrough" },
+                        { d: "M 12 2 A 10 10 0 1 0 12 22 A 10 10 0 1 0 12 2 Z M 2 12 L 22 12 M 12 2 Q 7 12 12 22 M 12 2 Q 17 12 12 22", filled: false, title: "Local, remote or VM" },
+                    ]: VerticalLayout {
+                        // All one width (the words wrap, three lines at most).
+                        width: (strip.width - 6 * 4px) / 7;
+                        spacing: 7px;
+                        alignment: start;
+                        HorizontalLayout { alignment: center; Glyph { d: f.d; filled: f.filled; size: 34px; } }
+                        Text { text: f.title; height: 44px; color: Look.fg; font-size: 11px; horizontal-alignment: center; wrap: word-wrap; }
+                    }
+                }
+                Rectangle { height: 4px; }
+                // Sweeflow's keys, one under the other.
+                VerticalLayout {
+                    vertical-stretch: 0;
+                    spacing: 8px;
+                    Text { text: "Sweeflow shortcuts"; color: Look.fg; font-size: 13px; font-weight: 700; }
+                    KeyLine { key: root.key-open; what: "Open Sweeflow"; }
+                    KeyLine { key: root.key-menu; what: "Global menu (from Mac windows)"; }
+                    KeyLine { key: root.key-pause; what: "Pause or resume"; }
+                    KeyLine { key: root.key-stop; what: "Stop or start"; }
+                    if !root.shortcut-settings: Text { text: "Change keys in your Hyprland config."; color: Look.muted; font-size: 11px; }
+                }
+                // Where Mac shortcuts go: the picture, and under it which keys are which there.
+                VerticalLayout {
+                    vertical-stretch: 0;
+                    padding-top: 16px;
+                    spacing: 6px;
+                    HorizontalLayout { alignment: start; MacScene { width: 320px; height: 96px; } }
+                    KeyMapping { font-size: 12px; swapped: root.swapped; }
+                }
                 Rectangle {}
                 HorizontalLayout {
-                    alignment: end;
+                    spacing: 8px;
+                    Btn { text: "Change shortcuts…"; clicked => { root.change-shortcuts(); } }
+                    Rectangle {}
                     Btn { text: "Done"; primary: true; clicked => { root.finish(); } }
                 }
-            }
-          }
+            }          }
         }
     }
 }
@@ -384,6 +493,8 @@ thread_local! {
     static ATTEMPT: RefCell<u32> = const { RefCell::new(0) };
     /// The link request under way: what cancels it, and its thread.
     static LINKING: RefCell<Option<(Arc<Notify>, JoinHandle<()>)>> = const { RefCell::new(None) };
+    /// The Mac just linked (its fingerprint), for renaming it on the last page.
+    static LINKED: RefCell<String> = const { RefCell::new(String::new()) };
     /// Where the code typed goes, while the Mac shows one.
     static CODES: RefCell<Option<mpsc::UnboundedSender<String>>> = const { RefCell::new(None) };
 }
@@ -405,40 +516,10 @@ pub fn run() -> Result<()> {
     let model = Rc::new(VecModel::<MacRow>::default());
     ui.set_macs(ModelRc::from(model.clone()));
 
-    let _server = crate::installer::serve().inspect_err(|e| log::info!("installer not served: {e:#}")).ok();
-    if let Some(s) = &_server {
-        ui.set_installer_url(s.url.clone().into());
-        ui.set_tailscale_url(s.tailscale_url.clone().unwrap_or_default().into());
-    }
     // The window has one size. GNOME keeps to that (with the title bar's double click fixed, see
     // vendor/sctk-adwaita); Hyprland maximises any window it is told to (the button in Omarchy's
     // title bars), so there it is put straight back.
     crate::hyprland::keep_window_size();
-
-    // CachyOS and others ship ufw switched on: the Mac can't reach the page until it's allowed.
-    // The opening lasts while this window is open, so it's offered again each time.
-    let _ = std::fs::remove_file(crate::config::dir().join("firewall-allowed"));
-    ui.set_firewall_on(_server.is_some() && firewall_active());
-    let opening: Arc<Mutex<Option<Child>>> = Arc::default();
-    let weak_fw = ui.as_weak();
-    let opening_fw = opening.clone();
-    ui.on_open_firewall(move || {
-        let weak = weak_fw.clone();
-        let opening = opening_fw.clone();
-        std::thread::spawn(move || {
-            let note = match allow_installer_port() {
-                Ok(child) => {
-                    *opening.lock().unwrap() = Some(child);
-                    "The page is allowed until this window closes. Open the address on your Mac now."
-                }
-                Err(e) => {
-                    log::warn!("firewall: {e:#}");
-                    "The firewall wasn't changed. To load the page, allow TCP port 44130 in its settings."
-                }
-            };
-            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_firewall_note(note.into()));
-        });
-    });
 
     let weak = ui.as_weak();
     let _browser = pair::browse(pair::PAIR_SERVICE, move |f| {
@@ -490,7 +571,7 @@ pub fn run() -> Result<()> {
     ui.on_cancel_wait(move || {
         cancel_link();
         if let Some(ui) = weak.upgrade() {
-            ui.set_page(1);
+            ui.set_page(0);
         }
     });
 
@@ -514,20 +595,48 @@ pub fn run() -> Result<()> {
         }
     });
 
+    let weak = ui.as_weak();
+    ui.on_open_site(move || {
+        // In this computer's browser: to read there, or send on to the Mac.
+        let Some(ui) = weak.upgrade() else { return };
+        let site = ui.get_download_site();
+        if let Err(e) = std::process::Command::new("xdg-open").arg(format!("https://{site}")).spawn() {
+            log::warn!("opening {site}: {e}");
+        }
+    });
+    ui.set_hyprland(crate::hyprland::running());
+    ui.set_omarchy(crate::hyprland::running() && crate::hyprland::omarchy());
     ui.on_finish(|| {
         let _ = slint::quit_event_loop();
     });
+    ui.set_shortcut_settings(crate::tray::shortcut_settings_place().is_some());
+    // The Shortcuts window: Sweeflow's keys (and the desktop's settings for them), and the keys kept
+    // for Linux.
+    ui.on_change_shortcuts(|| crate::ui::run_own("shortcuts", "Shortcuts"));
+    let weak = ui.as_weak();
+    ui.on_rename(move |name| {
+        let name = name.trim().to_string();
+        let fingerprint = LINKED.with_borrow(|l| l.clone());
+        let Some(ui) = weak.upgrade() else { return };
+        if name.is_empty() || fingerprint.is_empty() {
+            return;
+        }
+        match rename_mac(&fingerprint, &name) {
+            Ok(()) => {
+                ui.set_mac_name(name.clone().into());
+                ui.set_new_name(name.into());
+                ui.set_renamed(true);
+            }
+            Err(e) => ui.set_error(format!("Couldn't rename it: {e:#}").into()),
+        }
+    });
 
     crate::look::fit_to_screen_soon(&ui, |ui, h| ui.set_room(h));
+    ui.set_swapped(crate::config::swap_cmd_opt());
     let shown = ui.run();
     // Closed while asking a Mac: say so there (it takes its question down) before leaving.
     if let Some((_, thread)) = cancel_link() {
         let _ = thread.join();
-    }
-    // Closing the helper's input takes the firewall rule back out.
-    if let Some(mut child) = opening.lock().unwrap().take() {
-        drop(child.stdin.take());
-        let _ = child.wait();
     }
     shown?;
     Ok(())
@@ -565,7 +674,7 @@ fn start_link(ui: &Wizard, mac: FoundMac) {
     let typed = mac.name.parse::<std::net::IpAddr>().is_ok() || mac.name == "localhost" || mac.name.contains(':');
     ui.set_mac_name(if typed { "your Mac".into() } else { mac.name.clone().into() });
     ui.set_error(SharedString::new());
-    ui.set_page(2);
+    ui.set_page(1);
     let attempt = ATTEMPT.with_borrow(|a| *a);
     let cancel = Arc::new(Notify::new());
     let cancelled = cancel.clone();
@@ -603,6 +712,8 @@ fn start_link(ui: &Wizard, mac: FoundMac) {
                     let why = match outcome {
                         Outcome::Unreachable => "It isn't answering yet. Waiting for it: wake it, and check Sweeflow is open on it.",
                         Outcome::Locked => "It's locked. Waiting for it: unlock it to see the code.",
+                        // The Mac only links once its setup is done, from its Link window.
+                        Outcome::Closed => "Waiting for your Mac. Finish setting up Sweeflow there, or choose Link a Linux machine in its menu. The code then shows up on the Mac.",
                         other => return Ok(other),
                     };
                     waiting(why.into());
@@ -631,32 +742,79 @@ fn start_link(ui: &Wizard, mac: FoundMac) {
                         Ok(b) => b,
                         Err(e) => {
                             ui.set_error(format!("Linked, but the settings couldn't be saved: {e:#}").into());
-                            ui.set_page(1);
+                            ui.set_page(0);
                             return;
                         }
                     };
                     ui.set_switched_from(before.unwrap_or_default().into());
+                    LINKED.with_borrow_mut(|l| *l = p.fingerprint.clone());
+                    ui.set_new_name(p.name.clone().into());
+                    ui.set_renamed(false);
                     ui.set_mac_name(p.name.into());
                     ui.set_error(SharedString::new());
                     if let Err(e) = after_first_link(&p.fingerprint) {
                         log::warn!("starting to stream from the Mac just linked: {e:#}");
                         ui.set_error(format!("Couldn't start streaming from it: {e:#}").into());
                     }
-                    ui.set_page(3);
+                    show_keys(&ui);
+                    ui.set_page(2);
                 }
                 Ok(other) => {
                     ui.set_error(other.message(&name).unwrap_or_default().into());
-                    ui.set_page(1);
+                    ui.set_page(0);
                 }
                 Err(e) => {
                     log::warn!("linking to {name}: {e:#}");
                     ui.set_error(format!("Linking to {name} didn't work ({e:#}).").into());
-                    ui.set_page(1);
+                    ui.set_page(0);
                 }
             }
         });
     });
     LINKING.with_borrow_mut(|l| *l = Some((cancel, thread)));
+}
+
+/// Renames a linked Mac (what this computer calls it): through the running client, which saves
+/// it and shows the new name at once, else in the config.
+fn rename_mac(fingerprint: &str, name: &str) -> Result<()> {
+    let by_client = zbus::blocking::Connection::session().and_then(|bus| {
+        bus.call_method(Some("dev.sweeflow.Client"), "/dev/sweeflow/Panel", Some("dev.sweeflow.Panel"), "Rename", &(fingerprint, name))
+            .map(|_| ())
+    });
+    if by_client.is_ok() {
+        return Ok(());
+    }
+    let mut cfg = Config::load_or_default()?;
+    if let Some(m) = cfg.macs.iter_mut().find(|m| m.fingerprint == fingerprint) {
+        m.name = name.to_string();
+        cfg.save()?;
+    }
+    Ok(())
+}
+
+/// The desktop's keys for Sweeflow, read off the UI thread (it asks the desktop) and put on the
+/// last page.
+fn show_keys(ui: &Wizard) {
+    // Sweeflow's keys as set (keys.json), shown again each second: a key changed in the Shortcuts
+    // window (opened from here) shows here at once.
+    let set = |ui: &Wizard| {
+        let keys = crate::keys::own_json(crate::setup::mac_keys_remapped());
+        let text = |name: &str| crate::keys::caps_model(keys[name].as_str().unwrap_or_default());
+        ui.set_key_open(text("open"));
+        ui.set_key_pause(text("pause"));
+        ui.set_key_stop(text("stop"));
+        ui.set_key_menu(text("menu"));
+    };
+    set(ui);
+    let weak = ui.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(1), move || {
+        if let Some(ui) = weak.upgrade() {
+            set(&ui);
+        }
+    });
+    // Lives as long as the window: the event loop ends with it.
+    std::mem::forget(timer);
 }
 
 /// A Mac typed in by address ("my-mac.local", "192.168.1.20", optionally ":port").
@@ -701,77 +859,4 @@ fn after_first_link(fingerprint: &str) -> Result<()> {
     // (A Mac streaming to another computer meanwhile answers Busy: "In use by …" until it's free.)
     crate::net::set_offline(false);
     crate::setup::start_client()
-}
-
-/// ufw is switched on (it then blocks incoming connections by default). Ubuntu and Mint keep
-/// ufw.service "active" even with the firewall off (the unit only runs ufw's boot script), so
-/// the switch itself is read: `ENABLED=yes` in ufw.conf, which anyone can read.
-fn firewall_active() -> bool {
-    let service = Command::new("systemctl")
-        .args(["is-active", "--quiet", "ufw"])
-        .status()
-        .is_ok_and(|s| s.success());
-    service && std::fs::read_to_string("/etc/ufw/ufw.conf").is_ok_and(|s| ufw_enabled(&s))
-}
-
-fn ufw_enabled(conf: &str) -> bool {
-    conf.lines()
-        .filter_map(|l| l.trim().strip_prefix("ENABLED="))
-        .last()
-        .is_some_and(|v| v.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case("yes"))
-}
-
-/// Lets the local network reach the installer page for a while: one ufw rule, for this
-/// computer's network only, asked for with the usual password prompt (pkexec). The helper keeps
-/// running as root and deletes the rule when its input closes: when the window closes, or if
-/// Sweeflow dies, so it's never left open.
-fn allow_installer_port() -> anyhow::Result<Child> {
-    let net = local_network().ok_or_else(|| anyhow::anyhow!("couldn't tell which network this is"))?;
-    let port = crate::installer::PORT.to_string();
-    // The local network, and Tailscale's addresses when this computer is on a tailnet.
-    let tailnet = if crate::installer::tailscale_ip().is_some() { "100.64.0.0/10" } else { "" };
-    let script = r#"for net in $1 $3; do
-  ufw allow from $net to any port $2 proto tcp comment 'Sweeflow installer' >/dev/null || exit 1
-done
-echo open
-cat >/dev/null
-for net in $1 $3; do
-  ufw delete allow from $net to any port $2 proto tcp >/dev/null
-done"#;
-    let mut child = Command::new("pkexec")
-        .args(["sh", "-c", script, "sh", &net, &port, tailnet])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line)?;
-    if line.trim() != "open" {
-        let _ = child.wait();
-        anyhow::bail!("the firewall wasn't changed");
-    }
-    Ok(child)
-}
-
-/// This computer's local network as an address range ("192.168.1.0/24"), from `ip`.
-fn local_network() -> Option<String> {
-    let out = Command::new("ip").args(["-o", "-4", "route", "show", "scope", "link"]).output().ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .find(|n| n.contains('/') && !n.starts_with("169.254."))
-        .map(String::from)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ufw_enabled;
-
-    #[test]
-    fn ufw_switch() {
-        assert!(!ufw_enabled("# comment\nENABLED=no\nLOGLEVEL=low\n"));
-        assert!(ufw_enabled("ENABLED=yes\n"));
-        assert!(ufw_enabled("ENABLED=\"yes\"\n"));
-        assert!(!ufw_enabled("#ENABLED=yes\n"));
-        assert!(!ufw_enabled(""));
-    }
 }

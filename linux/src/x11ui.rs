@@ -128,16 +128,6 @@ impl Mods {
     }
 }
 
-/// Cmd+Opt+<letter> alone (Super+Alt here): the keys ui.rs catches in Mac windows. `keysym`:
-/// what the layout puts on the key, unshifted.
-fn cmd_opt_letter(m: Mods, keysym: u32) -> Option<char> {
-    if !(m.logo && m.alt && !m.ctrl && !m.shift) {
-        return None;
-    }
-    let k = if (0x41..=0x5a).contains(&keysym) { keysym + 0x20 } else { keysym };
-    (0x61..=0x7a).contains(&k).then(|| k as u8 as char)
-}
-
 /// X keycode → the evdev code the Mac is sent (what Wayland gives as the raw code).
 fn evdev_code(x_keycode: u8) -> u32 {
     (x_keycode as u32).saturating_sub(8)
@@ -2933,7 +2923,7 @@ impl App {
                 self.swallowed.remove(i);
                 return;
             }
-            self.send(W::new(t::KEY).u32(code).u8(0).finish());
+            self.send(W::new(t::KEY).u32(crate::keys::mac_code(code)).u8(0).finish());
             return;
         }
         if !self.keys_down.insert(keycode) {
@@ -2941,7 +2931,7 @@ impl App {
             if self.swallowed.contains(&code) {
                 return;
             }
-            self.send(W::new(t::KEY).u32(code).u8(2).finish());
+            self.send(W::new(t::KEY).u32(crate::keys::mac_code(code)).u8(2).finish());
             return;
         }
         if is_meta {
@@ -2951,26 +2941,34 @@ impl App {
             self.shift_down += 1;
         }
         let mods = Mods::from_state(state);
-        match cmd_opt_letter(mods, self.keysym(keycode)) {
-            Some('u') if self.app_window_focused() => {
+        // Sweeflow's own keys, as set (keys.rs).
+        let sym = smithay_client_toolkit::seat::keyboard::Keysym::new(self.keysym(keycode));
+        let own = crate::deskkeys::Mods { logo: mods.logo, alt: mods.alt, ctrl: mods.ctrl, shift: mods.shift };
+        match crate::keys::own_action(code, sym.key_char(), sym.name(), own) {
+            Some("menu") if self.app_window_focused() => {
                 crate::ui::open_global_menu();
                 self.swallowed.push(code);
                 return;
             }
-            Some('o') => {
+            Some("open") => {
                 crate::ui::run_own("open", "Sweeflow");
                 self.swallowed.push(code);
                 return;
             }
-            Some(c @ ('y' | 'z')) => {
-                let toggle = if c == 'y' { "pause-toggle" } else { "stream-toggle" };
+            Some(t @ ("pause" | "stop")) => {
+                let toggle = if t == "pause" { "pause-toggle" } else { "stream-toggle" };
                 std::thread::spawn(move || crate::tray::panel_do(toggle, ""));
                 self.swallowed.push(code);
                 return;
             }
             _ => {}
         }
-        if code == KEY_SPACE && self.meta_down > 0 && self.shift_down == 0 && crate::keys::desktop().contains("Cinnamon") {
+        if code == KEY_SPACE
+            && self.meta_down > 0
+            && self.shift_down == 0
+            && crate::keys::desktop().contains("Cinnamon")
+            && !crate::deskkeys::press_removed(code, crate::deskkeys::Mods { logo: true, alt: state & 8 != 0, ctrl: state & 4 != 0, shift: false })
+        {
             // The desktop's menu takes the keyboard to open: let it go first (the focus moving
             // there then releases the Mac's keys, see focus_out).
             self.grab_hold_off = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
@@ -2983,7 +2981,10 @@ impl App {
         // go, and the key pressed again for the window manager (XTest), whose binding runs; one
         // it doesn't use comes back to the Mac window as usual.
         let m = crate::deskkeys::Mods { logo: self.meta_down > 0, alt: state & 8 != 0, ctrl: state & 4 != 0, shift: self.shift_down > 0 };
-        if self.kb_grabbed && crate::deskkeys::is_desktop_key(code, m) {
+        // The person's own keys for Linux (deskkeys::UserKey) go the same way.
+        let sym = smithay_client_toolkit::seat::keyboard::Keysym::new(self.keysym(keycode));
+        let own = self.kb_grabbed && crate::deskkeys::is_user_key(code, sym.key_char(), sym.name(), m).is_some();
+        if own || (self.kb_grabbed && crate::deskkeys::is_desktop_key(code, m)) {
             use x11rb::protocol::xtest::ConnectionExt as _;
             self.grab_hold_off = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
             self.sync_keyboard_grab();
@@ -2994,7 +2995,7 @@ impl App {
             self.swallowed.push(code);
             return;
         }
-        self.send(W::new(t::KEY).u32(code).u8(1).finish());
+        self.send(W::new(t::KEY).u32(crate::keys::mac_code(code)).u8(1).finish());
     }
 }
 
@@ -3277,13 +3278,6 @@ mod tests {
         assert_eq!(evdev_code(133), 125, "left Super is KEY_LEFTMETA");
         let m = Mods::from_state(0x40 | 0x08);
         assert_eq!(m, Mods { logo: true, alt: true, ctrl: false, shift: false });
-        assert_eq!(cmd_opt_letter(m, 0x75), Some('u'));
-        assert_eq!(cmd_opt_letter(m, 0x55), Some('u'), "a capital keysym too");
-        assert_eq!(cmd_opt_letter(Mods::from_state(0x40 | 0x08 | 0x01), 0x75), None, "with Shift");
-        assert_eq!(cmd_opt_letter(Mods::from_state(0x40), 0x75), None, "Super alone");
-        assert_eq!(cmd_opt_letter(m, 0xff0d), None, "not a letter");
-        // Caps Lock (0x02) and Num Lock (Mod2, 0x10) don't count.
-        assert_eq!(cmd_opt_letter(Mods::from_state(0x40 | 0x08 | 0x02 | 0x10), 0x79), Some('y'));
     }
 
     #[test]

@@ -35,8 +35,7 @@ pub fn add_to_config() {
     }
     std::thread::spawn(|| {
         hide_title_bars();
-        bind_open_key();
-        bind_stream_keys();
+        bind_own_keys();
         keep_menu_focused();
         place_sweeflow_window();
         close_on_click_elsewhere();
@@ -44,8 +43,7 @@ pub fn add_to_config() {
         for event in events {
             if event.starts_with("configreloaded") {
                 hide_title_bars();
-                bind_open_key();
-                bind_stream_keys();
+                bind_own_keys();
                 keep_menu_focused();
                 place_sweeflow_window();
                 close_on_click_elsewhere();
@@ -127,27 +125,6 @@ fn close_on_click_elsewhere() {
     }
 }
 
-/// SUPER + ALT + O opens Sweeflow (its window: `sweeflow open`) from anywhere. The key is free
-/// on Omarchy. Runs the installed binary, the one the service runs. A config reload drops the
-/// binding, so it is added again after each.
-fn bind_open_key() {
-    let Some(command) = own_command("open") else { return };
-    // Once per Hyprland config (its Lua globals go with a reload, as the binding does): added
-    // again by every start of the client, the key ran `sweeflow open` twice, which opens the
-    // window and closes it again.
-    // With a Mac-style key remapper (Toshy, Kinto), Cmd+Opt+O arrives as CTRL + ALT + O outside
-    // the Mac windows: that key too.
-    let keys: &[&str] = if crate::setup::mac_keys_remapped() { &["SUPER + ALT + O", "CTRL + ALT + O"] } else { &["SUPER + ALT + O"] };
-    let binds: String =
-        keys.iter().map(|k| format!(r#"hl.bind("{k}", hl.dsp.exec_cmd("{command}"), {{ description = "{OURS}{OPEN_NAME}" }}); "#)).collect();
-    let lua = format!("if not sweeflow_open_key then sweeflow_open_key = true; {binds}end");
-    match Command::new("hyprctl").args(["eval", &lua]).output() {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => log::info!("Hyprland: {} opens Sweeflow", keys.join(" or ")),
-        Ok(o) => log::warn!("Hyprland didn't take the key for Sweeflow's window ({lua}): {}", String::from_utf8_lossy(&o.stdout).trim()),
-        Err(e) => log::debug!("hyprctl: {e}"),
-    }
-}
-
 /// `sweeflow <arg>` with the installed binary, the one the service runs: quoted for the shell
 /// Hyprland runs it through, and the whole command for a Lua string.
 fn own_command(arg: &str) -> Option<String> {
@@ -156,17 +133,24 @@ fn own_command(arg: &str) -> Option<String> {
     Some(format!("'{}' {arg}", bin.replace('\'', r"'\''")).replace('\\', r"\\").replace('"', "\\\""))
 }
 
-/// SUPER + ALT + P (pause or resume) and SUPER + ALT + X (stop or start): `sweeflow
-/// toggle-pause` / `toggle-stream` (setup::STREAM_KEYS), like the open key, but only on a key
-/// nothing else has (Omarchy has SUPER + ALT + K for its tmux keys, say): the user's own binding
-/// wins, and binding `sweeflow toggle-…` to other keys in their config is how they change them.
-fn bind_stream_keys() {
+/// Sweeflow's keys from anywhere (as set in its Shortcuts window, keys.rs: Super+Alt+O opens it,
+/// Y pauses or resumes, Z stops or starts), bound to the installed binary's `sweeflow open` /
+/// `toggle-pause` / `toggle-stream`. Each time: the ones bound before let go first, so a key
+/// changed in the Shortcuts window replaces the old one (`rebind_own_keys`); a key the user has
+/// bound to something else is left to them. With a Mac-style key remapper (Toshy, Kinto), ⌘
+/// arrives as CTRL outside the Mac windows: that key too. A config reload drops them all, so they
+/// are bound again after each.
+fn bind_own_keys() {
     // Just after a config reload Hyprland may list nothing for a moment: asked again, and
     // nothing bound while it still lists nothing (a key the user has could be taken over).
+    let mut listed = String::new();
     let mut bound = Vec::new();
     for _ in 0..10 {
         match Command::new("hyprctl").args(["binds", "-j"]).output() {
-            Ok(o) => bound = parse_binds(&String::from_utf8_lossy(&o.stdout)),
+            Ok(o) => {
+                listed = String::from_utf8_lossy(&o.stdout).to_string();
+                bound = parse_binds(&listed);
+            }
             Err(e) => return log::debug!("hyprctl: {e}"),
         }
         if !bound.is_empty() {
@@ -175,49 +159,55 @@ fn bind_stream_keys() {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     if bound.is_empty() {
-        return log::warn!("Hyprland lists no key bindings: Sweeflow's streaming keys not bound");
+        return log::warn!("Hyprland lists no key bindings: Sweeflow's keys not bound");
     }
-    let mods: &[(&str, u32)] = if crate::setup::mac_keys_remapped() { &[("SUPER + ALT", SUPER_ALT), ("CTRL + ALT", CTRL_ALT)] } else { &[("SUPER + ALT", SUPER_ALT)] };
-    let mut binds = String::new();
+    let (mut lua, _) = unbind_lua(&listed);
+    let remapped = crate::setup::mac_keys_remapped();
     let mut keys = Vec::new();
-    for k in &crate::setup::STREAM_KEYS {
-        let Some(command) = own_command(k.id) else { return };
-        // The letter an earlier version bound (Cmd+Opt+P / X), while still ours: let go.
-        for &(m, mask) in mods {
-            if bound.iter().any(|b| b.0 == mask && b.1.eq_ignore_ascii_case(&k.old.to_string()) && b.2.starts_with(OURS)) {
-                binds.push_str(&format!(r#"hl.unbind("{m} + {}"); "#, k.old));
-            }
+    for (name, arg, what) in [("open", "open", OPEN_NAME), ("pause", "toggle-pause", "Pause or resume streaming"), ("stop", "toggle-stream", "Stop or start streaming")] {
+        let Some(k) = crate::keys::own_key(name) else { continue };
+        let Some(command) = own_command(arg) else { return };
+        let mut variants = vec![k.clone()];
+        if remapped && k.logo && !k.ctrl {
+            variants.push(crate::deskkeys::UserKey { logo: false, ctrl: true, ..k.clone() });
         }
-        for &(m, mask) in mods {
-            if let Some(by) = bound_by(&bound, mask, k.letter) {
-                log::info!("Hyprland: {m} + {} is bound already ({by}): left alone, not set for \"{}\"", k.letter, k.name);
+        for v in variants {
+            let mask = (v.shift as u32) | ((v.ctrl as u32) << 2) | ((v.alt as u32) << 3) | ((v.logo as u32) << 6);
+            let key = hypr_key(&v.key);
+            if let Some(by) = taken_by(&bound, mask, &key) {
+                log::info!("Hyprland: {} is bound already ({by}): left alone, not set for \"{what}\"", v.label());
                 continue;
             }
-            binds.push_str(&format!(r#"hl.bind("{m} + {}", hl.dsp.exec_cmd("{command}"), {{ description = "{OURS}{}" }}); "#, k.letter, k.name));
-            keys.push(format!("{m} + {} ({})", k.letter, k.name));
+            let Some(mods) = mods_of(mask) else { continue };
+            lua.push_str(&format!(r#"hl.bind("{mods} + {}", hl.dsp.exec_cmd("{command}"), {{ description = "{OURS}{what}" }}); "#, key.to_uppercase()));
+            keys.push(format!("{} ({what})", v.label()));
         }
     }
-    if binds.is_empty() {
-        return;
-    }
-    // Once per Hyprland config, as the open key. (Named for the letters: a running Hyprland that
-    // has the earlier ones, P and X, takes these and lets those go.)
-    let lua = format!("if not sweeflow_stream_keys_yz then sweeflow_stream_keys_yz = true; {binds}end");
     match Command::new("hyprctl").args(["eval", &lua]).output() {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => {
-            log::info!("Hyprland: {}", keys.join(", "));
-            // The menu and panels show them.
-            crate::keys::reread();
-        }
-        Ok(o) => log::warn!("Hyprland didn't take Sweeflow's streaming keys ({lua}): {}", String::from_utf8_lossy(&o.stdout).trim()),
+        Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "ok" => log::info!("Hyprland: {}", keys.join(", ")),
+        Ok(o) => log::warn!("Hyprland didn't take Sweeflow's keys ({lua}): {}", String::from_utf8_lossy(&o.stdout).trim()),
         Err(e) => log::debug!("hyprctl: {e}"),
+    }
+}
+
+/// What else has a key in Hyprland's bindings (its description, or "another binding"); None
+/// when nothing or only Sweeflow does.
+fn taken_by(bound: &[(u32, String, String)], mask: u32, key: &str) -> Option<String> {
+    bound
+        .iter()
+        .find(|b| b.0 == mask && b.1.eq_ignore_ascii_case(key) && !b.2.starts_with(OURS))
+        .map(|b| if b.2.is_empty() { "another binding".to_string() } else { b.2.clone() })
+}
+
+/// Sweeflow's keys were changed (its Shortcuts window): bound again.
+pub fn rebind_own_keys() {
+    if running() {
+        std::thread::spawn(bind_own_keys);
     }
 }
 
 /// Hyprland's modifier masks (`hyprctl binds -j`'s modmask): SUPER (64) + ALT (8), CTRL (4) +
 /// ALT.
-const SUPER_ALT: u32 = 64 | 8;
-const CTRL_ALT: u32 = 4 | 8;
 /// How Sweeflow's own bindings' descriptions start.
 const OURS: &str = "Sweeflow: ";
 const OPEN_NAME: &str = "Open Sweeflow";
@@ -258,13 +248,48 @@ fn parse_binds(json: &str) -> Vec<(u32, String, String)> {
         .collect()
 }
 
-/// What else has this key (its description, or "another binding"); None when it's free or
-/// only Sweeflow's own.
-fn bound_by(bound: &[(u32, String, String)], mask: u32, letter: char) -> Option<String> {
-    bound
-        .iter()
-        .find(|b| b.0 == mask && b.1.eq_ignore_ascii_case(&letter.to_string()) && !b.2.starts_with(OURS))
-        .map(|b| if b.2.is_empty() { "another binding".to_string() } else { b.2.clone() })
+/// `sweeflow uninstall`: Sweeflow's key bindings let go in the running Hyprland, and its marks
+/// that they were added, so a new install adds them again. Nothing of Sweeflow's is in the config
+/// files: its window rules and the click that closes its window go with the next config reload
+/// or login (they only ever touch Sweeflow's windows). How many keys were let go.
+pub fn unbind_ours() -> anyhow::Result<usize> {
+    let o = Command::new("hyprctl").args(["binds", "-j"]).output()?;
+    let (unbinds, n) = unbind_lua(&String::from_utf8_lossy(&o.stdout));
+    let lua = format!("sweeflow_open_key = nil; sweeflow_stream_keys_yz = nil; {unbinds}");
+    let o = Command::new("hyprctl").args(["eval", &lua]).output()?;
+    let said = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    anyhow::ensure!(said == "ok", "Hyprland said {said}");
+    Ok(n)
+}
+
+/// The Lua that lets go of Sweeflow's bindings (by their descriptions) among those `hyprctl binds
+/// -j` lists, and how many keys. Unbinding goes by the key, so a key that has a binding of the
+/// user's too (the open key is bound whether or not it's free) is left alone: theirs would go.
+fn unbind_lua(json: &str) -> (String, usize) {
+    let bound = parse_binds(json);
+    let mut keys: Vec<String> = Vec::new();
+    for (mask, key, description) in &bound {
+        if !description.starts_with(OURS) || bound.iter().any(|b| b.0 == *mask && b.1.eq_ignore_ascii_case(key) && !b.2.starts_with(OURS)) {
+            continue;
+        }
+        let Some(mods) = mods_of(*mask) else { continue };
+        let key = format!("{mods} + {}", key.to_uppercase());
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    (keys.iter().map(|k| format!(r#"hl.unbind("{k}"); "#)).collect(), keys.len())
+}
+
+/// A modmask as Hyprland's key names ("SUPER + ALT"); None for one with modifiers Sweeflow never
+/// binds.
+fn mods_of(mask: u32) -> Option<String> {
+    const NAMES: [(u32, &str); 4] = [(64, "SUPER"), (4, "CTRL"), (8, "ALT"), (1, "SHIFT")];
+    let known = NAMES.iter().fold(0, |m, n| m | n.0);
+    if mask == 0 || mask & !known != 0 {
+        return None;
+    }
+    Some(NAMES.iter().filter(|n| mask & n.0 != 0).map(|n| n.1).collect::<Vec<_>>().join(" + "))
 }
 
 /// No title bars on Sweeflow's windows. Omarchy draws one on every window of a floating
@@ -563,11 +588,33 @@ mod tests {
         ]"#;
         let bound = super::parse_binds(json);
         assert_eq!(bound.len(), 4);
-        assert_eq!(super::bound_by(&bound, super::SUPER_ALT, 'K').as_deref(), Some("Tmux keybindings"));
-        assert_eq!(super::bound_by(&bound, super::SUPER_ALT, 'P'), None);
-        assert_eq!(super::bound_by(&bound, super::CTRL_ALT, 'P'), None);
-        assert_eq!(super::bound_by(&bound, super::CTRL_ALT, 'K').as_deref(), Some("another binding"));
+        let (super_alt, ctrl_alt) = (64 | 8, 4 | 8);
+        assert_eq!(super::taken_by(&bound, super_alt, "K").as_deref(), Some("Tmux keybindings"));
+        assert_eq!(super::taken_by(&bound, super_alt, "P"), None);
+        assert_eq!(super::taken_by(&bound, ctrl_alt, "P"), None);
+        assert_eq!(super::taken_by(&bound, ctrl_alt, "K").as_deref(), Some("another binding"));
         assert!(super::parse_binds("not json").is_empty());
+    }
+
+    #[test]
+    fn uninstall_lets_go_of_our_keys_only() {
+        let json = r#"[
+            {"modmask": 72, "key": "O", "submap": "", "mouse": false, "description": "Sweeflow: Open Sweeflow"},
+            {"modmask": 12, "key": "o", "submap": "", "mouse": false, "description": "Sweeflow: Open Sweeflow"},
+            {"modmask": 72, "key": "Y", "submap": "", "mouse": false, "description": "Sweeflow: Pause or resume streaming"},
+            {"modmask": 72, "key": "Z", "submap": "", "mouse": false, "description": "Sweeflow: Stop or start streaming"},
+            {"modmask": 72, "key": "z", "submap": "", "mouse": false, "description": "My own"},
+            {"modmask": 72, "key": "K", "submap": "", "mouse": false, "description": "Tmux keybindings"},
+            {"modmask": 72, "key": "mouse:272", "submap": "", "mouse": true, "description": ""}
+        ]"#;
+        let (lua, n) = super::unbind_lua(json);
+        assert_eq!(n, 3);
+        assert_eq!(lua, r#"hl.unbind("SUPER + ALT + O"); hl.unbind("CTRL + ALT + O"); hl.unbind("SUPER + ALT + Y"); "#);
+        assert_eq!(super::unbind_lua("[]"), (String::new(), 0));
+        assert_eq!(super::mods_of(64 | 8).as_deref(), Some("SUPER + ALT"));
+        assert_eq!(super::mods_of(4 | 8).as_deref(), Some("CTRL + ALT"));
+        assert_eq!(super::mods_of(0), None);
+        assert_eq!(super::mods_of(64 | 128), None);
     }
 }
 
@@ -591,29 +638,46 @@ pub fn mac_keys(on: bool) {
         } else {
             ""
         };
+        // The person's own keys for Linux (deskkeys::UserKey): what Hyprland runs on them, bound
+        // in the key mode too. Only programs it starts (exec): the other dispatchers have no
+        // name to call here.
+        let own = own_binds();
+        // Each bind with its name (keptkeys::hyprland's): the ones the person took out in the
+        // Shortcuts window aren't bound, and in a Mac window those keys go to the Mac.
+        let mut binds: Vec<(String, String)> = Vec::new();
+        for n in 1..=10 {
+            let (digit, code) = (n % 10, n + 9);
+            binds.push((format!("Super+{digit}"), format!(r#"hl.bind("SUPER + code:{code}", hl.dsp.focus({{ workspace = {n} }}))"#)));
+            binds.push((format!("Super+Shift+{digit}"), format!(r#"hl.bind("SUPER + SHIFT + code:{code}", hl.dsp.window.move({{ workspace = {n} }}))"#)));
+        }
+        binds.push(("Super+Tab".into(), r#"hl.bind("SUPER + TAB", hl.dsp.focus({ workspace = "m+1" }))"#.into()));
+        binds.push(("Super+Shift+Tab".into(), r#"hl.bind("SUPER + SHIFT + TAB", hl.dsp.focus({ workspace = "m-1" }))"#.into()));
+        binds.push(("Alt+Tab".into(), r#"hl.bind("ALT + TAB", hl.dsp.window.cycle_next())"#.into()));
+        binds.push(("Alt+Shift+Tab".into(), r#"hl.bind("ALT + SHIFT + TAB", hl.dsp.window.cycle_next({ next = false }))"#.into()));
+        for (name, line) in omarchy.lines().zip(["Super+Space", "Super+Alt+Space", "Super+Ctrl+Space", "Super+Ctrl+Shift+Space"]).map(|(l, n)| (n, l.trim())) {
+            binds.push((name.into(), line.into()));
+        }
+        for (name, line) in [
+            ("Volume Up", r#"hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"), { locked = true, repeating = true })"#),
+            ("Volume Down", r#"hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"), { locked = true, repeating = true })"#),
+            ("Mute", r#"hl.bind("XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"), { locked = true })"#),
+            ("Play/Pause", r#"hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })"#),
+            ("Play/Pause", r#"hl.bind("XF86AudioPause", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })"#),
+            ("Next", r#"hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl next"), { locked = true })"#),
+            ("Previous", r#"hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl previous"), { locked = true })"#),
+            ("Brightness Up", r#"hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("brightnessctl set 5%+"), { locked = true, repeating = true })"#),
+            ("Brightness Down", r#"hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("brightnessctl set 5%-"), { locked = true, repeating = true })"#),
+        ] {
+            binds.push((name.into(), line.into()));
+        }
+        let mut body: String = binds.iter().filter(|(name, _)| !crate::deskkeys::key_removed(name)).map(|(_, line)| format!("{line}\n  ")).collect();
+        body += &own;
+        // Made again whenever what's in it changes (a version of it, from its text).
+        let version = format!("4-{:x}", body.len() * 31 + body.bytes().map(|b| b as usize).sum::<usize>());
         let lua = if on {
-            r#"if sweeflow_submap ~= 3 then sweeflow_submap = 3; hl.define_submap("sweeflow", function()
-  for n = 1, 10 do
-    local key = "code:" .. tostring(n + 9)
-    hl.bind("SUPER + " .. key, hl.dsp.focus({ workspace = n }))
-    hl.bind("SUPER + SHIFT + " .. key, hl.dsp.window.move({ workspace = n }))
-  end
-  hl.bind("SUPER + TAB", hl.dsp.focus({ workspace = "m+1" }))
-  hl.bind("SUPER + SHIFT + TAB", hl.dsp.focus({ workspace = "m-1" }))
-  hl.bind("ALT + TAB", hl.dsp.window.cycle_next())
-  hl.bind("ALT + SHIFT + TAB", hl.dsp.window.cycle_next({ next = false }))
-  OMARCHY
-  hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"), { locked = true, repeating = true })
-  hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"), { locked = true, repeating = true })
-  hl.bind("XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"), { locked = true })
-  hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })
-  hl.bind("XF86AudioPause", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })
-  hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl next"), { locked = true })
-  hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl previous"), { locked = true })
-  hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("brightnessctl set 5%+"), { locked = true, repeating = true })
-  hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("brightnessctl set 5%-"), { locked = true, repeating = true })
-end) end; hl.dispatch(hl.dsp.submap("sweeflow"))"#
-                .replace("OMARCHY", omarchy)
+            format!(r#"if sweeflow_submap ~= "{version}" then sweeflow_submap = "{version}"; hl.define_submap("sweeflow", function()
+  {body}end) end; hl.dispatch(hl.dsp.submap("sweeflow"))"#)
+
         } else {
             r#"hl.dispatch(hl.dsp.submap("reset"))"#.to_string()
         };
@@ -623,4 +687,72 @@ end) end; hl.dispatch(hl.dsp.submap("sweeflow"))"#
             Err(e) => log::debug!("hyprctl: {e}"),
         }
     });
+}
+
+/// The keys kept for Linux changed: the key mode is made again, now if it's on (made again
+/// anyway the next time a Mac window takes the keys: its text changed).
+pub fn refresh_mac_keys() {
+    if running() && current_submap().as_deref() == Some("sweeflow") {
+        mac_keys(true);
+    }
+}
+
+fn current_submap() -> Option<String> {
+    let o = Command::new("hyprctl").args(["submap"]).output().ok()?;
+    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Lua binds for the person's own keys for Linux, from what Hyprland has on them (`hyprctl binds`):
+/// the programs they start. Empty with none.
+fn own_binds() -> String {
+    let keys: Vec<crate::deskkeys::UserKey> =
+        crate::deskkeys::load_user_keys().iter().filter_map(|k| crate::deskkeys::UserKey::parse(k)).collect();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let Ok(out) = Command::new("hyprctl").args(["binds", "-j"]).output() else { return String::new() };
+    let binds: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let lua_str = |t: &str| t.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut lua = String::new();
+    for k in &keys {
+        let mask = (k.shift as u64) | ((k.ctrl as u64) << 2) | ((k.alt as u64) << 3) | ((k.logo as u64) << 6);
+        let name = hypr_key(&k.key);
+        let found = binds.iter().find(|b| {
+            b["modmask"].as_u64() == Some(mask)
+                && b["key"].as_str().is_some_and(|key| key.eq_ignore_ascii_case(&name))
+                && b["submap"].as_str().unwrap_or("").is_empty()
+        });
+        match found.map(|b| (b["dispatcher"].as_str().unwrap_or(""), b["arg"].as_str().unwrap_or(""))) {
+            Some(("exec", cmd)) => {
+                let mods: Vec<&str> = [(k.logo, "SUPER"), (k.ctrl, "CTRL"), (k.alt, "ALT"), (k.shift, "SHIFT")]
+                    .iter()
+                    .filter(|m| m.0)
+                    .map(|m| m.1)
+                    .collect();
+                let combo = if mods.is_empty() { name.clone() } else { format!("{} + {name}", mods.join(" + ")) };
+                lua += &format!("hl.bind(\"{}\", hl.dsp.exec_cmd(\"{}\"))\n  ", lua_str(&combo), lua_str(cmd));
+            }
+            Some((other, _)) => log::info!("{}: Hyprland's {other} can't be kept for Linux over Mac windows", k.label()),
+            None => log::info!("{}: Hyprland has nothing on it", k.label()),
+        }
+    }
+    lua
+}
+
+/// A key's name as Hyprland writes it.
+fn hypr_key(key: &str) -> String {
+    match key {
+        "Enter" => "Return".into(),
+        "Esc" => "Escape".into(),
+        "PageUp" => "Prior".into(),
+        "PageDown" => "Next".into(),
+        "Backspace" => "BackSpace".into(),
+        "ScrollLock" => "Scroll_Lock".into(),
+        other => other.into(),
+    }
+}
+
+/// Omarchy (its menu command is there).
+pub fn omarchy() -> bool {
+    Command::new("sh").args(["-c", "command -v omarchy-menu"]).output().is_ok_and(|o| o.status.success())
 }
