@@ -3,8 +3,8 @@ import CryptoKit
 
 /// Updates. Each release has `latest.json` (linux/release/build.sh): its version, what's new, and
 /// where the Mac app is. Sweeflow looks a little after it starts and every few hours. A newer one
-/// is said once in a notification, and the menu's line turns from "Check for Updates…" into
-/// "Update to Sweeflow X…". Chosen, it shows what's new while it downloads the disk image, checks
+/// is said once in a notification, and the menu's line turns from "Check for updates" into
+/// "Update to Sweeflow X". Chosen, it shows what's new while it downloads the disk image, checks
 /// it (its checksum, and that the app in it is signed as this one is), swaps it in and opens it.
 final class Updater: NSObject {
     static let shared = Updater()
@@ -54,7 +54,7 @@ final class Updater: NSObject {
     }
 
     /// The menu's line: what it says, and what it does.
-    var menuTitle: String { available.map { "Update to Sweeflow \($0.version)…" } ?? "Check for Updates…" }
+    var menuTitle: String { available.map { "Update to Sweeflow \($0.version)" } ?? "Check for updates" }
 
     func menuChosen() {
         if let feed = available { return showAndInstall(feed) }
@@ -126,7 +126,7 @@ final class Updater: NSObject {
             Smoother windows, and Sweeflow tells you when a new version is out.
 
             - Mac windows open and move about faster, with less delay when typing.
-            - Check for Updates… in the Mac menu and the Linux tray, with this window.
+            - Check for updates in the Mac menu and the Linux tray, with this window.
             - The Mac says in a notification when streaming starts, pauses and stops.
             - Shortcuts you keep for Linux now also work while a Mac window is in front.
             - Fixes for sheets on Hyprland and the Alt+Tab switcher on Linux Mint.

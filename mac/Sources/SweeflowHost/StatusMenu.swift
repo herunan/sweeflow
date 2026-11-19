@@ -191,13 +191,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(linked)
 
         menu.addItem(.separator())
-        // Updates: "Check for Updates…", or "Update to Sweeflow X…" once one is out (Updater).
-        let update = ClosureMenuItem(title: Updater.shared.menuTitle) { Updater.shared.menuChosen() }
-        if Updater.shared.available != nil {
-            update.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(paletteColors: [.white, .sweeflowViolet]))
-        }
-        menu.addItem(update)
+        // Updates: "Check for updates", or "Update to Sweeflow X" once one is out (Updater).
+        menu.addItem(ClosureMenuItem(title: Updater.shared.menuTitle) { Updater.shared.menuChosen() })
         let quit = ClosureMenuItem(title: "Quit Sweeflow") { Self.quit() }
         quit.keyEquivalent = "q"
         menu.addItem(quit)

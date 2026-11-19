@@ -409,7 +409,7 @@ PlasmoidItem {
                     onClicked: { root.act("shortcuts"); root.expanded = false; }
                 }
                 SfButton {
-                    text: "Check for Updates"
+                    text: "Check for updates"
                     onClicked: { root.act("update-window", ""); root.expanded = false; }
                 }
                 Item { Layout.fillWidth: true }

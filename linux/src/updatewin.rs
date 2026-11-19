@@ -1,4 +1,4 @@
-//! The update window (`sweeflow update-window`): from the tray's Check for Updates and the
+//! The update window (`sweeflow update-window`): from the tray's Check for updates and the
 //! panel's update banner. It looks for the latest release, says when this is the latest, and
 //! otherwise shows what's new and updates it: install.sh's copy right here (downloaded, checked
 //! against the signed checksums, put in place, Sweeflow restarted), a packaged copy by saying the
@@ -413,7 +413,7 @@ fn preview(ui: &UpdateWindow, state: &str) {
         date: "2026-12-03".into(),
         notes: "Smoother windows, and Sweeflow tells you when a new version is out.\n\n\
                 - Mac windows open and move about faster, with less delay when typing.\n\
-                - Check for Updates… in the Mac menu and the Linux tray, with this window.\n\
+                - Check for updates in the Mac menu and the Linux tray, with this window.\n\
                 - The Mac says in a notification when streaming starts, pauses and stops.\n\
                 - Shortcuts you keep for Linux now also work while a Mac window is in front.\n\
                 - Fixes for sheets on Hyprland and the Alt+Tab switcher on Linux Mint."

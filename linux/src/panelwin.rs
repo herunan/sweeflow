@@ -650,12 +650,12 @@ slint::slint! {
                     }
                 }
 
-                // The Shortcuts window and Check for Updates at the left, Quit at the right.
+                // The Shortcuts window and Check for updates at the left, Quit at the right.
                 if root.running && root.paired: HorizontalLayout {
                     vertical-stretch: 0;
                     spacing: 8px;
                     Btn { text: "Shortcuts"; clicked => { root.act("shortcuts", ""); } }
-                    Btn { text: "Check for Updates"; clicked => { root.act("update-window", ""); } }
+                    Btn { text: "Check for updates"; clicked => { root.act("update-window", ""); } }
                     Rectangle { horizontal-stretch: 1; }
                     Btn { text: "Quit Sweeflow"; clicked => { root.quit-all(); } }
                 }
