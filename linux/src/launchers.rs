@@ -76,57 +76,35 @@ pub fn seen(bid: &str, name: &str, png: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
-/// How long GNOME's shell takes to read entries after the last one was written (a few ms for
-/// one; it reads them all again for each change, so longer while a first connection writes
-/// every app's).
+/// How long GNOME's shell usually takes to read an entry just written.
 const GNOME_READS_IN: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// `sync` is writing the apps' entries.
-static SYNCING: AtomicBool = AtomicBool::new(false);
-
-/// Before a Mac app's window is shown on GNOME: waits until the shell has read the app's entry,
-/// if it was only just written (or is being written with the rest). GNOME matches a window to
-/// its app once, as the window appears, and never again when entries change; a window that came
-/// first stayed an app of its own ("sweeflow-dev.herdr.app"), and for such a window GNOME skips
-/// its permission store, so "Allow inhibiting shortcuts" came up for it although Sweeflow grants
-/// it for its Mac apps. Waits from the last change in the folder: a first connection writes
-/// every app's entry at once (72), and a window that waited for its own only was still too early.
-/// Only while entries are new: once per app. At most 6 s.
+/// Before a Mac app's window is shown on GNOME: waits until the shell has most likely read the
+/// app's entry, if it was only just written. GNOME matches a window to its app once, as the
+/// window appears; one that came first is an app of its own until it's matched again
+/// (ui.rs gnome_ready, which makes sure of it). Only while the entry is new: once per app.
 pub fn wait_until_read(bid: &str) {
-    if cfg!(test) || !crate::desktop::is("GNOME") || bid.is_empty() || bid.contains('/') {
+    if cfg!(test) || !crate::desktop::is("GNOME") {
         return;
+    }
+    let Some(age) = entries_changed_at(bid).and_then(|t| t.elapsed().ok()) else { return };
+    if age < GNOME_READS_IN {
+        log::info!("{bid}: waiting for GNOME to read its new entry before its window");
+        std::thread::sleep(GNOME_READS_IN - age);
+    }
+}
+
+/// When a Mac app's entries (taskbar and menu) last changed, if it has any.
+pub fn entries_changed_at(bid: &str) -> Option<std::time::SystemTime> {
+    if bid.is_empty() || bid.contains('/') {
+        return None;
     }
     let dir = data_dir().join("applications");
-    let age = |p: &std::path::Path| fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-    let own = [task_file(bid), menu_file(bid)].iter().filter_map(|f| age(&dir.join(f))).min();
-    let fresh = match own {
-        Some(a) => a < GNOME_READS_IN,
-        // Not written yet: if the rest are being written, it's among them.
-        None => SYNCING.load(Ordering::SeqCst),
-    };
-    if !fresh {
-        return;
-    }
-    log::info!("{bid}: waiting for GNOME to read its new entry before its window");
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(6);
-    while std::time::Instant::now() < until {
-        let quiet = age(&dir).is_none_or(|a| a >= GNOME_READS_IN);
-        if quiet && !SYNCING.load(Ordering::SeqCst) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    [task_file(bid), menu_file(bid)].iter().filter_map(|f| fs::metadata(dir.join(f)).and_then(|m| m.modified()).ok()).max()
 }
 
 /// Keeps ~/.local/share/applications/sweeflow-*.desktop in sync with the Mac's installed apps.
 pub fn sync(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
-    SYNCING.store(true, Ordering::SeqCst);
-    let r = sync_now(apps);
-    SYNCING.store(false, Ordering::SeqCst);
-    r
-}
-
-fn sync_now(apps: &[(String, String, Vec<u8>)]) -> Result<()> {
     let apps_dir = data_dir().join("applications");
     let icon_dir = data_dir().join("sweeflow/icons");
     fs::create_dir_all(&apps_dir)?;

@@ -274,6 +274,9 @@ struct Win {
     /// Where a popup was dragged to on its window (window points), kept from then on over where
     /// the Mac has it (Quick Look, dragged by its bar: see drag_popup).
     moved_to: Option<(f32, f32)>,
+    /// When it was made, and whether GNOME was had to match it to its app again (gnome_ready).
+    born: std::time::SystemTime,
+    rematched: bool,
     /// A "did the Mac follow?" look (adopt_mac_size) is scheduled.
     check_pending: bool,
     /// The "Mac display" view (kind 3): letterboxed and scaled to fit, never resized on the Mac.
@@ -330,6 +333,8 @@ pub struct App {
     let_go: Option<Instant>,
     /// Hyprland is in Sweeflow's key mode (hyprland::mac_keys).
     hypr_mac_keys: bool,
+    /// A look at the shortcuts inhibitor is due (a window waits for GNOME, gnome_ready).
+    inhibit_recheck: bool,
     /// Launches whose app had no window here yet: their token, for the window when it comes.
     launch_tokens: HashMap<String, (String, std::time::Instant)>,
     /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
@@ -532,6 +537,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
             }
             false
         },
+        inhibit_recheck: false,
         launch_tokens: HashMap::new(),
         srgb: None,
         srgb_ready: false,
@@ -1206,6 +1212,8 @@ impl App {
                 settling: None,
                 popup_settled: false,
                 moved_to: None,
+                born: std::time::SystemTime::now(),
+                rematched: false,
             },
         );
         if !is_popup {
@@ -2769,15 +2777,32 @@ impl App {
             return;
         }
         let (Some(m), Some(seat)) = (self.inhibit_mgr.clone(), self.seat.clone()) else { return };
+        let gnome = crate::desktop::is("GNOME");
+        let mut later: Option<Duration> = None;
         for (wid, w) in self.windows.iter_mut() {
             let want = Some(*wid) == target && matches!(w.role, Role::Toplevel(_)) && !w.display;
             if want && w.inhibitor.is_none() {
+                if gnome {
+                    if let Some(wait) = gnome_ready(w) {
+                        later = Some(wait);
+                        continue;
+                    }
+                }
                 w.inhibitor = Some(m.inhibit_shortcuts(w.base(), &seat, qh, ()));
             } else if !want {
                 if let Some(i) = w.inhibitor.take() {
                     i.destroy();
                 }
             }
+        }
+        if let Some(wait) = later.filter(|_| !self.inhibit_recheck) {
+            self.inhibit_recheck = true;
+            let qh = qh.clone();
+            let _ = self.loop_handle.insert_source(Timer::from_duration(wait), move |_, _, app| {
+                app.inhibit_recheck = false;
+                app.sync_inhibitor(&qh);
+                TimeoutAction::Drop
+            });
         }
     }
 
@@ -3169,6 +3194,40 @@ fn gnome_allow_shortcuts(bundle_id: &str) {
             }
         }
     }
+}
+
+/// How long after a Mac app's entry was written GNOME surely has it (it took over 1.5 s on a
+/// fresh Ubuntu, while a first connection wrote every app's).
+const GNOME_HAS_ENTRY: Duration = Duration::from_secs(3);
+
+/// GNOME: whether a Mac window may ask for the keyboard's shortcuts now (None), or how long it
+/// waits. GNOME matches a window to its app once, as it appears; one that appeared before GNOME
+/// had read its app's new entry stays an app of its own, and for such a window GNOME skips its
+/// permission store and asks "Allow inhibiting shortcuts" (each time), although Sweeflow grants
+/// it for its Mac apps. So the window waits until the entry has surely been read, then has
+/// GNOME match it again (it does when the window's app id changes: changed and changed back),
+/// and asks after that. Only while the entry is new: once per app.
+fn gnome_ready(w: &mut Win) -> Option<Duration> {
+    // A window that has been here a while was matched long ago (entries rewritten later, by
+    // "Apps in launcher", change nothing for it).
+    if w.rematched || w.born.elapsed().is_ok_and(|a| a > Duration::from_secs(30)) {
+        return None;
+    }
+    let changed = crate::launchers::entries_changed_at(&w.info.bundle_id)?;
+    let has_it = changed + GNOME_HAS_ENTRY;
+    if let Ok(left) = has_it.duration_since(std::time::SystemTime::now()) {
+        return Some(left.max(Duration::from_millis(50)));
+    }
+    if w.born < has_it {
+        w.rematched = true;
+        if let Role::Toplevel(t) = &w.role {
+            let id = format!("sweeflow-{}", w.info.bundle_id);
+            t.set_app_id(format!("{id}.matching"));
+            t.set_app_id(id);
+            log::info!("window {}: matched to its app again (it came before GNOME had read its entry)", w.info.wid);
+        }
+    }
+    None
 }
 
 /// Smallest a Mac window gets here, unless its app is known to need more.

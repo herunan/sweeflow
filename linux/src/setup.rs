@@ -1470,6 +1470,14 @@ fn gnome_utilities_folder(add: bool) {
 /// (install.sh's was ~/.local/bin/sweeflow, the .deb's /usr/bin/sweeflow), and the list is set
 /// again, which is what makes Cinnamon read them: it went on running the old one, gone, so the
 /// keys did nothing until the next login. (The keys stay as the person has them.)
+/// At each start of the service too: a package upgrade (or a move from install.sh's copy to the
+/// .deb's) runs no step of the user's, and Cinnamon's keys went on running the old program.
+pub fn desktop_commands_now(home: &std::path::Path) {
+    if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("Cinnamon") {
+        cinnamon_commands_now(home);
+    }
+}
+
 fn cinnamon_commands_now(home: &std::path::Path) {
     let Ok(list) = gsettings(&["get", CINNAMON_KEYS, "custom-list"]) else { return };
     let ids = quoted(&list);

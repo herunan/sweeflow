@@ -120,6 +120,7 @@ fn main() -> Result<()> {
                 // Installs from before Sweeflow was in the app menu.
                 if let Some(home) = std::env::var_os("HOME") {
                     let _ = setup::write_launcher(std::path::Path::new(&home));
+                    setup::desktop_commands_now(std::path::Path::new(&home));
                 }
             }
             hyprland::add_to_config();
