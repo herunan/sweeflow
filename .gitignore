@@ -1,6 +1,5 @@
 linux/target/
 mac/.build/
-spike/linux/target/
 dist/
 
 # Local: the Mac the dev scripts build on; tools' own folders
