@@ -670,9 +670,17 @@ final class Session {
     ///   was already over it), the press goes straight through;
     /// - covered, or not known: the press and what follows it wait (holdInput) while the
     ///   window server is asked off this queue, and the window is raised if it's covered.
-    private func press(_ wid: UInt32, at p: CGPoint, then post: @escaping () -> Void) {
+    private func press(_ wid: UInt32, at p: CGPoint, appWaited: Bool = false, then post: @escaping () -> Void) {
         // Menus and floating panels are already on top.
         guard let win = tracker.windows[wid], win.kind == .toplevel else { return post() }
+        // A window of an app that isn't the active one: a press there only makes the app
+        // active, and many controls don't act on it (the first click on "New Document" in
+        // TextEdit's Open panel did nothing; the second worked). On Linux every click counts:
+        // the app is made active first, and the press waits for it.
+        if !appWaited, NSWorkspace.shared.frontmostApplication?.processIdentifier != win.pid {
+            raise(win)
+            return holdForApp(win, wid: wid, at: p, then: post)
+        }
         raisedWid = wid
         let raises = raiseState
         let known = raises.pending ? nil : tracker.frontmostAtLastLook(wid, at: p, maxAgeMs: 2000, since: raises.doneAt)
@@ -782,6 +790,41 @@ final class Session {
         }
         // Sent anyway after 0.6 s, whether or not the window server has answered by then.
         queue.asyncAfter(deadline: .now() + .milliseconds(600)) { release(front: false) }
+        look()
+    }
+
+    /// A press on a window of an app that isn't the active one (see `press`) waits, and what
+    /// follows it with it, until the app is (0.3 s at most), then goes as any press does.
+    private func holdForApp(_ win: TrackedWindow, wid: UInt32, at p: CGPoint, then post: @escaping () -> Void) {
+        heldInput = []
+        let start = DispatchTime.now()
+        var released = false
+        func release(active: Bool) {
+            guard !released else { return }
+            released = true
+            let waited = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e6
+            log(String(format: "click on %u held %.0f ms for %@ to be the active app%@", wid, waited, win.appName, active ? "" : ": it isn't, sent anyway"))
+            var rest = heldInput ?? []
+            heldInput = nil
+            // Now as any press: it may still wait for its window to come to the front.
+            press(wid, at: p, appWaited: true, then: post)
+            while !rest.isEmpty {
+                let next = rest.removeFirst()
+                if heldInput != nil { heldInput?.append(next); continue }
+                next()
+            }
+        }
+        func look() {
+            pressQueue.async { [weak self] in
+                let active = NSWorkspace.shared.frontmostApplication?.processIdentifier == win.pid
+                self?.queue.async {
+                    guard let self, !released else { return }
+                    if active { return release(active: true) }
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(16)) { if !released { look() } }
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + .milliseconds(300)) { release(active: false) }
         look()
     }
 
