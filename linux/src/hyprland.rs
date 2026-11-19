@@ -562,6 +562,34 @@ pub fn bring_up(class: String, title: String) {
     });
 }
 
+/// A sheet shown as a dialog of its window (Hyprland, see ui.rs add_window): at the spot it has
+/// in that window on the Mac (`rel`, points), kept inside the window as it is here (a tile can
+/// be narrower than the Mac window). Once Hyprland has both.
+pub fn place_on_parent(class: String, title: String, parent_title: String, rel: (f32, f32)) {
+    std::thread::spawn(move || {
+        for _ in 0..10 {
+            let sheet = our_client(&class, &title).filter(|c| c["title"].as_str() == Some(title.as_str()));
+            let parent = our_client(&class, &parent_title).filter(|c| c["title"].as_str() == Some(parent_title.as_str()));
+            if let (Some(s), Some(p)) = (sheet, parent) {
+                let n = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
+                let (px, py, pw, ph) = (n(&p["at"][0]), n(&p["at"][1]), n(&p["size"][0]), n(&p["size"][1]));
+                let (sw, sh) = (n(&s["size"][0]), n(&s["size"][1]));
+                let x = (px + (rel.0 as f64).clamp(0.0, (pw - sw).max(0.0))).round();
+                let y = (py + (rel.1 as f64).clamp(0.0, (ph - sh).max(0.0))).round();
+                let Some(address) = s["address"].as_str() else { return };
+                let window = format!("address:{address}");
+                dispatch(
+                    &format!(r#"hl.dsp.window.move({{ x = {x}, y = {y}, window = "{window}" }})"#),
+                    &["movewindowpixel", &format!("exact {x} {y},{window}")],
+                );
+                repick_pointer_soon();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
 /// Every Hyprland window (any process) that `pick` says.
 fn clients_where(pick: impl Fn(&serde_json::Value) -> bool) -> Vec<serde_json::Value> {
     let Some(out) = Command::new("hyprctl").args(["-j", "clients"]).output().ok() else { return Vec::new() };

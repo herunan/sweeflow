@@ -2077,6 +2077,8 @@ final class Session {
         m.f32(w.frame.width); m.f32(w.frame.height)
         m.u32(w.parent); m.f32(w.rel.x); m.f32(w.rel.y)
         m.u8(w.kind.rawValue)
+        // Newer clients read on (older ones stop at the kind).
+        m.u8(w.sheet ? 1 : 0)
     }
 
     /// A tab switched (see WindowTracker.onReplaced): `w` is where `old` was. Linux is told in

@@ -3112,6 +3112,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
             rel_y: 0.0,
             kind: 0,
             parent: 0,
+            sheet: false,
         };
         app.on_net(UiEvent::WindowAdded(info));
         // Round corner tiles: transparent outside a quarter circle, white inside.
@@ -3135,7 +3136,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
         app.windows.get_mut(&wid).ok_or_else(|| anyhow!("window {wid} wasn't made"))?.pending = Some(frame);
     }
     // A popup on the first window: a lossless half-transparent magenta square.
-    let popup = WinInfo { wid: 3, pid: 1, app_name: "Sweeflow self-test".into(), bundle_id: "test.sweeflow".into(), title: "menu".into(), w: 60.0, h: 40.0, rel_x: 100.0, rel_y: 120.0, kind: 1, parent: 1 };
+    let popup = WinInfo { wid: 3, pid: 1, app_name: "Sweeflow self-test".into(), bundle_id: "test.sweeflow".into(), title: "menu".into(), w: 60.0, h: 40.0, rel_x: 100.0, rel_y: 120.0, kind: 1, parent: 1, sheet: false };
     app.on_net(UiEvent::WindowAdded(popup));
     let magenta: Vec<u8> = (0..60 * 40).flat_map(|_| [128u8, 0, 128, 128]).collect();
     app.on_net(UiEvent::RawFrame { wid: 3, w: 60, h: 40, px_per_pt: 1, capture_us: 7, bgra: magenta });

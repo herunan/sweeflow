@@ -33,6 +33,8 @@ pub struct WinInfo {
     pub rel_x: f32,
     pub rel_y: f32,
     pub kind: u8,
+    /// A sheet (kind 1, at window level in its parent: a save sheet). Older Macs don't say.
+    pub sheet: bool,
 }
 
 impl WinInfo {
@@ -1226,6 +1228,7 @@ fn read_win_info(r: &mut R) -> Result<WinInfo> {
         rel_x: r.f32()?,
         rel_y: r.f32()?,
         kind: r.u8()?,
+        sheet: r.u8().is_ok_and(|s| s != 0),
     })
 }
 

@@ -15,6 +15,9 @@ struct TrackedWindow: Equatable {
     var kind: Kind
 
     var rel: CGPoint = .zero   // offset from parent's origin, for popups
+    /// A sheet (a popup at window level hanging in one of its app's windows): Linux may show it as
+    /// a dialog of that window instead of a popup (Hyprland drew popups under floating windows).
+    var sheet = false
 }
 
 /// Polls the window server for on-screen windows of the streamed apps and reports diffs.
@@ -418,6 +421,7 @@ final class WindowTracker {
             // moves with it (a tiler scrolling, the window dragged) and keeps its size. Shown
             // as a dialog of its own instead, it stayed behind on Plasma and could be resized.
             p.kind = .popup
+            p.sheet = true
             popups.append(p)
             seen[wid] = nil
             order.removeAll { $0 == wid }

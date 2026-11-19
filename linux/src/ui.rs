@@ -956,8 +956,18 @@ impl App {
         }
     }
 
-    fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
+    fn add_window(&mut self, mut info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
+        // Hyprland: a sheet is a dialog of its window, its own size, on top. As a popup it was
+        // drawn at its window's level, under any floating window (its buttons hidden).
+        let hypr_sheet = info.kind == 1
+            && info.sheet
+            && crate::hyprland::running()
+            && self.windows.get(&info.parent).is_some_and(|p| matches!(p.role, Role::Toplevel(_)) && !p.display);
+        if hypr_sheet {
+            info.kind = 0;
+            self.pending_fixed.insert(wid, (None, true));
+        }
         self.arrival.window_added(wid, info.parent == 0);
         // The window last used here, back after a Stop and Start: in front on the Mac again,
         // which then says so (Focused) and it's focused here as it arrives.
@@ -1090,7 +1100,13 @@ impl App {
                 if let Some(p) = &parent {
                     window.xdg_toplevel().set_parent(Some(p));
                     if crate::hyprland::running() {
-                        crate::hyprland::bring_up(format!("sweeflow-{}", info.bundle_id), display_title(&info.app_name, &info.title));
+                        let class = format!("sweeflow-{}", info.bundle_id);
+                        if hypr_sheet {
+                            // Where it hangs in its window, as on the Mac.
+                            let parent_title = self.windows.get(&info.parent).map(|p| display_title(&p.info.app_name, &p.info.title)).unwrap_or_default();
+                            crate::hyprland::place_on_parent(class.clone(), display_title(&info.app_name, &info.title), parent_title, (info.rel_x, info.rel_y));
+                        }
+                        crate::hyprland::bring_up(class, display_title(&info.app_name, &info.title));
                     }
                 }
                 floated_now = true;
