@@ -582,8 +582,23 @@ pub fn place_on_parent(class: String, title: String, parent_title: String, rel: 
                 let n = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
                 let (px, py, pw, ph) = (n(&p["at"][0]), n(&p["at"][1]), n(&p["size"][0]), n(&p["size"][1]));
                 let (sw, sh) = (n(&s["size"][0]), n(&s["size"][1]));
-                let x = (px + (rel.0 as f64).clamp(0.0, (pw - sw).max(0.0))).round();
-                let y = (py + (rel.1 as f64).clamp(0.0, (ph - sh).max(0.0))).round();
+                let mut x = px + (rel.0 as f64).clamp(0.0, (pw - sw).max(0.0));
+                let mut y = py + (rel.1 as f64).clamp(0.0, (ph - sh).max(0.0));
+                // And on the screen: over a window shorter than it, at the bottom, its buttons
+                // ran off the screen's edge.
+                if let Some(serde_json::Value::Array(monitors)) =
+                    Command::new("hyprctl").args(["-j", "monitors"]).output().ok().and_then(|o| serde_json::from_slice(&o.stdout).ok())
+                {
+                    if let Some(m) = monitors.iter().find(|m| m["id"] == s["monitor"]) {
+                        let scale = n(&m["scale"]).max(0.1);
+                        let (left, top, right, bottom) = (n(&m["reserved"][0]), n(&m["reserved"][1]), n(&m["reserved"][2]), n(&m["reserved"][3]));
+                        let (ax, ay) = (n(&m["x"]) + left, n(&m["y"]) + top);
+                        let (aw, ah) = (n(&m["width"]) / scale - left - right, n(&m["height"]) / scale - top - bottom);
+                        x = x.min(ax + (aw - sw).max(0.0)).max(ax);
+                        y = y.min(ay + (ah - sh).max(0.0)).max(ay);
+                    }
+                }
+                let (x, y) = (x.round(), y.round());
                 let Some(address) = s["address"].as_str() else { return };
                 let window = format!("address:{address}");
                 dispatch(
