@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="201" height="20" role="img" aria-label="Omarchy Hyprland, Wayland">
+<title>Omarchy Hyprland, Wayland</title>
+<linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+<clipPath id="r"><rect width="201" height="20" rx="3" fill="#fff"/></clipPath>
+<g clip-path="url(#r)">
+<rect width="80" height="20" fill="#2D333B"/>
+<rect x="80" width="62" height="20" fill="#444C56"/>
+<rect x="142" width="59" height="20" fill="#8B5CF6"/>
+<rect width="201" height="20" fill="url(#s)"/>
+</g>
+<path transform="translate(6 3) scale(0.5833333333333334)" fill="#fff" d="M0 0v24h12.8v-3.2h8V3.2h-3.2v1.6h1.6v14.4H4.8V4.8h8V1.6h9.6v20.8h-8V24H24V0Zm1.6 1.6h9.6v1.6h-8v8H1.6Zm0 11.2h1.6v8h8v1.6H1.6Z"/>
+<g fill="#fff" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+<text x="24" y="15" fill="#010101" fill-opacity=".3">Omarchy</text><text x="24" y="14">Omarchy</text>
+<text x="86" y="15" fill="#010101" fill-opacity=".3">Hyprland</text><text x="86" y="14">Hyprland</text>
+<text x="148" y="15" fill="#010101" fill-opacity=".3">Wayland</text><text x="148" y="14">Wayland</text>
+</g>
+</svg>

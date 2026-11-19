@@ -6,72 +6,89 @@
 
 ### A Linux home for your Mac apps
 
-Are you Linux at heart, with one Mac app you can't drop?<br>
-Keep both on one screen.
+Are you Linux at heart, with one Mac app you can't drop? Keep both on one screen.
 
 [**Website**](https://sweeflow.app) · [**Download**](https://github.com/herunan/sweeflow/releases/latest) · [**Sponsor**](https://github.com/sponsors/herunan)
 
 [![MIT licence](https://img.shields.io/badge/licence-MIT-8b5cf6)](LICENSE)
-![Linux client](https://img.shields.io/badge/Linux-Wayland%20%26%20X11-8b5cf6)
-![Mac host](https://img.shields.io/badge/macOS-15%2B-8b5cf6)
+![Linux client](https://img.shields.io/badge/Linux-client-8b5cf6?logo=linux&logoColor=white)
+![Mac host](https://img.shields.io/badge/macOS-15%2B-8b5cf6?logo=apple&logoColor=white)
 
 <img src="site/og.png" width="820" alt="Mac apps in their own windows on a Linux desktop, next to Konsole and Dolphin">
 
 </div>
 
-Sweeflow streams the windows of your Mac apps to your Linux desktop, one window each. They sit next to your Linux windows in the taskbar, tile and snap with them, and take your keyboard and mouse like any other window. No remote desktop, no second screen to look at.
+## Why Sweeflow
 
-## What it does
+You moved to Linux, but one app still keeps you on your Mac. So you switch screens all day, or you open a remote desktop with a whole Mac squeezed into one window.
 
-- 🔗 **Link your Mac.** Choose it on Linux, type the 4-digit code it shows, and you're streaming. Encrypted, with each computer's certificate pinned when you link them.
-- 🚀 **Open Mac apps** from your Linux launcher, next to your Linux apps.
-- 🪟 **Use them like any window.** Move, resize, minimise, close, tile. Smooth at up to 120 fps, and Retina sharp.
-- 🤝 **Both working together.** Drag files across, copy and paste between apps, hear the Mac's sound on Linux.
-- ⌨️ **Mac shortcuts where they belong.** ⌘ shortcuts go to the Mac window you're in; your desktop keeps its own (window switching, workspaces, launcher), and you choose which.
-- 🌍 **Your Mac, anywhere.** A MacBook beside you, a Mac mini miles away over Tailscale, or a macOS VM on your PC.
+Sweeflow seamlessly streams just the apps you need from your Mac to your Linux desktop. Each Mac window opens as its own window on Linux. It sits in your taskbar and moves, tiles and closes like your other windows.
 
-## Your Linux flavour
+## Features
 
-Tested on **KDE Plasma**, **GNOME** (Ubuntu, CachyOS), **Cinnamon** (Linux Mint) and **Hyprland** (Omarchy), on Wayland and X11.
+- **Fast, sharp and smooth.** Up to 120 fps and Retina sharp.
+- **Apps in launcher.** Your Mac apps show up in your launcher, next to your Linux apps.
+- **Shared clipboard.** Copy on one, paste on the other.
+- **Drag and drop files.** Move files between Mac windows and Linux.
+- **Sound passthrough.** The Mac's sound plays on your Linux machine.
+- **Global menu.** On KDE Plasma, the Mac app's menu bar sits in your panel.
+- **Mac shortcuts.** Sweeflow maps your keys like a Mac. Super is ⌘ and Alt is ⌥. You choose which shortcuts stay with Linux.
+- **Local, remote or VM.** Use a MacBook beside you, a Mac mini miles away over Tailscale, or a macOS VM on your PC.
+
+## Tested on
+
+<img src="assets/badges/cachyos-plasma.svg" alt="CachyOS KDE Plasma, Wayland">
+<img src="assets/badges/cachyos-gnome.svg" alt="CachyOS GNOME, Wayland">
+<img src="assets/badges/ubuntu-gnome.svg" alt="Ubuntu GNOME, Wayland">
+<img src="assets/badges/mint-cinnamon.svg" alt="Linux Mint Cinnamon, X11">
+<img src="assets/badges/omarchy-hyprland.svg" alt="Omarchy Hyprland, Wayland">
+
+Using another Linux flavour? Contributions to support it are welcome.
 
 ## Install
 
-Two apps: the **host** goes on your Mac and shares its windows; the **client** goes on Linux and shows them.
+Sweeflow comes in two parts. The Mac host goes on your Mac and shares its windows. The Linux client goes on Linux and shows them.
 
-### On Linux
+### 1. Install the Mac host
 
-Any distro:
+[**Download Sweeflow for Mac**](https://github.com/herunan/sweeflow/releases/latest/download/Sweeflow.dmg) and drag it to Applications. It needs macOS 15 or later.
+
+Open it and allow all permissions. Then go to the **Link a Linux machine** screen.
+
+### 2. Install the Linux client
+
+**Any distro**
 
 ```sh
 curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/install.sh | sh
 ```
 
-Arch (AUR):
+**Arch**
 
 ```sh
 yay -S sweeflow
 ```
 
-Debian, Ubuntu, Mint:
+**Debian, Ubuntu and Mint**
 
 ```sh
 curl -fsSLO https://github.com/herunan/sweeflow/releases/latest/download/sweeflow_amd64.deb
 sudo apt install ./sweeflow_amd64.deb
 ```
 
-Fedora and other RPM distros: `sweeflow.x86_64.rpm` from the [latest release](https://github.com/herunan/sweeflow/releases/latest).
+**Fedora**
 
-### On your Mac
+Get `sweeflow.x86_64.rpm` from the [latest release](https://github.com/herunan/sweeflow/releases/latest).
 
-[**Download Sweeflow for Mac**](https://github.com/herunan/sweeflow/releases/latest/download/Sweeflow.dmg) (macOS 15 or later), open it and drag Sweeflow to Applications. Its setup asks for the permissions it needs (Screen Recording, Accessibility) and ends on the **Link a Linux machine** screen.
+### 3. Link them
 
-### Link them
-
-On Linux, Sweeflow's setup opens by itself: choose your Mac and type the code it shows. That's it.
+Sweeflow opens **Link a Mac** by itself. Choose your Mac and type the code it shows. Your Mac apps then appear in your launcher.
 
 ## How it works
 
-The Mac host captures each window with ScreenCaptureKit and encodes it as HEVC (10-bit colour in High quality). The Linux client decodes with VA-API on the GPU (or on the CPU where it can't) and shows each Mac window as a window of its own, in a Wayland or X11 client written in Rust. Pictures, input, clipboard, files and sound travel over QUIC. See [PROTOCOL.md](PROTOCOL.md) for the details.
+The Mac host captures each window and sends it as video. The Linux client shows each one as a window of its own. Everything travels over QUIC and is encrypted. Each computer's certificate is pinned when you link them.
+
+The details are in [PROTOCOL.md](PROTOCOL.md).
 
 ## Build from source
 
@@ -85,9 +102,11 @@ cd mac && ./install.sh
 
 ## Support
 
-Sweeflow is free and open source under the [MIT licence](LICENSE). If it's useful to you, you can help keep it going:
+Sweeflow is free and open source under the [MIT licence](LICENSE). If it's useful to you, you can help keep it going.
 
 [![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-8b5cf6?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/herunan)
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-Ko--fi-8b5cf6?logo=kofi&logoColor=white)](https://ko-fi.com/herunan)
+
+Thank you!
 
 <sub>Mac and macOS are trademarks of Apple Inc. Sweeflow is not affiliated with Apple.</sub>
