@@ -758,7 +758,51 @@ mod tests {
 /// binding while an app holds its shortcuts, nor one asked for by name: the way other desktops
 /// do it doesn't work here.)
 pub fn mac_keys(on: bool) {
-    std::thread::spawn(move || {
+    // One at a time, the newest asked for last: each on a thread of its own, they finished in
+    // any order (on, off, on quickly: Hyprland was left in its own mode while a Mac window had
+    // the keys, and Super+O went to Omarchy).
+    static WANT: std::sync::Mutex<(Option<bool>, bool)> = std::sync::Mutex::new((None, false));
+    {
+        let mut want = WANT.lock().unwrap();
+        want.0 = Some(on);
+        if want.1 {
+            return; // the one working takes it up
+        }
+        want.1 = true;
+    }
+    std::thread::spawn(|| loop {
+        let next = {
+            let mut want = WANT.lock().unwrap();
+            match want.0.take() {
+                Some(on) => on,
+                None => {
+                    want.1 = false;
+                    return;
+                }
+            }
+        };
+        set_mac_keys(next);
+    });
+}
+
+/// mac_keys' work: Hyprland's key mode for Mac windows on, or its own mode back. Checked after
+/// (once again if Hyprland isn't in the mode asked for).
+fn set_mac_keys(on: bool) {
+    for attempt in 0..2 {
+        apply_mac_keys(on);
+        let now = current_submap();
+        let is_ours = now.as_deref().is_some_and(|s| s.starts_with("sweeflow"));
+        if is_ours == on || now.is_none() {
+            return;
+        }
+        if attempt == 0 {
+            log::info!("Hyprland's key mode is {now:?}, not {}: asked again", if on { "Sweeflow's" } else { "its own" });
+        }
+    }
+}
+
+fn apply_mac_keys(on: bool) {
+    {
         // Omarchy's menus, where it's Omarchy (Hyprland's Lua can't look for the command).
         let omarchy = Command::new("sh").args(["-c", "command -v omarchy-menu"]).output().is_ok_and(|o| o.status.success());
         let omarchy = if omarchy {
@@ -823,7 +867,7 @@ pub fn mac_keys(on: bool) {
             Ok(o) => log::warn!("Hyprland didn't take Sweeflow's key mode ({on}): {}", String::from_utf8_lossy(&o.stdout).trim()),
             Err(e) => log::debug!("hyprctl: {e}"),
         }
-    });
+    }
 }
 
 /// The keys kept for Linux changed: the key mode is made again, now if it's on (made again

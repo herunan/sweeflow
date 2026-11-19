@@ -343,6 +343,8 @@ pub struct App {
     swallowed: Vec<u32>,
     /// Keys handed to the window manager, pressed again for it once let go (see `key`).
     handed: Vec<u8>,
+    /// Keys typed right after ⌘N, waiting for the window it opens (keys::NewWindowWait).
+    new_window_wait: crate::keys::NewWindowWait,
     press_id: u32,
     press_at: (f64, f64),
     move_ready: bool,
@@ -489,6 +491,7 @@ impl App {
             keys_down: HashSet::new(),
             swallowed: Vec::new(),
             handed: Vec::new(),
+            new_window_wait: Default::default(),
             press_id: 0,
             press_at: (0.0, 0.0),
             move_ready: false,
@@ -771,8 +774,35 @@ impl App {
 
     // --- windows ----------------------------------------------------------------------------
 
+    /// A key to the Mac (1 press, 0 let go, 2 repeat), unless it waits for the window ⌘N opens.
+    fn send_key(&mut self, raw: u32, state: u8) {
+        let code = crate::keys::mac_code(raw);
+        let was_waiting = self.new_window_wait.waiting();
+        if !self.new_window_wait.pass(code, state) {
+            return;
+        }
+        self.send(W::new(t::KEY).u32(code).u8(state).finish());
+        if !was_waiting && self.new_window_wait.waiting() {
+            let _ = self.loop_handle.insert_source(Timer::from_duration(crate::keys::HOLD_FOR_NEW_WINDOW), |_, _, app| {
+                app.send_held_keys();
+                TimeoutAction::Drop
+            });
+        }
+    }
+
+    /// The keys typed after ⌘N, now its window is there (or the wait is up).
+    fn send_held_keys(&mut self) {
+        for (code, state) in self.new_window_wait.release() {
+            self.send(W::new(t::KEY).u32(code).u8(state).finish());
+        }
+    }
+
     fn add_window(&mut self, info: WinInfo) {
         let wid = info.wid;
+        // The window ⌘N opened, maybe: what was typed after it goes now, into it.
+        if info.kind != 1 && self.new_window_wait.waiting() {
+            self.send_held_keys();
+        }
         self.arrival.window_added(wid, info.parent == 0);
         if self.closed_offline.remove(&wid) {
             log::info!("window {wid} was closed while the Mac was away: closing it there");
@@ -2950,7 +2980,7 @@ impl App {
                 self.swallowed.remove(i);
                 return;
             }
-            self.send(W::new(t::KEY).u32(crate::keys::mac_code(code)).u8(0).finish());
+            self.send_key(code, 0);
             return;
         }
         if !self.keys_down.insert(keycode) {
@@ -2958,7 +2988,7 @@ impl App {
             if self.swallowed.contains(&code) {
                 return;
             }
-            self.send(W::new(t::KEY).u32(crate::keys::mac_code(code)).u8(2).finish());
+            self.send_key(code, 2);
             return;
         }
         if is_meta {
@@ -3023,7 +3053,7 @@ impl App {
             self.swallowed.push(code);
             return;
         }
-        self.send(W::new(t::KEY).u32(crate::keys::mac_code(code)).u8(1).finish());
+        self.send_key(code, 1);
     }
 }
 

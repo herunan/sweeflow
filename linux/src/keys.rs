@@ -421,6 +421,91 @@ fn swapped(raw: u32) -> u32 {
     }
 }
 
+/// Keys typed right after ⌘N wait for the window it opens. On the Mac the app takes them in
+/// order, after ⌘N, into the new window; sent from here they reached it before the window was
+/// there (it took half a second on the Mac to appear) and went into the old one. So after ⌘N
+/// (with Shift or not) the keys that follow are held, in order, until a new window comes or
+/// `HOLD_FOR_NEW_WINDOW` is up. The ⌘N's own keys let go meanwhile still go at once.
+#[derive(Default)]
+pub struct NewWindowWait {
+    cmd_down: u8,
+    until: Option<std::time::Instant>,
+    held: Vec<(u32, u8)>,
+}
+
+pub const HOLD_FOR_NEW_WINDOW: std::time::Duration = std::time::Duration::from_millis(800);
+
+impl NewWindowWait {
+    /// A key on its way to the Mac (Mac-side code as mac_code gives it; 1 press, 0 let go, 2
+    /// repeat): true when it goes now, false when it's held (taken: `release` gives it back).
+    pub fn pass(&mut self, code: u32, state: u8) -> bool {
+        let is_cmd = code == 125 || code == 126;
+        if self.until.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.until = None;
+        }
+        let holding = self.until.is_some();
+        // Keys let go before anything was held: the ⌘N's own.
+        let goes = !holding || (state == 0 && self.held.is_empty());
+        if goes {
+            if is_cmd {
+                match state {
+                    1 => self.cmd_down = self.cmd_down.saturating_add(1),
+                    0 => self.cmd_down = self.cmd_down.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            // ⌘N pressed: what comes next waits for its window.
+            if code == 49 && state == 1 && self.cmd_down > 0 {
+                self.until = Some(std::time::Instant::now() + HOLD_FOR_NEW_WINDOW);
+            }
+            return true;
+        }
+        self.held.push((code, state));
+        false
+    }
+
+    /// Waiting for a new window (a timer should call `release` when it's up).
+    pub fn waiting(&self) -> bool {
+        self.until.is_some()
+    }
+
+    /// The new window came (or the wait is up): the keys held, in order, to send now.
+    pub fn release(&mut self) -> Vec<(u32, u8)> {
+        self.until = None;
+        let held = std::mem::take(&mut self.held);
+        for &(code, state) in &held {
+            if code == 125 || code == 126 {
+                match state {
+                    1 => self.cmd_down = self.cmd_down.saturating_add(1),
+                    0 => self.cmd_down = self.cmd_down.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        held
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn keys_after_cmd_n_wait_for_the_new_window() {
+    let mut w = NewWindowWait::default();
+    // ⌘ down, N down: both go.
+    assert!(w.pass(125, 1) && w.pass(49, 1));
+    assert!(w.waiting());
+    // N and ⌘ let go before anything is typed: go too (the shortcut's own).
+    assert!(w.pass(49, 0));
+    // Typing: held, and what's let go after it too (order kept).
+    assert!(!w.pass(45, 1));
+    assert!(!w.pass(125, 0));
+    assert!(!w.pass(45, 0));
+    assert_eq!(w.release(), vec![(45, 1), (125, 0), (45, 0)]);
+    assert!(!w.waiting());
+    // ⌘ is up now: N alone doesn't wait.
+    assert!(w.pass(49, 1) && w.pass(49, 0));
+    assert!(!w.waiting());
+}
+
 #[cfg(test)]
 #[test]
 fn swap_turns_alt_into_cmd_and_super_into_opt() {

@@ -335,6 +335,8 @@ pub struct App {
     hypr_mac_keys: bool,
     /// A look at the shortcuts inhibitor is due (a window waits for GNOME, gnome_ready).
     inhibit_recheck: bool,
+    /// Keys typed right after ⌘N, waiting for the window it opens (keys::NewWindowWait).
+    new_window_wait: crate::keys::NewWindowWait,
     /// Launches whose app had no window here yet: their token, for the window when it comes.
     launch_tokens: HashMap<String, (String, std::time::Instant)>,
     /// Plain sRGB, stated on every surface showing video (KWin would otherwise guess for
@@ -543,6 +545,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
             false
         },
         inhibit_recheck: false,
+        new_window_wait: Default::default(),
         launch_tokens: HashMap::new(),
         srgb: None,
         srgb_ready: false,
@@ -1253,6 +1256,10 @@ impl App {
             }
         }
         if !is_popup {
+            // The window ⌘N opened, maybe: what was typed after it goes now, into it.
+            if self.new_window_wait.waiting() {
+                self.send_held_keys();
+            }
             self.apply_icon(wid, qh);
             // Launched here moments ago: the launcher's token puts it in front (and ends the
             // launch feedback); without it a compositor may keep it behind.
@@ -2854,9 +2861,39 @@ impl App {
     }
 
     /// Hands the desktop its keys back for a moment (and while a modifier stays held).
+    /// A key to the Mac (1 press, 0 let go, 2 repeat), unless it waits for the window ⌘N opens.
+    fn send_key(&mut self, raw: u32, state: u8, _: &QueueHandle<Self>) {
+        let code = crate::keys::mac_code(raw);
+        let was_waiting = self.new_window_wait.waiting();
+        if !self.new_window_wait.pass(code, state) {
+            return;
+        }
+        self.send(W::new(t::KEY).u32(code).u8(state).finish());
+        if !was_waiting && self.new_window_wait.waiting() {
+            let _ = self.loop_handle.insert_source(Timer::from_duration(crate::keys::HOLD_FOR_NEW_WINDOW), |_, _, app| {
+                app.send_held_keys();
+                TimeoutAction::Drop
+            });
+        }
+    }
+
+    /// The keys typed after ⌘N, now its window is there (or the wait is up).
+    fn send_held_keys(&mut self) {
+        for (code, state) in self.new_window_wait.release() {
+            self.send(W::new(t::KEY).u32(code).u8(state).finish());
+        }
+    }
+
     fn let_go_now(&mut self, qh: &QueueHandle<Self>) {
         self.let_go = Some(Instant::now() + Duration::from_millis(1500));
         self.sync_inhibitor(qh);
+        // Taken back when the moment's up: otherwise only with the next key let go, and a Mac
+        // window gained meanwhile (Hyprland) kept the desktop's keys.
+        let qh = qh.clone();
+        let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(1550)), move |_, _, app| {
+            app.sync_inhibitor(&qh);
+            TimeoutAction::Drop
+        });
     }
 
     /// The user pressed a key or a button: a focus kept from the Mac while windows arrived is
@@ -4112,17 +4149,17 @@ impl KeyboardHandler for App {
                 return;
             }
         }
-        self.send(W::new(t::KEY).u32(crate::keys::mac_code(e.raw_code)).u8(1).finish());
+        self.send_key(e.raw_code, 1, qh);
     }
 
-    fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
+    fn repeat_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
         if self.swallowed.contains(&e.raw_code) {
             if e.raw_code == KEY_TAB {
                 switch_windows(self.shift_down > 0);
             }
             return;
         }
-        self.send(W::new(t::KEY).u32(crate::keys::mac_code(e.raw_code)).u8(2).finish());
+        self.send_key(e.raw_code, 2, qh);
     }
 
     fn release_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
@@ -4138,7 +4175,7 @@ impl KeyboardHandler for App {
             self.swallowed.remove(i);
             return;
         }
-        self.send(W::new(t::KEY).u32(crate::keys::mac_code(e.raw_code)).u8(0).finish());
+        self.send_key(e.raw_code, 0, qh);
     }
 
     fn update_modifiers(
