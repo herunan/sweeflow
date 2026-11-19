@@ -701,6 +701,9 @@ final class Session {
         holdInput(until: wid, at: p, raised: known == false, why: why, then: post)
     }
 
+    /// Windows moved once more after coming onto the virtual display (placeOnVirtualDisplay).
+    private var movedOnceMore = Set<UInt32>()
+
     /// Windows pressed on at least once (see `press`).
     private var pressedOnce = Set<UInt32>()
 
@@ -1233,7 +1236,8 @@ final class Session {
         // after the first move (TextEdit's Open panel: clicks on New Document did nothing, as
         // if they landed where the panel had been); a second move puts it right.
         let fromElsewhere = !area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1))
-        guard fromElsewhere else { return }
+        // Once (it's placed again on every look until the tracker sees it there).
+        guard fromElsewhere, movedOnceMore.insert(w.wid).inserted else { return }
         let (wid, pid) = (w.wid, w.pid)
         queue.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             guard let self, let at = self.tracker.liveFrame(wid)?.origin else { return }
@@ -1681,6 +1685,7 @@ final class Session {
             let wid = w.wid
             self.announced.remove(wid)
             self.pressedOnce.remove(wid)
+            self.movedOnceMore.remove(wid)
             // Its popups waiting for it: told now, with whatever window they have by then.
             for c in self.awaitingParent.removeValue(forKey: wid) ?? [] {
                 if let now = self.tracker.windows[c] { self.sendAdded(now) }
