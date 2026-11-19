@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="site/icon.svg" width="96" alt="Sweeflow logo">
+<img src="assets/readme/logo.svg" width="96" alt="Sweeflow logo">
 
 # Sweeflow
 
@@ -14,7 +14,7 @@ Are you Linux at heart, with one Mac app you can't drop? Keep both on one screen
 ![Linux client](https://img.shields.io/badge/Linux-client-8b5cf6?logo=linux&logoColor=white)
 ![Mac host](https://img.shields.io/badge/macOS-15%2B-8b5cf6?logo=apple&logoColor=white)
 
-<img src="site/og.png" width="820" alt="Mac apps in their own windows on a Linux desktop, next to Konsole and Dolphin">
+<img src="assets/readme/screenshot.png" width="820" alt="Mac apps in their own windows on a Linux desktop, next to Konsole and Dolphin">
 
 </div>
 

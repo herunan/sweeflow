@@ -15,7 +15,7 @@ accepted = [
     "WTFPL",
     # Slint offers GPL-3.0-only, this one, or a commercial licence. The Royalty-free one lets a
     # desktop app be distributed under its own licence (MIT) if it shows the Slint badge on its
-    # download page (site/index.html does) or an AboutSlint widget. cargo-about warns that it has
+    # download page (the website does) or an AboutSlint widget. cargo-about warns that it has
     # no licence file for those crates; licenses.sh adds the text.
     "LicenseRef-Slint-Royalty-free-2.0",
 ]
