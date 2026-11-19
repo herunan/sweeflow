@@ -407,6 +407,11 @@ pub struct App {
     pointer: Option<wl_pointer::WlPointer>,
     cursor_device: Option<WpCursorShapeDeviceV1>,
     pointer_focus: Option<u32>,
+    /// The window under the pointer went away (closed on the Mac, an Open panel giving way to
+    /// the document it opened), and since then the pointer is on none of ours: when. The desktop
+    /// says nothing until it reaches one of ours again, though it's likely still over the Mac
+    /// window just opened there (sync_inhibitor).
+    pointer_stranded: Option<Instant>,
     kb_focus: Option<u32>,
     /// The Mac window that last had the keyboard here: after a Stop and Start it's the one put in
     /// front again (the Mac's own front window may have changed meanwhile: Herdr came up instead).
@@ -586,6 +591,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         pointer: None,
         cursor_device: None,
         pointer_focus: None,
+        pointer_stranded: None,
         kb_focus: None,
         last_mac_focus: None,
         arrival: Default::default(),
@@ -1416,6 +1422,7 @@ impl App {
         }
         if self.pointer_focus == Some(wid) {
             self.pointer_focus = None;
+            self.pointer_stranded = Some(Instant::now());
         }
         if self.kb_focus == Some(wid) {
             self.kb_focus = None;
@@ -2794,8 +2801,14 @@ impl App {
                 self.let_go = None;
             }
         }
+        // Or the window under the pointer went away a moment ago, and nothing has said where it is
+        // since: as if still over a Mac window (Super+A after "New Document" in TextEdit's Open
+        // panel went to GNOME: the panel went, the document opened elsewhere, the pointer was
+        // on no window of ours). Until the pointer is heard of again, or 20 s.
+        let stranded = self.pointer_focus.is_none() && self.pointer_stranded.is_some_and(|t| t.elapsed() < Duration::from_secs(20));
         let target = match (self.kb_focus, self.pointer_focus) {
             (Some(f), Some(p)) if self.let_go.is_none() && self.windows.contains_key(&p) => Some(f),
+            (Some(f), None) if self.let_go.is_none() && stranded => Some(f),
             _ => None,
         };
         if crate::hyprland::running() {
@@ -3779,6 +3792,7 @@ impl PointerHandler for App {
                 PointerEventKind::Enter { serial } => {
                     log::debug!("pointer entered {wid} at {x:.0},{y:.0}");
                     self.pointer_focus = Some(wid);
+                    self.pointer_stranded = None;
                     self.sync_inhibitor(qh);
                     self.enter_serial = serial;
                     if self.cursor_surface.is_some() {
@@ -3797,6 +3811,7 @@ impl PointerHandler for App {
                     if self.pointer_focus == Some(wid) {
                         self.pointer_focus = None;
                     }
+                    self.pointer_stranded = None;
                     self.sync_inhibitor(qh);
                     if let Some(w) = self.windows.get_mut(&wid) {
                         w.lights_hover = false;
