@@ -169,6 +169,8 @@ pub enum Internal {
     DropRead,
     /// Told to stop (SIGTERM: a restart, Quit): the windows go first, then the process.
     Shutdown,
+    /// The next window's paused still (App::freeze_all).
+    FreezeNext,
 }
 
 enum Role {
@@ -370,6 +372,8 @@ pub struct App {
     /// Mac window under a Linux drag, and where.
     dnd_target: Option<(u32, f64, f64)>,
     internal: channel::Sender<Internal>,
+    /// Windows whose paused still is still to be made (freeze_all).
+    to_freeze: Vec<u32>,
     menus: Option<Menus>,
     trace: bool,
     loop_handle: LoopHandle<'static, App>,
@@ -550,6 +554,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         pointer_at: (0, 0.0, 0.0),
         dnd_target: None,
         internal: int_tx,
+        to_freeze: Vec::new(),
         menus: None,
         trace: std::env::var_os("SWEEFLOW_TRACE").is_some(),
         compositor,
@@ -641,13 +646,22 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let qh3 = qh.clone();
     event_loop
         .handle()
-        .insert_source(int_rx, |ev, _, app: &mut App| match ev {
+        .insert_source(int_rx, move |ev, _, app: &mut App| match ev {
             channel::Event::Msg(Internal::DropRead) => {
                 if let Some(offer) = app.dnd_device.as_ref().and_then(|d| d.data().drag_offer()) {
                     offer.finish();
                     offer.destroy();
+                }
+            }
+            channel::Event::Msg(Internal::FreezeNext) => {
+                // Still paused (a resume meanwhile leaves the rest live).
+                if app.paused || !app.connected {
+                    app.freeze_next(&qh3);
+                } else {
+                    app.to_freeze.clear();
                 }
             }
             channel::Event::Msg(Internal::Shutdown) => {
@@ -1058,6 +1072,9 @@ impl App {
                 });
                 if let Some(p) = &parent {
                     window.xdg_toplevel().set_parent(Some(p));
+                    if crate::hyprland::running() {
+                        crate::hyprland::bring_up(format!("sweeflow-{}", info.bundle_id), display_title(&info.app_name, &info.title));
+                    }
                 }
                 floated_now = true;
                 fixed_spot = spot;
@@ -2648,10 +2665,18 @@ impl App {
         });
     }
 
+    /// Every window's still, one window per turn of the event loop (Internal::FreezeNext): each
+    /// reads its picture back from the GPU, and all at once held everything else up to 230 ms.
     fn freeze_all(&mut self, qh: &QueueHandle<Self>) {
-        let wids: Vec<u32> = self.windows.iter().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))).map(|(k, _)| *k).collect();
-        for wid in wids {
-            self.freeze(wid, qh);
+        self.to_freeze = self.windows.iter().filter(|(_, w)| matches!(w.role, Role::Toplevel(_))).map(|(k, _)| *k).collect();
+        self.freeze_next(qh);
+    }
+
+    fn freeze_next(&mut self, qh: &QueueHandle<Self>) {
+        let Some(wid) = self.to_freeze.pop() else { return };
+        self.freeze(wid, qh);
+        if !self.to_freeze.is_empty() {
+            let _ = self.internal.send(Internal::FreezeNext);
         }
     }
 

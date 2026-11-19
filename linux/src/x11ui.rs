@@ -369,6 +369,8 @@ pub struct App {
     host: String,
     connected: bool,
     paused: bool,
+    /// Windows whose paused still is still to be made, one per turn of the loop (freeze_all).
+    to_freeze: Vec<u32>,
     closed_offline: HashSet<u32>,
     menu_panel_shown: Option<bool>,
     hostname: String,
@@ -504,6 +506,7 @@ impl App {
             host,
             connected: false,
             paused: false,
+            to_freeze: Vec::new(),
             closed_offline: HashSet::new(),
             menu_panel_shown: None,
             hostname,
@@ -553,8 +556,11 @@ impl App {
             if until.is_some_and(|u| Instant::now() >= u) {
                 return Ok(());
             }
+            self.freeze_next();
             let t0 = Instant::now();
-            event_loop.dispatch(Duration::from_millis(100), &mut self)?;
+            // Not waiting while stills are still to be made.
+            let wait = if self.to_freeze.is_empty() { Duration::from_millis(100) } else { Duration::ZERO };
+            event_loop.dispatch(wait, &mut self)?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             if ms > 130.0 {
                 log::warn!("UI stall: event loop iteration took {ms:.0} ms");
@@ -1839,9 +1845,18 @@ impl App {
         });
     }
 
+    /// Every window's still, one per turn of the loop: each reads its picture back from the GPU,
+    /// and all at once held everything else up (ui.rs's freeze_all).
     fn freeze_all(&mut self) {
-        let wids: Vec<u32> = self.windows.iter().filter(|(_, w)| !w.popup).map(|(k, _)| *k).collect();
-        for wid in wids {
+        self.to_freeze = self.windows.iter().filter(|(_, w)| !w.popup).map(|(k, _)| *k).collect();
+        self.freeze_next();
+    }
+
+    fn freeze_next(&mut self) {
+        if !(self.paused || !self.connected) {
+            return self.to_freeze.clear();
+        }
+        if let Some(wid) = self.to_freeze.pop() {
             self.freeze(wid);
         }
     }

@@ -499,6 +499,24 @@ pub fn take_focus(title: &str) {
     dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
 }
 
+/// A sheet or dialog of a Mac window (it has a parent here): on top and focused once Hyprland has
+/// it. Hyprland left a tiled window's sheet under floating windows, its buttons hidden.
+pub fn bring_up(class: String, title: String) {
+    std::thread::spawn(move || {
+        for _ in 0..10 {
+            if let Some(c) = our_client(&class, &title) {
+                if let Some(address) = c["address"].as_str() {
+                    let window = format!("address:{address}");
+                    dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
+                    dispatch(&format!(r#"hl.dsp.focus({{ window = "{window}" }})"#), &["focuswindow", &window]);
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
 /// Every Hyprland window (any process) that `pick` says.
 fn clients_where(pick: impl Fn(&serde_json::Value) -> bool) -> Vec<serde_json::Value> {
     let Some(out) = Command::new("hyprctl").args(["-j", "clients"]).output().ok() else { return Vec::new() };
