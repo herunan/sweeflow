@@ -341,6 +341,8 @@ pub struct App {
     shift_down: u8,
     keys_down: HashSet<u8>,
     swallowed: Vec<u32>,
+    /// Keys handed to the window manager, pressed again for it once let go (see `key`).
+    handed: Vec<u8>,
     press_id: u32,
     press_at: (f64, f64),
     move_ready: bool,
@@ -486,6 +488,7 @@ impl App {
             shift_down: 0,
             keys_down: HashSet::new(),
             swallowed: Vec::new(),
+            handed: Vec::new(),
             press_id: 0,
             press_at: (0.0, 0.0),
             move_ready: false,
@@ -2934,6 +2937,15 @@ impl App {
             if is_shift {
                 self.shift_down = self.shift_down.saturating_sub(1);
             }
+            if let Some(i) = self.handed.iter().position(|&k| k == keycode) {
+                // Up now: pressed again for the window manager (modifiers still held, as Alt
+                // is when Tab comes up), whose binding runs.
+                use x11rb::protocol::xtest::ConnectionExt as _;
+                self.handed.remove(i);
+                let _ = self.conn.xtest_fake_input(xproto::KEY_PRESS_EVENT, keycode, CURRENT_TIME, self.root, 0, 0, 0);
+                let _ = self.conn.xtest_fake_input(xproto::KEY_RELEASE_EVENT, keycode, CURRENT_TIME, self.root, 0, 0, 0);
+                let _ = self.conn.flush();
+            }
             if let Some(i) = self.swallowed.iter().position(|&k| k == code) {
                 self.swallowed.remove(i);
                 return;
@@ -2994,18 +3006,19 @@ impl App {
         }
         // Keys for windows and the desktop stay the desktop's (deskkeys): the keyboard is let
         // go, and the key pressed again for the window manager (XTest), whose binding runs; one
-        // it doesn't use comes back to the Mac window as usual.
+        // it doesn't use comes back to the Mac window as usual. Pressed again once it's up:
+        // while the key is still down, the X server takes a second press of it for a repeat,
+        // which the window manager's binding ignores (every Alt+Tab handed over did nothing;
+        // only one pressed while the keyboard was still let go from the last worked).
         let m = crate::deskkeys::Mods { logo: self.meta_down > 0, alt: state & 8 != 0, ctrl: state & 4 != 0, shift: self.shift_down > 0 };
         // The person's own keys for Linux (deskkeys::UserKey) go the same way.
         let sym = smithay_client_toolkit::seat::keyboard::Keysym::new(self.keysym(keycode));
         let own = self.kb_grabbed && crate::deskkeys::is_user_key(code, sym.key_char(), sym.name(), m).is_some();
         if own || (self.kb_grabbed && crate::deskkeys::is_desktop_key(code, m)) {
-            use x11rb::protocol::xtest::ConnectionExt as _;
             self.grab_hold_off = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
             self.sync_keyboard_grab();
-            let _ = self.conn.xtest_fake_input(xproto::KEY_PRESS_EVENT, keycode, CURRENT_TIME, self.root, 0, 0, 0);
-            let _ = self.conn.xtest_fake_input(xproto::KEY_RELEASE_EVENT, keycode, CURRENT_TIME, self.root, 0, 0, 0);
             let _ = self.conn.flush();
+            self.handed.push(keycode);
             log::debug!("key {code} with {m:?}: handed to the window manager");
             self.swallowed.push(code);
             return;

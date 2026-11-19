@@ -455,7 +455,10 @@ pub fn apply_own_key(name: &str) {
     } else if desktop.contains("Cinnamon") {
         let cid = id.map_or(CINNAMON_OPEN.to_string(), cinnamon_id);
         let list = if text.is_empty() { "@as []".to_string() } else { format!("[{}]", gvariant_str(&text)) };
-        gsettings(&["set", &cinnamon_schema(&cid), "binding", &list])
+        let r = gsettings(&["set", &cinnamon_schema(&cid), "binding", &list]);
+        // Cinnamon takes a changed key up only with its list (the old key went on working).
+        cinnamon_reread();
+        r
     } else {
         return;
     };
@@ -1484,12 +1487,36 @@ fn cinnamon_commands_now(home: &std::path::Path) {
         }
     }
     if changed {
-        let all = |ids: &[&String]| format!("[{}]", ids.iter().map(|i| gvariant_str(i)).collect::<Vec<_>>().join(", "));
-        let others: Vec<&String> = ids.iter().filter(|i| !cinnamon_ours(i)).collect();
-        let _ = gsettings(&["set", CINNAMON_KEYS, "custom-list", &all(&others)]);
-        let _ = gsettings(&["set", CINNAMON_KEYS, "custom-list", &all(&ids.iter().collect::<Vec<_>>())]);
+        // Rereading the list isn't enough: Cinnamon keeps a binding whose key didn't change,
+        // with its old command. So the keys go, are read, come back, and are read again.
+        let mut keys = Vec::new();
+        for id in ids.iter().filter(|i| cinnamon_ours(i)) {
+            let ours = cinnamon_schema(id);
+            if let Ok(binding) = gsettings(&["get", &ours, "binding"]) {
+                let _ = gsettings(&["set", &ours, "binding", "@as []"]);
+                keys.push((ours, binding.trim().to_string()));
+            }
+        }
+        cinnamon_reread();
+        for (ours, binding) in keys {
+            let _ = gsettings(&["set", &ours, "binding", &binding]);
+        }
+        cinnamon_reread();
         println!("    Sweeflow's Cinnamon shortcuts run {program} now");
     }
+}
+
+/// Has Cinnamon read its custom shortcuts again: it does on a change to their list only (a
+/// shortcut's own settings changing isn't noticed). The list with an entry more, then as it was,
+/// as Cinnamon's own settings do (an entry it skips: "__dummy__").
+fn cinnamon_reread() {
+    let Ok(list) = gsettings(&["get", CINNAMON_KEYS, "custom-list"]) else { return };
+    let ids = quoted(&list);
+    let all = |ids: &[String]| format!("[{}]", ids.iter().map(|i| gvariant_str(i)).collect::<Vec<_>>().join(", "));
+    let mut more = ids.clone();
+    more.push("__dummy__".into());
+    let _ = gsettings(&["set", CINNAMON_KEYS, "custom-list", &all(&more)]);
+    let _ = gsettings(&["set", CINNAMON_KEYS, "custom-list", &all(&ids)]);
 }
 
 /// The keys Cinnamon has now for Sweeflow's custom shortcuts (open, pause, stop), as it writes
