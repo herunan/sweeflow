@@ -1,11 +1,12 @@
 #!/bin/bash
 # Builds Sweeflow.dmg on a Mac over SSH and brings it back to dist/ (the Mac's download, from the
 # website and the GitHub release).
-# Usage: ./release-mac.sh VERSION [user@mac]  (default: your Mac)
+# Usage: ./release-mac.sh VERSION [user@mac]  (default: the one in .dev-mac, a line like you@mac.local)
 set -euo pipefail
 cd "$(dirname "$0")"
 VERSION="${1:?usage: $0 VERSION [user@mac]}"
-TARGET="${2:-you@your-mac.local}"
+TARGET="${2:-$(cat .dev-mac 2>/dev/null)}"
+[ -n "$TARGET" ] || { echo "which Mac? $0 VERSION user@mac, or put user@mac in .dev-mac" >&2; exit 1; }
 BUILD=${BUILD:-$(git rev-list --count HEAD)}  # override for test builds of one commit
 REMOTE='~/.sweeflow/release-src'
 
