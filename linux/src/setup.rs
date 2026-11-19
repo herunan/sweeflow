@@ -215,6 +215,9 @@ pub fn install() -> Result<()> {
     if !crate::globalkeys::available() {
         register_open_key(&home);
         register_stream_keys(&home);
+        if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("Cinnamon") {
+            cinnamon_commands_now(&home);
+        }
     }
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
@@ -1342,6 +1345,7 @@ fn cinnamon_schema(id: &str) -> String {
 fn cinnamon_custom_key(home: &std::path::Path, id: &str, name: &str, arg: &str, key: &str) -> Result<OpenKey> {
     let list = gsettings(&["get", CINNAMON_KEYS, "custom-list"])?;
     let ids = quoted(&list);
+    let command = format!("{} {arg}", command_word(&installed_binary(home).display().to_string()));
     // Ours from an earlier install, whatever key the user has given it since.
     if ids.iter().any(|i| i == id) {
         return Ok(OpenKey::Kept);
@@ -1361,7 +1365,6 @@ fn cinnamon_custom_key(home: &std::path::Path, id: &str, name: &str, arg: &str, 
         }
     }
     let ours = cinnamon_schema(id);
-    let command = format!("{} {arg}", command_word(&installed_binary(home).display().to_string()));
     gsettings(&["set", &ours, "name", &gvariant_str(name)])?;
     gsettings(&["set", &ours, "command", &gvariant_str(&command)])?;
     gsettings(&["set", &ours, "binding", &format!("[{}]", gvariant_str(key))])?;
@@ -1369,6 +1372,35 @@ fn cinnamon_custom_key(home: &std::path::Path, id: &str, name: &str, arg: &str, 
     ids.push(id.to_string());
     gsettings(&["set", CINNAMON_KEYS, "custom-list", &format!("[{}]", ids.iter().map(|i| gvariant_str(i)).collect::<Vec<_>>().join(", "))])?;
     Ok(OpenKey::Set { now: true })
+}
+
+/// Each install: Sweeflow's Cinnamon shortcuts from an earlier one run this install's program
+/// (install.sh's was ~/.local/bin/sweeflow, the .deb's /usr/bin/sweeflow), and the list is set
+/// again, which is what makes Cinnamon read them: it went on running the old one, gone, so the
+/// keys did nothing until the next login. (The keys stay as the person has them.)
+fn cinnamon_commands_now(home: &std::path::Path) {
+    let Ok(list) = gsettings(&["get", CINNAMON_KEYS, "custom-list"]) else { return };
+    let ids = quoted(&list);
+    let program = command_word(&installed_binary(home).display().to_string());
+    let mut changed = false;
+    for (id, arg) in [(CINNAMON_OPEN.to_string(), "open"), (cinnamon_id("toggle-pause"), "toggle-pause"), (cinnamon_id("toggle-stream"), "toggle-stream")] {
+        if !ids.contains(&id) {
+            continue;
+        }
+        let ours = cinnamon_schema(&id);
+        let command = format!("{program} {arg}");
+        let had = gsettings(&["get", &ours, "command"]).ok().and_then(|c| quoted(&c).into_iter().next()).unwrap_or_default();
+        if had != command && gsettings(&["set", &ours, "command", &gvariant_str(&command)]).is_ok() {
+            changed = true;
+        }
+    }
+    if changed {
+        let all = |ids: &[&String]| format!("[{}]", ids.iter().map(|i| gvariant_str(i)).collect::<Vec<_>>().join(", "));
+        let others: Vec<&String> = ids.iter().filter(|i| !cinnamon_ours(i)).collect();
+        let _ = gsettings(&["set", CINNAMON_KEYS, "custom-list", &all(&others)]);
+        let _ = gsettings(&["set", CINNAMON_KEYS, "custom-list", &all(&ids.iter().collect::<Vec<_>>())]);
+        println!("    Sweeflow's Cinnamon shortcuts run {program} now");
+    }
 }
 
 /// The keys Cinnamon has now for Sweeflow's custom shortcuts (open, pause, stop), as it writes

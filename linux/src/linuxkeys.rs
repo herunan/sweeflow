@@ -394,6 +394,14 @@ pub fn run() -> Result<()> {
         let Some(ui) = weak.upgrade() else { return };
         match UserKey::parse(&text) {
             Some(k) if k.logo || k.alt || k.ctrl || k.key.starts_with('F') && k.key.len() > 1 => {
+                // Hyprland: a key the desktop uses already is left to it (hyprland.rs), so it's
+                // said here rather than shown as set. (The Global menu's acts in Mac windows only.)
+                if name != "menu" {
+                    if let Some(by) = crate::hyprland::bound_elsewhere(&k) {
+                        ui.set_key_error(format!("{} is taken in Hyprland ({by}). Pick another.", k.label()).into());
+                        return;
+                    }
+                }
                 match crate::keys::set_own_key(&name, &k.label()) {
                     Ok(()) => {
                         ui.set_editing(SharedString::new());

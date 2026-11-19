@@ -199,6 +199,19 @@ fn taken_by(bound: &[(u32, String, String)], mask: u32, key: &str) -> Option<Str
         .map(|b| if b.2.is_empty() { "another binding".to_string() } else { b.2.clone() })
 }
 
+/// What a key is bound to already in Hyprland, other than Sweeflow ("Google Photos", or "another
+/// binding" without a description): Sweeflow leaves such a key alone, so its Shortcuts window
+/// says so instead of showing it as set.
+pub fn bound_elsewhere(k: &crate::deskkeys::UserKey) -> Option<String> {
+    if !running() {
+        return None;
+    }
+    let o = Command::new("hyprctl").args(["binds", "-j"]).output().ok()?;
+    let bound = parse_binds(&String::from_utf8_lossy(&o.stdout));
+    let mask = (k.shift as u32) | ((k.ctrl as u32) << 2) | ((k.alt as u32) << 3) | ((k.logo as u32) << 6);
+    taken_by(&bound, mask, &hypr_key(&k.key))
+}
+
 /// Sweeflow's keys were changed (its Shortcuts window): bound again.
 pub fn rebind_own_keys() {
     if running() {
@@ -701,8 +714,12 @@ pub fn mac_keys(on: bool) {
         // Made again whenever what's in it changes (a version of it, from its text).
         let version = format!("4-{:x}", body.len() * 31 + body.bytes().map(|b| b as usize).sum::<usize>());
         let lua = if on {
-            format!(r#"if sweeflow_submap ~= "{version}" then sweeflow_submap = "{version}"; hl.define_submap("sweeflow", function()
-  {body}end) end; hl.dispatch(hl.dsp.submap("sweeflow"))"#)
+            // A key mode of its own for each version: define_submap adds to one that exists
+            // already, so a key taken out of the list stayed bound (copies piled up), and
+            // hl.unbind can't clear it (it unbinds the key in every mode, the person's own
+            // bindings included). Only the mode switched to is used.
+            format!(r#"if sweeflow_submap ~= "{version}" then sweeflow_submap = "{version}"; hl.define_submap("sweeflow-{version}", function()
+  {body}end) end; hl.dispatch(hl.dsp.submap("sweeflow-{version}"))"#)
 
         } else {
             r#"hl.dispatch(hl.dsp.submap("reset"))"#.to_string()
@@ -718,7 +735,7 @@ pub fn mac_keys(on: bool) {
 /// The keys kept for Linux changed: the key mode is made again, now if it's on (made again
 /// anyway the next time a Mac window takes the keys: its text changed).
 pub fn refresh_mac_keys() {
-    if running() && current_submap().as_deref() == Some("sweeflow") {
+    if running() && current_submap().is_some_and(|s| s.starts_with("sweeflow")) {
         mac_keys(true);
     }
 }
