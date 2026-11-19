@@ -424,9 +424,12 @@ fn is_key_note(name: &str) -> bool {
 /// gets the new key. Where the portal or Hyprland's bindings have the keys, nothing here.
 pub fn apply_own_key(name: &str) {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    // Plasma through the portal: Sweeflow gives Plasma the key (globalkeys.rs).
+    // Plasma and GNOME through the portal: Sweeflow gives the desktop the key (globalkeys.rs).
     if desktop.contains("KDE") && crate::globalkeys::in_use() {
         return crate::globalkeys::plasma_set(name);
+    }
+    if desktop.contains("GNOME") && crate::globalkeys::in_use() {
+        return crate::globalkeys::gnome_set();
     }
     let id = match name {
         "open" => None,
@@ -454,7 +457,7 @@ pub fn apply_own_key(name: &str) {
 
 /// A key as GNOME and Cinnamon write one: "<Super><Alt>o". Behind a Mac-style remapper ⌘
 /// arrives as Ctrl outside the Mac windows: that's the key set.
-fn gtk_accel(k: &crate::deskkeys::UserKey, remapped: bool) -> String {
+pub(crate) fn gtk_accel(k: &crate::deskkeys::UserKey, remapped: bool) -> String {
     let mut out = String::new();
     if k.logo && !remapped {
         out.push_str("<Super>");

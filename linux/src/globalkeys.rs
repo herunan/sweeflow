@@ -9,6 +9,7 @@
 //! Cinnamon) the shortcuts `sweeflow install` writes into their settings (setup.rs).
 
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -100,6 +101,9 @@ fn run() -> Result<()> {
         }
     }
     log::info!("global shortcuts portal: Sweeflow's keys are the desktop's");
+    if crate::keys::desktop().contains("GNOME") {
+        watch_gnome(remapped);
+    }
     *SESSION.lock().unwrap() = Some((bus.clone(), session.clone()));
 
     let rule = MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(IFACE)?.build();
@@ -199,6 +203,60 @@ pub fn plasma_set(id: &str) {
         ),
         Err(e) => log::warn!("Plasma: couldn't give {name} its key: {e}"),
     }
+}
+
+/// GNOME keeps the portal's keys in its own settings (this list, which GNOME Settings changes
+/// too) and applies a change at once; its portal has no dialog for them (GNOME 50) or refuses
+/// Sweeflow's (CachyOS). So Sweeflow writes them there, and watches them (watch_gnome).
+const GNOME_KEYS: &str = "/org/gnome/settings-daemon/global-shortcuts/sweeflow/shortcuts";
+
+/// GNOME: Sweeflow's keys as set (keys.json) written into GNOME's list of them.
+pub fn gnome_set() {
+    let remapped = crate::setup::mac_keys_remapped();
+    let items: Vec<String> = SHORTCUTS
+        .iter()
+        .map(|(id, description)| {
+            let accel = crate::keys::own_key(id).map(|k| crate::setup::gtk_accel(&k, remapped)).unwrap_or_default();
+            let keys = if accel.is_empty() { "@as []".to_string() } else { format!("['{accel}']") };
+            format!("('{id}', {{'shortcuts': <{keys}>, 'description': <'{description}'>}})")
+        })
+        .collect();
+    let value = format!("[{}]", items.join(", "));
+    match Command::new("dconf").args(["write", GNOME_KEYS, &value]).status() {
+        Ok(s) if s.success() => log::info!("GNOME: Sweeflow's keys set ({value})"),
+        Ok(s) => log::warn!("GNOME: couldn't set Sweeflow's keys (dconf {s})"),
+        Err(e) => log::warn!("GNOME: couldn't set Sweeflow's keys: {e}"),
+    }
+}
+
+/// GNOME: a key changed in GNOME Settings is saved as Sweeflow's (keys.json), so its windows and
+/// Mac windows follow. GNOME's portal doesn't say (no ShortcutsChanged), so its list is watched.
+fn watch_gnome(remapped: bool) {
+    std::thread::spawn(move || {
+        let read = || Command::new("dconf").args(["read", GNOME_KEYS]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let apply = |text: &str| {
+            for (id, _) in SHORTCUTS {
+                let Some(after) = text.split(&format!("('{id}', {{'shortcuts': <")).nth(1) else { continue };
+                // ['<Alt><Super>y'] or @as [] (none).
+                let first = after.split(']').next().unwrap_or_default().split('\'').nth(1).unwrap_or_default();
+                let now = if first.is_empty() { None } else { from_description(first, remapped) };
+                let had = crate::keys::own_key(id);
+                if now.as_ref().map(|k| k.label()) != had.as_ref().map(|k| k.label()) {
+                    log::info!("GNOME: {id} is {} now (GNOME Settings)", now.as_ref().map_or("nothing".to_string(), |k| k.label()));
+                    let _ = crate::keys::set_own_key(id, &now.map(|k| k.label()).unwrap_or_default());
+                }
+            }
+        };
+        let Ok(mut child) = Command::new("dconf").args(["watch", "/org/gnome/settings-daemon/global-shortcuts/sweeflow/"]).stdout(std::process::Stdio::piped()).spawn() else { return };
+        let Some(out) = child.stdout.take() else { return };
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if line.trim().ends_with("/shortcuts") {
+                apply(&read());
+            }
+        }
+    });
 }
 
 /// A key pressed: what it does.

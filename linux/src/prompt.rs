@@ -158,6 +158,48 @@ pub fn run(args: &[String]) -> Result<()> {
         std::process::exit(10 + index)
     });
     ui.on_cancelled(move || std::process::exit(if cancel >= 0 { 10 + cancel } else { 0 }));
+    // The keyboard, here: a password is typed in this dialog, and with the focus elsewhere it
+    // went to the Mac window beneath (Hyprland: Sweeflow's panel keeps the focus while open;
+    // Cinnamon turns down a window's own ask from a background process).
+    let title = args.get(2).cloned().unwrap_or_default();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if crate::hyprland::running() {
+            crate::hyprland::take_focus(&title);
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            x11_take_focus();
+        }
+    });
     ui.run()?;
     Ok(())
+}
+
+/// X11: this process's window made the active one, asked as a taskbar asks (source 2), which
+/// window managers grant where they turn down the app's own ask.
+fn x11_take_focus() {
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask},
+    };
+    let Ok((conn, screen)) = x11rb::connect(None) else { return };
+    let root = conn.setup().roots[screen].root;
+    let atom = |n: &[u8]| conn.intern_atom(false, n).ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+    let (Some(active), Some(pid), Some(clients)) = (atom(b"_NET_ACTIVE_WINDOW"), atom(b"_NET_WM_PID"), atom(b"_NET_CLIENT_LIST")) else { return };
+    let words = |w: u32, a: u32, ty: AtomEnum, n: u32| -> Vec<u32> {
+        conn.get_property(false, w, a, ty, 0, n).ok().and_then(|c| c.reply().ok()).and_then(|r| r.value32().map(|v| v.collect())).unwrap_or_default()
+    };
+    // Until it has it (the window manager may list the window only a moment after it shows),
+    // for three seconds at most.
+    for _ in 0..15 {
+        let ours = words(root, clients, AtomEnum::WINDOW, 1024).into_iter().rev().find(|w| words(*w, pid, AtomEnum::CARDINAL, 1).first() == Some(&std::process::id()));
+        if let Some(w) = ours {
+            if words(root, active, AtomEnum::WINDOW, 1).first() == Some(&w) {
+                return;
+            }
+            let ev = ClientMessageEvent::new(32, w, active, [2, 0, 0, 0, 0]);
+            let _ = conn.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev);
+            let _ = conn.flush();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }

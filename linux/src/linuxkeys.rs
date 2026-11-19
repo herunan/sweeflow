@@ -349,10 +349,10 @@ pub fn run() -> Result<()> {
             ui.set_changed(not_as_shipped(&load_exceptions()));
         }
     });
-    // The desktop's own dialog for them: GNOME's portal has one; Plasma's doesn't, so there
-    // they're typed here like the Global menu's and Sweeflow gives Plasma the key.
-    let plasma = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE");
-    ui.set_portal(crate::globalkeys::in_use() && !crate::hyprland::running() && !plasma);
+    // The desktop's own dialog for them: neither Plasma's portal nor GNOME's has a working one,
+    // so there they're typed here like the Global menu's and Sweeflow gives the desktop the key.
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    ui.set_portal(crate::globalkeys::in_use() && !crate::hyprland::running() && !desktop.contains("KDE") && !desktop.contains("GNOME"));
     // Sweeflow's keys as set (keys.json), shown again whenever they change: here, or in the
     // desktop's dialog (the client saves what it gives back).
     // Only when they changed: setting them rebuilds the rows, which took away what was being

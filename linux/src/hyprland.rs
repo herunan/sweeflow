@@ -469,6 +469,32 @@ pub fn minimise(class: String, title: String) -> bool {
     true
 }
 
+/// A dialog of this process (the stand-in for a Mac password prompt) takes the keyboard: the
+/// Sweeflow panel, which keeps the focus while it's open (stay_focused), is closed first, and the
+/// dialog focused and put on top. Without that, keys went to the Mac window beneath it.
+pub fn take_focus(title: &str) {
+    for w in clients_where(|c| c["class"].as_str() == Some("sweeflow") && c["title"].as_str() == Some("Sweeflow")) {
+        if let Some(a) = w["address"].as_str() {
+            let window = format!("address:{a}");
+            dispatch(&format!(r#"hl.dsp.window.close({{ window = "{window}" }})"#), &["closewindow", &window]);
+        }
+    }
+    let Some(c) = our_client("sweeflow", title) else { return };
+    let Some(address) = c["address"].as_str() else { return };
+    let window = format!("address:{address}");
+    dispatch(&format!(r#"hl.dsp.focus({{ window = "{window}" }})"#), &["focuswindow", &window]);
+    dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
+}
+
+/// Every Hyprland window (any process) that `pick` says.
+fn clients_where(pick: impl Fn(&serde_json::Value) -> bool) -> Vec<serde_json::Value> {
+    let Some(out) = Command::new("hyprctl").args(["-j", "clients"]).output().ok() else { return Vec::new() };
+    match serde_json::from_slice(&out.stdout) {
+        Ok(serde_json::Value::Array(clients)) => clients.into_iter().filter(|c| pick(c)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Brings this process's window of that class back from the "minimized" workspace to the one
 /// in front, on top and focused, as Omarchy's dock does: a minimised one first, else the one
 /// with that title. For a launch of the app.
