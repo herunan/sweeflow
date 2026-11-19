@@ -467,13 +467,12 @@ impl ksni::Tray for Tray {
         items.push(MenuItem::Separator);
         // Updates: a newer release, once seen, or a look for one. Either opens the update window.
         let update_label = match crate::update::available() {
-            Some(v) => format!("Update to Sweeflow {v}…"),
-            None => "Check for Updates…".into(),
+            Some(v) => format!("Update to Sweeflow {v}"),
+            None => "Check for Updates".into(),
         };
         items.push(
             StandardItem {
                 label: update_label.replace('_', "__"),
-                icon_name: menu_icon("system-software-update-symbolic"),
                 activate: Box::new(|_| open_update_window()),
                 ..Default::default()
             }
@@ -999,7 +998,7 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
-        // Check for Updates…, and a newer release's What's new: the update window (which updates
+        // Check for Updates, and a newer release's What's new: the update window (which updates
         // install.sh's copy itself, from a scope of its own: the service restarts under it).
         // "update" is what a widget from before the window sends.
         "update-window" | "update" => open_update_window(),

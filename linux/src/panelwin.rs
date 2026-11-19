@@ -333,7 +333,7 @@ slint::slint! {
                         // The update window: what's new, and the update (or how it's done).
                         VerticalLayout {
                             alignment: center;
-                            Btn { text: root.update-how == "self" ? "Update…" : "What's New"; small: true; primary: true; clicked => { root.act("update-window", ""); } }
+                            Btn { text: root.update-how == "self" ? "Update" : "What's New"; small: true; primary: true; clicked => { root.act("update-window", ""); } }
                         }
                     }
                 }
@@ -654,8 +654,8 @@ slint::slint! {
                 if root.running && root.paired: HorizontalLayout {
                     vertical-stretch: 0;
                     spacing: 8px;
-                    Btn { text: "⌘  Shortcuts"; clicked => { root.act("shortcuts", ""); } }
-                    Btn { text: "Check for Updates…"; clicked => { root.act("update-window", ""); } }
+                    Btn { text: "Shortcuts"; clicked => { root.act("shortcuts", ""); } }
+                    Btn { text: "Check for Updates"; clicked => { root.act("update-window", ""); } }
                     Rectangle { horizontal-stretch: 1; }
                     Btn { text: "Quit Sweeflow"; clicked => { root.quit-all(); } }
                 }

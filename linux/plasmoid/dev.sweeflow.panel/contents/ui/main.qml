@@ -405,13 +405,11 @@ PlasmoidItem {
                 anchors.fill: parent
                 // The Shortcuts window: Sweeflow's shortcuts, the swap, the ones kept for Linux.
                 SfButton {
-                    icon.name: "input-keyboard-symbolic"
                     text: "Shortcuts"
                     onClicked: { root.act("shortcuts"); root.expanded = false; }
                 }
                 SfButton {
-                    icon.name: "system-software-update-symbolic"
-                    text: "Check for Updates…"
+                    text: "Check for Updates"
                     onClicked: { root.act("update-window", ""); root.expanded = false; }
                 }
                 Item { Layout.fillWidth: true }
@@ -451,7 +449,7 @@ PlasmoidItem {
                         PlasmaComponents3.Label { text: upd.u ? upd.u.words : ""; opacity: 0.7; font: Kirigami.Theme.smallFont; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     }
                     // The update window: what's new, and the update (or how it's done).
-                    SfButton { text: upd.u && upd.u.how === "self" ? "Update…" : "What's New"; onClicked: { root.act("update-window", ""); root.expanded = false; } }
+                    SfButton { text: upd.u && upd.u.how === "self" ? "Update" : "What's New"; onClicked: { root.act("update-window", ""); root.expanded = false; } }
                 }
             }
             // The Mac on another version of Sweeflow.

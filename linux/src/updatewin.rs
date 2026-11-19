@@ -1,4 +1,4 @@
-//! The update window (`sweeflow update-window`): from the tray's Check for Updates… and the
+//! The update window (`sweeflow update-window`): from the tray's Check for Updates and the
 //! panel's update banner. It looks for the latest release, says when this is the latest, and
 //! otherwise shows what's new and updates it: install.sh's copy right here (downloaded, checked
 //! against the signed checksums, put in place, Sweeflow restarted), a packaged copy by saying the
