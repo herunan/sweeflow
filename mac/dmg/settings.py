@@ -12,9 +12,9 @@ symlinks = {"Applications": "/Applications"}
 # The disk's own icon: Sweeflow's.
 icon = os.path.join(app, "Contents/Resources/AppIcon.icns")
 
-# 640 x 460 points, the background's size; its @2x copy is used on Retina screens.
+# 640 x 320 points, the background's size; its @2x copy is used on Retina screens.
 background = os.path.join(here, "background.png")
-window_rect = ((200, 140), (640, 460))
+window_rect = ((200, 140), (640, 320))
 show_status_bar = False
 show_tab_view = False
 show_toolbar = False

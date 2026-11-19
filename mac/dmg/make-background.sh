@@ -4,5 +4,5 @@
 # and the Fira Sans font); the PNGs are committed, since the Mac that builds the DMG has neither.
 set -eu
 cd "$(dirname "$0")"
-rsvg-convert -w 640 -h 460 background.svg -o background.png
-rsvg-convert -w 1280 -h 920 background.svg -o background@2x.png
+rsvg-convert -w 640 -h 320 background.svg -o background.png
+rsvg-convert -w 1280 -h 640 background.svg -o background@2x.png

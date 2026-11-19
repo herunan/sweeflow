@@ -1,10 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="640" height="460" viewBox="0 0 640 460">
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="320" viewBox="0 0 640 320">
   <!-- The installer window's background (dmgbuild, see settings.py). Finder puts Sweeflow.app at
        (170, 150) and Applications at (470, 150), 112 pt icons, labels below them: the violet is a
-       mid tone, so the labels read in black (light mode) and white (dark mode) alike. The two
-       steps: drag, then open (it's notarised, so macOS opens it without asking).
-       Taller than what's drawn (460, content within 420): Finder takes its title bar out of the
-       window's height, and the steps were cut off at the bottom.
+       mid tone, so the labels read in black (light mode) and white (dark mode) alike. No written
+       steps: the arrow says it, and it's notarised, so macOS opens it without asking.
+       Finder takes its title bar out of the window's height, so the bottom ~28 pt are hidden.
        Rendered to background.png and background@2x.png by make-background.sh. -->
   <defs>
     <linearGradient id="stage" x1="0" y1="0" x2="1" y2="1">
@@ -20,9 +19,9 @@
     </filter>
   </defs>
 
-  <rect width="640" height="460" fill="url(#stage)"/>
+  <rect width="640" height="320" fill="url(#stage)"/>
 
-  <!-- Confetti, clear of the icons, their names and the steps. -->
+  <!-- Confetti, clear of the icons and their names. -->
   <g>
     <rect x="34" y="30" width="8" height="12" rx="2" fill="#fbbf24" transform="rotate(24 38 36)"/>
     <rect x="600" y="34" width="8" height="12" rx="2" fill="#f472b6" transform="rotate(-24 604 40)"/>
@@ -42,18 +41,4 @@
   <path d="M240 146 C 268 72, 350 68, 398 124" fill="none" stroke="url(#arrow)" stroke-width="7" stroke-linecap="round"/>
   <path d="M 387.6 130.3 L 411.0 139.2 L 405.8 114.7 Z" fill="#ffffff" stroke="#ffffff" stroke-width="4" stroke-linejoin="round"/>
 
-  <!-- The steps: drag, then open. -->
-  <rect x="168" y="274" width="304" height="100" rx="16" fill="#1e0b4b" fill-opacity="0.35"/>
-  <g font-family="Fira Sans" fill="#ffffff">
-    <g>
-      <circle cx="198" cy="306" r="11" fill="#ffffff"/>
-      <text x="198" y="311" text-anchor="middle" font-size="13" font-weight="700" fill="#7c3aed">1</text>
-      <text x="220" y="311" font-size="15" font-weight="600">Drag Sweeflow into Applications</text>
-    </g>
-    <g>
-      <circle cx="198" cy="342" r="11" fill="#ffffff"/>
-      <text x="198" y="347" text-anchor="middle" font-size="13" font-weight="700" fill="#7c3aed">2</text>
-      <text x="220" y="347" font-size="15" font-weight="600">Open Sweeflow from Applications</text>
-    </g>
-  </g>
 </svg>

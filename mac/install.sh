@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds Sweeflow.app and (re)starts it as a LaunchAgent. Idempotent: safe to re-run after every
-# change. On a Mac that has the "Sweeflow Release" key (made by release.sh) it updates the
-# released app in /Applications, signed with that key, so macOS keeps its permissions. Elsewhere
+# change. On a Mac that makes the releases (release.sh's keychain, with the Developer ID) it
+# updates the released app in /Applications, signed with that Developer ID, so macOS keeps its
+# permissions. Elsewhere
 # it's a development copy in ~/Applications, signed with a stable local identity.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,7 +29,7 @@ if [ -z "${SWEEFLOW_DEV_COPY:-}" ] && [ -f "$REL/release.keychain-db" ] &&
     APP="/Applications/Sweeflow.app"
     KEYCHAIN="$REL/release.keychain-db"
     KC_PASS="sweeflow-release"
-    SIGN_NAME="Sweeflow Release"
+    SIGN_NAME=""   # the Developer ID's name, read from the keychain below
     # Keep the installed version number; the build number says when it was built.
     VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo 0.1.0)
     BUILD="${SWEEFLOW_BUILD:-$(date +%Y%m%d%H%M)}"
@@ -70,9 +71,18 @@ EOF
     fi
 fi
 security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
-# codesign only searches keychains on the search list.
-if ! security list-keychains -d user | grep -q "$(basename "$KEYCHAIN")"; then
-    security list-keychains -d user -s $(security list-keychains -d user | tr -d '"') "$KEYCHAIN"
+# codesign only searches keychains on the search list (paths with spaces: read line by line).
+if ! security list-keychains -d user | grep -qF "$KEYCHAIN"; then
+    keychains=()
+    while IFS= read -r k; do
+        k=${k#*\"}; k=${k%\"}
+        case "$k" in */Application|*/Support/*) ;; *) keychains+=("$k") ;; esac
+    done < <(security list-keychains -d user)
+    security list-keychains -d user -s "${keychains[@]}" "$KEYCHAIN"
+fi
+if [ -z "$SIGN_NAME" ]; then
+    SIGN_NAME=$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+    [ -n "$SIGN_NAME" ] || { echo "no Developer ID Application identity in $KEYCHAIN" >&2; exit 1; }
 fi
 
 echo "==> bundling $APP ($SIGN_NAME, $VERSION build $BUILD)"
