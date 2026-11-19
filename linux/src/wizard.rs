@@ -506,9 +506,7 @@ pub fn run() -> Result<()> {
     // Matches sweeflow.desktop (written by `sweeflow install`), which gives KDE the logo for
     // the title bar and taskbar. After the window is made (set before, it was refused, and the
     // title bar showed a placeholder icon), and before it's shown.
-    if let Err(e) = slint::set_xdg_app_id("sweeflow") {
-        log::warn!("app id: {e}");
-    }
+    crate::look::set_app_id();
     let model = Rc::new(VecModel::<MacRow>::default());
     ui.set_macs(ModelRc::from(model.clone()));
 

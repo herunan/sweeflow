@@ -14,6 +14,8 @@ PlasmaComponents3.ItemDelegate {
     property string actionTip
     /// A short explanation, said on hover.
     property string hint
+    /// Under the name while the setting waits on something (the Mac's password), or empty.
+    property string note
     signal flipped(bool value)
     signal extraClicked()
 
@@ -25,7 +27,19 @@ PlasmaComponents3.ItemDelegate {
 
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing
-        PlasmaComponents3.Label { text: row.label; elide: Text.ElideRight; Layout.fillWidth: true }
+        ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 0
+            PlasmaComponents3.Label { text: row.label; elide: Text.ElideRight; Layout.fillWidth: true }
+            PlasmaComponents3.Label {
+                visible: row.note !== ""
+                text: row.note
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+                opacity: 0.7
+                font: Kirigami.Theme.smallFont
+            }
+        }
         SfButton {
             visible: row.actionText !== "" && row.on && row.enabled
             text: row.actionText

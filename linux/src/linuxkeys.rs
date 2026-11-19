@@ -76,7 +76,7 @@ slint::slint! {
                 accepted(t) => { root.save(t); }
                 combo(t, meta, ctrl, alt, shift) => { return root.combo(t, meta, ctrl, alt, shift); }
             }
-            VerticalLayout { alignment: center; Btn { text: "Save"; small: true; primary: true; enabled: typed.text != ""; clicked => { root.save(typed.text); } } }
+            VerticalLayout { alignment: center; Btn { text: "Save"; small: true; enabled: typed.text != ""; clicked => { root.save(typed.text); } } }
             VerticalLayout { alignment: center; Btn { text: "Cancel"; small: true; clicked => { root.cancel(); } } }
         }
     }
@@ -332,9 +332,7 @@ pub fn run() -> Result<()> {
     };
     let ui = Shortcuts::new()?;
     crate::look::apply!(ui);
-    if let Err(e) = slint::set_xdg_app_id("sweeflow") {
-        log::warn!("app id: {e}");
-    }
+    crate::look::set_app_id();
     crate::hyprland::keep_window_size();
     let hyprland = crate::hyprland::running();
     ui.set_hyprland(hyprland);
@@ -587,10 +585,18 @@ pub fn run() -> Result<()> {
         }
         show_again(&load_exceptions());
     });
-    // Behind a Mac-style remapper, the key in ⌘'s place reaches Linux windows as Ctrl and the
-    // one in ⌃'s place as Super: a press is written the Mac way (⌘ as Super, as Mac windows get it).
+    // Behind a Mac-style remapper a press reaches Linux windows changed: it's written as the keys
+    // pressed (⌘ as Super, as Mac windows get it).
+    // Which keyboard: Toshy maps an Apple one's keys and a PC one's differently (setup::pc_keyboard).
+    let pc = remapped && crate::setup::pc_keyboard();
     ui.on_combo(move |text, meta, ctrl, alt, shift| {
-        let (meta, ctrl) = if remapped { (ctrl, meta) } else { (meta, ctrl) };
+        // Apple keyboard: ⌘ (Super) reaches here as Ctrl, Ctrl as Super. PC keyboard: Alt (in ⌘'s
+        // place) as Ctrl, Super (in ⌥'s) as Alt, Ctrl as Super (globalkeys::as_linux_gets, undone).
+        let (meta, ctrl, alt) = match (remapped, pc) {
+            (false, _) => (meta, ctrl, alt),
+            (true, false) => (ctrl, meta, alt),
+            (true, true) => (alt, meta, ctrl),
+        };
         let written = combo(&text, meta, ctrl, alt, shift);
         // Shown the way the window shows keys: ⌘⌥E behind a remapper (read back the same).
         match UserKey::parse(&written) {

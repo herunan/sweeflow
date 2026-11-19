@@ -24,7 +24,7 @@ slint::slint! {
     // tip: why it can't be chosen now (it's then shown faded, and says so on hover); empty: it can.
     export struct Action { id: string, label: string, tip: string }
     // tip: what it does, on hover (the Plasma widget's hint).
-    export struct Toggle { key: string, label: string, on: bool, tip: string }
+    export struct Toggle { key: string, label: string, on: bool, tip: string, note: string }
 
     // A small button, for the actions on a row.
     component Chip inherits Rectangle {
@@ -412,7 +412,13 @@ slint::slint! {
                                 padding-left: 8px;
                                 padding-right: 6px;
                                 spacing: 8px;
-                                Text { text: t.label; color: Look.fg; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Text { text: t.label; color: Look.fg; font-size: 13px; overflow: elide; }
+                                    // A setting waiting on something (the Mac's password).
+                                    if t.note != "": Text { text: t.note; color: Look.muted; font-size: 11px; overflow: elide; }
+                                }
                                 VerticalLayout {
                                     alignment: center;
                                     Switch { on: t.on; tip: t.tip; toggled => { root.flip(t.key); } }
@@ -681,6 +687,7 @@ struct Settings {
     quality: String,
     lid: bool,
     has_lid: bool,
+    lid_asking: bool,
 }
 
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
@@ -763,6 +770,8 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
         "clipboard" => Call::Set(serde_json::json!({ "clipboard": !s.settings.clipboard })),
         "dragDrop" => Call::Set(serde_json::json!({ "dragDrop": !s.settings.drag_drop })),
         "launcher" => Call::Set(serde_json::json!({ "launcher": !s.settings.launcher })),
+        // Once its password prompt is up, the prompt is the way (the Mac asks once at a time).
+        "lid" if s.settings.lid_asking => return None,
         "lid" => Call::Set(serde_json::json!({ "lid": !s.settings.lid })),
         "sharp" => Call::Set(serde_json::json!({ "quality": if s.settings.quality == "light" { "sharp" } else { "light" } })),
         "square" => act("square", on_off(s.square)),
@@ -774,9 +783,12 @@ fn flip_call(key: &str, s: &PanelState) -> Option<Call> {
 /// Stream with lid closed, on hover (here and in the Plasma widget).
 const LID_TIP: &str = "Keep the MacBook available while its lid is closed. Asks for the Mac's admin password to turn it on or off.";
 
+/// Under Stream with lid closed while the Mac's password prompt is up (here and in the widget).
+const LID_WAITING: &str = "Waiting for the Mac's password";
+
 /// The settings, in the widget's words and order.
 fn toggles(s: &PanelState) -> Vec<Toggle> {
-    let t = |key: &str, label: &str, on: bool, tip: &str| Toggle { key: key.into(), label: label.into(), on, tip: tip.into() };
+    let t = |key: &str, label: &str, on: bool, tip: &str| Toggle { key: key.into(), label: label.into(), on, tip: tip.into(), note: Default::default() };
     // The features first, named and ordered as on the setup window's last page; the tips as the
     // Plasma widget's hints.
     let mut all = vec![
@@ -790,7 +802,12 @@ fn toggles(s: &PanelState) -> Vec<Toggle> {
     ];
     // A MacBook, connected: its answer (the password asked for on the Mac) comes from there.
     if s.connected && s.settings.has_lid {
-        all.insert(6, t("lid", "Stream with lid closed", s.settings.lid, LID_TIP));
+        let mut lid = t("lid", "Stream with lid closed", s.settings.lid, LID_TIP);
+        // As it is until the password is given (or the prompt cancelled).
+        if s.settings.lid_asking {
+            lid.note = LID_WAITING.into();
+        }
+        all.insert(6, lid);
     }
     all
 }
@@ -1080,9 +1097,7 @@ pub fn run() -> Result<()> {
     crate::hyprland::keep_window_size();
     // Matches sweeflow.desktop (written by `sweeflow install`): Sweeflow's logo in the title bar
     // and the taskbar. After the window is made, and before it's shown.
-    if let Err(e) = slint::set_xdg_app_id("sweeflow") {
-        log::warn!("app id: {e}");
-    }
+    crate::look::set_app_id();
     VIEW.with_borrow(|v| {
         ui.set_apps(ModelRc::from(v.apps.clone()));
         ui.set_macs(ModelRc::from(v.macs.clone()));

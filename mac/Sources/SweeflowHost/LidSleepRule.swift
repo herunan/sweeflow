@@ -19,9 +19,13 @@ enum LidSleepRule {
     /// The rule asked for while its password prompt is up (nil: none is).
     private static var asking: Bool?
 
-    /// What the switches show: the setting, or on while the password for it is awaited (so a
-    /// switch flipped on Linux doesn't spring back meanwhile). Any thread.
-    static var shown: Bool { lock.withLock { asking } ?? wanted }
+    /// What the switches show: the setting as it is. While its password is awaited it hasn't
+    /// changed yet (it showed the new state then, and looked done with the prompt still up):
+    /// `asking` says so instead. Any thread.
+    static var shown: Bool { wanted }
+
+    /// Its password prompt is up (the switches show it waiting). Any thread.
+    static var waiting: Bool { lock.withLock { asking } != nil }
 
     /// Turns the setting on or off from either of its switches (the menu-bar item, Linux): the
     /// password prompt to install the rule or take it away, unless one is up already, then

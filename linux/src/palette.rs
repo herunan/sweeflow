@@ -819,9 +819,7 @@ pub fn run() -> Result<()> {
     }
     // Matches sweeflow.desktop (written by `sweeflow install`): Sweeflow's logo in the title bar
     // and the taskbar. After the window is made, and before it's shown.
-    if let Err(e) = slint::set_xdg_app_id("sweeflow") {
-        log::warn!("app id: {e}");
-    }
+    crate::look::set_app_id();
     let (pid, mut revision) = (menu.pid, menu.revision);
     take_menu(&ui, menu);
 

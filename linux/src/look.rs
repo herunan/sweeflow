@@ -189,6 +189,20 @@ macro_rules! apply {
 }
 pub(crate) use apply;
 
+/// Sweeflow's own windows say they're Sweeflow (app id "sweeflow", matching sweeflow.desktop:
+/// its logo in the title bar and taskbar). After the window is made, before it's shown. Only on
+/// Wayland: on X11 Slint gives the window's class an empty instance name with it
+/// ("\0sweeflow"), and without it the class is the program's name, "sweeflow" for both.
+pub fn set_app_id() {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return;
+    }
+    if let Err(e) = slint::set_xdg_app_id("sweeflow") {
+        log::warn!("app id: {e}");
+    }
+}
+
+
 /// Room for a window on a short screen: once it's up, the height of the screen it's on (in the
 /// window's own units, after the desktop's scaling) less some for the desktop's bars and the
 /// window's title bar, handed to `set` (which caps the window's height; its content scrolls).

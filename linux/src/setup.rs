@@ -1062,6 +1062,50 @@ fn remapper_running() -> Option<&'static str> {
     })
 }
 
+/// Behind a Mac-style remapper, whether the keyboard typed on is a PC one: Toshy's modmaps
+/// differ by keyboard (an Apple one's ⌘ is Super, a PC one's is Alt; see
+/// globalkeys::as_linux_gets). Toshy's own choice when the person set one (its tray's
+/// "Keyboard type"), else what it would decide from the keyboards plugged in: a PC one when
+/// none is an Apple one. An Apple keyboard next to a PC one (a laptop's own and a Magic
+/// Keyboard): Apple, the one more likely typed on with a remapper.
+pub fn pc_keyboard() -> bool {
+    let config = config::xdg_home("XDG_CONFIG_HOME", ".config");
+    if let Some(kind) = std::fs::read(config.join("toshy/toshy_user_preferences.sqlite")).ok().and_then(|db| toshy_override(&db)) {
+        return kind != "Apple";
+    }
+    let devices = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
+    pc_keyboards_only(&devices)
+}
+
+/// The keyboard type set in Toshy's preferences (an SQLite file: the row's name and value sit
+/// next to each other in it), unless it's left to Toshy ("Auto-Adapt").
+fn toshy_override(db: &[u8]) -> Option<&'static str> {
+    const NAME: &[u8] = b"override_kbtype";
+    let mut at = 0;
+    while let Some(i) = db[at..].windows(NAME.len()).position(|w| w == NAME) {
+        let rest = &db[at + i + NAME.len()..];
+        if let Some(kind) = ["Apple", "Windows", "IBM", "Chromebook"].into_iter().find(|k| rest.starts_with(k.as_bytes())) {
+            return Some(kind);
+        }
+        at += i + NAME.len();
+    }
+    None
+}
+
+/// Keyboards plugged in (/proc/bus/input/devices), none of them an Apple one by Toshy's list.
+/// Virtual ones (a remapper's own, a software KVM's) don't count.
+fn pc_keyboards_only(devices: &str) -> bool {
+    let names: Vec<String> = devices
+        .lines()
+        .filter_map(|l| l.strip_prefix("N: Name=\""))
+        .map(|n| n.trim_end_matches('"').to_lowercase())
+        .filter(|n| n.contains("keyboard"))
+        .filter(|n| !["virtual", "xwaykeyz", "keyszer", "uinput", "deskflow", "barrier", "synergy", "input-remapper"].iter().any(|v| n.contains(v)))
+        .collect();
+    let apple = |n: &String| ["apple", "magic keyboard", "mx keys mac", "usb to adb", "hp touchpad wireless keyboard"].iter().any(|a| n.contains(a));
+    !names.is_empty() && !names.iter().any(apple)
+}
+
 /// How setting the desktop's shortcut went.
 enum OpenKey {
     /// Ours now; `now`: it works already, without logging in again.
@@ -1589,6 +1633,18 @@ fn command_word(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tells_a_pc_keyboard_from_an_apple_one() {
+        let dev = |names: &[&str]| names.iter().map(|n| format!("I: Bus=0003\nN: Name=\"{n}\"\nH: Handlers=kbd\n\n")).collect::<String>();
+        assert!(!pc_keyboards_only(&dev(&["Apple Inc. Magic Keyboard with Touch ID", "XWayKeyz (virtual) Keyboard", "libvirtualhid Keyboard"])));
+        assert!(pc_keyboards_only(&dev(&["AT Translated Set 2 keyboard", "XWayKeyz (virtual) Keyboard"])));
+        assert!(!pc_keyboards_only(&dev(&["AT Translated Set 2 keyboard", "Magic Keyboard"])));
+        // Nothing to go by: as before (Apple).
+        assert!(!pc_keyboards_only(&dev(&["Power Button", "mac-trackpad-deskflow-bridge keyboard"])));
+        assert_eq!(toshy_override(b"..\x1doverride_kbtypeAuto-Adapt.."), None);
+        assert_eq!(toshy_override(b"override_kbtype\x00..\x1doverride_kbtypeWindows.."), Some("Windows"));
+    }
 
     #[test]
     fn reads_the_strings_gsettings_prints() {

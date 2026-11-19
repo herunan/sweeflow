@@ -90,6 +90,8 @@ fn wait_for_a_mac() -> Result<config::Config> {
             return Ok(cfg);
         }
         if !asked {
+            // The desktop's dialog about Sweeflow's keys first (globalkeys), on its own.
+            globalkeys::wait_until_asked(std::time::Duration::from_secs(120));
             log::info!("no Mac paired yet: opening the pairing window");
             tray::open_wizard();
             asked = true;

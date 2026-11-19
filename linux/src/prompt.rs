@@ -124,9 +124,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // Matches sweeflow.desktop (written by `sweeflow install`): Sweeflow's logo in the title bar
     // and the taskbar. After the window is made (there's nothing to set it on before), and
     // before it's shown.
-    if let Err(e) = slint::set_xdg_app_id("sweeflow") {
-        log::warn!("app id: {e}");
-    }
+    crate::look::set_app_id();
     ui.set_heading(args.get(2).map(String::as_str).unwrap_or_default().into());
     ui.set_body(args.get(3).map(String::as_str).unwrap_or_default().into());
     ui.set_buttons(ModelRc::new(VecModel::from(buttons)));

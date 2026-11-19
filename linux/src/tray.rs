@@ -41,6 +41,9 @@ pub struct Settings {
     /// The Mac has a lid (a MacBook): only then is `lid` offered. Older Macs don't say: none.
     #[serde(default)]
     pub has_lid: bool,
+    /// The Mac's password prompt for `lid` is up: the switch waits for it.
+    #[serde(default)]
+    pub lid_asking: bool,
 }
 
 fn yes() -> bool {
@@ -62,6 +65,7 @@ impl Default for Settings {
             desktop: true,
             lid: false,
             has_lid: false,
+            lid_asking: false,
         }
     }
 }

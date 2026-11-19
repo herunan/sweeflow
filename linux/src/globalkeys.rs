@@ -50,10 +50,29 @@ const NOTE: &str = "keys.portal";
 /// Asks for the keys and waits for their presses, on a thread of its own. Without the portal,
 /// nothing: the desktop's settings have them (setup.rs).
 pub fn start() {
-    std::thread::spawn(|| match run() {
-        Ok(()) => {}
-        Err(e) => log::info!("global shortcuts portal: {e:#}"),
+    std::thread::spawn(|| {
+        if let Err(e) = run() {
+            log::info!("global shortcuts portal: {e:#}");
+        }
+        asked();
     });
+}
+
+/// The desktop has had its say on Sweeflow's keys (its "Add Keyboard Shortcuts" dialog
+/// answered, or there was none).
+static ASKED: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+fn asked() {
+    *ASKED.0.lock().unwrap() = true;
+    ASKED.1.notify_all();
+}
+
+/// Waits (up to `most`) until the desktop's dialog about Sweeflow's keys is answered. The
+/// setup window opens after it: opened first, it covered GNOME's dialog, which comes up at the
+/// same moment without a window to sit on.
+pub fn wait_until_asked(most: std::time::Duration) {
+    let done = ASKED.0.lock().unwrap();
+    let _ = ASKED.1.wait_timeout_while(done, most, |done| !*done);
 }
 
 fn run() -> Result<()> {
@@ -96,6 +115,7 @@ fn run() -> Result<()> {
         bus.call_method(Some(DEST), PATH, Some(IFACE), "BindShortcuts", &(&session, &shortcuts, "", opts))
     })?;
     let _ = std::fs::write(crate::config::dir().join(NOTE), "");
+    asked();
     if let Some(list) = bound.get("shortcuts") {
         save_triggers(list, remapped);
         if crate::keys::desktop().contains("KDE") {

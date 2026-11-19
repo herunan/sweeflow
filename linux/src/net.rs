@@ -1238,11 +1238,17 @@ static ICONS_FOR_ENTRIES: std::sync::Mutex<Option<std::collections::HashMap<Stri
 /// the first Sweeflow entry it matched by process ("Claude"). Only the first time: with the entry
 /// there already, nothing waits.
 fn taskbar_entry_first(bid: &str, name: &str) {
-    let Some(png) = ICONS_FOR_ENTRIES.lock().unwrap().get_or_insert_with(Default::default).remove(bid) else { return };
-    let write = || match crate::launchers::seen(bid, name, &png) {
-        Ok(true) => log::info!("{name}: taskbar entry written before its first window"),
-        Ok(false) => {}
-        Err(e) => log::warn!("taskbar entry for {bid}: {e:#}"),
+    let png = ICONS_FOR_ENTRIES.lock().unwrap().get_or_insert_with(Default::default).remove(bid);
+    let write = || {
+        if let Some(png) = png {
+            match crate::launchers::seen(bid, name, &png) {
+                Ok(true) => log::info!("{name}: taskbar entry written before its first window"),
+                Ok(false) => {}
+                Err(e) => log::warn!("taskbar entry for {bid}: {e:#}"),
+            }
+        }
+        // GNOME: until the shell has it (launchers::wait_until_read).
+        crate::launchers::wait_until_read(bid);
     };
     // A wait of the network task's: the other one goes on meanwhile.
     match tokio::runtime::Handle::try_current() {

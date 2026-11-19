@@ -40,13 +40,15 @@ final class Settings {
         var lid: Bool?
         /// A MacBook: only then is `lid` offered (sent, not read).
         var hasLid: Bool?
+        /// The password prompt for `lid` is up (sent, not read).
+        var lidAsking: Bool?
     }
 
     func wire() -> Data {
         let c = config
         let w = Wire(enabled: c.enabled, exclude: c.excludeApps, sound: c.soundOnLinux, dim: c.dimMacScreenWhileStreaming,
                      clipboard: c.clipboard, dragDrop: c.dragDrop, launcher: c.launcherMenu, quality: c.quality,
-                     desktop: c.ownDesktop, lid: LidSleepRule.shown, hasLid: LidSleepRule.hasLid)
+                     desktop: c.ownDesktop, lid: LidSleepRule.shown, hasLid: LidSleepRule.hasLid, lidAsking: LidSleepRule.waiting)
         return (try? JSONEncoder().encode(w)) ?? Data()
     }
 
