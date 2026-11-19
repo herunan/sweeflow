@@ -233,6 +233,7 @@ pub fn install() -> Result<()> {
 /// own files (under /usr) are its package manager's. The pairing with the Mac (the config
 /// folder) stays unless `purge`: installed again, Sweeflow knows its Mac.
 pub fn uninstall(purge: bool) -> Result<()> {
+    crate::hyprland::find_session();
     let home = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
     let kde = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("KDE");
     let rm = |path: &std::path::Path| remove_path(&home, path);

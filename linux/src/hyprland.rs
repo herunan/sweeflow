@@ -12,6 +12,22 @@ pub fn running() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
 }
 
+/// Run outside the Hyprland session (`sweeflow uninstall` over SSH, from a TTY): the session that
+/// is running, found by its socket, so its bindings can still be taken away. Only when there is
+/// exactly one. Call before any thread starts (it sets the environment).
+pub fn find_session() {
+    if running() {
+        return;
+    }
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else { return };
+    let Ok(dirs) = std::fs::read_dir(runtime.join("hypr")) else { return };
+    let live: Vec<_> = dirs.flatten().filter(|d| d.path().join(".socket.sock").exists()).map(|d| d.file_name()).collect();
+    if let [one] = live.as_slice() {
+        // SAFETY: only from `sweeflow uninstall`'s start, before it has started any thread.
+        unsafe { std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", one) };
+    }
+}
+
 /// Hyprland's event socket, when this is a Hyprland session: a line per event.
 fn events() -> Option<impl Iterator<Item = String>> {
     let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
