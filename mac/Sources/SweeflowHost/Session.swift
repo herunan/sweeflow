@@ -681,6 +681,15 @@ final class Session {
             raise(win)
             return holdForApp(win, wid: wid, at: p, then: post)
         }
+        // The first press on a window raises it, and waits until it's in front: raised as it
+        // appeared and then moved onto the virtual display (TextEdit's Open panel, which came on
+        // the Mac's own screen), it was in front by the window list, yet clicks on New Document
+        // did nothing until it had been raised again.
+        if pressedOnce.insert(wid).inserted {
+            raisedWid = wid
+            raise(win)
+            return holdInput(until: wid, at: p, raised: true, why: "for its first press", then: post)
+        }
         raisedWid = wid
         let raises = raiseState
         let known = raises.pending ? nil : tracker.frontmostAtLastLook(wid, at: p, maxAgeMs: 2000, since: raises.doneAt)
@@ -691,6 +700,9 @@ final class Session {
             : String(format: "for the window server's answer (last look %.0f ms ago)", tracker.lastLookAgeMs)
         holdInput(until: wid, at: p, raised: known == false, why: why, then: post)
     }
+
+    /// Windows pressed on at least once (see `press`).
+    private var pressedOnce = Set<UInt32>()
 
     /// Whether a raise asked of an app may still change what's in front (it's under way, or
     /// the newest one hasn't had its turn), and when the last one finished: a look at the
@@ -1651,6 +1663,7 @@ final class Session {
             self.recentlyGone[w.wid] = (w.frame, w.parent == 0 ? w.wid : w.parent, now)
             let wid = w.wid
             self.announced.remove(wid)
+            self.pressedOnce.remove(wid)
             // Its popups waiting for it: told now, with whatever window they have by then.
             for c in self.awaitingParent.removeValue(forKey: wid) ?? [] {
                 if let now = self.tracker.windows[c] { self.sendAdded(now) }
