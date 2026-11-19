@@ -24,6 +24,10 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
 }
 
 fn main() {
+    // The release's build number (linux/release/build.sh), for telling a newer release of the same
+    // version (update.rs). 0: a development build.
+    println!("cargo:rerun-if-env-changed=SWEEFLOW_BUILD");
+    println!("cargo:rustc-env=SWEEFLOW_BUILD={}", env::var("SWEEFLOW_BUILD").unwrap_or_else(|_| "0".into()));
     // FFmpeg 7.1 (libavfilter 10.4) and later take a picture's colour space and range in a
     // buffer source's parameters; older ones (Ubuntu 24.04 / Mint 22: FFmpeg 6.1) don't.
     println!("cargo::rustc-check-cfg=cfg(avfilter_colour)");

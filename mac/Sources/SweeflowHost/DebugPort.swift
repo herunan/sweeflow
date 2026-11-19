@@ -14,6 +14,7 @@ import CoreImage
 ///   focus WID                 as the client focusing a window
 ///   front WID X Y             whether the window is in front at that point: by the last look and asked now
 ///   windows                   list tracked windows
+///   update check|choose|state as the update check, the menu's update line chosen, or what it knows
 final class DebugPort {
     private var listener: NWListener?
     static weak var session: Session?
@@ -40,6 +41,12 @@ final class DebugPort {
         let p = line.split(separator: " ").map(String.init)
         guard let cmd = p.first else { return reply("empty") }
         switch cmd {
+        case "update" where p.count == 2:
+            switch p[1] {
+            case "check": Updater.shared.check(manual: false); reply("checking")
+            case "choose": Updater.shared.menuChosen(); reply(Updater.shared.menuTitle)
+            default: reply("this \(Updater.version) (\(Updater.build)); menu: \(Updater.shared.menuTitle)")
+            }
         case "shot" where p.count == 2:
             let id = host.display.displayID ?? CGMainDisplayID()
             SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in

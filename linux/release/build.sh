@@ -9,9 +9,14 @@
 #   sweeflow.db, sweeflow.files (+ .sig)   Sweeflow's pacman repo: the release's download folder is its
 #                                    Server; signed with the Sweeflow release key, whose public half is
 #   sweeflow.asc                     this (pacman-key --add)
+#   InRelease, Release(.gpg), Packages(.gz)   Sweeflow's apt repo (deb ... releases/latest/download ./)
+#   rpm/ (repodata, sweeflow.repo)   Sweeflow's dnf repo index, for sweeflow.app/rpm/ (a release can't hold a
+#                                    folder): it points at this release's .rpm
+#   Sweeflow.dmg                     the Mac app, if ../../release-mac.sh made it (dist/Sweeflow.dmg)
+#   latest.json                      what's new and where to get it: the update notice of both apps
+#   SHA256SUMS(.sig)                 signed, so an update is checked before it's installed
 #   install.sh                       curl ... | sh for any distro
 #   ffmpeg-*.tar.xz, FFMPEG-CONFIGURE.txt   the source of the FFmpeg inside, as its licence (LGPL) asks
-#   SHA256SUMS
 # One binary for all of them, built in env.sh's Ubuntu 22.04 with FFmpeg linked in (ffmpeg.sh), so it runs
 # on any distro with glibc 2.35 or later and doesn't care which FFmpeg the distro has.
 #
@@ -21,12 +26,18 @@
 set -eu
 cd "$(dirname "$0")/../.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' linux/Cargo.toml | head -1)
+# The build number: both apps compare it with the release's (update.rs, Updater.swift) to see a rebuild of
+# one version as newer.
+build=${BUILD:-$(git rev-list --count HEAD)}
+# Where the release's files are downloaded from (GitHub; the local stand-in for tests): what the update
+# notice, the apt repo and the dnf repo point at.
+release_url=${RELEASE_URL:-https://github.com/herunan/sweeflow/releases/download/v$version}
 out=dist/linux
 rm -rf "$out" && mkdir -p "$out"
 
 linux/release/env.sh '
 set -eu
-export CARGO_TARGET_DIR=/src/linux/target/portable SWEEFLOW_PORTABLE=1
+export CARGO_TARGET_DIR=/src/linux/target/portable SWEEFLOW_PORTABLE=1 SWEEFLOW_BUILD='"$build"'
 cd linux
 cargo build --release --locked --features portable
 ./licenses.sh
@@ -85,8 +96,71 @@ for f in sweeflow.db sweeflow.db.sig sweeflow.files sweeflow.files.sig; do
     t=$(readlink "$out/$f") && cp --remove-destination "$out/$t" "$out/$f"
 done
 gpg --armor --export "$key" > "$out/sweeflow.asc"
+
+# The apt repo, flat in the same folder: Packages for the versioned .deb only (the other is a copy), a
+# Release listing it, signed.
+linux/release/env.sh '
+set -eu
+cd /src/dist/linux
+apt-ftparchive packages . 2>/dev/null | awk -v RS= -v ORS="\n\n" "!/Filename: .\/sweeflow_amd64.deb/" > Packages
+gzip -9kn Packages
+apt-ftparchive -o APT::FTPArchive::Release::Origin=Sweeflow -o APT::FTPArchive::Release::Label=Sweeflow \
+    -o APT::FTPArchive::Release::Suite=stable -o APT::FTPArchive::Release::Architectures=amd64 release . > /tmp/Release
+mv /tmp/Release Release
+'
+gpg --batch --yes --clearsign --digest-algo SHA512 -o "$out/InRelease" "$out/Release"
+gpg --batch --yes --detach-sign --digest-algo SHA512 -o "$out/Release.gpg" "$out/Release"
+
+# The dnf repo's index (repodata/), for sweeflow.app/rpm/: the packages stay in the release, so their
+# addresses in it are the release's.
+rpmrepo=linux/target/portable/rpmrepo
+rm -rf "$rpmrepo" && mkdir -p "$rpmrepo"
+cp "$out/sweeflow-$version-1.x86_64.rpm" "$rpmrepo/"
+linux/release/env.sh "createrepo_c --quiet --baseurl '$release_url/' /src/$rpmrepo"
+mkdir -p "$out/rpm"
+cp -r "$rpmrepo/repodata" "$out/rpm/"
+gpg --batch --yes --armor --detach-sign -o "$out/rpm/repodata/repomd.xml.asc" "$out/rpm/repodata/repomd.xml"
+cp "$out/sweeflow.asc" "$out/rpm/sweeflow.asc"
+cat > "$out/rpm/sweeflow.repo" <<REPO
+[sweeflow]
+name=Sweeflow
+baseurl=${RPM_REPO_URL:-https://sweeflow.app/rpm}
+enabled=1
+repo_gpgcheck=1
+gpgcheck=0
+gpgkey=${RPM_REPO_URL:-https://sweeflow.app/rpm}/sweeflow.asc
+REPO
+
+# The Mac app, made first by release-mac.sh (with its build number), goes up with the rest.
+mac_json=null
+if [ -f dist/Sweeflow.dmg ]; then
+    cp dist/Sweeflow.dmg "$out/Sweeflow.dmg"
+    mac_build=$(cat dist/Sweeflow.build 2>/dev/null || echo "$build")
+    mac_json=$(printf '{"version": "%s", "build": %s, "url": "%s/Sweeflow.dmg", "sha256": "%s"}' \
+        "$version" "$mac_build" "$release_url" "$(sha256sum "$out/Sweeflow.dmg" | cut -d" " -f1)")
+fi
+# The update notice: this release's notes (CHANGELOG.md's section for it) and where each app gets it.
+python3 - "$version" "$build" "$release_url" "$mac_json" "$out" <<'PY'
+import json, re, sys, hashlib, datetime
+version, build, url, mac, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+log = open("CHANGELOG.md").read()
+m = re.search(r"^## " + re.escape(version) + r"\s*\n(.*?)(?=^## |\Z)", log, re.S | re.M)
+notes = m.group(1).strip() if m else ""
+tar = f"sweeflow-{version}-x86_64.tar.gz"
+sha = hashlib.sha256(open(f"{out}/{tar}", "rb").read()).hexdigest()
+feed = {
+    "version": version,
+    "date": datetime.date.today().isoformat(),
+    "notes": notes,
+    "page": f"https://github.com/herunan/sweeflow/releases/tag/v{version}",
+    "mac": json.loads(mac),
+    "linux": {"version": version, "build": build, "url": f"{url}/{tar}", "sha256": sha},
+}
+open(f"{out}/latest.json", "w").write(json.dumps(feed, indent=2) + "\n")
+PY
 cp linux/release/install.sh "$out/"
 cp ~/.cache/sweeflow-build/jammy/opt/ffmpeg/share/source/ffmpeg-*.tar.xz "$out/"
 cp ~/.cache/sweeflow-build/jammy/opt/ffmpeg/share/source/CONFIGURE.txt "$out/FFMPEG-CONFIGURE.txt"
-(cd "$out" && sha256sum -- * > SHA256SUMS)
+(cd "$out" && find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name SHA256SUMS.sig -printf '%P\n' | sort | xargs sha256sum -- > SHA256SUMS)
+gpg --batch --yes --detach-sign -o "$out/SHA256SUMS.sig" "$out/SHA256SUMS"
 ls -la "$out"

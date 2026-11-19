@@ -225,6 +225,14 @@ slint::slint! {
         in property <bool> mac-style;
         // Alt and Super swapped in Mac windows (config::swap_cmd_opt).
         in property <bool> swapped;
+        // A newer Sweeflow: its version ("" for none), how it's updated (update.rs How: "self",
+        // "system", "download"), that in words, and its release page.
+        in property <string> update-version;
+        in property <string> update-how;
+        in property <string> update-words;
+        in property <string> update-page;
+        // The Mac on another version of Sweeflow, in words ("" when the same).
+        in property <string> mac-note;
         // The Mac being renamed, or asked about forgetting (fingerprints).
         in-out property <string> editing;
         in-out property <string> confirming;
@@ -306,6 +314,34 @@ slint::slint! {
                         }
                     }
                 }
+
+                // A newer Sweeflow, and how to get it.
+                if root.update-version != "": Rectangle {
+                    vertical-stretch: 0;
+                    border-radius: 8px;
+                    background: Look.accent.transparentize(0.88);
+                    HorizontalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Text { text: "Sweeflow " + root.update-version + " is available"; color: Look.fg; font-size: 13px; font-weight: 600; overflow: elide; }
+                            Text { text: root.update-words; color: Look.muted; font-size: 11px; wrap: word-wrap; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Btn { text: "What's new"; small: true; clicked => { root.act("update-page", root.update-page); } }
+                        }
+                        if root.update-how == "self": VerticalLayout {
+                            alignment: center;
+                            Btn { text: "Update"; small: true; primary: true; clicked => { root.act("update", ""); } }
+                        }
+                    }
+                }
+                // The Mac on another version.
+                if root.mac-note != "": Text { text: root.mac-note; color: Look.muted; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
 
                 if root.running && root.paired: HorizontalLayout {
                     vertical-stretch: 0;
@@ -663,6 +699,24 @@ struct PanelState {
     display_shown: bool,
     /// The keys the desktop has now (keys::Keys::json); None from a client before them.
     keys: Option<ShownKeys>,
+    /// This copy's version, a newer release, the Mac's version (update::panel_json).
+    updates: Updates,
+}
+
+#[derive(Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+struct Updates {
+    update: Option<UpdateInfo>,
+    mac_note: Option<String>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+struct UpdateInfo {
+    version: String,
+    page: String,
+    how: String,
+    words: String,
 }
 
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
@@ -1022,6 +1076,12 @@ fn show(ui: &PanelWin, v: &mut View) {
     ui.set_dim_enabled(streaming && !s.settings.dim);
     ui.set_dimmed(s.settings.dim);
     ui.set_display_shown(s.display_shown);
+    let u = s.updates.update.clone().unwrap_or_default();
+    ui.set_update_version(u.version.as_str().into());
+    ui.set_update_how(u.how.as_str().into());
+    ui.set_update_words(u.words.as_str().into());
+    ui.set_update_page(u.page.as_str().into());
+    ui.set_mac_note(s.updates.mac_note.clone().unwrap_or_default().as_str().into());
     v.toggles.set_vec(toggles(&s));
     ui.set_app_count(s.apps.len() as i32);
     show_apps(v);

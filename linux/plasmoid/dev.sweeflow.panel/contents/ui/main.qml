@@ -425,6 +425,40 @@ PlasmoidItem {
             anchors.fill: parent
             visible: root.paired
             spacing: 0
+            // A newer Sweeflow, and how to get it (update.rs panel_json).
+            Rectangle {
+                id: upd
+                readonly property var u: (root.st.updates || {}).update || null
+                visible: !!u
+                Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.smallSpacing
+                implicitHeight: updateRow.implicitHeight + Kirigami.Units.largeSpacing
+                radius: Kirigami.Units.cornerRadius
+                color: Qt.rgba(0.545, 0.361, 0.965, 0.12)
+                RowLayout {
+                    id: updateRow
+                    anchors.fill: parent
+                    anchors.margins: Kirigami.Units.smallSpacing
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        PlasmaComponents3.Label { text: upd.u ? "Sweeflow " + upd.u.version + " is available" : ""; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
+                        PlasmaComponents3.Label { text: upd.u ? upd.u.words : ""; opacity: 0.7; font: Kirigami.Theme.smallFont; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                    }
+                    SfButton { text: "What's new"; onClicked: root.act("update-page", upd.u.page) }
+                    SfButton { visible: !!upd.u && upd.u.how === "self"; text: "Update"; onClicked: root.act("update", "") }
+                }
+            }
+            // The Mac on another version of Sweeflow.
+            PlasmaComponents3.Label {
+                readonly property string note: (root.st.updates || {}).macNote || ""
+                visible: note !== ""
+                text: note
+                opacity: 0.7
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.smallSpacing
+            }
             PlasmaComponents3.TabBar {
                 id: tabs
                 Layout.fillWidth: true

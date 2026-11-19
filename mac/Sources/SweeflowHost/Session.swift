@@ -61,6 +61,7 @@ final class Session {
 
     /// What the client calls itself (its Hello; empty from older clients).
     private(set) var clientName = ""
+    private(set) var clientAppVersion = ""
     /// Asked on hello, before anything is served: may this client have the session? False: it
     /// has been answered already (Busy).
     var onHello: ((Session) -> Bool)?
@@ -195,6 +196,8 @@ final class Session {
             // Newer clients say their name. One linked without a name (the development setup)
             // takes it, so the menu lists it by name rather than a code from its certificate.
             clientName = (try? m.str()) ?? ""
+            // And its Sweeflow's version (newer clients): the menu says when it differs.
+            clientAppVersion = (try? m.str()) ?? ""
             if let fp = clientFingerprint, !clientName.isEmpty,
                Identity.pairedClients().first(where: { $0.fingerprint == fp })?.name.isEmpty == true {
                 Identity.renameClient(fp, to: clientName)
@@ -212,7 +215,8 @@ final class Session {
             if !started {
                 started = true
                 let fp = clientFingerprint, name = clientName
-                DispatchQueue.main.async { host.clientSaysName = name; host.client = fp; host.sessionStarted() }
+                let appVersion = clientAppVersion
+                DispatchQueue.main.async { host.clientSaysName = name; host.clientAppVersion = appVersion; host.client = fp; host.sessionStarted() }
             }
             let key = ObjectIdentifier(s)
             if let st = streamers.removeValue(forKey: key) { st.stop() }
@@ -221,6 +225,8 @@ final class Session {
             // The Mac's name as set in its settings, from configd (Host.current() can wait on name lookups).
             w.str(SCDynamicStoreCopyComputerName(nil, nil) as String? ?? macName)
             w.str(Self.macKind)
+            // Which Sweeflow this is (newer clients show it when it differs from theirs).
+            w.str(Updater.version)
             s.send(w)
             var a = MsgWriter(.addresses)
             let all = Self.ownAddresses()

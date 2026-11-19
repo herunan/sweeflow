@@ -16,6 +16,7 @@ DMG=$(ssh "$TARGET" "$REMOTE/release.sh $VERSION $BUILD" | tail -1)
 mkdir -p dist
 scp -q "$TARGET:$DMG" "dist/Sweeflow-$VERSION.dmg"
 cp "dist/Sweeflow-$VERSION.dmg" dist/Sweeflow.dmg
+echo "$BUILD" > dist/Sweeflow.build   # for the update notice (linux/release/build.sh)
 # The signing key never changes; keep a copy off the Mac (not in git).
 mkdir -p ~/.local/share/sweeflow-release && chmod 700 ~/.local/share/sweeflow-release
 ssh "$TARGET" 'cat "$HOME/Library/Application Support/sweeflow-release/release.p12"' > ~/.local/share/sweeflow-release/release.p12

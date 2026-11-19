@@ -1024,7 +1024,8 @@ async fn session(
 
     let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
     let hello = W::new(t::HELLO).u16(proto::VERSION).f32(cfg.scale as f32).f32(0.0);   // (was the capture scale: the screen's own scale now goes with SCREEN_SIZE)
-    ctl_tx.write_all(&hello.str(&this_computer()).finish()).await?;
+    // This computer's name, then its Sweeflow's version (the Mac's menu says when the two differ).
+    ctl_tx.write_all(&hello.str(&this_computer()).str(crate::update::VERSION).finish()).await?;
     let held: Vec<String> = if busy { Vec::new() } else { PENDING_LAUNCHES.lock().unwrap().drain(..).map(|(b, _)| b).collect() };
     for bid in held {
         log::info!("launching {bid} (requested while offline)");
@@ -1281,6 +1282,8 @@ fn handle_control(ty: u8, body: &[u8], ui: &UiTx) -> Result<()> {
             if let Ok(kind) = r.str() {
                 crate::tray::set_mac_kind(&kind);
             }
+            // And which version of Sweeflow it has (newer hosts).
+            crate::update::set_mac_version(r.str().ok());
             if crate::tray::elsewhere() {
                 log::info!("the Mac is free again: streaming here");
                 crate::tray::set_elsewhere(false);

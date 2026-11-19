@@ -241,8 +241,12 @@ pub fn connected(mac: Option<String>) {
         s.settings = None;
         s.running.clear();
     }
+    let gone = mac.is_none();
     s.mac = mac;
     drop(s);
+    if gone {
+        crate::update::set_mac_version(None);
+    }
     refresh();
 }
 
@@ -953,6 +957,8 @@ pub fn panel_state() -> serde_json::Value {
         "keys": crate::keys::current().json(),
         // The shortcut setup wants the tray widget to give itself (setup.rs, WIDGET_KEY).
         "setKey": crate::setup::widget_key().map(|(id, key)| serde_json::json!({ "id": id, "key": key })),
+        // This copy's version, a newer release (and how it's updated), the Mac's version if it differs.
+        "updates": crate::update::panel_json(),
     })
 }
 
@@ -979,6 +985,19 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
+        // A newer release: install.sh's copy updates itself (outside the service, which it restarts).
+        "update" => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| "sweeflow".into());
+            let mut cmd = std::process::Command::new("systemd-run");
+            cmd.args(["--user", "--collect", "--quiet", "--unit=sweeflow-update"]).arg(&exe).arg("update");
+            if cmd.status().map_or(true, |s| !s.success()) {
+                let _ = std::process::Command::new(&exe).arg("update").spawn();
+            }
+        }
+        // What's new: the release's page.
+        "update-page" => {
+            let _ = std::process::Command::new("xdg-open").arg(arg).spawn();
+        }
         "start" if elsewhere() => log::info!("Start: the Mac is streaming to another computer"),
         "start" | "stop" => set_started(action == "start"),
         // What a widget from before Start / Stop still sends, until Plasma reloads it.

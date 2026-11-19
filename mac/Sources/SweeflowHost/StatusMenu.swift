@@ -97,6 +97,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        // The Linux machine on another version of Sweeflow (it says which when it connects).
+        if client != nil, !host.clientAppVersion.isEmpty, host.clientAppVersion != Updater.version {
+            let other = host.clientAppVersion
+            let behind = Updater.newer((Updater.version, 0), than: (other, 0))
+            let note = NSMenuItem(title: behind ? "Linux has Sweeflow \(other): update it there" : "Linux has Sweeflow \(other), newer than this Mac's", action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
+        }
         if let fp = client {
             menu.addItem(ClosureMenuItem(title: c.enabled ? "Pause" : "Resume") { settings.update { $0.enabled.toggle() } })
             menu.addItem(ClosureMenuItem(title: "Stop") { Self.disconnect(fp) })
@@ -186,6 +194,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(linked)
 
         menu.addItem(.separator())
+        // Updates: "Check for Updates…", or "Update to Sweeflow X…" once one is out (Updater).
+        let update = ClosureMenuItem(title: Updater.shared.menuTitle) { Updater.shared.menuChosen() }
+        if Updater.shared.available != nil {
+            update.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(paletteColors: [.white, .sweeflowViolet]))
+        }
+        menu.addItem(update)
         let quit = ClosureMenuItem(title: "Quit Sweeflow") { Self.quit() }
         quit.keyEquivalent = "q"
         menu.addItem(quit)
@@ -208,6 +223,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             // launchd ends this process as it unloads it.
             _ = try? run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(LoginItem.devAgentLabel)"])
         }
+        NSApp.terminate(nil)
+    }
+
+    /// Quits for an update (Updater): left as it was, then the new copy opens.
+    static func quitForUpdate() {
+        log("quitting for an update")
+        leaveMacAsItWas()
         NSApp.terminate(nil)
     }
 

@@ -27,6 +27,7 @@ mod proto;
 mod setup;
 mod tray;
 mod ui;
+mod update;
 mod wake;
 mod wizard;
 mod x11clip;
@@ -46,6 +47,7 @@ USAGE:
     sweeflow panel           Sweeflow's own window: its apps, settings and Macs (without the Plasma widget)
     sweeflow pair            link a Mac on this network (the Mac shows a code, you type it here)
     sweeflow pair --text     the same, in the terminal
+    sweeflow update          install the latest release (install.sh's copy; packages say how)
     sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it (development)
     sweeflow launch BUNDLEID open a Mac app (what the Mac app launchers run)
     sweeflow quit BUNDLEID   quit a Mac app (the Mac app launchers' Quit action)
@@ -128,12 +130,15 @@ fn main() -> Result<()> {
             tray::start();
             // Sweeflow's keys from any window, the standard way where the desktop has it.
             globalkeys::start();
+            // A newer release, looked for now and then (the panel and a notification say so).
+            update::start();
             if x11ui::wanted() { x11ui::run(wait_for_a_mac()?) } else { ui::run(wait_for_a_mac()?) }
         }
         Some("pair") if args.get(1).is_some_and(|a| a == "--text") => pair::run_text(),
         Some("pair") => wizard::run(),
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
+        Some("update") => update::run(),
         Some("uninstall") if args.len() == 1 => setup::uninstall(false),
         Some("uninstall") if args.len() == 2 && args[1] == "--purge" => setup::uninstall(true),
         Some("open") => setup::open(),

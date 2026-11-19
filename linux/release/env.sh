@@ -36,7 +36,8 @@ run() {
 if [ ! -f "$root/.sweeflow-ready" ]; then
     run 'apt-get update -q && apt-get install -y -q --no-install-recommends build-essential nasm pkg-config curl \
         ca-certificates git xz-utils clang libclang-dev libva-dev libdrm-dev libxkbcommon-dev libfontconfig-dev \
-        libfreetype-dev libwayland-dev libx11-dev libegl-dev libgl-dev libdbus-1-dev dpkg-dev rpm file python3'
+        libfreetype-dev libwayland-dev libx11-dev libegl-dev libgl-dev libdbus-1-dev dpkg-dev rpm file python3 \
+        apt-utils createrepo-c'
     run 'command -v cargo >/dev/null || curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal'
     run 'cargo install --locked cargo-about --features cli && cargo install --locked cargo-deb'
     run 'linux/release/ffmpeg.sh'
