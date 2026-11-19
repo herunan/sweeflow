@@ -413,6 +413,7 @@ pub fn float_window_sized(class: String, title: String, size: Option<(u32, u32)>
                 let _ = Command::new("hyprctl").args(["dispatch", &lua]).output();
             }
         }
+        repick_pointer_soon();
     });
 }
 
@@ -437,6 +438,32 @@ pub fn place_window(class: &str, title: &str, spot: (f32, f32)) {
     let Some(address) = c["address"].as_str() else { return };
     let lua = format!(r#"hl.dsp.window.move({{ x = {x}, y = {y}, window = "address:{address}" }})"#);
     let _ = Command::new("hyprctl").args(["dispatch", &lua]).output();
+    repick_pointer_soon();
+}
+
+/// Hyprland looks again at which window is under the pointer only when the pointer moves: a
+/// window that came up (or was moved) under a still pointer didn't get its presses, the window
+/// it covered did (Calculator relaunched under the pointer, its red button clicked: the click
+/// went to TextEdit beneath, on the Mac too). The pointer is moved to where it is, which makes
+/// Hyprland look; nothing moves. A moment after the last such change, once.
+pub fn repick_pointer_soon() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LATEST: AtomicU64 = AtomicU64::new(0);
+    if !running() {
+        return;
+    }
+    let n = LATEST.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if LATEST.load(Ordering::SeqCst) != n {
+            return;
+        }
+        let Ok(out) = Command::new("hyprctl").args(["-j", "cursorpos"]).output() else { return };
+        let Ok(at) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { return };
+        let (Some(x), Some(y)) = (at["x"].as_f64(), at["y"].as_f64()) else { return };
+        let (x, y) = (x.round() as i64, y.round() as i64);
+        dispatch(&format!("hl.dsp.cursor.move({{ x = {x}, y = {y} }})"), &["movecursor", &x.to_string(), &y.to_string()]);
+    });
 }
 
 /// Runs a dispatcher: Hyprland 0.5x takes Lua (`lua`), earlier ones the plain form (`legacy`).
@@ -513,6 +540,7 @@ pub fn take_focus(title: &str) {
     let window = format!("address:{address}");
     dispatch(&format!(r#"hl.dsp.focus({{ window = "{window}" }})"#), &["focuswindow", &window]);
     dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
+    repick_pointer_soon();
 }
 
 /// A sheet or dialog of a Mac window (it has a parent here): on top and focused once Hyprland has
@@ -525,6 +553,7 @@ pub fn bring_up(class: String, title: String) {
                     let window = format!("address:{address}");
                     dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
                     dispatch(&format!(r#"hl.dsp.focus({{ window = "{window}" }})"#), &["focuswindow", &window]);
+                    repick_pointer_soon();
                 }
                 return;
             }
@@ -561,6 +590,7 @@ pub fn unminimise(class: String, title: String) {
         }
         dispatch(&format!(r#"hl.dsp.focus({{ window = "{window}" }})"#), &["focuswindow", &window]);
         dispatch(&format!(r#"hl.dsp.window.alter_zorder({{ mode = "top", window = "{window}" }})"#), &["alterzorder", &format!("top,{window}")]);
+        repick_pointer_soon();
     });
 }
 

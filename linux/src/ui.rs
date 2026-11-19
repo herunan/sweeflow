@@ -1853,6 +1853,10 @@ impl App {
         self.lay_out(wid, Some(&buffer), true, qh);
         if first_picture {
             self.add_waiting_popups(wid, qh);
+            // Up under a still pointer: Hyprland gives it the pointer only once asked.
+            if matches!(self.windows.get(&wid).map(|w| &w.role), Some(Role::Toplevel(_))) {
+                crate::hyprland::repick_pointer_soon();
+            }
         }
     }
 
