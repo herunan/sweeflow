@@ -403,6 +403,9 @@ pub struct App {
     cursor_device: Option<WpCursorShapeDeviceV1>,
     pointer_focus: Option<u32>,
     kb_focus: Option<u32>,
+    /// The Mac window that last had the keyboard here: after a Stop and Start it's the one put in
+    /// front again (the Mac's own front window may have changed meanwhile: Herdr came up instead).
+    last_mac_focus: Option<u32>,
     /// Focus while windows arrive after (re)connecting (see arrival.rs).
     arrival: crate::arrival::Arrival,
     scroll_active: bool,
@@ -578,6 +581,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_device: None,
         pointer_focus: None,
         kb_focus: None,
+        last_mac_focus: None,
         arrival: Default::default(),
         scroll_active: false,
         enter_serial: 0,
@@ -949,6 +953,13 @@ impl App {
     fn add_window(&mut self, info: WinInfo, qh: &QueueHandle<Self>) {
         let wid = info.wid;
         self.arrival.window_added(wid, info.parent == 0);
+        // The window last used here, back after a Stop and Start: in front on the Mac again,
+        // which then says so (Focused) and it's focused here as it arrives.
+        if self.arrival.arriving_now() && self.last_mac_focus == Some(wid) {
+            log::info!("window {wid}: last used here, put in front on the Mac again");
+            self.send(W::new(t::FOCUS).u32(wid).finish());
+            self.last_mac_focus = None;
+        }
         if self.closed_offline.remove(&wid) {
             // Closed here while the Mac was away: close it there (it comes back if the app asks
             // first, e.g. to save).
@@ -3844,6 +3855,7 @@ impl KeyboardHandler for App {
             }
             log::debug!("keyboard focus → {wid}: focusing it on the Mac");
             self.kb_focus = Some(wid);
+            self.last_mac_focus = Some(wid);
             // Remembered past this focus for the Global menu, which takes the focus to open
             // (not the Mac's display: it's no one app's).
             if let Some(info) = self.windows.get(&wid).map(|w| &w.info).filter(|i| i.kind != 3) {

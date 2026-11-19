@@ -90,6 +90,11 @@ impl Arrival {
         Some(key)
     }
 
+    /// Windows are arriving after a (re)connect, the user hasn't done anything yet.
+    pub fn arriving_now(&mut self) -> bool {
+        self.arriving()
+    }
+
     fn arriving(&mut self) -> bool {
         if self.until.is_some_and(|u| Instant::now() > u) {
             self.until = None;
