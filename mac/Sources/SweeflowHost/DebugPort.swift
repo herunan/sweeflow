@@ -14,7 +14,8 @@ import CoreImage
 ///   focus WID                 as the client focusing a window
 ///   front WID X Y             whether the window is in front at that point: by the last look and asked now
 ///   windows                   list tracked windows
-///   update check|choose|state as the update check, the menu's update line chosen, or what it knows
+///   update check|show|hide|choose|state as the update check (show: as chosen from the menu, window only), the menu's update line chosen, or what it knows
+///   update preview STATE      the update window with made-up contents (checking, latest, failed, available, installing)
 final class DebugPort {
     private var listener: NWListener?
     static weak var session: Session?
@@ -41,9 +42,13 @@ final class DebugPort {
         let p = line.split(separator: " ").map(String.init)
         guard let cmd = p.first else { return reply("empty") }
         switch cmd {
+        case "update" where p.count == 3 && p[1] == "preview":
+            Updater.shared.preview(p[2]); reply("ok")
         case "update" where p.count == 2:
             switch p[1] {
             case "check": Updater.shared.check(manual: false); reply("checking")
+            case "show": Updater.shared.check(manual: true); reply("checking, then the window")
+            case "hide": Updater.shared.hideWindow(); reply("ok")
             case "choose": Updater.shared.menuChosen(); reply(Updater.shared.menuTitle)
             default: reply("this \(Updater.version) (\(Updater.build)); menu: \(Updater.shared.menuTitle)")
             }

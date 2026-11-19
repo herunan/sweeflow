@@ -88,10 +88,6 @@ curl -fsSLO https://github.com/herunan/sweeflow/releases/latest/download/sweeflo
 sudo apt install ./sweeflow_amd64.deb
 ```
 
-**Fedora**
-
-Get `sweeflow.x86_64.rpm` from the [latest release](https://github.com/herunan/sweeflow/releases/latest).
-
 ### 3. Link them
 
 Sweeflow opens **Link a Mac** by itself. Choose your Mac and type the code it shows. Your Mac apps then appear in your launcher.

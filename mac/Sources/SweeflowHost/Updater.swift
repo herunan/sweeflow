@@ -1,13 +1,12 @@
 import AppKit
 import CryptoKit
-import UserNotifications
 
 /// Updates. Each release has `latest.json` (linux/release/build.sh): its version, what's new, and
 /// where the Mac app is. Sweeflow looks a little after it starts and every few hours. A newer one
 /// is said once in a notification, and the menu's line turns from "Check for Updates…" into
 /// "Update to Sweeflow X…". Chosen, it shows what's new while it downloads the disk image, checks
 /// it (its checksum, and that the app in it is signed as this one is), swaps it in and opens it.
-final class Updater: NSObject, UNUserNotificationCenterDelegate {
+final class Updater: NSObject {
     static let shared = Updater()
 
     struct Feed: Decodable {
@@ -15,6 +14,8 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
         let version: String
         let notes: String?
         let page: String?
+        /// When it was released ("2026-11-19").
+        let date: String?
         let mac: Part?
     }
 
@@ -44,7 +45,9 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
 
     /// Looks now and again. Main thread.
     func start() {
-        UNUserNotificationCenter.current().delegate = self
+        Notices.shared.onClick["update"] = { [weak self] in
+            if let feed = self?.available { self?.showAndInstall(feed) }
+        }
         sayIfUpdated()
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.check(manual: false) }
         timer = Timer.scheduledTimer(withTimeInterval: Self.every, repeats: true) { [weak self] _ in self?.check(manual: false) }
@@ -61,18 +64,19 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
     /// Looks at the latest release. `manual`: chosen from the menu, so the answer is shown either
     /// way (a window with what's new, or that this is the latest).
     func check(manual: Bool) {
+        if manual { shownWindow().checking() }
         let url = UserDefaults.standard.string(forKey: "updateFeed").flatMap(URL.init(string:)) ?? URL(string: Self.feedURL)!
         URLSession.shared.dataTask(with: URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)) { data, response, error in
             let feed = data.flatMap { try? JSONDecoder().decode(Feed.self, from: $0) }
             DispatchQueue.main.async { [self] in
                 guard let feed, let mac = feed.mac, (response as? HTTPURLResponse)?.statusCode ?? 200 < 400 else {
                     log("update check: \(error.map { "\($0)" } ?? "no release found")")
-                    if manual { self.say("Couldn't check for updates", "The latest release couldn't be reached. Try again later.") }
+                    if manual { self.shownWindow().failed(checking: true, "Sweeflow couldn't reach github.com. Check you're online, then try again.") }
                     return
                 }
                 guard Self.newer((mac.version, mac.build), than: (Self.version, Self.build)) else {
                     self.available = nil
-                    if manual { self.say("Sweeflow is up to date", "You have the latest version, \(Self.version).") }
+                    if manual { self.shownWindow().upToDate() }
                     return
                 }
                 log("update: Sweeflow \(mac.version) (\(mac.build)) is out, this is \(Self.version) (\(Self.build))")
@@ -90,28 +94,7 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func notify(_ title: String, _ body: String, id: String) {
-        let center = UNUserNotificationCenter.current()
-        center.requestAuthorization(options: [.alert]) { granted, _ in
-            guard granted else { return }
-            let c = UNMutableNotificationContent()
-            c.title = title
-            c.body = body
-            center.add(UNNotificationRequest(identifier: id, content: c, trigger: nil))
-        }
-    }
-
-    /// The update notification clicked: what's new, and the update under way.
-    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
-                                withCompletionHandler done: @escaping () -> Void) {
-        DispatchQueue.main.async { [self] in
-            if response.notification.request.identifier == "update", let feed = available { showAndInstall(feed) }
-        }
-        done()
-    }
-
-    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
-                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-        done([.banner])
+        Notices.shared.post(title, body, kind: id)
     }
 
     /// After an update, once: what it is now.
@@ -123,17 +106,39 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func say(_ title: String, _ text: String) {
-        let a = NSAlert()
-        a.messageText = title
-        a.informativeText = text
-        NSApp.activate(ignoringOtherApps: true)
-        a.runModal()
+    /// The update window closed (the debug port's `update hide`).
+    func hideWindow() { window?.close() }
+
+    private func shownWindow() -> UpdateWindow {
+        if let window { return window }
+        let w = UpdateWindow(update: { [weak self] in self?.install() }, retry: { [weak self] in self?.check(manual: true) })
+        window = w
+        return w
     }
 
     private func show(_ feed: Feed, installing: Bool) {
-        if window == nil { window = UpdateWindow { [weak self] in self?.install() } }
-        window?.show(feed, installing: installing)
+        shownWindow().show(feed, installing: installing)
+    }
+
+    /// The window in one of its states with made-up contents (the debug port, for screenshots).
+    func preview(_ state: String) {
+        let feed = Feed(version: "0.2.0", notes: """
+            Smoother windows, and Sweeflow tells you when a new version is out.
+
+            - Mac windows open and move about faster, with less delay when typing.
+            - Check for Updates… in the Mac menu and the Linux tray, with this window.
+            - The Mac says in a notification when streaming starts, pauses and stops.
+            - Shortcuts you keep for Linux now also work while a Mac window is in front.
+            - Fixes for sheets on Hyprland and the Alt+Tab switcher on Linux Mint.
+            """, page: nil, date: "2026-12-03", mac: nil)
+        let w = shownWindow()
+        switch state {
+        case "checking": w.checking()
+        case "latest": w.upToDate()
+        case "failed": w.failed(checking: true, "Sweeflow couldn't reach github.com. Check you're online, then try again.")
+        case "installing": w.show(feed, installing: false); w.status("Downloading…", progress: 0.42)
+        default: w.show(feed, installing: false)
+        }
     }
 
     private func showAndInstall(_ feed: Feed) {
@@ -147,17 +152,17 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
     private func install() {
         guard !installing, let feed = available, let mac = feed.mac, let url = URL(string: mac.url) else { return }
         installing = true
-        window?.status("Downloading Sweeflow \(mac.version)…", progress: 0)
+        window?.status("Downloading…", progress: 0)
         let task = URLSession.shared.downloadTask(with: url) { [self] file, _, error in
             do {
                 guard let file else { throw UpdateError("the download didn't come (\(error.map { "\($0)" } ?? "no file"))") }
                 let dmg = FileManager.default.temporaryDirectory.appendingPathComponent("Sweeflow-update.dmg")
                 try? FileManager.default.removeItem(at: dmg)
                 try FileManager.default.moveItem(at: file, to: dmg)
-                DispatchQueue.main.async { self.window?.status("Checking it…", progress: nil) }
+                DispatchQueue.main.async { self.window?.status("Checking the download and its signature…", progress: nil) }
                 let app = try Self.verifiedApp(dmg: dmg, sha256: mac.sha256)
                 DispatchQueue.main.async {
-                    self.window?.status("Restarting…", progress: nil)
+                    self.window?.status("Restarting Sweeflow…", progress: nil)
                     log("update: installing Sweeflow \(mac.version) from \(app.path)")
                     self.swapAndRestart(with: app)
                 }
@@ -165,7 +170,7 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
                 log("update failed: \(error)")
                 DispatchQueue.main.async {
                     self.installing = false
-                    self.window?.failed("The update didn't install: \(error). Sweeflow stays as it is.")
+                    self.window?.failed(checking: false, "The update didn't install (\(error)). Sweeflow stays as it is.")
                 }
             }
         }
@@ -229,95 +234,302 @@ final class Updater: NSObject, UNUserNotificationCenterDelegate {
         p.arguments = ["-c", script]
         do { try p.run() } catch {
             installing = false
-            window?.failed("The update didn't install: \(error). Sweeflow stays as it is.")
+            window?.failed(checking: false, "The update didn't install (\(error)). Sweeflow stays as it is.")
             return
         }
         StatusMenu.quitForUpdate()
     }
 }
 
-/// What's new in a release, and how its update is going.
-final class UpdateWindow: NSObject {
+/// The update window: looking for a release, up to date, couldn't look, or a newer one with what's
+/// new (and how its update is going). The same as Linux's (linux/src/updatewin.rs).
+final class UpdateWindow: NSObject, NSWindowDelegate {
     private let window: NSWindow
+    private let icon = NSImageView()
     private let heading = NSTextField(labelWithString: "")
+    private let subheading = NSTextField(labelWithString: "")
+    private let spinner = NSProgressIndicator()
+    private let notesLabel = NSTextField(labelWithString: "What's new")
+    private let notesBox = NSView()
     private let notes = NSTextView()
-    private let line = NSTextField(labelWithString: "")
+    private var notesHeight: NSLayoutConstraint!
     private let bar = NSProgressIndicator()
-    private let button = NSButton(title: "Update and Restart", target: nil, action: nil)
+    private let line = NSTextField(labelWithString: "")
+    private let pageButton = NSButton(title: "Release page", target: nil, action: nil)
+    private let secondButton = NSButton(title: "Later", target: nil, action: nil)
+    private let mainButton = NSButton(title: "Update and Restart", target: nil, action: nil)
     private let update: () -> Void
+    private let retry: () -> Void
+    private var page: String?
+    private enum Main { case update, retry, ok }
+    private var main = Main.update
+    private var busy = false
 
-    init(update: @escaping () -> Void) {
+    init(update: @escaping () -> Void, retry: @escaping () -> Void) {
         self.update = update
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 420), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        self.retry = retry
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init()
-        window.title = "Sweeflow Update"
+        window.title = "Software Update"
         window.isReleasedWhenClosed = false
-        heading.font = .boldSystemFont(ofSize: 15)
+        window.delegate = self
+
+        icon.image = NSApp.applicationIconImage
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        heading.font = .systemFont(ofSize: 17, weight: .semibold)
+        heading.lineBreakMode = .byWordWrapping
+        subheading.font = .systemFont(ofSize: 13)
+        subheading.textColor = .secondaryLabelColor
+        subheading.lineBreakMode = .byWordWrapping
+        subheading.maximumNumberOfLines = 3
+        subheading.preferredMaxLayoutWidth = 380
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        let titles = NSStackView(views: [heading, subheading])
+        titles.orientation = .vertical
+        titles.alignment = .leading
+        titles.spacing = 3
+        let header = NSStackView(views: [icon, titles, NSView(), spinner])
+        header.spacing = 16
+        header.alignment = .centerY
+
+        notesLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        notesLabel.textColor = .secondaryLabelColor
+        // The notes on a rounded panel, scrolling when there are many.
+        notesBox.wantsLayer = true
+        notesBox.layer?.cornerRadius = 10
+        notesBox.layer?.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.08).cgColor
+        notesBox.layer?.borderColor = NSColor.separatorColor.cgColor
+        notesBox.layer?.borderWidth = 0.5
         notes.isEditable = false
+        notes.isSelectable = true
         notes.drawsBackground = false
-        notes.textContainerInset = NSSize(width: 0, height: 4)
+        notes.textContainerInset = NSSize(width: 12, height: 14)
+        notes.autoresizingMask = [.width]
         let scroll = NSScrollView()
         scroll.documentView = notes
         scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
         scroll.drawsBackground = false
-        notes.autoresizingMask = [.width]
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        notesBox.addSubview(scroll)
+
         bar.style = .bar
         bar.minValue = 0
         bar.maxValue = 1
+        line.font = .systemFont(ofSize: 12)
         line.textColor = .secondaryLabelColor
-        button.target = self
-        button.action = #selector(chosen)
-        button.keyEquivalent = "\r"
-        let stack = NSStackView(views: [heading, scroll, bar, line, button])
+
+        pageButton.isBordered = false
+        pageButton.contentTintColor = .labelColor
+        pageButton.attributedTitle = NSAttributedString(string: "Release page", attributes: [.foregroundColor: NSColor.labelColor, .font: NSFont.systemFont(ofSize: 13), .underlineStyle: NSUnderlineStyle.single.rawValue])
+        pageButton.target = self
+        pageButton.action = #selector(openPage)
+        secondButton.bezelStyle = .rounded
+        secondButton.target = self
+        secondButton.action = #selector(dismiss)
+        secondButton.keyEquivalent = "\u{1b}"
+        mainButton.bezelStyle = .rounded
+        mainButton.keyEquivalent = "\r"
+        mainButton.target = self
+        mainButton.action = #selector(chosen)
+        let buttons = NSStackView(views: [pageButton, NSView(), secondButton, mainButton])
+        buttons.spacing = 8
+
+        let stack = NSStackView(views: [header, notesLabel, notesBox, bar, line, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.spacing = 14
+        stack.setCustomSpacing(8, after: notesLabel)
+        stack.setCustomSpacing(8, after: bar)
+        stack.setCustomSpacing(20, after: line)
+        stack.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView = NSView()
-        window.contentView!.addSubview(stack)
+        let content = NSView()
+        window.contentView = content
+        content.addSubview(stack)
+        notesHeight = notesBox.heightAnchor.constraint(equalToConstant: 200)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
-            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 220),
-            bar.widthAnchor.constraint(equalTo: scroll.widthAnchor),
+            content.widthAnchor.constraint(equalToConstant: 520),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48),
+            notesBox.widthAnchor.constraint(equalTo: header.widthAnchor),
+            notesHeight,
+            scroll.leadingAnchor.constraint(equalTo: notesBox.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: notesBox.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: notesBox.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: notesBox.bottomAnchor),
+            bar.widthAnchor.constraint(equalTo: header.widthAnchor),
+            buttons.widthAnchor.constraint(equalTo: header.widthAnchor),
         ])
-        button.setContentHuggingPriority(.required, for: .horizontal)
     }
 
-    @objc private func chosen() { update() }
+    // MARK: the states
+
+    func checking() {
+        set(heading: "Checking for updates…", sub: "Looking at the latest release.", notes: false)
+        spinner.isHidden = false
+        spinner.startAnimation(nil)
+        buttons(second: "Cancel", main: nil)
+        present()
+    }
+
+    func upToDate() {
+        set(heading: "Sweeflow is up to date", sub: "You have the latest version, \(Updater.version).", notes: false)
+        buttons(second: nil, main: ("OK", .ok))
+        present()
+    }
+
+    /// `checking`: it couldn't look (else: the update didn't install, its notes still shown).
+    func failed(checking: Bool, _ text: String) {
+        busy = false
+        if checking {
+            set(heading: "Couldn't check for updates", sub: text, notes: false)
+            buttons(second: "Close", main: ("Try Again", .retry))
+        } else {
+            bar.isHidden = true
+            line.isHidden = false
+            line.stringValue = text
+            line.textColor = .systemRed
+            buttons(second: "Close", main: ("Try Again", .update))
+        }
+        present()
+    }
 
     func show(_ feed: Updater.Feed, installing: Bool) {
-        heading.stringValue = "Sweeflow \(feed.version)"
-        let text = feed.notes?.isEmpty == false ? feed.notes! : "No notes for this release."
-        let md = (try? NSAttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-            ?? NSAttributedString(string: text)
-        let body = NSMutableAttributedString(attributedString: md)
-        body.addAttributes([.foregroundColor: NSColor.labelColor, .font: NSFont.systemFont(ofSize: 13)], range: NSRange(location: 0, length: body.length))
-        notes.textStorage?.setAttributedString(body)
-        bar.isHidden = !installing
-        button.isHidden = installing
-        line.stringValue = installing ? "Getting it ready…" : "You have \(Updater.version). Sweeflow restarts to update."
-        NSApp.activate(ignoringOtherApps: true)
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        page = feed.page
+        let released = feed.date.flatMap(Self.niceDate).map { "  ·  Released \($0)" } ?? ""
+        set(heading: "Sweeflow \(feed.version) is available", sub: "You have \(Updater.version)\(released)", notes: true)
+        setNotes(feed.notes ?? "")
+        buttons(second: "Later", main: ("Update and Restart", .update))
+        if installing { status("Downloading…", progress: nil) }
+        present()
     }
 
     /// How the update is going: a line, and how far the download is (nil: it can't say).
     func status(_ text: String?, progress: Double?) {
+        busy = true
         if let text { line.stringValue = text }
+        if let v = heading.stringValue.split(separator: " ").dropFirst().first, heading.stringValue.hasSuffix("is available") {
+            heading.stringValue = "Updating to Sweeflow \(v)…"
+        }
+        line.textColor = .secondaryLabelColor
         bar.isHidden = false
-        button.isHidden = true
+        line.isHidden = false
         if let progress { bar.isIndeterminate = false; bar.doubleValue = progress } else { bar.isIndeterminate = true; bar.startAnimation(nil) }
+        secondButton.isHidden = true
+        mainButton.isEnabled = false
     }
 
-    func failed(_ text: String) {
-        line.stringValue = text
+    func close() { window.orderOut(nil) }
+
+    // MARK: pieces
+
+    private func set(heading text: String, sub: String, notes shown: Bool) {
+        heading.stringValue = text
+        subheading.stringValue = sub
+        spinner.stopAnimation(nil)
+        spinner.isHidden = true
+        notesLabel.isHidden = !shown
+        notesBox.isHidden = !shown
+        pageButton.isHidden = !shown
         bar.isHidden = true
-        button.isHidden = false
-        button.title = "Try Again"
+        line.isHidden = true
+        mainButton.isEnabled = true
     }
+
+    private func buttons(second: String?, main: (String, Main)?) {
+        secondButton.isHidden = second == nil
+        secondButton.title = second ?? ""
+        mainButton.isHidden = main == nil
+        if let main { mainButton.title = main.0; self.main = main.1 }
+        // Return presses the main button, or Cancel / Close while there's none.
+        secondButton.keyEquivalent = main == nil ? "\r" : "\u{1b}"
+    }
+
+    /// CHANGELOG.md's markdown: "- " items as bullets in the text's colour, hanging; paragraphs
+    /// as they are; **bold** and `code` inline.
+    private func setNotes(_ md: String) {
+        let body = NSMutableAttributedString()
+        let font = NSFont.systemFont(ofSize: 13)
+        var paragraphs: [(bullet: Bool, text: String)] = []
+        for raw in md.components(separatedBy: "\n") {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty || t.hasPrefix("#") { paragraphs.append((false, "")); continue }
+            if t.hasPrefix("- ") || t.hasPrefix("* ") {
+                paragraphs.append((true, String(t.dropFirst(2))))
+            } else if let last = paragraphs.last, !last.text.isEmpty {
+                paragraphs[paragraphs.count - 1].text += " " + t
+            } else {
+                paragraphs.append((false, t))
+            }
+        }
+        paragraphs = paragraphs.filter { !$0.text.isEmpty }
+        if paragraphs.isEmpty { paragraphs = [(false, "No notes for this release.")] }
+        for (i, p) in paragraphs.enumerated() {
+            let style = NSMutableParagraphStyle()
+            style.paragraphSpacing = i == paragraphs.count - 1 ? 0 : 8
+            style.lineSpacing = 1.5
+            if p.bullet {
+                style.headIndent = 16
+                style.tabStops = [NSTextTab(textAlignment: .left, location: 16)]
+                body.append(NSAttributedString(string: "●\t", attributes: [.font: NSFont.systemFont(ofSize: 8), .foregroundColor: NSColor.labelColor, .paragraphStyle: style, .baselineOffset: 2]))
+            }
+            let inline = (try? NSAttributedString(markdown: p.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? NSAttributedString(string: p.text)
+            let text = NSMutableAttributedString(attributedString: inline)
+            text.addAttributes([.foregroundColor: NSColor.labelColor, .paragraphStyle: style], range: NSRange(location: 0, length: text.length))
+            text.enumerateAttribute(.font, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+                let traits = (value as? NSFont)?.fontDescriptor.symbolicTraits ?? []
+                text.addAttribute(.font, value: traits.contains(.bold) ? NSFont.systemFont(ofSize: 13, weight: .semibold) : font, range: range)
+            }
+            body.append(text)
+            if i < paragraphs.count - 1 { body.append(NSAttributedString(string: "\n", attributes: [.paragraphStyle: style])) }
+        }
+        notes.textStorage?.setAttributedString(body)
+        // As tall as the notes, up to a point (then they scroll).
+        notes.frame.size.width = 472
+        notes.layoutManager?.ensureLayout(for: notes.textContainer!)
+        let used = notes.layoutManager?.usedRect(for: notes.textContainer!).height ?? 160
+        notesHeight.constant = min(ceil(used) + 30, 300)
+    }
+
+    private func present() {
+        window.contentView?.layoutSubtreeIfNeeded()
+        let size = window.contentView?.fittingSize ?? NSSize(width: 520, height: 200)
+        let wasVisible = window.isVisible
+        window.setContentSize(size)
+        if !wasVisible { window.center() }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    static func niceDate(_ iso: String) -> String? {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        guard let d = f.date(from: iso) else { return nil }
+        let out = DateFormatter()
+        out.dateFormat = "d MMM yyyy"
+        return out.string(from: d)
+    }
+
+    @objc private func chosen() {
+        switch main {
+        case .update: update()
+        case .retry: retry()
+        case .ok: close()
+        }
+    }
+    @objc private func dismiss() { close() }
+    @objc private func openPage() {
+        let url = URL(string: page ?? "") ?? URL(string: "https://github.com/herunan/sweeflow/releases/latest")!
+        NSWorkspace.shared.open(url)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool { !busy }
 }

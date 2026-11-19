@@ -172,7 +172,7 @@ if !LoginItem.underLaunchd {
         if !other.isTerminated { other.forceTerminate(); RunLoop.current.run(until: Date().addingTimeInterval(1)) }
     }
     // For the next login.
-    DispatchQueue.main.async { LoginItem.check(); Updater.shared.start() }
+    DispatchQueue.main.async { LoginItem.check(); Notices.shared.start(); StreamNotices.shared.start(); Updater.shared.start() }
 }
 
 let settings = Settings(Config.load())
@@ -201,6 +201,12 @@ final class HostState {
     }
     /// What that computer calls itself (said in its hello; empty from older ones). Main thread.
     var clientSaysName = ""
+    /// What to call the connected Linux machine: the name it has here (renamed here, or from
+    /// linking), else what it calls itself, never a code made from its certificate.
+    var clientName: String {
+        let known = client.flatMap { fp in fp.isEmpty ? nil : Identity.pairedClients().first { $0.fingerprint == fp }?.name } ?? ""
+        return !known.isEmpty ? known : !clientSaysName.isEmpty ? clientSaysName : "a Linux machine"
+    }
     /// The version of Sweeflow the connected Linux machine has ("" for an older one that doesn't say).
     var clientAppVersion = ""
     private var teardown: DispatchWorkItem?

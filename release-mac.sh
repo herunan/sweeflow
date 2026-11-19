@@ -19,6 +19,6 @@ cp "dist/Sweeflow-$VERSION.dmg" dist/Sweeflow.dmg
 echo "$BUILD" > dist/Sweeflow.build   # for the update notice (linux/release/build.sh)
 # The signing key never changes; keep a copy off the Mac (not in git).
 mkdir -p ~/.local/share/sweeflow-release && chmod 700 ~/.local/share/sweeflow-release
-ssh "$TARGET" 'cat "$HOME/Library/Application Support/sweeflow-release/release.p12"' > ~/.local/share/sweeflow-release/release.p12
-chmod 600 ~/.local/share/sweeflow-release/release.p12
+ssh "$TARGET" 'cat "$HOME/Library/Application Support/sweeflow-release/devid.p12"' > ~/.local/share/sweeflow-release/devid.p12
+chmod 600 ~/.local/share/sweeflow-release/devid.p12
 echo "==> dist/Sweeflow-$VERSION.dmg"

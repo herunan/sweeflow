@@ -39,6 +39,9 @@ pub struct Feed {
     pub notes: String,
     #[serde(default)]
     pub page: String,
+    /// When it was released ("2026-11-19").
+    #[serde(default)]
+    pub date: String,
     /// The Mac app's (Updater.swift reads it).
     #[allow(dead_code)]
     pub mac: Option<Part>,
@@ -96,16 +99,36 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Looks at the latest release: a newer one is noted, and said once (a notification).
-pub fn check() -> Result<Option<Feed>> {
-    let feed: Feed = serde_json::from_slice(&fetch(&feed_url())?).context("latest.json")?;
+/// The latest release, if it's newer than this copy. Nothing said or shown (the update window).
+pub fn check_quiet() -> Result<Option<Feed>> {
+    let body = fetch(&feed_url()).map_err(|e| {
+        log::info!("update check: {e:#}");
+        anyhow::anyhow!("Sweeflow couldn't reach github.com. Check you're online, then try again.")
+    })?;
+    let feed: Feed = serde_json::from_slice(&body).context("the release's latest.json doesn't read")?;
     *LATEST.lock().unwrap() = Some(feed.clone());
     let new = feed.linux.as_ref().is_some_and(|l| newer((&l.version, l.build), (VERSION, build())));
     *AVAILABLE.lock().unwrap() = new.then(|| feed.clone());
+    Ok(new.then_some(feed))
+}
+
+/// A newer release's version, once seen.
+pub fn available() -> Option<String> {
+    AVAILABLE.lock().unwrap().as_ref().map(|f| f.version.clone())
+}
+
+/// The latest release, as last looked at.
+pub fn latest() -> Option<Feed> {
+    LATEST.lock().unwrap().clone()
+}
+
+/// Looks at the latest release: a newer one is noted, and said once (a notification).
+pub fn check() -> Result<Option<Feed>> {
+    let found = check_quiet();
     crate::tray::refresh();
-    if !new {
+    let Some(feed) = found? else {
         return Ok(None);
-    }
+    };
     log::info!("Sweeflow {} is out (this is {VERSION})", feed.version);
     // Said once per version, however often it's looked at or Sweeflow restarts.
     let said = crate::config::dir().join("update-notified");
@@ -226,10 +249,16 @@ pub fn run() -> Result<()> {
         }
         return Ok(());
     }
+    install_tarball(&feed, &|words| println!("==> {words}"))
+}
+
+/// Puts the release in place of install.sh's copy, checked against the release's signed
+/// checksums, and restarts Sweeflow. `step` is told each step, in words.
+pub fn install_tarball(feed: &Feed, step: &dyn Fn(&str)) -> Result<()> {
     let part = feed.linux.clone().context("the release has nothing for Linux")?;
     let dir = tempdir()?;
     let base = part.url.rsplit_once('/').map(|(b, _)| b.to_string()).context("download address")?;
-    println!("==> downloading Sweeflow {}", part.version);
+    step(&format!("Downloading Sweeflow {}…", part.version));
     let sums = fetch(&format!("{base}/SHA256SUMS"))?;
     let sig = fetch(&format!("{base}/SHA256SUMS.sig"))?;
     std::fs::write(dir.join("SHA256SUMS"), &sums)?;
@@ -246,6 +275,7 @@ pub fn run() -> Result<()> {
     ensure!(ok.status.success(), "the release's checksums aren't signed by Sweeflow's key: not installed");
     let name = part.url.rsplit('/').next().unwrap_or_default().to_string();
     let tarball = fetch(&part.url)?;
+    step("Checking the download against the release's signature…");
     let sum = sha256(&tarball)?;
     let listed = String::from_utf8_lossy(&sums).lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == [sum.as_str(), name.as_str()]);
     ensure!(listed && sum == part.sha256, "{name} isn't the file the release lists: not installed");
@@ -254,6 +284,7 @@ pub fn run() -> Result<()> {
     ensure!(st.success(), "couldn't unpack {name}");
     let new = dir.join(format!("sweeflow-{}", part.version)).join("sweeflow");
     ensure!(new.exists(), "{name} has no sweeflow in it");
+    step("Installing…");
     // In place in one step: the running copy goes on running until it restarts.
     let target = std::env::current_exe()?;
     let staged = target.with_extension("new");
@@ -261,7 +292,8 @@ pub fn run() -> Result<()> {
     std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     std::fs::rename(&staged, &target)?;
     let _ = std::fs::remove_dir_all(&dir);
-    println!("==> Sweeflow {} installed to {}", part.version, target.display());
+    log::info!("Sweeflow {} installed to {}", part.version, target.display());
+    step("Restarting Sweeflow…");
     // Its setup again (launcher, widget, keys), as the new copy has it; it restarts the service.
     let st = Command::new(&target).arg("install").status()?;
     if !st.success() {

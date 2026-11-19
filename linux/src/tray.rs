@@ -465,6 +465,20 @@ impl ksni::Tray for Tray {
         );
         // (The Global menu opens with Cmd+Opt+U in a Mac window, on every desktop: no item here.)
         items.push(MenuItem::Separator);
+        // Updates: a newer release, once seen, or a look for one. Either opens the update window.
+        let update_label = match crate::update::available() {
+            Some(v) => format!("Update to Sweeflow {v}…"),
+            None => "Check for Updates…".into(),
+        };
+        items.push(
+            StandardItem {
+                label: update_label.replace('_', "__"),
+                icon_name: menu_icon("system-software-update-symbolic"),
+                activate: Box::new(|_| open_update_window()),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(
             StandardItem {
                 label: "Quit Sweeflow".into(),
@@ -985,15 +999,10 @@ pub fn panel_do(action: &str, arg: &str) {
             std::thread::spawn(crate::wake::wake);
         }
         "pair" => open_wizard(),
-        // A newer release: install.sh's copy updates itself (outside the service, which it restarts).
-        "update" => {
-            let exe = std::env::current_exe().unwrap_or_else(|_| "sweeflow".into());
-            let mut cmd = std::process::Command::new("systemd-run");
-            cmd.args(["--user", "--collect", "--quiet", "--unit=sweeflow-update"]).arg(&exe).arg("update");
-            if cmd.status().map_or(true, |s| !s.success()) {
-                let _ = std::process::Command::new(&exe).arg("update").spawn();
-            }
-        }
+        // Check for Updates…, and a newer release's What's new: the update window (which updates
+        // install.sh's copy itself, from a scope of its own: the service restarts under it).
+        // "update" is what a widget from before the window sends.
+        "update-window" | "update" => open_update_window(),
         // What's new: the release's page.
         "update-page" => {
             let _ = std::process::Command::new("xdg-open").arg(arg).spawn();
@@ -1214,6 +1223,11 @@ pub fn rename(fingerprint: &str, name: &str) {
         return log::warn!("saving config: {e:#}");
     }
     refresh();
+}
+
+/// The update window: looks for a newer release, shows what's new and updates.
+pub fn open_update_window() {
+    run_window("update-window", "the update window");
 }
 
 pub fn open_wizard() {

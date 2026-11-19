@@ -28,6 +28,7 @@ mod setup;
 mod tray;
 mod ui;
 mod update;
+mod updatewin;
 mod wake;
 mod wizard;
 mod x11clip;
@@ -48,6 +49,7 @@ USAGE:
     sweeflow pair            link a Mac on this network (the Mac shows a code, you type it here)
     sweeflow pair --text     the same, in the terminal
     sweeflow update          install the latest release (install.sh's copy; packages say how)
+    sweeflow update-window   the update window: checks, shows what's new, updates
     sweeflow setup USER@MAC  install/update the Mac host over SSH and pair with it (development)
     sweeflow launch BUNDLEID open a Mac app (what the Mac app launchers run)
     sweeflow quit BUNDLEID   quit a Mac app (the Mac app launchers' Quit action)
@@ -139,6 +141,7 @@ fn main() -> Result<()> {
         Some("setup") => setup::setup(args.get(1).map(String::as_str).ok_or_else(|| anyhow::anyhow!("{USAGE}"))?),
         Some("install") => setup::install(),
         Some("update") => update::run(),
+        Some("update-window") => updatewin::run(&args[1..]),
         Some("uninstall") if args.len() == 1 => setup::uninstall(false),
         Some("uninstall") if args.len() == 2 && args[1] == "--purge" => setup::uninstall(true),
         Some("open") => setup::open(),

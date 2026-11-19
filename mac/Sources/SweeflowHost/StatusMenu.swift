@@ -75,11 +75,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let client: String? = host.connected ? (host.client ?? "") : nil
         let refused = Identity.disconnectedClients().intersection(Identity.pairedClients().map(\.fingerprint))
         let statusText: String
-        if let fp = client {
-            // The name it has here (renamed here, or from linking), else what it calls itself,
-            // never a code made from its certificate.
-            let known = fp.isEmpty ? "" : (Identity.pairedClients().first { $0.fingerprint == fp }?.name ?? "")
-            let who = !known.isEmpty ? known : !host.clientSaysName.isEmpty ? host.clientSaysName : "a Linux machine"
+        if client != nil {
+            let who = host.clientName
             statusText = c.enabled ? "Streaming to \(who)" : "Paused · \(who)"
         } else {
             statusText = refused.isEmpty ? "Not streaming" : "Stopped"

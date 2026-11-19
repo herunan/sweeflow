@@ -409,6 +409,11 @@ PlasmoidItem {
                     text: "Shortcuts"
                     onClicked: { root.act("shortcuts"); root.expanded = false; }
                 }
+                SfButton {
+                    icon.name: "system-software-update-symbolic"
+                    text: "Check for Updates…"
+                    onClicked: { root.act("update-window", ""); root.expanded = false; }
+                }
                 Item { Layout.fillWidth: true }
                 SfButton {
                     text: "Quit Sweeflow"
@@ -445,8 +450,8 @@ PlasmoidItem {
                         PlasmaComponents3.Label { text: upd.u ? "Sweeflow " + upd.u.version + " is available" : ""; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
                         PlasmaComponents3.Label { text: upd.u ? upd.u.words : ""; opacity: 0.7; font: Kirigami.Theme.smallFont; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     }
-                    SfButton { text: "What's new"; onClicked: root.act("update-page", upd.u.page) }
-                    SfButton { visible: !!upd.u && upd.u.how === "self"; text: "Update"; onClicked: root.act("update", "") }
+                    // The update window: what's new, and the update (or how it's done).
+                    SfButton { text: upd.u && upd.u.how === "self" ? "Update…" : "What's New"; onClicked: { root.act("update-window", ""); root.expanded = false; } }
                 }
             }
             // The Mac on another version of Sweeflow.

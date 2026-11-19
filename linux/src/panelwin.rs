@@ -330,13 +330,10 @@ slint::slint! {
                             Text { text: "Sweeflow " + root.update-version + " is available"; color: Look.fg; font-size: 13px; font-weight: 600; overflow: elide; }
                             Text { text: root.update-words; color: Look.muted; font-size: 11px; wrap: word-wrap; }
                         }
+                        // The update window: what's new, and the update (or how it's done).
                         VerticalLayout {
                             alignment: center;
-                            Btn { text: "What's new"; small: true; clicked => { root.act("update-page", root.update-page); } }
-                        }
-                        if root.update-how == "self": VerticalLayout {
-                            alignment: center;
-                            Btn { text: "Update"; small: true; primary: true; clicked => { root.act("update", ""); } }
+                            Btn { text: root.update-how == "self" ? "Update…" : "What's New"; small: true; primary: true; clicked => { root.act("update-window", ""); } }
                         }
                     }
                 }
@@ -653,10 +650,12 @@ slint::slint! {
                     }
                 }
 
-                // The Shortcuts window at the left, Quit at the right.
+                // The Shortcuts window and Check for Updates at the left, Quit at the right.
                 if root.running && root.paired: HorizontalLayout {
                     vertical-stretch: 0;
+                    spacing: 8px;
                     Btn { text: "⌘  Shortcuts"; clicked => { root.act("shortcuts", ""); } }
+                    Btn { text: "Check for Updates…"; clicked => { root.act("update-window", ""); } }
                     Rectangle { horizontal-stretch: 1; }
                     Btn { text: "Quit Sweeflow"; clicked => { root.quit-all(); } }
                 }
