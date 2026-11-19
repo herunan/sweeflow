@@ -3211,11 +3211,11 @@ const GNOME_HAS_ENTRY: Duration = Duration::from_secs(7);
 fn gnome_ready(w: &mut Win) -> Option<Duration> {
     // A window that has been here a while was matched long ago (entries rewritten later, by
     // "Apps in launcher", change nothing for it).
-    if w.rematched || w.born.elapsed().is_ok_and(|a| a > Duration::from_secs(30)) {
+    if w.rematched || w.born.elapsed().is_ok_and(|a| a > Duration::from_secs(60)) {
         return None;
     }
-    let changed = crate::launchers::first_written_at(&w.info.bundle_id)?;
-    let has_it = changed + GNOME_HAS_ENTRY;
+    let first = crate::launchers::first_written_at(&w.info.bundle_id)?;
+    let has_it = first + GNOME_HAS_ENTRY;
     if let Ok(left) = has_it.duration_since(std::time::SystemTime::now()) {
         return Some(left.max(Duration::from_millis(50)));
     }
@@ -3224,8 +3224,13 @@ fn gnome_ready(w: &mut Win) -> Option<Duration> {
         if let Role::Toplevel(t) = &w.role {
             let id = format!("sweeflow-{}", w.info.bundle_id);
             t.set_app_id(format!("{id}.matching"));
+            t.wl_surface().commit();
             t.set_app_id(id);
+            t.wl_surface().commit();
             log::info!("window {}: matched to its app again (it came before GNOME had read its entry)", w.info.wid);
+            // Asked a moment later, not with the change: asked at once it was still the app of
+            // its own's (Ubuntu: prompted).
+            return Some(Duration::from_millis(500));
         }
     }
     None
