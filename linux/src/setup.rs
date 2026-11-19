@@ -219,6 +219,9 @@ pub fn install() -> Result<()> {
             cinnamon_commands_now(&home);
         }
     }
+    if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") {
+        gnome_utilities_folder(true);
+    }
     println!("==> sweeflow installed to {} and running as a user service", target.display());
     println!("    logs: journalctl --user -u sweeflow -f");
     Ok(())
@@ -262,6 +265,9 @@ pub fn uninstall(purge: bool) -> Result<()> {
     unregister_plasma_keys(&home, kde, &widgets);
     unregister_gsettings_keys("GNOME", GNOME_KEYS, "custom-keybindings", gnome_ours, |p| format!("{GNOME_KEYS}.custom-keybinding:{p}"));
     unregister_gsettings_keys("Cinnamon", CINNAMON_KEYS, "custom-list", cinnamon_ours, |id| cinnamon_schema(id));
+    if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") {
+        gnome_utilities_folder(false);
+    }
     if crate::hyprland::running() {
         match crate::hyprland::unbind_ours() {
             Ok(0) => {}
@@ -1382,6 +1388,34 @@ fn cinnamon_custom_key(home: &std::path::Path, id: &str, name: &str, arg: &str, 
     ids.push(id.to_string());
     gsettings(&["set", CINNAMON_KEYS, "custom-list", &format!("[{}]", ids.iter().map(|i| gvariant_str(i)).collect::<Vec<_>>().join(", "))])?;
     Ok(OpenKey::Set { now: true })
+}
+
+/// GNOME's Utilities folder in the app grid is a list of apps (Ubuntu's, CachyOS's), not a
+/// category: Sweeflow is put in it (or taken out), as dragging it there does; else it sat loose
+/// in the grid although it's a utility.
+const GNOME_UTILITIES: &str = "org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/Utilities/";
+
+fn gnome_utilities_folder(add: bool) {
+    let Ok(list) = gsettings(&["get", GNOME_UTILITIES, "apps"]) else { return };
+    let mut apps = quoted(&list);
+    // No such folder (its list empty and unnamed): left alone.
+    if apps.is_empty() && gsettings(&["get", GNOME_UTILITIES, "name"]).map_or(true, |n| quoted(&n).is_empty()) {
+        return;
+    }
+    let ours = "sweeflow.desktop".to_string();
+    let has = apps.contains(&ours);
+    if add == has {
+        return;
+    }
+    if add {
+        apps.push(ours);
+    } else {
+        apps.retain(|a| *a != ours);
+    }
+    let value = format!("[{}]", apps.iter().map(|a| gvariant_str(a)).collect::<Vec<_>>().join(", "));
+    if gsettings(&["set", GNOME_UTILITIES, "apps", &value]).is_ok() && add {
+        println!("    Sweeflow is in the app grid's Utilities folder");
+    }
 }
 
 /// Each install: Sweeflow's Cinnamon shortcuts from an earlier one run this install's program
