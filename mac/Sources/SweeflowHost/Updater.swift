@@ -218,25 +218,37 @@ final class Updater: NSObject {
 
     /// The new copy put where this one is, by a small script that waits for this one to quit, then
     /// opens it. (Put back as it was if the copy fails.)
+    /// The new copy goes in place before this one quits: whatever starts Sweeflow again (a login
+    /// agent that keeps it running restarts it at once) finds the new copy, never the old one
+    /// being swapped. The old one stays in Sweeflow.app.old until this quits; then it opens the
+    /// new one, unless something already started it.
     private func swapAndRestart(with staged: URL) {
-        let app = Bundle.main.bundleURL.path
-        let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let script = """
-        while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done
-        rm -rf \(q(app + ".old"))
-        if mv \(q(app)) \(q(app + ".old")) && /usr/bin/ditto \(q(staged.path)) \(q(app)); then rm -rf \(q(app + ".old")); \
-        else rm -rf \(q(app)); mv \(q(app + ".old")) \(q(app)); fi
-        rm -rf \(q(staged.deletingLastPathComponent().path))
-        /usr/bin/open \(q(app))
-        """
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", script]
-        do { try p.run() } catch {
+        let app = Bundle.main.bundleURL
+        let old = URL(fileURLWithPath: app.path + ".old")
+        let fm = FileManager.default
+        try? fm.removeItem(at: old)
+        do {
+            try fm.moveItem(at: app, to: old)
+            do { try fm.moveItem(at: staged, to: app) } catch {
+                try? fm.moveItem(at: old, to: app)
+                throw error
+            }
+        } catch {
             installing = false
             window?.failed(checking: false, "The update didn't install (\(error)). Sweeflow stays as it is.")
             return
         }
+        let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let script = """
+        while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done
+        rm -rf \(q(old.path)) \(q(staged.deletingLastPathComponent().path))
+        sleep 1
+        /usr/bin/pgrep -x SweeflowHost >/dev/null || /usr/bin/open \(q(app.path))
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script]
+        try? p.run()
         StatusMenu.quitForUpdate()
     }
 }

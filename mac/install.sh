@@ -31,7 +31,12 @@ if [ -z "${SWEEFLOW_DEV_COPY:-}" ] && [ -f "$REL/release.keychain-db" ] &&
     KC_PASS="sweeflow-release"
     SIGN_NAME=""   # the Developer ID's name, read from the keychain below
     # Keep the installed version number; the build number says when it was built.
-    VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo 0.1.0)
+    # (PlistBuddy prints "File Doesn't Exist, Will Create" and succeeds when there's no app yet.)
+    VERSION=0.1.0
+    if [ -f "$APP/Contents/Info.plist" ]; then
+        VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo 0.1.0)
+    fi
+    [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || VERSION=0.1.0
     BUILD="${SWEEFLOW_BUILD:-$(date +%Y%m%d%H%M)}"
     # A development copy from before goes: one Sweeflow, the permitted one.
     rm -rf "$HOME/Applications/Sweeflow.app"
