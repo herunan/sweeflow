@@ -2,7 +2,6 @@ linux/target/
 mac/.build/
 spike/linux/target/
 dist/
-.enjoy-logs/
 
 # Local: the Mac the dev scripts build on; tools' own folders
 .dev-mac
