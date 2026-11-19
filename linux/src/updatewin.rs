@@ -5,7 +5,7 @@
 //! command that updates it. A process of its own, like the pairing wizard, so the streaming
 //! client restarting under it (the update) doesn't close it.
 //!
-//!   sweeflow update-window [--preview checking|latest|failed|available|system|installing|done]
+//!   sweeflow update-window [--preview checking|latest|failed|available|system|download|installing|done]
 
 use anyhow::Result;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -318,7 +318,11 @@ fn look(ui: &UpdateWindow) {
     ui.set_state("checking".into());
     let weak = ui.as_weak();
     std::thread::spawn(move || {
+        // Shown for half a second at least: an answer that came before the window was on screen
+        // left it at the checking size (the compositor dropped the resize), and it doesn't flash.
+        let started = std::time::Instant::now();
         let found = update::check_quiet();
+        std::thread::sleep(std::time::Duration::from_millis(500).saturating_sub(started.elapsed()));
         let _ = weak.upgrade_in_event_loop(move |ui| match found {
             Ok(Some(feed)) => show_feed(&ui, &feed),
             Ok(None) => ui.set_state("latest".into()),
@@ -432,6 +436,10 @@ fn preview(ui: &UpdateWindow, state: &str) {
             show_feed(ui, &feed);
             ui.set_how("system".into());
             ui.set_command("sudo pacman -Syu".into());
+        }
+        "download" => {
+            show_feed(ui, &feed);
+            ui.set_how("download".into());
         }
         "installing" => {
             show_feed(ui, &feed);
