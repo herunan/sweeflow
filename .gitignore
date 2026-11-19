@@ -8,6 +8,4 @@ dist/
 .dev-mac
 .claude/
 .agents/
-.hallmark/
 skills-lock.json
-.cloudflare-account
