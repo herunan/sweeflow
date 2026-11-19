@@ -494,7 +494,9 @@ final class Session {
             let (wid, p) = try pointerTarget(&m)
             let b = Int(try m.u8()), pressed = try m.u8() != 0
             let pressId = (try? m.u32()) ?? 0   // newer clients number their presses
-            log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")")
+            let f = tracker.windows[wid]?.frame
+            log("click \(pressed ? "down" : "up") on \(wid) at \(p.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nowhere (unknown window)")"
+                + (pressed ? f.map { " (window at \(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height)))" } ?? "" : ""))
             if pressed { spotProbe.last = nil }   // the hover after this looks afresh (see probeSpot)
             if let p {
                 let post = { [self] in

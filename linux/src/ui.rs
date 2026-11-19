@@ -3895,6 +3895,15 @@ impl PointerHandler for App {
                             self.start_selection(wid, e.position.0, e.position.1, qh);
                         }
                     }
+                    if let Some(w) = self.windows.get(&wid) {
+                        // What a press lands on: the Mac window's size as last heard, the size
+                        // here, and the picture shown (a press missed in a tile once: these
+                        // didn't agree, it seems).
+                        log::debug!(
+                            "press on {wid} at {x:.0},{y:.0}: Mac size {:.0}x{:.0}, here {}x{}, picture {:?}, resize asked {:?}",
+                            w.info.w, w.info.h, w.size.0, w.size.1, w.picture, w.requested.map(|(s, _)| s)
+                        );
+                    }
                     self.send(W::new(t::POINTER_BUTTON).u32(wid).f32(x).f32(y).u8(mac_button(button)).u8(1).u32(self.press_id).finish());
                 }
                 PointerEventKind::Release { button, .. } => {
