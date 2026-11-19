@@ -718,7 +718,9 @@ pub fn mac_keys(on: bool) {
             // already, so a key taken out of the list stayed bound (copies piled up), and
             // hl.unbind can't clear it (it unbinds the key in every mode, the person's own
             // bindings included). Only the mode switched to is used.
-            format!(r#"if sweeflow_submap ~= "{version}" then sweeflow_submap = "{version}"; hl.define_submap("sweeflow-{version}", function()
+            // Each defined once (a version gone back to is there already: defined again it
+            // would have every key twice).
+            format!(r#"sweeflow_modes = sweeflow_modes or {{}}; if not sweeflow_modes["{version}"] then sweeflow_modes["{version}"] = true; hl.define_submap("sweeflow-{version}", function()
   {body}end) end; hl.dispatch(hl.dsp.submap("sweeflow-{version}"))"#)
 
         } else {
