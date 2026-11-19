@@ -500,7 +500,8 @@ PlasmoidItem {
                             required property int index
                             readonly property bool appRunning: modelData.state > 0
                             readonly property bool shown: !(root.settings.exclude || []).includes(modelData.id)
-                            function group(a) { return a.pinned ? "Pinned" : a.state > 0 ? "Running" : "Not running"; }
+                            // Not streaming, the Mac doesn't say which apps run: one list.
+                            function group(a) { return a.pinned ? "Pinned" : !root.streaming ? "Apps" : a.state > 0 ? "Running" : "Not running"; }
                             readonly property bool firstOfGroup: index === 0 || group(appList.model[index - 1]) !== group(modelData)
                             width: ListView.view.width
                             spacing: 0

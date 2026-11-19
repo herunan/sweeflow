@@ -723,9 +723,13 @@ fn parse_state(json: &str) -> Option<PanelState> {
 }
 
 /// The heading an app is listed under.
-fn group(app: &App) -> &'static str {
+/// Its heading. Not streaming, the Mac doesn't say which apps run: one list ("Apps") rather
+/// than every app under "Not running".
+fn group(app: &App, streaming: bool) -> &'static str {
     if app.pinned {
         "Pinned"
+    } else if !streaming {
+        "Apps"
     } else if app.state > 0 {
         "Running"
     } else {
@@ -1027,11 +1031,12 @@ fn show(ui: &PanelWin, v: &mut View) {
 /// The app rows for what's typed, each group's first under its heading.
 fn show_apps(v: &mut View) {
     let Some(s) = &v.state else { return };
+    let streaming = s.connected && s.settings.enabled;
     let mut last = "";
     let rows: Vec<AppRow> = filter_apps(&s.apps, &v.typed)
         .into_iter()
         .map(|a| {
-            let g = group(a);
+            let g = group(a, streaming);
             let heading = if g != last { g } else { "" };
             last = g;
             let image = icon(&a.icon);
@@ -1375,8 +1380,11 @@ mod tests {
         assert_eq!(names(filter_apps(&s.apps, "fa")), ["Safari"]);
         assert_eq!(names(filter_apps(&s.apps, "TERM")), ["Terminal"]);
         assert!(filter_apps(&s.apps, "xcode").is_empty());
-        let groups: Vec<&str> = s.apps.iter().map(group).collect();
+        let groups: Vec<&str> = s.apps.iter().map(|a| group(a, true)).collect();
         assert_eq!(groups, ["Pinned", "Running", "Not running", "Not running"]);
+        // Stopped: which run isn't known, so no "Not running" for them all.
+        let groups: Vec<&str> = s.apps.iter().map(|a| group(a, false)).collect();
+        assert_eq!(groups, ["Pinned", "Apps", "Apps", "Apps"]);
     }
 
     #[test]
