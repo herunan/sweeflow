@@ -1225,7 +1225,24 @@ final class Session {
         // covers it where it seems to be says nothing.
         let recentlyMoved = justMoved[w.wid].map { DispatchTime.now().uptimeNanoseconds - $0.at.uptimeNanoseconds < 1_500_000_000 } ?? false
         if w.kind == .toplevel && !recentlyMoved { origin = uncovered(w, at: origin, in: area) }
-        if origin != w.frame.origin { ax(pid: w.pid) { $0.setPosition(w.wid, pid: w.pid, origin) } }
+        guard origin != w.frame.origin else { return }
+        ax(pid: w.pid) { $0.setPosition(w.wid, pid: w.pid, origin) }
+        // Come from another display (the Mac's own screen, where an app's first window opens):
+        // moved once more a moment later, a point and back, from wherever it is by then. Some
+        // windows' contents are drawn by another process that keeps the old display's place
+        // after the first move (TextEdit's Open panel: clicks on New Document did nothing, as
+        // if they landed where the panel had been); a second move puts it right.
+        let fromElsewhere = !area.contains(CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1))
+        guard fromElsewhere else { return }
+        let (wid, pid) = (w.wid, w.pid)
+        queue.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+            guard let self, let at = self.tracker.liveFrame(wid)?.origin else { return }
+            self.ax(pid: pid) { c in
+                c.setPosition(wid, pid: pid, CGPoint(x: at.x + 1, y: at.y))
+                c.setPosition(wid, pid: pid, at)
+            }
+            log("window \(wid): moved once more after coming onto the virtual display")
+        }
     }
 
     /// Nobody sees the virtual display, but macOS still works out which windows are hidden
