@@ -1099,9 +1099,11 @@ impl App {
                 // like a sheet) instead of at the spot it had on the Mac's screen.
                 // Only one lying inside that window on the Mac: a reminder or a video's floating
                 // panel keeps its own place.
+                // (A sheet is always its window's, though wider than it in a narrow tile.)
                 let parent = self.windows.get(&info.parent).filter(|p| {
-                    info.rel_x >= -1.0 && info.rel_y >= -1.0
-                        && info.rel_x + info.w <= p.info.w + 1.0 && info.rel_y + info.h <= p.info.h + 1.0
+                    hypr_sheet
+                        || (info.rel_x >= -1.0 && info.rel_y >= -1.0
+                            && info.rel_x + info.w <= p.info.w + 1.0 && info.rel_y + info.h <= p.info.h + 1.0)
                 }).and_then(|p| match &p.role {
                     Role::Toplevel(t) => Some(t.xdg_toplevel().clone()),
                     _ => None,

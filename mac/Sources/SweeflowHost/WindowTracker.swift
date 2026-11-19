@@ -397,9 +397,16 @@ final class WindowTracker {
             // (a tile on Linux), taken for a window of its own then.
             let corner = CGPoint(x: w.frame.minX + 1, y: w.frame.minY + 1)
             let top = CGPoint(x: w.frame.midX, y: w.frame.minY + 1)
+            // Bigger than it; or, hanging from just under its top (a sheet of a window narrower
+            // than the sheet, a Linux tile: taken for a window of its own, it was tiled tiny).
             let host = seen.values.contains {
-                $0.wid != wid && $0.pid == w.pid && $0.kind == .toplevel && ($0.frame.contains(corner) || $0.frame.contains(top))
-                    && $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
+                guard $0.wid != wid, $0.pid == w.pid, $0.kind == .toplevel else { return false }
+                let bigger = $0.frame.width * $0.frame.height > w.frame.width * w.frame.height
+                // (Wider than it and centred on it: a cascaded document, a little down and to the
+                // right, is neither.)
+                let hangs = $0.frame.contains(top) && w.frame.minY >= $0.frame.minY && w.frame.minY - $0.frame.minY < 80
+                    && w.frame.width > $0.frame.width && abs(w.frame.midX - $0.frame.midX) < 4
+                return (($0.frame.contains(corner) || $0.frame.contains(top)) && bigger) || hangs
             }
             guard host else { continue }
             guard let none = noButtonsSeen[wid] else {
