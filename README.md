@@ -39,9 +39,9 @@ Sweeflow seamlessly streams just the apps you need from your Mac to your Linux d
 
 <img src="assets/badges/cachyos-plasma.svg" alt="CachyOS KDE Plasma, Wayland">
 <img src="assets/badges/cachyos-gnome.svg" alt="CachyOS GNOME, Wayland">
+<img src="assets/badges/omarchy-hyprland.svg" alt="Omarchy Hyprland, Wayland">
 <img src="assets/badges/ubuntu-gnome.svg" alt="Ubuntu GNOME, Wayland">
 <img src="assets/badges/mint-cinnamon.svg" alt="Linux Mint Cinnamon, X11">
-<img src="assets/badges/omarchy-hyprland.svg" alt="Omarchy Hyprland, Wayland">
 
 Using another Linux flavour? Contributions to support it are welcome.
 
