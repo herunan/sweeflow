@@ -7,5 +7,16 @@ Exec=sweeflow open
 Icon=sweeflow
 Terminal=false
 StartupNotify=false
-Categories=Network;RemoteAccess;
+Categories=Utility;
 Keywords=mac;macos;stream;
+Actions=toggle-pause;toggle-stream;
+
+[Desktop Action toggle-pause]
+Name=Pause or resume streaming
+Exec=sweeflow toggle-pause
+Icon=media-playback-pause
+
+[Desktop Action toggle-stream]
+Name=Stop or start streaming
+Exec=sweeflow toggle-stream
+Icon=media-playback-stop

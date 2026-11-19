@@ -32,7 +32,9 @@ static SESSION: Mutex<Option<(Connection, OwnedObjectPath)>> = Mutex::new(None);
 pub fn available() -> bool {
     !crate::hyprland::running()
         && Connection::session().is_ok_and(|bus| {
-            zbus::blocking::Proxy::new(&bus, DEST, PATH, IFACE).is_ok_and(|p| p.get_property::<u32>("version").is_ok())
+            // Asked directly: a proxy fetches every property first and, without the interface,
+            // printed zbus's warning into `sweeflow install`'s output.
+            bus.call_method(Some(DEST), PATH, Some("org.freedesktop.DBus.Properties"), "Get", &(IFACE, "version")).is_ok()
         })
 }
 

@@ -319,6 +319,12 @@ final class WindowTracker {
                 small.append(w)
                 continue
             }
+            // Smaller still, untitled: macOS 26's indicator at the text cursor (TextEdit, 53x48 pt),
+            // not a window of the app. Taken for one, it came and went on Linux as a black square
+            // in the middle of the screen, took the keyboard and made a second dock entry.
+            if layer == 0, title.isEmpty, bounds.width < 64, bounds.height < 64 {
+                continue
+            }
             var realWindow = true
             if layer == 0, title.isEmpty {
                 if let isApp = looksLikeAppWindow(wid, pid: pid) { realWindow = isApp }

@@ -177,7 +177,7 @@ slint::slint! {
             }
             // Where Mac shortcuts work (the Mac window focused and under the pointer, apart from
             // the ones kept for Linux below) and where Linux's do: the setup window's picture.
-            MacScene { height: 76px; big: true; note: "When focused and hovered over (exceptions below)"; }
+            MacScene { height: 88px; big: true; note: "When focused and hovered over (exceptions below)"; }
             // The swap for keyboards made for Windows, on a card: ⌘ next to the space bar in Mac
             // windows, as on a Mac keyboard.
             Rectangle {

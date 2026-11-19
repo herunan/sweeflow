@@ -666,6 +666,16 @@ fn launcher_entry(bin: &str) -> String {
 
 /// `sweeflow toggle-pause` / `toggle-stream`, what the shortcuts run: the running client's
 /// toggle (tray::panel_do "pause-toggle" / "stream-toggle").
+#[cfg(test)]
+mod packaged_entry_tests {
+    /// The packages' own menu entry (packaging/sweeflow.desktop) is the one `sweeflow install` writes:
+    /// it said Internet and had no Pause/Stop actions until Sweeflow first ran.
+    #[test]
+    fn the_packages_entry_is_sweeflows() {
+        assert_eq!(include_str!("../packaging/sweeflow.desktop"), super::launcher_entry("sweeflow"));
+    }
+}
+
 pub fn toggle(action: &str) -> Result<()> {
     let bus = zbus::blocking::Connection::session()?;
     bus.call_method(Some("dev.sweeflow.Client"), "/dev/sweeflow/Panel", Some("dev.sweeflow.Panel"), "Do", &(action, ""))

@@ -244,8 +244,9 @@ export component TipBubble inherits Rectangle {
     property <string> w: Tip.want;
     property <string> ready;
     property <bool> shown: Tip.want != "" && root.ready == Tip.want;
-    property <length> bw: label.preferred-width + 16px;
-    property <length> bh: 24px;
+    // As wide as its text, up to the window's width; a longer one wraps.
+    property <length> bw: min(label.preferred-width + 16px, root.bounds-w - 8px);
+    property <length> bh: max(24px, label.height + 8px);
     changed w => { if (self.w == "") { self.ready = ""; } }
 
     Timer {
@@ -265,11 +266,14 @@ export component TipBubble inherits Rectangle {
     background: Look.bg.mix(Look.fg, 0.9);
     label := Text {
         x: 8px;
+        y: 4px;
+        width: root.bw - 16px;
+        height: self.preferred-height;
         text: Tip.want;
         color: Look.fg;
         font-size: 12px;
+        wrap: word-wrap;
         vertical-alignment: center;
-        height: parent.height;
     }
 }
 

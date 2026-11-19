@@ -260,13 +260,9 @@ slint::slint! {
                                     }
                                 }
                             }
-                            // The Mac window's name in bold.
-                            HorizontalLayout {
-                                alignment: start;
-                                Dim { text: "Install it, allow all permissions and reach the "; font-size: 12px; wrap: no-wrap; }
-                                Text { text: "Link a Linux machine"; color: Look.fg; font-size: 12px; font-weight: 700; }
-                                Dim { text: " screen."; font-size: 12px; wrap: no-wrap; }
-                            }
+                            // One sentence that wraps: in three pieces side by side it ran off the
+                            // window in a wider font (Omarchy's).
+                            Dim { text: "Install it, allow all permissions and reach the “Link a Linux machine” screen."; font-size: 12px; wrap: word-wrap; }
                         }
                     }
                 }
