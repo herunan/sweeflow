@@ -10,3 +10,4 @@ dist/
 .agents/
 .hallmark/
 skills-lock.json
+.cloudflare-account
