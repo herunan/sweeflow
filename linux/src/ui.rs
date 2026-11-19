@@ -2292,7 +2292,7 @@ impl App {
         let s = self.scale;
         let (bw, bh) = w.size;
         let px_per_pt = px_per_pt(ppp, fw, w.info.w, s);
-        log::info!("popup {wid}: frame {fw}x{fh} ppp {ppp} window {bw}x{bh} info {}x{}", w.info.w, w.info.h);
+        log::info!("window {wid}: lossless frame {fw}x{fh} ppp {ppp} window {bw}x{bh} info {}x{}", w.info.w, w.info.h);
         let vis_w = (fw as f64 / px_per_pt).min(bw as f64 / s);
         let vis_h = (fh as f64 / px_per_pt).min(bh as f64 / s);
         w.video_viewport.set_source(0.0, 0.0, vis_w * px_per_pt, vis_h * px_per_pt);
