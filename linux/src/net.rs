@@ -1247,8 +1247,6 @@ fn taskbar_entry_first(bid: &str, name: &str) {
                 Err(e) => log::warn!("taskbar entry for {bid}: {e:#}"),
             }
         }
-        // GNOME: until the shell has it (launchers::wait_until_read).
-        crate::launchers::wait_until_read(bid);
     };
     // A wait of the network task's: the other one goes on meanwhile.
     match tokio::runtime::Handle::try_current() {

@@ -3196,9 +3196,9 @@ fn gnome_allow_shortcuts(bundle_id: &str) {
     }
 }
 
-/// How long after a Mac app's entry was written GNOME surely has it (it took over 1.5 s on a
-/// fresh Ubuntu, while a first connection wrote every app's).
-const GNOME_HAS_ENTRY: Duration = Duration::from_secs(3);
+/// How long after a Mac app's first entry was written GNOME surely has it: it took 4-5 s on
+/// Ubuntu 26.04 (a window shown 3.5 s after was still an app of its own, one 6 s after matched).
+const GNOME_HAS_ENTRY: Duration = Duration::from_secs(7);
 
 /// GNOME: whether a Mac window may ask for the keyboard's shortcuts now (None), or how long it
 /// waits. GNOME matches a window to its app once, as it appears; one that appeared before GNOME
@@ -3206,14 +3206,15 @@ const GNOME_HAS_ENTRY: Duration = Duration::from_secs(3);
 /// permission store and asks "Allow inhibiting shortcuts" (each time), although Sweeflow grants
 /// it for its Mac apps. So the window waits until the entry has surely been read, then has
 /// GNOME match it again (it does when the window's app id changes: changed and changed back),
-/// and asks after that. Only while the entry is new: once per app.
+/// and asks after that. Only for an app new to this computer, on its first stream: meanwhile
+/// Super's shortcuts in its window are GNOME's.
 fn gnome_ready(w: &mut Win) -> Option<Duration> {
     // A window that has been here a while was matched long ago (entries rewritten later, by
     // "Apps in launcher", change nothing for it).
     if w.rematched || w.born.elapsed().is_ok_and(|a| a > Duration::from_secs(30)) {
         return None;
     }
-    let changed = crate::launchers::entries_changed_at(&w.info.bundle_id)?;
+    let changed = crate::launchers::first_written_at(&w.info.bundle_id)?;
     let has_it = changed + GNOME_HAS_ENTRY;
     if let Ok(left) = has_it.duration_since(std::time::SystemTime::now()) {
         return Some(left.max(Duration::from_millis(50)));
