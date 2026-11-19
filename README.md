@@ -63,11 +63,23 @@ Open it and allow all permissions. Then go to the **Link a Linux machine** scree
 curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/install.sh | sh
 ```
 
-**Arch**
+**Arch, CachyOS and Omarchy**
+
+Add Sweeflow's repo once.
 
 ```sh
-yay -S sweeflow
+curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8
+printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf
 ```
+
+Then install it. It updates with the rest of your system.
+
+```sh
+sudo pacman -Syu sweeflow
+```
+
+On Omarchy, install it with `sudo pacman -Sy sweeflow` instead. Omarchy's own updates then keep it up to date.
 
 **Debian, Ubuntu and Mint**
 

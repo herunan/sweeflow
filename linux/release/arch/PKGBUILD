@@ -1,7 +1,7 @@
 # Maintainer: Hernán Romero <herunan at users dot noreply dot github dot com>
-# The release's prebuilt binary (linux/release/build.sh): FFmpeg is built in, so it doesn't break when
-# Arch's FFmpeg changes version. For a build from source, see the sweeflow package.
-pkgname=sweeflow-bin
+# Sweeflow's own pacman repo (linux/release/build.sh builds, signs and publishes it with each release):
+# the release's prebuilt binary, FFmpeg built in, so it doesn't break when Arch's FFmpeg changes version.
+pkgname=sweeflow
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='Mac apps as windows on a Linux desktop'
@@ -12,11 +12,10 @@ depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'libxkbcommon' 'fontconfig' 'freety
 optdepends=('pipewire-audio: the Mac'"'"'s sound (pw-cat)'
             'libpulse: the Mac'"'"'s sound on PulseAudio (pacat)'
             'libnotify: notifications (notify-send)')
-provides=('sweeflow')
-conflicts=('sweeflow')
 install=sweeflow.install
 options=('!strip' '!debug')
-source=("$url/releases/download/v$pkgver/sweeflow-$pkgver-x86_64.tar.gz")
+# The release's tarball, put next to this file by build.sh.
+source=("sweeflow-$pkgver-x86_64.tar.gz")
 sha256sums=('SKIP')
 
 package() {

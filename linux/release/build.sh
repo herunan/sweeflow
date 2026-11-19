@@ -1,9 +1,14 @@
 #!/bin/sh
 # Builds everything a Linux release ships, into dist/linux/ at the repo root:
-#   sweeflow-VERSION-x86_64.tar.gz   the binary, launcher, icon and licences (install.sh and the AUR's
-#                                    sweeflow-bin unpack it); also as sweeflow-x86_64.tar.gz
+#   sweeflow-VERSION-x86_64.tar.gz   the binary, launcher, icon and licences (install.sh and the Arch
+#                                    package unpack it); also as sweeflow-x86_64.tar.gz
 #   sweeflow_VERSION-1_amd64.deb     Debian, Ubuntu, Mint, Pop!_OS... (also as sweeflow_amd64.deb)
 #   sweeflow-VERSION-1.x86_64.rpm    Fedora, openSUSE... (also as sweeflow.x86_64.rpm)
+#   sweeflow-VERSION-REL-x86_64.pkg.tar.zst (+ .sig)   Arch, CachyOS, Omarchy... (also as
+#                                    sweeflow-x86_64.pkg.tar.zst, for pacman -U)
+#   sweeflow.db, sweeflow.files (+ .sig)   Sweeflow's pacman repo: the release's download folder is its
+#                                    Server; signed with the Sweeflow release key, whose public half is
+#   sweeflow.asc                     this (pacman-key --add)
 #   install.sh                       curl ... | sh for any distro
 #   ffmpeg-*.tar.xz, FFMPEG-CONFIGURE.txt   the source of the FFmpeg inside, as its licence (LGPL) asks
 #   SHA256SUMS
@@ -11,6 +16,8 @@
 # on any distro with glibc 2.35 or later and doesn't care which FFmpeg the distro has.
 #
 # Usage: linux/release/build.sh (the Mac app is its own download: ../../release-mac.sh)
+# PKGREL=2 for a second Arch package of the same version (pacman only updates to a higher one).
+# The release key's GnuPG home: ~/.local/share/sweeflow-release/gnupg (SWEEFLOW_GNUPG elsewhere).
 set -eu
 cd "$(dirname "$0")/../.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' linux/Cargo.toml | head -1)
@@ -56,6 +63,28 @@ cp "$out/sweeflow-$version-1.x86_64.rpm" "$out/sweeflow.x86_64.rpm"
 rm -rf "$stage"
 
 cp "$out"/sweeflow_"$version"-1_amd64.deb "$out/sweeflow_amd64.deb"
+
+# The Arch package, from the same tarball (makepkg here: this is an Arch machine), signed, and the
+# pacman repo around it.
+arch=linux/target/portable/arch
+rm -rf "$arch" && mkdir -p "$arch"
+cp linux/release/arch/PKGBUILD linux/release/arch/sweeflow.install "$out/sweeflow-$version-x86_64.tar.gz" "$arch/"
+pkgrel=${PKGREL:-1}
+sed -i "s/^pkgver=.*/pkgver=$version/; s/^pkgrel=.*/pkgrel=$pkgrel/" "$arch/PKGBUILD"
+export GNUPGHOME="${SWEEFLOW_GNUPG:-$HOME/.local/share/sweeflow-release/gnupg}"
+key=$(gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')
+[ -n "$key" ] || { echo "no Sweeflow release key in $GNUPGHOME" >&2; exit 1; }
+(cd "$arch" && PKGDEST="$PWD" GPGKEY="$key" makepkg -f --sign --nodeps --noconfirm >/dev/null)
+pkg="sweeflow-$version-$pkgrel-x86_64.pkg.tar.zst"
+cp "$arch/$pkg" "$arch/$pkg.sig" "$out/"
+cp "$arch/$pkg" "$out/sweeflow-x86_64.pkg.tar.zst"
+cp "$arch/$pkg.sig" "$out/sweeflow-x86_64.pkg.tar.zst.sig"
+(cd "$out" && repo-add --quiet --sign --key "$key" sweeflow.db.tar.zst "$pkg")
+# A release's downloads can't be links: what pacman asks for (sweeflow.db…) as files of their own.
+for f in sweeflow.db sweeflow.db.sig sweeflow.files sweeflow.files.sig; do
+    t=$(readlink "$out/$f") && cp --remove-destination "$out/$t" "$out/$f"
+done
+gpg --armor --export "$key" > "$out/sweeflow.asc"
 cp linux/release/install.sh "$out/"
 cp ~/.cache/sweeflow-build/jammy/opt/ffmpeg/share/source/ffmpeg-*.tar.xz "$out/"
 cp ~/.cache/sweeflow-build/jammy/opt/ffmpeg/share/source/CONFIGURE.txt "$out/FFMPEG-CONFIGURE.txt"
