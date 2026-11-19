@@ -276,7 +276,7 @@ struct Win {
     moved_to: Option<(f32, f32)>,
     /// When it was made, and whether GNOME was had to match it to its app again (gnome_ready).
     born: std::time::SystemTime,
-    rematched: bool,
+    rematched: Option<Instant>,
     /// A "did the Mac follow?" look (adopt_mac_size) is scheduled.
     check_pending: bool,
     /// The "Mac display" view (kind 3): letterboxed and scaled to fit, never resized on the Mac.
@@ -1137,6 +1137,7 @@ impl App {
         if matches!(role, Role::Toplevel(_)) {
             gnome_allow_shortcuts(&info.bundle_id);
         }
+        let gnome_rematch_at = matches!(role, Role::Toplevel(_)).then(|| crate::launchers::first_written_at(&info.bundle_id)).flatten();
         let inhibitor = None;
 
         let appmenu = match (&role, &self.appmenu_mgr, &self.menus) {
@@ -1213,9 +1214,22 @@ impl App {
                 popup_settled: false,
                 moved_to: None,
                 born: std::time::SystemTime::now(),
-                rematched: false,
+                rematched: None,
             },
         );
+        // Every window of an app GNOME hadn't read yet is matched again once it has (not only the
+        // one that asks for the keyboard's shortcuts): the others showed a generic icon.
+        if gnome_rematch_at.is_some() {
+            if let Some(has_it) = self.windows.get(&wid).and_then(gnome_has_entry_at) {
+                let wait = has_it.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+                let _ = self.loop_handle.insert_source(Timer::from_duration(wait), move |_, _, app| {
+                    if let Some(w) = app.windows.get_mut(&wid).filter(|w| w.rematched.is_none()) {
+                        gnome_rematch(w);
+                    }
+                    TimeoutAction::Drop
+                });
+            }
+        }
         if !is_popup {
             self.apply_icon(wid, qh);
             // Launched here moments ago: the launcher's token puts it in front (and ends the
@@ -3211,29 +3225,46 @@ const GNOME_HAS_ENTRY: Duration = Duration::from_secs(7);
 fn gnome_ready(w: &mut Win) -> Option<Duration> {
     // A window that has been here a while was matched long ago (entries rewritten later, by
     // "Apps in launcher", change nothing for it).
-    if w.rematched || w.born.elapsed().is_ok_and(|a| a > Duration::from_secs(60)) {
+    if w.born.elapsed().is_ok_and(|a| a > Duration::from_secs(60)) {
         return None;
     }
-    let first = crate::launchers::first_written_at(&w.info.bundle_id)?;
-    let has_it = first + GNOME_HAS_ENTRY;
+    // Asked a moment after it's matched again, not with the change: asked at once it was still
+    // the app of its own's (Ubuntu: prompted).
+    if let Some(at) = w.rematched {
+        let left = Duration::from_millis(500).saturating_sub(at.elapsed());
+        return (!left.is_zero()).then_some(left);
+    }
+    let has_it = gnome_has_entry_at(w)?;
     if let Ok(left) = has_it.duration_since(std::time::SystemTime::now()) {
         return Some(left.max(Duration::from_millis(50)));
     }
-    if w.born < has_it {
-        w.rematched = true;
-        if let Role::Toplevel(t) = &w.role {
-            let id = format!("sweeflow-{}", w.info.bundle_id);
-            t.set_app_id(format!("{id}.matching"));
-            t.wl_surface().commit();
-            t.set_app_id(id);
-            t.wl_surface().commit();
-            log::info!("window {}: matched to its app again (it came before GNOME had read its entry)", w.info.wid);
-            // Asked a moment later, not with the change: asked at once it was still the app of
-            // its own's (Ubuntu: prompted).
-            return Some(Duration::from_millis(500));
-        }
+    gnome_rematch(w);
+    Some(Duration::from_millis(500))
+}
+
+/// GNOME: when it surely has the entry of a window that came before it had read it (a Mac app
+/// new to this computer, on its first stream); None when there's nothing to wait for.
+fn gnome_has_entry_at(w: &Win) -> Option<std::time::SystemTime> {
+    if w.rematched.is_some() || !crate::desktop::is("GNOME") {
+        return None;
     }
-    None
+    let has_it = crate::launchers::first_written_at(&w.info.bundle_id)? + GNOME_HAS_ENTRY;
+    (w.born < has_it).then_some(has_it)
+}
+
+/// Has GNOME match a window to its app again (it does when the window's app id changes):
+/// changed, and changed back. Its taskbar entry then has the app's name and icon (it showed a
+/// generic one), and GNOME's permission store is asked for it.
+fn gnome_rematch(w: &mut Win) {
+    w.rematched = Some(Instant::now());
+    if let Role::Toplevel(t) = &w.role {
+        let id = format!("sweeflow-{}", w.info.bundle_id);
+        t.set_app_id(format!("{id}.matching"));
+        t.wl_surface().commit();
+        t.set_app_id(id);
+        t.wl_surface().commit();
+        log::info!("window {}: matched to its app again (it came before GNOME had read its entry)", w.info.wid);
+    }
 }
 
 /// Smallest a Mac window gets here, unless its app is known to need more.
