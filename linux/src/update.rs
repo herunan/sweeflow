@@ -214,7 +214,10 @@ pub fn panel_json() -> serde_json::Value {
 /// `sweeflow update`: puts the latest release in place of install.sh's copy, checked against the
 /// release's signed checksums, and restarts Sweeflow. A packaged copy says how it's updated.
 pub fn run() -> Result<()> {
-    let feed = check()?.context("this is the latest version")?;
+    let Some(feed) = check()? else {
+        println!("Sweeflow {VERSION} is the latest version.");
+        return Ok(());
+    };
     let how = how();
     if how != How::Tarball {
         println!("Sweeflow {} is available. {}", feed.version, how.words());

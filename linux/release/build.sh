@@ -85,6 +85,13 @@ sed -i "s/^pkgver=.*/pkgver=$version/; s/^pkgrel=.*/pkgrel=$pkgrel/" "$arch/PKGB
 export GNUPGHOME="${SWEEFLOW_GNUPG:-$HOME/.local/share/sweeflow-release/gnupg}"
 key=$(gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')
 [ -n "$key" ] || { echo "no Sweeflow release key in $GNUPGHOME" >&2; exit 1; }
+# The RPM signed with it too (rpmsign in the build environment, which only sees the repo: the key is
+# copied in for the moment it takes, and removed).
+sign=linux/target/portable/gnupg-sign
+rm -rf "$sign" && cp -a "$GNUPGHOME" "$sign"
+linux/release/env.sh "export GNUPGHOME=/src/$sign; rpmsign --define '__gpg /usr/bin/gpg' --define '_gpg_name $key' --addsign /src/$out/sweeflow-$version-1.x86_64.rpm >/dev/null 2>&1; gpgconf --kill gpg-agent" || { rm -rf "$sign"; exit 1; }
+rm -rf "$sign"
+cp "$out/sweeflow-$version-1.x86_64.rpm" "$out/sweeflow.x86_64.rpm"
 (cd "$arch" && PKGDEST="$PWD" GPGKEY="$key" makepkg -f --sign --nodeps --noconfirm >/dev/null)
 pkg="sweeflow-$version-$pkgrel-x86_64.pkg.tar.zst"
 cp "$arch/$pkg" "$arch/$pkg.sig" "$out/"
@@ -127,7 +134,7 @@ name=Sweeflow
 baseurl=${RPM_REPO_URL:-https://sweeflow.app/rpm}
 enabled=1
 repo_gpgcheck=1
-gpgcheck=0
+gpgcheck=1
 gpgkey=${RPM_REPO_URL:-https://sweeflow.app/rpm}/sweeflow.asc
 REPO
 
