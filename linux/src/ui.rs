@@ -4032,6 +4032,12 @@ impl KeyboardHandler for App {
             }
             log::debug!("keyboard focus → {wid}: focusing it on the Mac");
             self.kb_focus = Some(wid);
+            // Hyprland puts the pointer on a window it focuses (a workspace switched, a focus
+            // dispatched) without saying so: as if the pointer were elsewhere, its own keys
+            // stayed on in the Mac window (Super+O went to Omarchy). Asked to look again.
+            if self.pointer_focus != Some(wid) {
+                crate::hyprland::repick_pointer_soon();
+            }
             self.last_mac_focus = Some(wid);
             // Remembered past this focus for the Global menu, which takes the focus to open
             // (not the Mac's display: it's no one app's).

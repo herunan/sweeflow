@@ -569,7 +569,15 @@ pub fn place_on_parent(class: String, title: String, parent_title: String, rel: 
     std::thread::spawn(move || {
         for _ in 0..10 {
             let sheet = our_client(&class, &title).filter(|c| c["title"].as_str() == Some(title.as_str()));
-            let parent = our_client(&class, &parent_title).filter(|c| c["title"].as_str() == Some(parent_title.as_str()));
+            // By its title; else the one of ours focused last before the sheet (its title had
+            // changed meanwhile, and the sheet was left in the middle of the screen).
+            let parent = our_client(&class, &parent_title).filter(|c| c["title"].as_str() == Some(parent_title.as_str())).or_else(|| {
+                let sheet_at = sheet.as_ref().and_then(|s| s["address"].as_str().map(str::to_string));
+                let pid = u64::from(std::process::id());
+                clients_where(|c| c["pid"].as_u64() == Some(pid) && c["class"].as_str() == Some(class.as_str()) && c["address"].as_str().map(str::to_string) != sheet_at)
+                    .into_iter()
+                    .min_by_key(|c| c["focusHistoryID"].as_i64().unwrap_or(i64::MAX))
+            });
             if let (Some(s), Some(p)) = (sheet, parent) {
                 let n = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
                 let (px, py, pw, ph) = (n(&p["at"][0]), n(&p["at"][1]), n(&p["size"][0]), n(&p["size"][1]));
