@@ -59,58 +59,41 @@ Open it and allow all permissions. Then go to the **Link a Linux machine** scree
 
 ### 2. Install the Linux client
 
-**Any distro**
+**Arch**
+
+For Arch and the distros built on it.
+
+```sh
+curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add - && sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8 && printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf && sudo pacman -Syu sweeflow
+```
+
+> **Omarchy**
+>
+> ```sh
+> curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add - && sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8 && printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf && sudo pacman -Sy sweeflow
+> ```
+
+**Debian**
+
+For Debian and the distros built on it, such as Ubuntu and Linux Mint.
+
+```sh
+curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo gpg --dearmor -o /usr/share/keyrings/sweeflow.gpg && echo "deb [signed-by=/usr/share/keyrings/sweeflow.gpg] https://github.com/herunan/sweeflow/releases/latest/download ./" | sudo tee /etc/apt/sources.list.d/sweeflow.list && sudo apt update && sudo apt install sweeflow
+```
+
+**Fedora**
+
+```sh
+sudo curl -fsSLo /etc/yum.repos.d/sweeflow.repo https://sweeflow.app/rpm/sweeflow.repo && sudo dnf install sweeflow
+```
+
+**Other**
 
 ```sh
 curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/install.sh | sh
 ```
 
-**Arch, CachyOS and Omarchy**
-
-Add Sweeflow's repo once.
-
-```sh
-curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add -
-sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8
-printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf
-```
-
-Then install it. It updates with the rest of your system.
-
-```sh
-sudo pacman -Syu sweeflow
-```
-
-On Omarchy, install with `sudo pacman -Sy sweeflow` instead. Omarchy's own updates keep it up to date.
-
-**Debian, Ubuntu and Mint**
-
-Add Sweeflow's repo once.
-
-```sh
-curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo gpg --dearmor -o /usr/share/keyrings/sweeflow.gpg
-echo "deb [signed-by=/usr/share/keyrings/sweeflow.gpg] https://github.com/herunan/sweeflow/releases/latest/download ./" | sudo tee /etc/apt/sources.list.d/sweeflow.list
-```
-
-Then install it. It updates with the rest of your system.
-
-```sh
-sudo apt update && sudo apt install sweeflow
-```
-
-**Fedora**
-
-Add Sweeflow's repo once.
-
-```sh
-sudo curl -fsSLo /etc/yum.repos.d/sweeflow.repo https://sweeflow.app/rpm/sweeflow.repo
-```
-
-Then install it. It updates with the rest of your system.
-
-```sh
-sudo dnf install sweeflow
-```
+This one doesn't update with your system. Sweeflow tells you when there's an update and installs it itself.
 
 ### 3. Link them
 
