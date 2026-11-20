@@ -12,5 +12,5 @@ post_upgrade() {
     done
 }
 pre_remove() {
-    echo "==> To remove Sweeflow's per-user setup (service, launchers, shortcuts), run before removing: sweeflow uninstall"
+    echo "==> Sweeflow takes its service, launchers and shortcuts away by itself within a minute. Your settings stay in ~/.config/sweeflow."
 }

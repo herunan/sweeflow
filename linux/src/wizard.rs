@@ -442,12 +442,16 @@ slint::slint! {
                         { d: "M 4 9 L 8 9 L 13 5 L 13 19 L 8 15 L 4 15 Z M 16 9 Q 18 12 16 15 M 18.5 6.5 Q 22.5 12 18.5 17.5", filled: false, title: "Sound passthrough" },
                         { d: "M 12 2 A 10 10 0 1 0 12 22 A 10 10 0 1 0 12 2 Z M 2 12 L 22 12 M 12 2 Q 7 12 12 22 M 12 2 Q 17 12 12 22", filled: false, title: "Local, remote or VM" },
                     ]: VerticalLayout {
-                        // All one width (the words wrap, three lines at most).
+                        // All one width (the words wrap, three lines at most). With a wide font
+                        // (Omarchy's is monospace) the longest word is wider than that and broke
+                        // in the middle ("passthroug" / "h"): the words are set smaller to fit.
                         width: (strip.width - 6 * 4px) / 7;
+                        property <length> words: longest.preferred-width > self.width ? 11px * (self.width / longest.preferred-width) : 11px;
+                        longest := Text { text: "passthrough"; font-size: 11px; visible: false; width: 0px; height: 0px; }
                         spacing: 7px;
                         alignment: start;
                         HorizontalLayout { alignment: center; Glyph { d: f.d; filled: f.filled; size: 34px; } }
-                        Text { text: f.title; height: 44px; color: Look.fg; font-size: 11px; horizontal-alignment: center; wrap: word-wrap; }
+                        Text { text: f.title; height: 44px; color: Look.fg; font-size: parent.words; horizontal-alignment: center; wrap: word-wrap; }
                     }
                 }
                 Rectangle { height: 4px; }
