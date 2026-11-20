@@ -30,6 +30,13 @@ var INSTALL_STEPS = [
   "sudo pacman -Sy sweeflow"
 ]
 
+// The same, as one line for a terminal Omarchy opens (the Install button): nothing added to
+// pacman.conf twice, and Sweeflow opened at the end to link the Mac.
+function installCommand() {
+  var rel = "https://github.com/herunan/sweeflow/releases/latest/download"
+  return "curl -fsSL " + rel + "/sweeflow.asc | sudo pacman-key --add - && sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8 && { grep -q '^\\[sweeflow\\]' /etc/pacman.conf || printf '\\n[sweeflow]\\nServer = " + rel + "\\n' | sudo tee -a /etc/pacman.conf >/dev/null; } && sudo pacman -Sy --noconfirm sweeflow && { setsid sweeflow open >/dev/null 2>&1 & }"
+}
+
 function installText() {
   return INSTALL_STEPS.join("\n") + "\n"
 }

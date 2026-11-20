@@ -125,6 +125,7 @@ fn unpaired() -> bool {
 
 /// Shows the tray icon (or serves the KDE widget). Before a Mac is linked too.
 pub fn start() {
+    omarchy_add_plugin_once();
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = REFRESH.set(tx);
     // The keys the menu and panels show, as the user changes them.
@@ -669,6 +670,40 @@ fn quit() {
 pub fn widget_installed() -> bool {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return false };
     home.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists() || omarchy_plugin_enabled(&home)
+}
+
+/// On Omarchy, once: adds Sweeflow's plugin to the bar (the package alone is then the whole
+/// install). Its own command does it, for this user, from Sweeflow's repository. Only ever once,
+/// noted beside the config: taken out again later, it stays out. Sweeflow restarts to match when
+/// the plugin appears (update.rs watches `widget_installed`).
+pub fn omarchy_add_plugin_once() {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let noted = crate::config::dir().join("omarchy-plugin-added");
+    if noted.exists() || !crate::hyprland::running() || !home.join(".config/omarchy").is_dir() {
+        return;
+    }
+    if omarchy_plugin_enabled(&home) {
+        let _ = std::fs::write(&noted, "");
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("omarchy");
+        cmd.args(["plugin", "add", "https://github.com/herunan/sweeflow.git", "--enable", "--yes"]);
+        // The service's environment has no OMARCHY_PATH (the session's does).
+        if std::env::var_os("OMARCHY_PATH").is_none() && std::path::Path::new("/usr/share/omarchy").is_dir() {
+            cmd.env("OMARCHY_PATH", "/usr/share/omarchy");
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                log::info!("Omarchy: Sweeflow's plugin added to the bar");
+                let _ = std::fs::write(&noted, "");
+            }
+            // Not noted: tried again at the next start (no network yet, say).
+            Ok(o) => log::warn!("Omarchy: adding Sweeflow's plugin: {}", String::from_utf8_lossy(&o.stderr).trim()),
+            // No `omarchy` command: not Omarchy after all.
+            Err(_) => {}
+        }
+    });
 }
 
 /// Omarchy's shell lists the plugins in its bar in shell.json; enabling Sweeflow's adds its id.

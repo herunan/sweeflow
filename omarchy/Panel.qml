@@ -97,6 +97,12 @@ Panel {
     root.tab = order[Math.max(0, Math.min(order.length - 1, i))]
   }
 
+  // Installs Sweeflow itself, in a terminal of Omarchy's own (it asks for the password there):
+  // its signing key, its pacman repository, the package, and then opens it to link the Mac.
+  function install() {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", Model.installCommand()])
+    root.close()
+  }
   function copyInstall() {
     // Only onto the clipboard: the user runs it, in their own terminal.
     Quickshell.execDetached(["wl-copy", "--", Model.installText()])
@@ -250,7 +256,8 @@ Panel {
           font.bold: true
         }
 
-        // Not installed: how to, for a terminal. The plugin installs nothing.
+        // Not installed: a button that installs it (in a terminal, where pacman asks for the
+        // password), and the same steps to read or copy.
         Column {
           visible: !root.installed
           width: parent.width
@@ -260,7 +267,23 @@ Panel {
             width: parent.width
             wrapMode: Text.WordWrap
             elide: Text.ElideNone
-            text: "This plugin is Sweeflow's panel. The streaming is done by Sweeflow itself, which you install with pacman. In a terminal:"
+            text: "This plugin is Sweeflow's panel. The streaming is done by Sweeflow itself, a package from Sweeflow's own pacman repository. It updates with your system."
+          }
+
+          Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Install Sweeflow"
+            bordered: true
+            foreground: Commons.Color.accent
+            fontFamily: root.fontFamily
+            onClicked: root.install()
+          }
+
+          Note {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            elide: Text.ElideNone
+            text: "It opens a terminal, asks for your password and runs:"
           }
 
           BorderSurface {
@@ -308,7 +331,7 @@ Panel {
             width: parent.width
             wrapMode: Text.WordWrap
             elide: Text.ElideNone
-            text: "Then open Sweeflow from the app launcher and link your Mac."
+            text: "Sweeflow then opens to link your Mac."
           }
         }
 
