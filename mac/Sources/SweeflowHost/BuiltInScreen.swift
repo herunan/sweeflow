@@ -154,14 +154,22 @@ enum BuiltInScreen {
     }
 
     private static func stopWatchingLocalInput() {
-        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
-        if let rl = tapRunLoop {
-            if let s = tapSource { CFRunLoopRemoveSource(rl, s, .commonModes) }
-            CFRunLoopStop(rl)
-        }
+        let (t, s, rl) = (tap, tapSource, tapRunLoop)
+        // Forgotten first: the tap's callback turns `tap` back on when macOS says it went off.
         tap = nil
         tapSource = nil
         tapRunLoop = nil
+        if let t {
+            CGEvent.tapEnable(tap: t, enable: false)
+            // Out of the window server for good: left there and on, with no thread serving it, it
+            // held the next key or click until macOS gave up on it, and that input was lost (the
+            // first keys typed after each reconnect, one lot per earlier connection).
+            CFMachPortInvalidate(t)
+        }
+        if let rl {
+            if let s { CFRunLoopRemoveSource(rl, s, .commonModes) }
+            CFRunLoopStop(rl)
+        }
     }
 
     private static func localInput(pointer: Bool) {

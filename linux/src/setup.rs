@@ -267,7 +267,8 @@ pub fn uninstall(purge: bool) -> Result<()> {
         let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
         let Ok(exe) = std::fs::read_link(e.path().join("exe")) else { continue };
         let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
-        if pid != me && bins.iter().any(|b| b.to_string_lossy() == exe) {
+        // (Run from a removed package's copy, this one's own path says "(deleted)" too.)
+        if pid != me && bins.iter().any(|b| b.to_string_lossy().trim_end_matches(" (deleted)") == exe) {
             let _ = Command::new("kill").arg(pid.to_string()).status();
         }
     }

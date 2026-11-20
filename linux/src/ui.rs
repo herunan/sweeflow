@@ -428,6 +428,8 @@ pub struct App {
     cursor_buffer: Option<(wl_buffer::WlBuffer, RawPool)>,
     cursor_hot: (i32, i32),
     meta_down: u8,
+    /// Alt keys held (GNOME: the inhibitor is let go while Alt alone is held, see sync_inhibitor).
+    alt_down: u8,
     shift_down: u8,
     /// The modifiers as the desktop counts them (for Cmd+Opt+U, which must have no others).
     mods: Modifiers,
@@ -604,6 +606,7 @@ pub fn run(net_cfg: crate::config::Config) -> Result<()> {
         cursor_buffer: None,
         cursor_hot: (0, 0),
         meta_down: 0,
+        alt_down: 0,
         shift_down: 0,
         mods: Modifiers::default(),
         swallowed: Vec::new(),
@@ -2820,6 +2823,13 @@ impl App {
             (Some(f), None) if self.let_go.is_none() && stranded => Some(f),
             _ => None,
         };
+        // GNOME runs no shortcut for a window that takes them all, and a Tab already handed to
+        // the window never opens its switcher (Alt+Tab only worked from the second press). So
+        // while Alt alone is held the desktop has its keys from the first press. Alt with a
+        // letter is no GNOME shortcut: it still comes here and goes to the Mac as ⌥.
+        let alt_alone = crate::desktop::is("GNOME") && self.alt_down > 0 && self.meta_down == 0 && !self.mods.ctrl
+            && !crate::deskkeys::press_removed(KEY_TAB, crate::deskkeys::Mods { alt: true, ..Default::default() });
+        let target = if alt_alone { None } else { target };
         if crate::hyprland::running() {
             // Its own way there (hyprland::mac_keys): no inhibitor.
             if target.is_some() != self.hypr_mac_keys {
@@ -3341,6 +3351,8 @@ pub(crate) const MIN_SIZE: (u32, u32) = (100, 60);
 const SETTLE: Duration = Duration::from_millis(120);
 const BTN_LEFT: u32 = 0x110;
 const KEY_TAB: u32 = 15;
+const KEY_LEFTALT: u32 = 56;
+const KEY_RIGHTALT: u32 = 100;
 pub(crate) const KEY_SPACE: u32 = 57;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
@@ -4069,6 +4081,7 @@ impl KeyboardHandler for App {
         self.sync_inhibitor(qh);
         self.schedule_menu_panel();
         self.meta_down = 0;
+        self.alt_down = 0;
         self.shift_down = 0;
         self.mods = Modifiers::default();
         self.swallowed.clear();
@@ -4081,8 +4094,12 @@ impl KeyboardHandler for App {
         self.user_pressed();
         match e.raw_code {
             KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down += 1,
+            KEY_LEFTALT | KEY_RIGHTALT => self.alt_down += 1,
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down += 1,
             _ => {}
+        }
+        if matches!(e.raw_code, KEY_LEFTALT | KEY_RIGHTALT | KEY_LEFTMETA | KEY_RIGHTMETA) {
+            self.sync_inhibitor(qh);
         }
         // Sweeflow's own keys (as set in its Shortcuts window, keys.rs): the desktop never sees a
         // key while a Mac window has focus (they pass every shortcut through to the Mac), so they
@@ -4173,10 +4190,11 @@ impl KeyboardHandler for App {
     fn release_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, e: KeyEvent) {
         match e.raw_code {
             KEY_LEFTMETA | KEY_RIGHTMETA => self.meta_down = self.meta_down.saturating_sub(1),
+            KEY_LEFTALT | KEY_RIGHTALT => self.alt_down = self.alt_down.saturating_sub(1),
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_down = self.shift_down.saturating_sub(1),
             _ => {}
         }
-        if self.let_go.is_some() {
+        if self.let_go.is_some() || matches!(e.raw_code, KEY_LEFTALT | KEY_RIGHTALT | KEY_LEFTMETA | KEY_RIGHTMETA) {
             self.sync_inhibitor(qh);
         }
         if let Some(i) = self.swallowed.iter().position(|&k| k == e.raw_code) {
