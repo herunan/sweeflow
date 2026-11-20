@@ -467,7 +467,7 @@ impl ksni::Tray for Tray {
         items.push(MenuItem::Separator);
         // Updates: a newer release, once seen, or a look for one. Either opens the update window.
         let update_label = match crate::update::available() {
-            Some(v) => format!("Update to Sweeflow {v}"),
+            Some(_) => String::from("Update available"),
             None => "Check for updates".into(),
         };
         items.push(

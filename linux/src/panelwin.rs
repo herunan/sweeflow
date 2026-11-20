@@ -315,7 +315,7 @@ slint::slint! {
                     }
                 }
 
-                // A newer Sweeflow, and how to get it.
+                // A newer Sweeflow (the update window says which and how to get it).
                 if root.update-version != "": Rectangle {
                     vertical-stretch: 0;
                     border-radius: 8px;
@@ -327,8 +327,7 @@ slint::slint! {
                             alignment: center;
                             horizontal-stretch: 1;
                             spacing: 2px;
-                            Text { text: "Sweeflow " + root.update-version + " is available"; color: Look.fg; font-size: 13px; font-weight: 600; overflow: elide; }
-                            Text { text: root.update-words; color: Look.muted; font-size: 11px; wrap: word-wrap; }
+                            Text { text: "Update available"; color: Look.fg; font-size: 13px; font-weight: 600; overflow: elide; }
                         }
                         // The update window: what's new, and the update (or how it's done).
                         VerticalLayout {

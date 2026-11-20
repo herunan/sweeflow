@@ -4,7 +4,7 @@ import CryptoKit
 /// Updates. Each release has `latest.json` (linux/release/build.sh): its version, what's new, and
 /// where the Mac app is. Sweeflow looks a little after it starts and every few hours. A newer one
 /// is said once in a notification, and the menu's line turns from "Check for updates" into
-/// "Update to Sweeflow X". Chosen, it shows what's new while it downloads the disk image, checks
+/// "Update available". Chosen, it shows what's new while it downloads the disk image, checks
 /// it (its checksum, and that the app in it is signed as this one is), swaps it in and opens it.
 final class Updater: NSObject {
     static let shared = Updater()
@@ -54,7 +54,7 @@ final class Updater: NSObject {
     }
 
     /// The menu's line: what it says, and what it does.
-    var menuTitle: String { available.map { "Update to Sweeflow \($0.version)" } ?? "Check for updates" }
+    var menuTitle: String { available == nil ? "Check for updates" : "Update available" }
 
     func menuChosen() {
         if let feed = available { return showAndInstall(feed) }
@@ -90,7 +90,7 @@ final class Updater: NSObject {
     private func notifyOnce(_ feed: Feed) {
         guard UserDefaults.standard.string(forKey: "updateNotified") != feed.version else { return }
         UserDefaults.standard.set(feed.version, forKey: "updateNotified")
-        notify("Sweeflow \(feed.version) is available", "Choose Update in Sweeflow's menu to install it.", id: "update")
+        notify("Sweeflow \(feed.version) is available", "Open Sweeflow's menu to install it.", id: "update")
     }
 
     private func notify(_ title: String, _ body: String, id: String) {

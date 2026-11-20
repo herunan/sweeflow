@@ -374,18 +374,12 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
-                text: upd.u ? "Sweeflow " + upd.u.version + " is available" : ""
+                text: "Update available"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
-              }
-              Note {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                elide: Text.ElideNone
-                text: upd.u ? String(upd.u.words || "") : ""
               }
             }
 
