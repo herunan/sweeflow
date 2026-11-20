@@ -348,55 +348,6 @@ Panel {
         anchors.bottom: parent.bottom
         spacing: Style.space(10)
 
-        // A newer Sweeflow, and how to get it (update.rs panel_json).
-        BorderSurface {
-          id: upd
-          readonly property var u: root.client ? (root.client.updates.update || null) : null
-          visible: !!u
-          Layout.fillWidth: true
-          implicitHeight: updRow.implicitHeight + Style.space(16)
-          radius: Style.cornerRadius
-          color: Style.selectedFillFor(root.foreground, Commons.Color.accent)
-          borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
-
-          RowLayout {
-            id: updRow
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.leftMargin: Style.space(10)
-            anchors.rightMargin: Style.space(10)
-            spacing: Style.space(10)
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              spacing: Style.space(2)
-              Text {
-                Layout.fillWidth: true
-                textFormat: Text.PlainText
-                text: "Update available"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                font.bold: true
-                elide: Text.ElideRight
-              }
-            }
-
-            // The update window: what's new, and the update (or how it's done).
-            Button {
-              text: upd.u && upd.u.how === "self" ? "Update" : "What's New"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: {
-                root.act("update-window", "")
-                root.close()
-              }
-            }
-          }
-        }
-
         // The Mac on another version of Sweeflow.
         Note {
           readonly property string words: root.client ? String(root.client.updates.macNote || "") : ""
@@ -913,7 +864,7 @@ Panel {
             }
           }
           Button {
-            text: "Check for updates"
+            text: root.client && root.client.updates.update ? "Update available" : "Check for updates"
             bordered: true
             foreground: root.foreground
             fontFamily: root.fontFamily

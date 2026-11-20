@@ -315,27 +315,6 @@ slint::slint! {
                     }
                 }
 
-                // A newer Sweeflow (the update window says which and how to get it).
-                if root.update-version != "": Rectangle {
-                    vertical-stretch: 0;
-                    border-radius: 8px;
-                    background: Look.accent.transparentize(0.88);
-                    HorizontalLayout {
-                        padding: 10px;
-                        spacing: 8px;
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            spacing: 2px;
-                            Text { text: "Update available"; color: Look.fg; font-size: 13px; font-weight: 600; overflow: elide; }
-                        }
-                        // The update window: what's new, and the update (or how it's done).
-                        VerticalLayout {
-                            alignment: center;
-                            Btn { text: root.update-how == "self" ? "Update" : "What's New"; small: true; primary: true; clicked => { root.act("update-window", ""); } }
-                        }
-                    }
-                }
                 // The Mac on another version.
                 if root.mac-note != "": Text { text: root.mac-note; color: Look.muted; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
 
@@ -661,7 +640,7 @@ slint::slint! {
                     HorizontalLayout {
                         spacing: 8px;
                         Btn { text: "Shortcuts"; pad: foot.pad; clicked => { root.act("shortcuts", ""); } }
-                        Btn { text: "Check for updates"; pad: foot.pad; clicked => { root.act("update-window", ""); } }
+                        Btn { text: root.update-version != "" ? "Update available" : "Check for updates"; pad: foot.pad; clicked => { root.act("update-window", ""); } }
                         Rectangle { horizontal-stretch: 1; }
                         Btn { text: "Quit Sweeflow"; pad: foot.pad; clicked => { root.quit-all(); } }
                     }
