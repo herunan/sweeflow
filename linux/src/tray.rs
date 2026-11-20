@@ -678,7 +678,8 @@ fn omarchy_plugin_enabled(home: &std::path::Path) -> bool {
         // And it's there: a name left in the bar's list after the plugin was taken out showed
         // nothing, and Sweeflow no icon of its own either.
         && home.join(".config/omarchy/plugins").read_dir().is_ok_and(|d| {
-            d.flatten().any(|e| std::fs::read_to_string(e.path().join("manifest.json")).is_ok_and(|m| m.contains("\"io.github.herunan.sweeflow\"")))
+            // (Not the copies Omarchy keeps of earlier ones, in folders starting with a dot.)
+            d.flatten().filter(|e| !e.file_name().to_string_lossy().starts_with('.')).any(|e| std::fs::read_to_string(e.path().join("manifest.json")).is_ok_and(|m| m.contains("\"io.github.herunan.sweeflow\"")))
         })
 }
 
