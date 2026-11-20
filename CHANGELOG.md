@@ -2,6 +2,14 @@
 
 Each release's notes. The release build takes the newest section for the update notice on the Mac and on Linux, so keep each section short and written for people who use Sweeflow.
 
+## 0.1.1
+
+Small fixes.
+
+- The update notice in Sweeflow's panel is no longer cut off.
+- Removing Sweeflow on GNOME also takes its shortcuts out of GNOME's settings.
+- Removing Sweeflow on Omarchy gives Hyprland its own keys back at once.
+
 ## 0.1.0
 
 The first release.

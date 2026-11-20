@@ -284,7 +284,10 @@ fn parse_binds(json: &str) -> Vec<(u32, String, String)> {
 pub fn unbind_ours() -> anyhow::Result<usize> {
     let o = Command::new("hyprctl").args(["binds", "-j"]).output()?;
     let (unbinds, n) = unbind_lua(&String::from_utf8_lossy(&o.stdout));
-    let lua = format!("sweeflow_open_key = nil; sweeflow_stream_keys_yz = nil; {unbinds}");
+    // Its key mode for Mac windows isn't left on (the mode itself stays until Hyprland's next
+    // reload, unused: unbinding its keys would unbind the person's own on the same keys).
+    let reset = if current_submap().is_some_and(|s| s.starts_with("sweeflow")) { r#"hl.dispatch(hl.dsp.submap("reset")); "# } else { "" };
+    let lua = format!("sweeflow_open_key = nil; sweeflow_stream_keys_yz = nil; {reset}{unbinds}");
     let o = Command::new("hyprctl").args(["eval", &lua]).output()?;
     let said = String::from_utf8_lossy(&o.stdout).trim().to_string();
     anyhow::ensure!(said == "ok", "Hyprland said {said}");

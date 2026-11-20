@@ -251,6 +251,34 @@ pub fn gnome_set() {
     }
 }
 
+/// `sweeflow uninstall` on GNOME: Sweeflow's keys go from GNOME's list, and Sweeflow from its
+/// list of apps that have some (both stayed, shown in GNOME Settings with nothing behind them).
+pub fn gnome_forget() {
+    const APPS: &str = "/org/gnome/settings-daemon/global-shortcuts/applications";
+    let Ok(o) = Command::new("dconf").args(["read", APPS]).output() else { return };
+    let _ = Command::new("dconf").args(["reset", "-f", "/org/gnome/settings-daemon/global-shortcuts/sweeflow/"]).status();
+    let apps = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if let Some(rest) = without_app(&apps, "sweeflow") {
+        let _ = match rest.as_str() {
+            "" => Command::new("dconf").args(["reset", APPS]).status(),
+            list => Command::new("dconf").args(["write", APPS, list]).status(),
+        };
+        println!("    removed Sweeflow's shortcuts from GNOME's");
+    }
+}
+
+/// dconf's list of apps (`['sweeflow', 'other']`) without one: None when it isn't in it, "" when
+/// it was the only one.
+fn without_app(list: &str, app: &str) -> Option<String> {
+    let inner = list.trim().strip_prefix("@as ").unwrap_or(list.trim()).strip_prefix('[')?.strip_suffix(']')?;
+    let all: Vec<&str> = inner.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    let rest: Vec<&str> = all.iter().copied().filter(|a| a.trim_matches('\'') != app).collect();
+    if rest.len() == all.len() {
+        return None;
+    }
+    Some(if rest.is_empty() { String::new() } else { format!("[{}]", rest.join(", ")) })
+}
+
 /// GNOME: a key changed in GNOME Settings is saved as Sweeflow's (keys.json), so its windows and
 /// Mac windows follow. GNOME's portal doesn't say (no ShortcutsChanged), so its list is watched.
 fn watch_gnome(remapped: bool) {
@@ -392,6 +420,15 @@ mod tests {
 
 #[cfg(test)]
 mod remapper_tests {
+    #[test]
+    fn sweeflow_leaves_gnomes_list_of_apps() {
+        assert_eq!(super::without_app("['sweeflow']", "sweeflow").as_deref(), Some(""));
+        assert_eq!(super::without_app("['a', 'sweeflow', 'b']", "sweeflow").as_deref(), Some("['a', 'b']"));
+        assert_eq!(super::without_app("['a']", "sweeflow"), None);
+        assert_eq!(super::without_app("@as []", "sweeflow"), None);
+        assert_eq!(super::without_app("", "sweeflow"), None);
+    }
+
     use crate::deskkeys::UserKey;
 
     #[test]

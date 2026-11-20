@@ -280,6 +280,7 @@ pub fn uninstall(purge: bool) -> Result<()> {
     unregister_gsettings_keys("Cinnamon", CINNAMON_KEYS, "custom-list", cinnamon_ours, |id| cinnamon_schema(id));
     if std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().contains("GNOME") {
         gnome_utilities_folder(false);
+        crate::globalkeys::gnome_forget();
     }
     if crate::hyprland::running() {
         match crate::hyprland::unbind_ours() {

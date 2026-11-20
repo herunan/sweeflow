@@ -183,7 +183,7 @@ pub fn check() -> Result<Option<Feed>> {
         let _ = std::fs::write(&said, &feed.version);
         let how = match how() {
             How::Tarball => "Open Sweeflow to update it.".to_string(),
-            other => other.words(),
+            other => other.short(),
         };
         let _ = Command::new("notify-send")
             .args(["--app-name=Sweeflow", "--icon=sweeflow", &format!("Sweeflow {} is available", feed.version), &how])
@@ -209,6 +209,14 @@ impl How {
             How::Tarball => "Update it from here.".into(),
             How::System(cmd) => format!("It comes with your system's updates ({cmd})."),
             How::Download => "Get the new package from the release page.".into(),
+        }
+    }
+    /// The same without the command, for the panel's line and the notification (too narrow: the
+    /// command was cut or wrapped in the middle). The update window has it.
+    pub fn short(&self) -> String {
+        match self {
+            How::System(_) => "It comes with your system's updates.".into(),
+            other => other.words(),
         }
     }
     pub fn id(&self) -> &'static str {
@@ -268,7 +276,7 @@ pub fn panel_json() -> serde_json::Value {
     let mac = MAC_VERSION.lock().unwrap().clone();
     let update = available.map(|f| {
         let how = how();
-        serde_json::json!({ "version": f.version, "notes": f.notes, "page": f.page, "how": how.id(), "words": how.words() })
+        serde_json::json!({ "version": f.version, "notes": f.notes, "page": f.page, "how": how.id(), "words": how.short() })
     });
     // The Mac on another version: which is behind.
     let mac_note = mac.filter(|v| v != VERSION).map(|v| {

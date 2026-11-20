@@ -4162,7 +4162,9 @@ impl KeyboardHandler for App {
             let handled = if kde {
                 crate::deskkeys::plasma_action(e.raw_code, m).map(|(c, a)| crate::deskkeys::plasma_invoke(&c, &a)).is_some()
             } else if crate::keys::desktop().contains("GNOME") && crate::deskkeys::gnome_uses(e.raw_code, m) {
-                // GNOME runs none for an app: let through from the next press (deskkeys).
+                // GNOME runs none for an app: let through from the next press (deskkeys). (Pressing
+                // the key again for it through Mutter's RemoteDesktop API works, but GNOME then
+                // shows its orange "being controlled" sign for 5 s each time: left out.)
                 self.let_go_now(qh);
                 true
             } else {
