@@ -106,6 +106,20 @@ Then install it. It updates with the rest of your system.
 sudo apt update && sudo apt install sweeflow
 ```
 
+**Fedora**
+
+Add Sweeflow's repo once.
+
+```sh
+sudo curl -fsSLo /etc/yum.repos.d/sweeflow.repo https://sweeflow.app/rpm/sweeflow.repo
+```
+
+Then install it. It updates with the rest of your system.
+
+```sh
+sudo dnf install sweeflow
+```
+
 ### 3. Link them
 
 Open **Sweeflow** from your app menu. It shows **Link a Mac**. Choose your Mac and type the code it shows. Your Mac apps then appear in your launcher.

@@ -6,9 +6,10 @@ Each release's notes. The release build takes the newest section for the update 
 
 Small fixes.
 
-- The update notice in Sweeflow's panel is no longer cut off.
 - Removing Sweeflow on GNOME also takes its shortcuts out of GNOME's settings.
 - Removing Sweeflow on Omarchy gives Hyprland its own keys back at once.
+- When an update is out, the Check for updates button says Update available and stands out.
+- Fedora has its own repo now, so Sweeflow updates with the system there too.
 
 ## 0.1.0
 
