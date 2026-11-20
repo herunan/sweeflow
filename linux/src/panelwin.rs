@@ -83,8 +83,10 @@ slint::slint! {
         opacity: root.enabled ? 1 : 0.45;
         border-radius: Look.outlined ? min(Look.radius, 10px) : 10px;
         border-width: Look.outlined ? 1px : 0px;
+        // Outlined (Omarchy): the shape of its shell's own switches, an empty box with a square knob,
+        // violet when on as everywhere else.
         border-color: root.on ? Look.accent : Look.line;
-        background: root.on ? Look.accent : Look.fg.transparentize(0.8);
+        background: Look.outlined ? transparent : root.on ? Look.accent : Look.fg.transparentize(0.8);
         accessible-role: checkbox;
         accessible-checkable: true;
         accessible-checked: root.on;
@@ -95,7 +97,7 @@ slint::slint! {
             y: 3px;
             x: root.on ? parent.width - 17px : 3px;
             border-radius: Look.outlined ? min(Look.radius, 7px) : 7px;
-            background: root.on ? Look.on-accent : Look.fg;
+            background: Look.outlined ? (root.on ? Look.accent : Look.fg.transparentize(0.75)) : root.on ? Look.on-accent : Look.fg;
             animate x { duration: 120ms; }
         }
         TouchArea {
@@ -139,7 +141,14 @@ slint::slint! {
         in property <bool> selected;
         callback clicked;
         height: 32px;
-        horizontal-stretch: 1;
+        horizontal-stretch: Look.outlined ? 0 : 1;
+        // Outlined (Omarchy): boxes side by side as in its shell, the chosen one filled; elsewhere
+        // equal thirds with a line under the chosen one.
+        preferred-width: label.preferred-width + 26px;
+        border-radius: Look.outlined ? Look.radius : 0px;
+        border-width: Look.outlined ? 1px : 0px;
+        border-color: Look.line;
+        background: Look.outlined && root.selected ? Look.fg.transparentize(0.85) : transparent;
         accessible-role: tab;
         accessible-label: root.text;
         accessible-action-default => { root.clicked(); }
@@ -147,9 +156,9 @@ slint::slint! {
             mouse-cursor: pointer;
             clicked => { Tip.leave(); root.clicked(); }
         }
-        Text {
+        label := Text {
             text: root.text;
-            color: root.selected ? Look.fg : Look.muted;
+            color: root.selected || Look.outlined ? Look.fg : Look.muted;
             font-size: 13px;
             font-weight: root.selected ? 600 : 400;
             horizontal-alignment: center;
@@ -158,6 +167,7 @@ slint::slint! {
         Rectangle {
             y: parent.height - 2px;
             height: 2px;
+            visible: !Look.outlined;
             background: root.selected ? Look.accent : Look.line.transparentize(0.5);
         }
     }
@@ -320,6 +330,8 @@ slint::slint! {
 
                 if root.running && root.paired: HorizontalLayout {
                     vertical-stretch: 0;
+                    alignment: Look.outlined ? start : stretch;
+                    spacing: Look.outlined ? 6px : 0px;
                     Tab { text: root.app-count > 0 ? "Apps (" + root.app-count + ")" : "Apps"; selected: root.tab == 0; clicked => { root.tab = 0; } }
                     Tab { text: "Settings"; selected: root.tab == 1; clicked => { root.tab = 1; } }
                     Tab { text: "Macs"; selected: root.tab == 2; clicked => { root.tab = 2; } }

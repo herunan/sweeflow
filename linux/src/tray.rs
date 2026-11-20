@@ -125,7 +125,6 @@ fn unpaired() -> bool {
 
 /// Shows the tray icon (or serves the KDE widget). Before a Mac is linked too.
 pub fn start() {
-    omarchy_add_plugin_once();
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = REFRESH.set(tx);
     // The keys the menu and panels show, as the user changes them.
@@ -666,67 +665,10 @@ fn quit() {
 
 /// A widget of the desktop's shell shows Sweeflow's icon and panel, so Sweeflow shows no tray
 /// icon or window of its own: the KDE tray widget (linux/plasmoid), installed by `sweeflow
-/// install` on Plasma, or the Omarchy plugin (omarchy/), while it's in Omarchy's bar.
+/// install` on Plasma.
 pub fn widget_installed() -> bool {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return false };
-    home.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists() || omarchy_plugin_enabled(&home)
-}
-
-/// On Omarchy, once: adds Sweeflow's plugin to the bar (the package alone is then the whole
-/// install), and after an update of Sweeflow brings it up to date. Omarchy's own command does
-/// both, for this user, from Sweeflow's repository. Added only ever once, noted beside the config:
-/// taken out again later, it stays out. Sweeflow restarts to match when
-/// the plugin appears (update.rs watches `widget_installed`).
-pub fn omarchy_add_plugin_once() {
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
-    let noted = crate::config::dir().join("omarchy-plugin-added");
-    if !crate::hyprland::running() || !home.join(".config/omarchy").is_dir() {
-        return;
-    }
-    // The note holds the version of Sweeflow the plugin was last brought up to: Omarchy's system
-    // update brings the package but not its plugins, so after one Sweeflow updates its own (the
-    // panel and the program then match again).
-    const THIS: &str = env!("CARGO_PKG_VERSION");
-    let there = omarchy_plugin_enabled(&home);
-    let args: &[&str] = match std::fs::read_to_string(&noted) {
-        Err(_) if there => {
-            let _ = std::fs::write(&noted, THIS);
-            return;
-        }
-        Err(_) => &["plugin", "add", "https://github.com/herunan/sweeflow.git", "--enable", "--yes"],
-        Ok(v) if there && v.trim() != THIS => &["plugin", "update", "io.github.herunan.sweeflow", "--yes"],
-        Ok(_) => return,
-    };
-    std::thread::spawn(move || {
-        let mut cmd = std::process::Command::new("omarchy");
-        cmd.args(args);
-        // The service's environment has no OMARCHY_PATH (the session's does).
-        if std::env::var_os("OMARCHY_PATH").is_none() && std::path::Path::new("/usr/share/omarchy").is_dir() {
-            cmd.env("OMARCHY_PATH", "/usr/share/omarchy");
-        }
-        match cmd.output() {
-            Ok(o) if o.status.success() => {
-                log::info!("Omarchy: Sweeflow's plugin {}", if args[1] == "add" { "added to the bar" } else { "brought up to date" });
-                let _ = std::fs::write(&noted, THIS);
-            }
-            // Not noted: tried again at the next start (no network yet, say).
-            Ok(o) => log::warn!("Omarchy: Sweeflow's plugin ({}): {}", args[1], String::from_utf8_lossy(&o.stderr).trim()),
-            // No `omarchy` command: not Omarchy after all.
-            Err(_) => {}
-        }
-    });
-}
-
-/// Omarchy's shell lists the plugins in its bar in shell.json; enabling Sweeflow's adds its id.
-fn omarchy_plugin_enabled(home: &std::path::Path) -> bool {
-    crate::hyprland::running()
-        && std::fs::read_to_string(home.join(".config/omarchy/shell.json")).is_ok_and(|s| s.contains("\"io.github.herunan.sweeflow\""))
-        // And it's there: a name left in the bar's list after the plugin was taken out showed
-        // nothing, and Sweeflow no icon of its own either.
-        && home.join(".config/omarchy/plugins").read_dir().is_ok_and(|d| {
-            // (Not the copies Omarchy keeps of earlier ones, in folders starting with a dot.)
-            d.flatten().filter(|e| !e.file_name().to_string_lossy().starts_with('.')).any(|e| std::fs::read_to_string(e.path().join("manifest.json")).is_ok_and(|m| m.contains("\"io.github.herunan.sweeflow\"")))
-        })
+    home.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists()
 }
 
 fn pinned_file() -> std::path::PathBuf {

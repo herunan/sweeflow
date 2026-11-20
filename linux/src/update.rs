@@ -101,8 +101,8 @@ pub fn watch_binary() {
     let widget = crate::tray::widget_installed();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
-        // The desktop's own widget for Sweeflow came or went (Omarchy's plugin, turned on or
-        // off): the tray icon and Sweeflow's own window make way for it, or come back.
+        // The desktop's own widget for Sweeflow came or went (Plasma's, put in or taken out): the
+        // tray icon and Sweeflow's own window make way for it, or come back.
         if crate::tray::widget_installed() != widget {
             log::info!("the desktop's Sweeflow widget {}: restarting to match", if widget { "is gone" } else { "is there now" });
             let _ = Command::new("systemctl").args(["--user", "--no-block", "restart", "sweeflow"]).status();
