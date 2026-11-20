@@ -61,17 +61,19 @@ Open it and allow all permissions. Then go to the **Link a Linux machine** scree
 
 **Arch**
 
-For Arch and the distros built on it.
+For Arch and the distros built on it, such as CachyOS.
 
 ```sh
 curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add - && sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8 && printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf && sudo pacman -Syu sweeflow
 ```
 
-> **Omarchy**
->
-> ```sh
-> curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add - && sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8 && printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf && sudo pacman -Sy sweeflow
-> ```
+**Omarchy**
+
+Omarchy is built on Arch, but it refuses pacman's full upgrade (`-Syu`) outside its own updater, so the Arch line stops there. This one installs Sweeflow alone, and `omarchy update` keeps it up to date.
+
+```sh
+curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo pacman-key --add - && sudo pacman-key --lsign-key E1D31233BB01463B575ACD5E387237FAEFBBB7B8 && printf '\n[sweeflow]\nServer = https://github.com/herunan/sweeflow/releases/latest/download\n' | sudo tee -a /etc/pacman.conf && sudo pacman -Sy sweeflow
+```
 
 **Debian**
 
