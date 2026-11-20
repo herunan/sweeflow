@@ -260,6 +260,17 @@ pub fn uninstall(purge: bool) -> Result<()> {
         let _ = systemctl(&["reset-failed", "sweeflow.service"]);
     }
     rm(&home.join(".config/autostart/sweeflow.desktop"));
+    // Sweeflow's own windows still open (Link a Mac, the panel): each a process of its own.
+    let me = std::process::id();
+    let bins = [installed_binary(&home), home.join(".local/bin/sweeflow")];
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(exe) = std::fs::read_link(e.path().join("exe")) else { continue };
+        let exe = exe.to_string_lossy().trim_end_matches(" (deleted)").to_string();
+        if pid != me && bins.iter().any(|b| b.to_string_lossy() == exe) {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
 
     // The shortcuts, before the widget: Plasma's open key belongs to it.
     let widgets = if kde { plasma_widgets().unwrap_or_default() } else { Vec::new() };
@@ -702,6 +713,14 @@ fn service_active() -> bool {
 /// it isn't running, and shows it: the tray widget's popup, or "Link a Mac" while none is paired.
 pub fn open() -> Result<()> {
     if !service_installed() {
+        // Opened twice at once (a double click on its launcher): one sets it up. Two did, each
+        // restarting the service, and GNOME asked about Sweeflow's keys twice.
+        let Some(_lock) = crate::lock("sweeflow-open.lock")? else {
+            return Ok(());
+        };
+        if service_installed() {
+            return Ok(());
+        }
         install()?;
         // The service opens "Link a Mac" itself when there's no Mac yet: Sweeflow's own window on
         // top of it would hide its steps (the first open after installing a package did that).

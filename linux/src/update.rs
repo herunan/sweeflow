@@ -93,6 +93,45 @@ pub fn start() {
     });
 }
 
+/// A package manager replaces or removes the binary under the running copy and can't restart a
+/// user's service. So the running copy looks: replaced (an upgrade), it restarts as the new one;
+/// gone (the package was removed), it takes away what it set up for this user (the service,
+/// launchers, shortcuts: `sweeflow uninstall`), leaving the link with the Mac.
+pub fn watch_binary() {
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let Ok(link) = std::fs::read_link("/proc/self/exe") else { continue };
+        let link = link.to_string_lossy().into_owned();
+        let Some(path) = link.strip_suffix(" (deleted)") else { continue };
+        // An upgrade puts the new file there within moments; a removal never does.
+        let mut there = false;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_secs(2));
+            if Path::new(path).exists() {
+                there = true;
+                break;
+            }
+        }
+        if there {
+            log::info!("{path} was replaced (an update): restarting as the new one");
+            let _ = Command::new("systemctl").args(["--user", "--no-block", "restart", "sweeflow"]).status();
+        } else {
+            log::info!("{path} is gone (the package was removed): removing Sweeflow's service, launchers and shortcuts");
+            // Outside this service, which the uninstall stops; this copy's code is still there to run.
+            let mut run = Command::new("systemd-run");
+            run.args(["--user", "--collect", "--quiet"]);
+            for var in ["XDG_CURRENT_DESKTOP", "WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
+                if let Ok(v) = std::env::var(var) {
+                    run.arg(format!("--setenv={var}={v}"));
+                }
+            }
+            let _ = run.arg(format!("/proc/{}/exe", std::process::id())).arg("uninstall").status();
+        }
+        // Either way this copy is stopped from outside; not asked twice.
+        std::thread::sleep(Duration::from_secs(120));
+    });
+}
+
 fn fetch(url: &str) -> Result<Vec<u8>> {
     let out = Command::new("curl").args(["-fsSL", "--max-time", "60", url]).output().context("curl")?;
     ensure!(out.status.success(), "{url}: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -196,7 +235,7 @@ pub fn how() -> How {
         let repo = std::fs::read_dir("/etc/apt/sources.list.d").into_iter().flatten().flatten().any(|e| {
             e.file_name().to_string_lossy().starts_with("sweeflow")
         });
-        return if repo { How::System("sudo apt upgrade") } else { How::Download };
+        return if repo { How::System("sudo apt update && sudo apt upgrade") } else { How::Download };
     }
     if Command::new("rpm").args(["-q", "sweeflow"]).output().is_ok_and(|o| o.status.success()) {
         return if has("/etc/yum.repos.d/sweeflow.repo") { How::System("sudo dnf upgrade") } else { How::Download };

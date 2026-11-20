@@ -651,13 +651,22 @@ slint::slint! {
                 }
 
                 // The Shortcuts window and Check for updates at the left, Quit at the right.
-                if root.running && root.paired: HorizontalLayout {
+                if root.running && root.paired: Rectangle {
                     vertical-stretch: 0;
-                    spacing: 8px;
-                    Btn { text: "Shortcuts"; clicked => { root.act("shortcuts", ""); } }
-                    Btn { text: "Check for updates"; clicked => { root.act("update-window", ""); } }
-                    Rectangle { horizontal-stretch: 1; }
-                    Btn { text: "Quit Sweeflow"; clicked => { root.quit-all(); } }
+                    height: 34px;
+                    foot := Rectangle {
+                    // With a wide font (Omarchy's is monospace) the three don't fit at their usual
+                    // size: the room around each one's text gives way first.
+                    property <length> pad: clamp((self.width - 16px - words.preferred-width) / 3, 10px, 32px);
+                    words := Text { text: "ShortcutsCheck for updatesQuit Sweeflow"; font-size: 13px; font-weight: 500; visible: false; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Btn { text: "Shortcuts"; pad: foot.pad; clicked => { root.act("shortcuts", ""); } }
+                        Btn { text: "Check for updates"; pad: foot.pad; clicked => { root.act("update-window", ""); } }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { text: "Quit Sweeflow"; pad: foot.pad; clicked => { root.quit-all(); } }
+                    }
+                    }
                 }
             }
         }

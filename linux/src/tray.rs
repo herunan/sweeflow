@@ -1227,6 +1227,13 @@ pub fn rename(fingerprint: &str, name: &str) {
 /// The update window: looks for a newer release, shows what's new and updates.
 pub fn open_update_window() {
     run_window("update-window", "the update window");
+    // The window looks for itself (it's a process of its own); the panel's line and the
+    // notification come from this one's look.
+    std::thread::spawn(|| {
+        if let Err(e) = crate::update::check() {
+            log::info!("update check: {e:#}");
+        }
+    });
 }
 
 pub fn open_wizard() {

@@ -86,8 +86,10 @@ export component Btn inherits Rectangle {
     callback clicked;
     // A small one, for a button on each row of a list.
     in property <bool> small;
+    // The room around the text, less where a row of buttons wouldn't fit (a wide font).
+    in property <length> pad: 32px;
     height: root.small ? 26px : 34px;
-    min-width: root.small ? label.preferred-width + 20px : max(84px, label.preferred-width + 32px + (root.sign != "" ? 18px : 0px));
+    min-width: root.small ? label.preferred-width + 20px : max(min(84px, label.preferred-width + root.pad), label.preferred-width + root.pad + (root.sign != "" ? 18px : 0px));
     horizontal-stretch: 0;
     vertical-stretch: 0;
     opacity: root.enabled ? 1 : 0.45;

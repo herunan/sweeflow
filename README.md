@@ -83,14 +83,22 @@ On Omarchy, install it with `sudo pacman -Sy sweeflow` instead. Omarchy's own up
 
 **Debian, Ubuntu and Mint**
 
+Add Sweeflow's repo once.
+
 ```sh
-curl -fsSLO https://github.com/herunan/sweeflow/releases/latest/download/sweeflow_amd64.deb
-sudo apt install ./sweeflow_amd64.deb
+curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/sweeflow.asc | sudo gpg --dearmor -o /usr/share/keyrings/sweeflow.gpg
+echo "deb [signed-by=/usr/share/keyrings/sweeflow.gpg] https://github.com/herunan/sweeflow/releases/latest/download ./" | sudo tee /etc/apt/sources.list.d/sweeflow.list
+```
+
+Then install it. It updates with the rest of your system.
+
+```sh
+sudo apt update && sudo apt install sweeflow
 ```
 
 ### 3. Link them
 
-Sweeflow opens **Link a Mac** by itself. Choose your Mac and type the code it shows. Your Mac apps then appear in your launcher.
+Open **Sweeflow** from your app menu. It shows **Link a Mac**. Choose your Mac and type the code it shows. Your Mac apps then appear in your launcher.
 
 ## How it works
 

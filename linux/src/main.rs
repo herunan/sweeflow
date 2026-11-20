@@ -108,6 +108,10 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zbus=warn,tracing=warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--version") | Some("-V") | Some("version") => {
+            println!("sweeflow {} ({})", update::VERSION, update::build());
+            Ok(())
+        }
         None | Some("run") => {
             // Started by hand (a terminal, KRunner) while installed as a service: start the
             // service instead, so there's one copy and Quit / restarts behave. (Not by
@@ -120,7 +124,10 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             let _lock = single_instance()?;
+            log::info!("Sweeflow {} ({})", update::VERSION, update::build());
             if in_service {
+                // A package's upgrade or removal, which can't reach a user's running copy.
+                update::watch_binary();
                 // Installs from before Sweeflow was in the app menu.
                 if let Some(home) = std::env::var_os("HOME") {
                     let _ = setup::write_launcher(std::path::Path::new(&home));
