@@ -4,7 +4,6 @@ Each release's notes. The release build takes the newest section for the update 
 
 ## 0.1.2
 
-- Sweeflow's own panel on Omarchy has Omarchy's tabs and switches.
 - The Omarchy bar plugin is gone: Sweeflow's own icon and panel do the same. If you added it, take it out with `omarchy plugin remove io.github.herunan.sweeflow`.
 
 ## 0.1.1

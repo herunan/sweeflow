@@ -39,6 +39,8 @@ Sweeflow seamlessly streams just the apps you need from your Mac to your Linux d
 
 <img src="assets/badges/cachyos-plasma.svg" alt="CachyOS KDE Plasma, Wayland">
 <img src="assets/badges/cachyos-gnome.svg" alt="CachyOS GNOME, Wayland">
+<img src="assets/badges/fedora-plasma.svg" alt="Fedora KDE Plasma, Wayland">
+<img src="assets/badges/fedora-gnome.svg" alt="Fedora GNOME, Wayland">
 <img src="assets/badges/omarchy-hyprland.svg" alt="Omarchy Hyprland, Wayland">
 <img src="assets/badges/ubuntu-gnome.svg" alt="Ubuntu GNOME, Wayland">
 <img src="assets/badges/mint-cinnamon.svg" alt="Linux Mint Cinnamon, X11">
@@ -63,7 +65,7 @@ Open it and allow all permissions. Then go to the **Link a Linux machine** scree
 curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/install.sh | sh
 ```
 
-**Arch and CachyOS**
+**Arch, CachyOS and Omarchy**
 
 Add Sweeflow's repo once.
 
@@ -79,17 +81,7 @@ Then install it. It updates with the rest of your system.
 sudo pacman -Syu sweeflow
 ```
 
-**Omarchy**
-
-Add the repo as above, then install with `sudo pacman -Sy sweeflow`. Omarchy's own updates keep it up to date.
-
-Sweeflow is also an Omarchy plugin: its icon in the bar and a panel in Omarchy's own look, with your Mac's apps, Pause, Stop and Start, and the settings.
-
-```sh
-omarchy plugin add https://github.com/herunan/sweeflow.git --enable
-```
-
-The plugin is the panel only. Without Sweeflow installed it shows the steps above. Remove it with `omarchy plugin remove io.github.herunan.sweeflow`.
+On Omarchy, install with `sudo pacman -Sy sweeflow` instead. Omarchy's own updates keep it up to date.
 
 **Debian, Ubuntu and Mint**
 
