@@ -54,6 +54,7 @@ final class Updater: NSObject {
     }
 
     /// The menu's line: what it says, and what it does.
+    var updateIsOut: Bool { available != nil }
     var menuTitle: String { available == nil ? "Check for updates" : "Update available" }
 
     func menuChosen() {

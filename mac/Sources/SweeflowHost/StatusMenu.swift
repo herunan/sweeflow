@@ -192,7 +192,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         // Updates: "Check for updates", or "Update available" once one is out (Updater).
-        menu.addItem(ClosureMenuItem(title: Updater.shared.menuTitle) { Updater.shared.menuChosen() })
+        let update = ClosureMenuItem(title: Updater.shared.menuTitle) { Updater.shared.menuChosen() }
+        // One that's out stands out: the badge macOS gives a menu line with an update behind it.
+        if Updater.shared.updateIsOut { update.badge = NSMenuItemBadge.updates(count: 1) }
+        menu.addItem(update)
         let quit = ClosureMenuItem(title: "Quit Sweeflow") { Self.quit() }
         quit.keyEquivalent = "q"
         menu.addItem(quit)

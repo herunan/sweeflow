@@ -640,7 +640,7 @@ slint::slint! {
                     HorizontalLayout {
                         spacing: 8px;
                         Btn { text: "Shortcuts"; pad: foot.pad; clicked => { root.act("shortcuts", ""); } }
-                        Btn { text: root.update-version != "" ? "Update available" : "Check for updates"; pad: foot.pad; clicked => { root.act("update-window", ""); } }
+                        Btn { text: root.update-version != "" ? "Update available" : "Check for updates"; primary: root.update-version != ""; pad: foot.pad; clicked => { root.act("update-window", ""); } }
                         Rectangle { horizontal-stretch: 1; }
                         Btn { text: "Quit Sweeflow"; pad: foot.pad; clicked => { root.quit-all(); } }
                     }

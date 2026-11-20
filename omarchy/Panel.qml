@@ -866,7 +866,7 @@ Panel {
           Button {
             text: root.client && root.client.updates.update ? "Update available" : "Check for updates"
             bordered: true
-            foreground: root.foreground
+            foreground: root.client && root.client.updates.update ? Commons.Color.accent : root.foreground
             fontFamily: root.fontFamily
             onClicked: {
               root.act("update-window", "")
