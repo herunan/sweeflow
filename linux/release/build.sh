@@ -68,7 +68,7 @@ cp "$out/sweeflow-$version-x86_64.tar.gz" "$out/sweeflow-x86_64.tar.gz"
 rpm=linux/target/portable/rpm
 rm -rf "$rpm" && mkdir -p "$rpm/SOURCES"
 cp "$out/sweeflow-$version-x86_64.tar.gz" "$rpm/SOURCES/"
-linux/release/env.sh "rpmbuild -bb --define '_topdir /src/$rpm' --define 'version $version' linux/release/sweeflow.spec"
+linux/release/env.sh "rpmbuild -bb --define '_buildhost sweeflow' --define '_topdir /src/$rpm' --define 'version $version' linux/release/sweeflow.spec"
 cp "$rpm/RPMS/x86_64/sweeflow-$version-1.x86_64.rpm" "$out/"
 cp "$out/sweeflow-$version-1.x86_64.rpm" "$out/sweeflow.x86_64.rpm"
 rm -rf "$stage"
