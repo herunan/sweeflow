@@ -663,11 +663,18 @@ fn quit() {
     std::process::exit(0);
 }
 
-/// The KDE tray widget (linux/plasmoid), installed by `sweeflow install` on Plasma.
+/// A widget of the desktop's shell shows Sweeflow's icon and panel, so Sweeflow shows no tray
+/// icon or window of its own: the KDE tray widget (linux/plasmoid), installed by `sweeflow
+/// install` on Plasma, or the Omarchy plugin (omarchy/), while it's in Omarchy's bar.
 pub fn widget_installed() -> bool {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .is_some_and(|h| h.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists())
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return false };
+    home.join(".local/share/plasma/plasmoids/dev.sweeflow.panel/metadata.json").exists() || omarchy_plugin_enabled(&home)
+}
+
+/// Omarchy's shell lists the plugins in its bar in shell.json; enabling Sweeflow's adds its id.
+fn omarchy_plugin_enabled(home: &std::path::Path) -> bool {
+    crate::hyprland::running()
+        && std::fs::read_to_string(home.join(".config/omarchy/shell.json")).is_ok_and(|s| s.contains("\"io.github.herunan.sweeflow\""))
 }
 
 fn pinned_file() -> std::path::PathBuf {

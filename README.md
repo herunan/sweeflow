@@ -63,7 +63,7 @@ Open it and allow all permissions. Then go to the **Link a Linux machine** scree
 curl -fsSL https://github.com/herunan/sweeflow/releases/latest/download/install.sh | sh
 ```
 
-**Arch, CachyOS and Omarchy**
+**Arch and CachyOS**
 
 Add Sweeflow's repo once.
 
@@ -79,7 +79,17 @@ Then install it. It updates with the rest of your system.
 sudo pacman -Syu sweeflow
 ```
 
-On Omarchy, install it with `sudo pacman -Sy sweeflow` instead. Omarchy's own updates then keep it up to date.
+**Omarchy**
+
+Add the repo as above, then install with `sudo pacman -Sy sweeflow`. Omarchy's own updates keep it up to date.
+
+Sweeflow is also an Omarchy plugin: its icon in the bar and a panel in Omarchy's own look, with your Mac's apps, Pause, Stop and Start, and the settings.
+
+```sh
+omarchy plugin add https://github.com/herunan/sweeflow.git --enable
+```
+
+The plugin is the panel only. Without Sweeflow installed it shows the steps above. Remove it with `omarchy plugin remove io.github.herunan.sweeflow`.
 
 **Debian, Ubuntu and Mint**
 

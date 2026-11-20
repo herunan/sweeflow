@@ -98,8 +98,16 @@ pub fn start() {
 /// gone (the package was removed), it takes away what it set up for this user (the service,
 /// launchers, shortcuts: `sweeflow uninstall`), leaving the link with the Mac.
 pub fn watch_binary() {
-    std::thread::spawn(|| loop {
+    let widget = crate::tray::widget_installed();
+    std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
+        // The desktop's own widget for Sweeflow came or went (Omarchy's plugin, turned on or
+        // off): the tray icon and Sweeflow's own window make way for it, or come back.
+        if crate::tray::widget_installed() != widget {
+            log::info!("the desktop's Sweeflow widget {}: restarting to match", if widget { "is gone" } else { "is there now" });
+            let _ = Command::new("systemctl").args(["--user", "--no-block", "restart", "sweeflow"]).status();
+            std::thread::sleep(Duration::from_secs(120));
+        }
         let Ok(link) = std::fs::read_link("/proc/self/exe") else { continue };
         let link = link.to_string_lossy().into_owned();
         let Some(path) = link.strip_suffix(" (deleted)") else { continue };
